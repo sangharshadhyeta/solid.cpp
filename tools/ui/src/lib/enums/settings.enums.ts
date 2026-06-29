@@ -22,6 +22,5 @@ export enum SettingsFieldType {
 	INPUT = 'input',
 	TEXTAREA = 'textarea',
 	CHECKBOX = 'checkbox',
-	SELECT = 'select',
-	RADIO = 'radio'
+	SELECT = 'select'
 }

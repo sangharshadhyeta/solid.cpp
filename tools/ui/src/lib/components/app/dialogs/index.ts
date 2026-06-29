@@ -92,36 +92,33 @@ export { default as DialogExportSettings } from './DialogExportSettings.svelte';
 export { default as DialogConfirmation } from './DialogConfirmation.svelte';
 
 /**
- * **DialogConversationRename** - Rename a conversation
+ * **DialogConversationTitleUpdate** - Conversation rename confirmation
  *
- * Modal dialog for renaming a conversation. Replaces the prior
- * `window.prompt()`-based flow with a styled, accessible AlertDialog
- * containing an editable input. Triggered from the sidebar conversation
- * item's "Edit" action.
+ * Confirmation dialog shown when editing the first user message in a conversation.
+ * Asks user whether to update the conversation title to match the new message content.
  *
  * **Architecture:**
  * - Uses ShadCN AlertDialog
- * - Bindable `value` keeps the new title in sync with parent state
- * - Submit is gated on a non-empty trimmed value that differs from the current title
+ * - Shows current vs proposed title comparison
+ * - Triggered by ChatMessages when first message is edited
  *
  * **Features:**
- * - Autofocus on open with text selected for quick overwrite
- * - Disabled Save button when value is empty or unchanged
- * - Trim-on-submit normalization
- * - Cancel via AlertDialog.Cancel or `onOpenChange(false)`
+ * - Side-by-side display of current and new title
+ * - "Keep Current Title" and "Update Title" action buttons
+ * - Styled title previews in muted background boxes
  *
  * @example
  * ```svelte
- * <DialogConversationRename
- *   bind:open={showRename}
+ * <DialogConversationTitleUpdate
+ *   bind:open={showTitleUpdate}
  *   currentTitle={conversation.name}
- *   bind:value={renameDraft}
- *   onConfirm={handleRenameConfirm}
- *   onCancel={() => (showRename = false)}
+ *   newTitle={truncatedMessageContent}
+ *   onConfirm={updateTitle}
+ *   onCancel={() => showTitleUpdate = false}
  * />
  * ```
  */
-export { default as DialogConversationRename } from './DialogConversationRename.svelte';
+export { default as DialogConversationTitleUpdate } from './DialogConversationTitleUpdate.svelte';
 
 /**
  *

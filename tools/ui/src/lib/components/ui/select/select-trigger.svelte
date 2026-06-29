@@ -1,12 +1,12 @@
 <script lang="ts">
+	import { Select as SelectPrimitive } from 'bits-ui';
 	import ChevronDownIcon from '@lucide/svelte/icons/chevron-down';
 	import { cn, type WithoutChild } from '$lib/components/ui/utils.js';
-	import { Select as SelectPrimitive } from 'bits-ui';
 
 	let {
-		children,
-		class: className,
 		ref = $bindable(null),
+		class: className,
+		children,
 		size = 'default',
 		variant = 'default',
 		...restProps

@@ -80,9 +80,7 @@ shared vec4 occupancy_limiter[LIMIT_OCCUPANCY_SHMEM > 0 ? LIMIT_OCCUPANCY_SHMEM 
 
 void main() {
 #ifdef NEEDS_INIT_IQ_SHMEM
-    if (fa_type_needs_shmem(FaTypeK) || fa_type_needs_shmem(FaTypeV)) {
-        init_iq_shmem(gl_WorkGroupSize);
-    }
+    init_iq_shmem(gl_WorkGroupSize);
 #endif
 
     init_indices();

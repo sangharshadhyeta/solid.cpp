@@ -9,7 +9,6 @@
 #include "peg-parser.h"
 
 #include <fstream>
-#include <iterator>
 #include <numeric>
 #include <optional>
 #include <sstream>
@@ -399,7 +398,7 @@ int main(int argc, char ** argv) {
         if (std::optional<common_chat_params> spec_tmpl =
                 common_chat_try_specialized_template(chat_template, template_source, params)) {
             LOG_ERR("\n");
-            LOG_ERR("This template uses a specialized parser, analysis results will not be available.\n");
+            LOG_ERR("This template uses a specialized parser, analysis results will not be available.");
             parser_data = *spec_tmpl;
         } else {
             // Render template scenarios if requested
@@ -427,9 +426,7 @@ int main(int argc, char ** argv) {
                 // Generate Parser
                 parser_data = autoparser::peg_generator::generate_parser(chat_template, params, analysis);
             }
-        }
 
-        if (!std::empty(parser_data.parser)) {
             LOG_ERR("\n=== Generated Parser ===\n");
             common_peg_arena arena;
             arena.load(parser_data.parser);

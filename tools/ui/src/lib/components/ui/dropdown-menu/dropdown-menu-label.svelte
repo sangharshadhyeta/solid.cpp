@@ -3,10 +3,10 @@
 	import type { HTMLAttributes } from 'svelte/elements';
 
 	let {
-		children,
+		ref = $bindable(null),
 		class: className,
 		inset,
-		ref = $bindable(null),
+		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> & {
 		inset?: boolean;

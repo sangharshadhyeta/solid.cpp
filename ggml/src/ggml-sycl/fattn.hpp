@@ -19,6 +19,4 @@ void ggml_sycl_flash_attn_ext(ggml_backend_sycl_context & ctx, ggml_tensor * dst
 
 bool ggml_sycl_flash_attn_ext_supported(int device, const ggml_tensor * dst);
 
-void ggml_sycl_flash_attn_ext_mkl(ggml_backend_sycl_context & ctx, ggml_tensor * dst);
-
 #endif // GGML_SYCL_FATTN_HPP

@@ -4,20 +4,20 @@
 	import { expect } from 'storybook/test';
 
 	const mockForkedConversation: DatabaseConversation = {
-		currNode: 'msg-2',
-		forkedFromConversationId: 'conv-1',
 		id: 'conv-2',
+		name: 'Forked Conversation',
 		lastModified: Date.now(),
-		name: 'Forked Conversation'
+		currNode: 'msg-2',
+		forkedFromConversationId: 'conv-1'
 	};
 
 	const { Story } = defineMeta({
+		title: 'Components/SidebarNavigationConversationItem/Accessibility',
 		component: SidebarNavigationConversationItem,
 		parameters: {
 			layout: 'centered'
 		},
-		tags: ['!dev'],
-		title: 'Components/SidebarNavigationConversationItem/Accessibility'
+		tags: ['!dev']
 	});
 </script>
 

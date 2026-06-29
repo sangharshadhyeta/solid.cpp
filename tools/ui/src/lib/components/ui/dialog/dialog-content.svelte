@@ -1,15 +1,15 @@
 <script lang="ts">
-	import * as Dialog from './index.js';
-	import XIcon from '@lucide/svelte/icons/x';
-	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils';
 	import { Dialog as DialogPrimitive } from 'bits-ui';
+	import XIcon from '@lucide/svelte/icons/x';
 	import type { Snippet } from 'svelte';
+	import * as Dialog from './index.js';
+	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils';
 
 	let {
-		children,
+		ref = $bindable(null),
 		class: className,
 		portalProps,
-		ref = $bindable(null),
+		children,
 		showCloseButton = true,
 		...restProps
 	}: WithoutChildrenOrChild<DialogPrimitive.ContentProps> & {

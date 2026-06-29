@@ -2,7 +2,7 @@
 	import { ChevronDown, ChevronRight } from '@lucide/svelte';
 	import * as Collapsible from '$lib/components/ui/collapsible';
 	import type { MCPConnectionLog } from '$lib/types';
-	import { formatTime, getMcpLogLevelClass, getMcpLogLevelIcon } from '$lib/utils';
+	import { formatTime, getMcpLogLevelIcon, getMcpLogLevelClass } from '$lib/utils';
 
 	interface Props {
 		logs: MCPConnectionLog[];
@@ -11,7 +11,7 @@
 		class?: string;
 	}
 
-	let { class: className, connectionTimeMs, defaultExpanded = false, logs }: Props = $props();
+	let { logs, connectionTimeMs, defaultExpanded = false, class: className }: Props = $props();
 
 	let isExpanded = $derived(defaultExpanded);
 

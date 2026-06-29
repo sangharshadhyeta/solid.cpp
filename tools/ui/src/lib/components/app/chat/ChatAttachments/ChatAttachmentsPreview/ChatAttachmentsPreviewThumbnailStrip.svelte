@@ -1,7 +1,6 @@
 <script lang="ts">
-	import { FileText, Music, Video } from '@lucide/svelte';
+	import { Music, Video, FileText } from '@lucide/svelte';
 	import { HorizontalScrollCarousel } from '$lib/components/app/misc';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 
 	interface PreviewItem {
 		id: string;
@@ -18,15 +17,13 @@
 		onNavigate: (index: number) => void;
 	}
 
-	let { currentIndex, items, onNavigate }: Props = $props();
+	let { items, currentIndex, onNavigate }: Props = $props();
 
 	function getFileExtension(name: string): string {
 		const parts = name.split('.');
-
 		if (parts.length > 1) {
 			return parts.pop()?.toUpperCase() ?? '';
 		}
-
 		return '';
 	}
 </script>
@@ -52,11 +49,11 @@
 							class="bg-foreground-muted/50 flex h-12 w-12 flex-col items-center justify-center gap-0.5 py-1"
 						>
 							{#if item.isAudio}
-								<Music class="{ICON_CLASS_DEFAULT} text-white/70" />
+								<Music class="h-4 w-4 text-white/70" />
 							{:else if item.isVideo}
-								<Video class="{ICON_CLASS_DEFAULT} text-white/70" />
+								<Video class="h-4 w-4 text-white/70" />
 							{:else}
-								<FileText class="{ICON_CLASS_DEFAULT} text-white/70" />
+								<FileText class="h-4 w-4 text-white/70" />
 							{/if}
 
 							<span class="font-mono text-[9px] text-white/60">{getFileExtension(item.name)}</span>

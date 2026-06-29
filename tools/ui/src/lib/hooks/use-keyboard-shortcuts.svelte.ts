@@ -1,6 +1,6 @@
 import { goto } from '$app/navigation';
-import { ROUTES } from '$lib/constants';
 import { KeyboardKey } from '$lib/enums';
+import { ROUTES } from '$lib/constants/routes';
 
 interface KeyboardShortcutsCallbacks {
 	activateSearchMode?: () => void;
@@ -9,7 +9,6 @@ interface KeyboardShortcutsCallbacks {
 	deleteActiveConversation?: () => void;
 	navigateToPrevConversation?: () => void;
 	navigateToNextConversation?: () => void;
-	toggleSidebar?: () => void;
 }
 
 export function useKeyboardShortcuts(callbacks: KeyboardShortcutsCallbacks) {
@@ -20,11 +19,6 @@ export function useKeyboardShortcuts(callbacks: KeyboardShortcutsCallbacks) {
 			event.preventDefault();
 			callbacks.activateSearchMode?.();
 			callbacks.onSearchActivated?.();
-		}
-
-		if (isCmdOrCtrl && event.key === KeyboardKey.B_LOWER) {
-			event.preventDefault();
-			callbacks.toggleSidebar?.();
 		}
 
 		if (

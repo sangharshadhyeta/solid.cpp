@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { TruncatedText } from '$lib/components/app';
 	import { ModelsService } from '$lib/services/models.service';
 	import { config } from '$lib/stores/settings.svelte';
+	import { TruncatedText } from '$lib/components/app';
 
 	interface Props {
 		modelId: string;
@@ -15,14 +15,14 @@
 	}
 
 	let {
-		aliases,
-		class: className = '',
+		modelId,
 		hideOrgName = false,
+		showRaw = undefined,
 		hideQuantization,
 		hideTags,
-		modelId,
-		showRaw = undefined,
+		aliases,
 		tags,
+		class: className = '',
 		...rest
 	}: Props = $props();
 

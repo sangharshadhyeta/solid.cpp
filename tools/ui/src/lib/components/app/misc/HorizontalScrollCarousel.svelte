@@ -1,6 +1,5 @@
 <script lang="ts">
 	import { ChevronLeft, ChevronRight } from '@lucide/svelte';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import type { Snippet } from 'svelte';
 
 	interface Props {
@@ -10,7 +9,7 @@
 		onScrollableChange?: (isScrollable: boolean) => void;
 	}
 
-	let { children, class: className = '', gapSize = '3', onScrollableChange }: Props = $props();
+	let { class: className = '', children, gapSize = '3', onScrollableChange }: Props = $props();
 
 	let canScrollLeft = $state(false);
 	let canScrollRight = $state(false);
@@ -22,7 +21,7 @@
 
 		if (!scrollContainer) return;
 
-		scrollContainer.scrollBy({ behavior: 'smooth', left: scrollContainer.clientWidth * -0.67 });
+		scrollContainer.scrollBy({ left: scrollContainer.clientWidth * -0.67, behavior: 'smooth' });
 	}
 
 	function scrollRight(event?: MouseEvent) {
@@ -31,19 +30,18 @@
 
 		if (!scrollContainer) return;
 
-		scrollContainer.scrollBy({ behavior: 'smooth', left: scrollContainer.clientWidth * 0.67 });
+		scrollContainer.scrollBy({ left: scrollContainer.clientWidth * 0.67, behavior: 'smooth' });
 	}
 
 	function updateScrollButtons() {
 		if (!scrollContainer) return;
 
-		const { clientWidth, scrollLeft, scrollWidth } = scrollContainer;
+		const { scrollLeft, scrollWidth, clientWidth } = scrollContainer;
 
 		canScrollLeft = scrollLeft > 0;
 		canScrollRight = scrollLeft < scrollWidth - clientWidth - 1;
 
 		const isScrollable = scrollWidth > clientWidth;
-
 		onScrollableChange?.(isScrollable);
 	}
 
@@ -60,7 +58,6 @@
 		if (!scrollContainer) return;
 
 		const observer = new ResizeObserver(() => updateScrollButtons());
-
 		observer.observe(scrollContainer);
 
 		return () => observer.disconnect();
@@ -74,7 +71,7 @@
 		disabled={!canScrollLeft}
 		aria-label="Scroll left"
 	>
-		<ChevronLeft class={ICON_CLASS_DEFAULT} />
+		<ChevronLeft class="h-4 w-4" />
 	</button>
 
 	<div
@@ -91,6 +88,6 @@
 		disabled={!canScrollRight}
 		aria-label="Scroll right"
 	>
-		<ChevronRight class={ICON_CLASS_DEFAULT} />
+		<ChevronRight class="h-4 w-4" />
 	</button>
 </div>

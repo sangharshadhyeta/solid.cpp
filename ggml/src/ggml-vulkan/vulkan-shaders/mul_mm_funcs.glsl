@@ -151,18 +151,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             buf_a[buf_idx + 1] = FLOAT_TYPEV2((bits & 0x04u) != 0u ? d : -d, (bits & 0x08u) != 0u ? d : -d);
             buf_a[buf_idx + 2] = FLOAT_TYPEV2((bits & 0x10u) != 0u ? d : -d, (bits & 0x20u) != 0u ? d : -d);
             buf_a[buf_idx + 3] = FLOAT_TYPEV2((bits & 0x40u) != 0u ? d : -d, (bits & 0x80u) != 0u ? d : -d);
-#elif defined(DATA_A_Q2_0)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
-
-            const uint ib = idx / 16;
-            const uint iqs = idx & 0xfu;
-
-            const FLOAT_TYPE d = FLOAT_TYPE(data_a[ib].d);
-            const uint bits = uint(data_a[ib].qs[iqs]);
-
-            buf_a[buf_idx    ] = d * (FLOAT_TYPEV2(bits & 3u, (bits >> 2u) & 3u) - FLOAT_TYPEV2(1.0f));
-            buf_a[buf_idx + 1] = d * (FLOAT_TYPEV2((bits >> 4u) & 3u, bits >> 6u) - FLOAT_TYPEV2(1.0f));
 #elif defined(DATA_A_Q2_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
@@ -182,22 +170,6 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
 
             buf_a[buf_idx    ] = FLOAT_TYPEV2(v.xy);
             buf_a[buf_idx + 1] = FLOAT_TYPEV2(v.zw);
-#elif defined(DATA_A_TQ2_0)
-            const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
-            const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
-
-            const uint ib = idx / 128;                         // 2 values per idx
-            const uint iqs = (idx % 128) * 2;                  // elem 0,2,4..254
-
-            const uint qsi   = (iqs / 128) * 32 + (iqs % 32);  // byte pair start
-            const uint shift = 2 * ((iqs % 128) / 32);         // 0,2,4,6
-
-            const uvec2 qs = uvec2(data_a[ib].qs[qsi], data_a[ib].qs[qsi + 1]);
-            const float d = float(data_a[ib].d);
-
-            const vec2 v = d * (vec2((qs >> shift) & 3) - 1.0);
-
-            buf_a[buf_idx] = FLOAT_TYPEV2(v.xy);
 #elif defined(DATA_A_Q3_K)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             const uint buf_idx = col * SHMEM_STRIDE + row * LOAD_VEC_A / 2;
@@ -530,21 +502,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint ib = idx / 8;
             const uint iqs = (idx & 0x07) * 2;
 
+            const float d = e8m0_to_fp32(data_a[ib].e) * 0.5;
             const uint vui = uint(data_a[ib].qs[iqs]);
             const uint vui2 = uint(data_a[ib].qs[iqs+1]);
 
-#ifdef USE_OCP_FP4
-            const float d = e8m0_to_fp32(data_a[ib].e);
-            const u8vec2 packed = u8vec2(vui, vui2);
-            buf_a[buf_idx    ] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 0u)) * FLOAT_TYPE(d);
-            buf_a[buf_idx + 8] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * FLOAT_TYPE(d);
-#else
-            const float d = e8m0_to_fp32(data_a[ib].e) * 0.5;
             buf_a[buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
                                               kvalues_mxfp4[vui2 & 0xF] * d);
             buf_a[buf_idx + 8] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
                                               kvalues_mxfp4[vui2 >>  4] * d);
-#endif
 #elif defined(DATA_A_NVFP4)
             const uint idx = pos_a + col * p.stride_a / LOAD_VEC_A + row;
             // lo and hi nibbles are 8 elements apart, which doesn't quite line up with
@@ -554,21 +519,14 @@ void load_a_to_shmem(const uint pos_a, const uint row, const uint col, const uin
             const uint ib = idx / 16u;
             const uint sub = (idx & 0xC) >> 2;
             const uint iqs = (idx & 0xF) * 2;
+            const float d = ue4m3_to_fp32(data_a[ib].d[sub]) * 0.5;
             const uint vui = uint(data_a[ib].qs[iqs]);
             const uint vui2 = uint(data_a[ib].qs[iqs+1]);
 
-#ifdef USE_OCP_FP4
-            const FLOAT_TYPE d = FLOAT_TYPE(ue4m3_from_bits(data_a[ib].d[sub]));
-            const u8vec2 packed = u8vec2(vui, vui2);
-            buf_a[buf_idx    ] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 0u)) * d;
-            buf_a[buf_idx + 4] = FLOAT_TYPEV2(bitcastExtractfe2m1EXT(packed, 4u)) * d;
-#else
-            const float d = ue4m3_to_fp32(data_a[ib].d[sub]) * 0.5;
             buf_a[buf_idx    ] = FLOAT_TYPEV2(kvalues_mxfp4[vui  & 0xF] * d,
                                               kvalues_mxfp4[vui2 & 0xF] * d);
             buf_a[buf_idx + 4] = FLOAT_TYPEV2(kvalues_mxfp4[vui  >>  4] * d,
                                               kvalues_mxfp4[vui2 >>  4] * d);
-#endif
 #endif
 }
 

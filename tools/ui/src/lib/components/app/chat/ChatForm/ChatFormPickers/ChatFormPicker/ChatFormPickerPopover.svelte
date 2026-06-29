@@ -1,6 +1,6 @@
 <script lang="ts">
-	import * as Popover from '$lib/components/ui/popover';
 	import type { Snippet } from 'svelte';
+	import * as Popover from '$lib/components/ui/popover';
 
 	interface Props {
 		class?: string;
@@ -12,12 +12,12 @@
 	}
 
 	let {
-		children,
 		class: className = '',
 		isOpen = $bindable(false),
+		srLabel = 'Open picker',
 		onClose,
 		onKeydown,
-		srLabel = 'Open picker'
+		children
 	}: Props = $props();
 </script>
 
@@ -42,7 +42,6 @@
 		align="start"
 		sideOffset={12}
 		class="w-[var(--bits-popover-anchor-width)] max-w-none rounded-xl border-border/50 p-0 shadow-xl {className}"
-		preventScroll={false}
 		onkeydown={onKeydown}
 		onOpenAutoFocus={(event) => event.preventDefault()}
 	>

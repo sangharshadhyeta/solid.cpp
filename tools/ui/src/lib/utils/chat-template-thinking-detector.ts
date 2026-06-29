@@ -12,6 +12,7 @@
  */
 
 const THINKING_KWARG_VARS = ['enable_thinking', 'reasoning_effort', 'thinking_budget'];
+
 /**
  * Paired thinking-content tag patterns.
  *
@@ -29,6 +30,7 @@ const THINKING_TAG_PATTERNS: Array<[string, string | null]> = [
 	['<seed:think|>', '</seed:think|>'],
 	['<think></think>', null]
 ];
+
 const JINJA_THINKING_CONDITIONALS: RegExp[] = [
 	// Matches: {% if enable thinking %}, {% if enable_thinking %}, {% if (enable_thinking is defined) %}
 	// Handles: underscore-separated (enable_thinking), space-separated (enable thinking),
@@ -45,13 +47,11 @@ const JINJA_THINKING_CONDITIONALS: RegExp[] = [
  */
 export function detectThinkingSupport(t: string): boolean {
 	if (!t) return false;
-
 	for (const kwarg of THINKING_KWARG_VARS) {
 		const regex = new RegExp(
 			`(\\{\\{[^{}]*\\b${kwarg}\\b[^{}]*\\}\\}|\\{%[^{}]*\\b${kwarg}\\b[^{}]*%\\})`,
 			'i'
 		);
-
 		if (regex.test(t)) return true;
 	}
 	for (const p of JINJA_THINKING_CONDITIONALS) {
@@ -60,31 +60,27 @@ export function detectThinkingSupport(t: string): boolean {
 	for (const [s, e] of THINKING_TAG_PATTERNS) {
 		if (t.includes(s) && (!e || t.includes(e))) return true;
 	}
-
 	return false;
 }
 
 export function detectThinkingSupportWithReason(t: string): { supported: boolean; reason: string } {
-	if (!t) return { reason: 'No chat template available', supported: false };
-
+	if (!t) return { supported: false, reason: 'No chat template available' };
 	for (const kwarg of THINKING_KWARG_VARS) {
 		const regex = new RegExp(
 			`(\\{\\{[^{}]*\\b${kwarg}\\b[^{}]*\\}\\}|\\{%[^{}]*\\b${kwarg}\\b[^{}]*%\\})`,
 			'i'
 		);
-
 		if (regex.test(t)) {
-			return { reason: 'Found: ' + kwarg, supported: true };
+			return { supported: true, reason: 'Found: ' + kwarg };
 		}
 	}
 	for (const p of JINJA_THINKING_CONDITIONALS) {
-		if (p.test(t)) return { reason: 'Found: thinking conditional', supported: true };
+		if (p.test(t)) return { supported: true, reason: 'Found: thinking conditional' };
 	}
 	for (const [s, e] of THINKING_TAG_PATTERNS) {
 		if (t.includes(s) && (!e || t.includes(e))) {
-			return { reason: 'Found: ' + s + (e ? ' .. ' + e : ' (self)'), supported: true };
+			return { supported: true, reason: 'Found: ' + s + (e ? ' .. ' + e : ' (self)') };
 		}
 	}
-
-	return { reason: 'No thinking patterns found', supported: false };
+	return { supported: false, reason: 'No thinking patterns found' };
 }

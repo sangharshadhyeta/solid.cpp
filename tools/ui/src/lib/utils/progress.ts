@@ -19,9 +19,7 @@ export function modelLoadStageLabel(stage: ApiModelLoadStage): string {
 export function modelLoadFraction(progress: ModelLoadProgress | null): number {
 	if (!progress) return 0;
 
-	// The server may emit a progress event before the stage plan is known, so
-	// `stages` can be absent. Fall back to the raw value in that case.
-	const { current, stages = [], value } = progress;
+	const { stages, current, value } = progress;
 	const tailCount = Math.max(stages.length - 1, 0);
 	const textCeiling = 1 - tailCount * MODEL_LOAD_TAIL_SHARE;
 	const idx = stages.indexOf(current);
@@ -41,8 +39,5 @@ export function modelLoadProgressText(progress: ModelLoadProgress | null): strin
 	if (!progress) return null;
 
 	const label = modelLoadStageLabel(progress.current);
-
-	if (!label) return null;
-
 	return `${label} ${Math.round(modelLoadFraction(progress) * 100)}%`;
 }

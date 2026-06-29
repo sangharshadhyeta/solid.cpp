@@ -104,21 +104,21 @@ jobs:
         id: server_integration_tests
         run: |
           cd tools/server/tests
-          ./tests.sh
+          pytest -v -x -m "not slow"
 
       - name: Slow tests
         id: server_integration_tests_slow
         if: ${{ github.event.schedule || github.event.inputs.slow_tests == 'true' }}
         run: |
           cd tools/server/tests
-          SLOW_TESTS=1 ./tests.sh
+          SLOW_TESTS=1 pytest -v -x
 
       - name: Tests (Backend sampling)
         id: server_integration_tests_backend_sampling
         run: |
           cd tools/server/tests
           export LLAMA_ARG_BACKEND_SAMPLING=1
-          ./tests.sh
+          pytest -v -x -m "not slow"
 
       - name: Slow tests (Backend sampling)
         id: server_integration_tests_slow_backend_sampling
@@ -126,7 +126,7 @@ jobs:
         run: |
           cd tools/server/tests
           export LLAMA_ARG_BACKEND_SAMPLING=1
-          SLOW_TESTS=1 ./tests.sh
+          SLOW_TESTS=1 pytest -v -x
 
   windows:
     runs-on: windows-2025
@@ -167,17 +167,15 @@ jobs:
 
       - name: Tests
         id: server_integration_tests
-        shell: bash
         run: |
           cd tools/server/tests
-          export PYTHONIOENCODING=":replace"
-          ./tests.sh
+          $env:PYTHONIOENCODING = ":replace"
+          pytest -v -x -m "not slow"
 
       - name: Slow tests
         id: server_integration_tests_slow
         if: ${{ github.event.schedule || github.event.inputs.slow_tests == 'true' }}
-        shell: bash
         run: |
           cd tools/server/tests
-          export SLOW_TESTS="1"
-          ./tests.sh
+          $env:SLOW_TESTS = "1"
+          pytest -v -x

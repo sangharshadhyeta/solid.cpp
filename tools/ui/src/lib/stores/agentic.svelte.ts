@@ -20,17 +20,24 @@
  * @see mcpStore in stores/mcp.svelte.ts for MCP operations
  */
 
-import { DEFAULT_AGENTIC_CONFIG, NEWLINE } from '$lib/constants';
+import { ChatService } from '$lib/services';
+import { config } from '$lib/stores/settings.svelte';
+import { mcpStore } from '$lib/stores/mcp.svelte';
+import { modelsStore } from '$lib/stores/models.svelte';
+import { toolsStore } from '$lib/stores/tools.svelte';
+import { permissionsStore } from '$lib/stores/permissions.svelte';
+import { ToolSource, ToolPermissionDecision } from '$lib/enums';
+import { SvelteMap } from 'svelte/reactivity';
+import { ToolsService } from '$lib/services/tools.service';
+import { SandboxService } from '$lib/services/sandbox.service';
+import { isAbortError } from '$lib/utils';
+import { DEFAULT_AGENTIC_CONFIG, NEWLINE_SEPARATOR } from '$lib/constants';
 import {
-	AUDIO_MIME_TO_EXTENSION,
-	DATA_URI_BASE64_REGEX,
-	DEFAULT_AUDIO_EXTENSION,
-	DEFAULT_IMAGE_EXTENSION,
 	IMAGE_MIME_TO_EXTENSION,
+	DATA_URI_BASE64_REGEX,
 	MCP_ATTACHMENT_NAME_PREFIX,
-	MIME_TYPE_PREFIXES
+	DEFAULT_IMAGE_EXTENSION
 } from '$lib/constants';
-import { BuiltInTool, ToolPermissionDecision, ToolSource } from '$lib/enums';
 import {
 	AttachmentType,
 	ContentPartType,
@@ -38,62 +45,48 @@ import {
 	MimeTypePrefix,
 	ToolCallType
 } from '$lib/enums';
-import { ChatService } from '$lib/services';
-import { ReadMediaService } from '$lib/services/read-media.service';
-import { SandboxService } from '$lib/services/sandbox.service';
-import { ToolsService } from '$lib/services/tools.service';
-import { conversationsStore } from '$lib/stores/conversations.svelte';
-import { mcpStore } from '$lib/stores/mcp.svelte';
-import { modelsStore } from '$lib/stores/models.svelte';
-import { permissionsStore } from '$lib/stores/permissions.svelte';
-import { config } from '$lib/stores/settings.svelte';
-import { toolsStore } from '$lib/stores/tools.svelte';
 import type {
-	AgenticConfig,
 	AgenticFlowParams,
 	AgenticFlowResult,
 	AgenticSession,
+	AgenticConfig,
+	SettingsConfigType,
 	McpServerOverride,
-	MCPToolCall,
-	SettingsConfigType
+	MCPToolCall
 } from '$lib/types';
 import type {
-	AgenticFlowCallbacks,
-	AgenticFlowOptions,
 	AgenticMessage,
 	AgenticToolCallList,
+	AgenticFlowCallbacks,
+	AgenticFlowOptions,
 	SteeringMessage
 } from '$lib/types/agentic';
 import type {
 	ApiChatCompletionToolCall,
-	ApiChatMessageContentPart,
-	ApiChatMessageData
+	ApiChatMessageData,
+	ApiChatMessageContentPart
 } from '$lib/types/api';
 import type {
-	ChatMessageAgenticTimings,
-	ChatMessageAgenticTurnStats,
 	ChatMessagePromptProgress,
 	ChatMessageTimings,
-	ChatMessageToolCallTiming
+	ChatMessageAgenticTimings,
+	ChatMessageToolCallTiming,
+	ChatMessageAgenticTurnStats
 } from '$lib/types/chat';
 import type {
 	DatabaseMessage,
 	DatabaseMessageExtra,
-	DatabaseMessageExtraAudioFile,
 	DatabaseMessageExtraImageFile
 } from '$lib/types/database';
-import { getAudioInputFormat, isAbortError } from '$lib/utils';
-import { SvelteMap } from 'svelte/reactivity';
 
 function createDefaultSession(): AgenticSession {
 	return {
-		currentTurn: 0,
-		executingToolCallId: null,
 		isRunning: false,
+		currentTurn: 0,
+		totalToolCalls: 0,
 		lastError: null,
-		pendingPermissionRequest: null,
 		streamingToolCall: null,
-		totalToolCalls: 0
+		pendingPermissionRequest: null
 	};
 }
 
@@ -105,39 +98,36 @@ function toAgenticMessages(messages: ApiChatMessageData[]): AgenticMessage[] {
 			message.tool_calls.length > 0
 		) {
 			return {
+				role: MessageRole.ASSISTANT,
 				content: message.content,
 				reasoning_content: message.reasoning_content,
-				role: MessageRole.ASSISTANT,
 				tool_calls: message.tool_calls.map((call, index) => ({
-					function: {
-						arguments: call.function?.arguments ?? '',
-						name: call.function?.name ?? ''
-					},
 					id: call.id ?? `call_${index}`,
-					type: (call.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION
+					type: (call.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION,
+					function: {
+						name: call.function?.name ?? '',
+						arguments: call.function?.arguments ?? ''
+					}
 				}))
 			} satisfies AgenticMessage;
 		}
-
 		if (message.role === MessageRole.ASSISTANT) {
 			return {
+				role: MessageRole.ASSISTANT,
 				content: message.content,
-				reasoning_content: message.reasoning_content,
-				role: MessageRole.ASSISTANT
+				reasoning_content: message.reasoning_content
 			} satisfies AgenticMessage;
 		}
-
 		if (message.role === MessageRole.TOOL && message.tool_call_id) {
 			return {
-				content: typeof message.content === 'string' ? message.content : '',
 				role: MessageRole.TOOL,
-				tool_call_id: message.tool_call_id
+				tool_call_id: message.tool_call_id,
+				content: typeof message.content === 'string' ? message.content : ''
 			} satisfies AgenticMessage;
 		}
-
 		return {
-			content: message.content,
-			role: message.role as MessageRole.SYSTEM | MessageRole.USER
+			role: message.role as MessageRole.SYSTEM | MessageRole.USER,
+			content: message.content
 		} satisfies AgenticMessage;
 	});
 }
@@ -167,24 +157,20 @@ class AgenticStore {
 		for (const session of this._sessions.values()) {
 			if (session.isRunning) return true;
 		}
-
 		return false;
 	}
 
 	getSession(conversationId: string): AgenticSession {
 		let session = this._sessions.get(conversationId);
-
 		if (!session) {
 			session = createDefaultSession();
 			this._sessions.set(conversationId, session);
 		}
-
 		return session;
 	}
 
 	private updateSession(conversationId: string, update: Partial<AgenticSession>): void {
 		const session = this.getSession(conversationId);
-
 		this._sessions.set(conversationId, { ...session, ...update });
 	}
 
@@ -194,36 +180,30 @@ class AgenticStore {
 
 	getActiveSessions(): Array<{ conversationId: string; session: AgenticSession }> {
 		const active: Array<{ conversationId: string; session: AgenticSession }> = [];
-
 		for (const [conversationId, session] of this._sessions.entries()) {
 			if (session.isRunning) active.push({ conversationId, session });
 		}
-
 		return active;
 	}
 
 	isRunning(conversationId: string): boolean {
-		return this._sessions.get(conversationId)?.isRunning ?? false;
+		return this.getSession(conversationId).isRunning;
 	}
 
 	currentTurn(conversationId: string): number {
-		return this._sessions.get(conversationId)?.currentTurn ?? 0;
+		return this.getSession(conversationId).currentTurn;
 	}
 
 	totalToolCalls(conversationId: string): number {
-		return this._sessions.get(conversationId)?.totalToolCalls ?? 0;
+		return this.getSession(conversationId).totalToolCalls;
 	}
 
 	lastError(conversationId: string): Error | null {
-		return this._sessions.get(conversationId)?.lastError ?? null;
+		return this.getSession(conversationId).lastError;
 	}
 
 	streamingToolCall(conversationId: string): { name: string; arguments: string } | null {
-		return this._sessions.get(conversationId)?.streamingToolCall ?? null;
-	}
-
-	executingToolCallId(conversationId: string): string | null {
-		return this._sessions.get(conversationId)?.executingToolCallId ?? null;
+		return this.getSession(conversationId).streamingToolCall;
 	}
 
 	pendingPermissionRequest(
@@ -238,7 +218,6 @@ class AgenticStore {
 
 	resolveContinue(conversationId: string, shouldContinue: boolean): void {
 		const resolver = this._continueResolvers.get(conversationId);
-
 		if (resolver) {
 			this._continueResolvers.delete(conversationId);
 			resolver(shouldContinue);
@@ -247,7 +226,6 @@ class AgenticStore {
 
 	resolvePermission(conversationId: string, decision: ToolPermissionDecision): void {
 		const resolver = this._permissionResolvers.get(conversationId);
-
 		if (resolver) {
 			this._permissionResolvers.delete(conversationId);
 			resolver(decision);
@@ -295,35 +273,30 @@ class AgenticStore {
 	 */
 	consumePendingSteeringMessage(conversationId: string): SteeringMessage | null {
 		const msg = this._steeringMessages.get(conversationId);
-
 		if (!msg) return null;
-
 		this._steeringMessages.delete(conversationId);
-
 		return msg;
 	}
 
 	getConfig(settings: SettingsConfigType, perChatOverrides?: McpServerOverride[]): AgenticConfig {
 		const maxTurns = Number(settings.agenticMaxTurns) || DEFAULT_AGENTIC_CONFIG.maxTurns;
+		const maxToolPreviewLines =
+			Number(settings.agenticMaxToolPreviewLines) || DEFAULT_AGENTIC_CONFIG.maxToolPreviewLines;
 		const hasTools =
 			mcpStore.hasEnabledServers(perChatOverrides) ||
 			toolsStore.builtinTools.length > 0 ||
-			toolsStore.frontendTools.length > 0 ||
 			toolsStore.customTools.length > 0;
-
 		return {
 			enabled: hasTools && DEFAULT_AGENTIC_CONFIG.enabled,
-			maxTurns
+			maxTurns,
+			maxToolPreviewLines
 		};
 	}
 
 	private parseToolArguments(args: string | Record<string, unknown>): Record<string, unknown> {
 		if (typeof args === 'object') return args;
-
 		const trimmed = args.trim();
-
 		if (trimmed === '') return {};
-
 		return JSON.parse(trimmed) as Record<string, unknown>;
 	}
 
@@ -334,24 +307,21 @@ class AgenticStore {
 		signal?: AbortSignal
 	): Promise<ToolPermissionDecision> {
 		const permissionKey = toolsStore.getPermissionKey(toolName);
-
 		if (permissionKey && permissionsStore.hasTool(permissionKey)) {
 			return ToolPermissionDecision.ONCE;
 		}
 
-		this._pendingPermissions.set(conversationId, { serverLabel, toolName });
+		this._pendingPermissions.set(conversationId, { toolName, serverLabel });
 
 		return new Promise<ToolPermissionDecision>((resolve) => {
 			if (signal?.aborted) {
 				this._pendingPermissions.set(conversationId, null);
 				resolve(ToolPermissionDecision.DENY);
-
 				return;
 			}
 
 			this._permissionResolvers.set(conversationId, (decision) => {
 				this._pendingPermissions.set(conversationId, null);
-
 				if (decision === ToolPermissionDecision.ALWAYS && permissionKey) {
 					permissionsStore.allowTool(permissionKey);
 				} else if (decision === ToolPermissionDecision.ALWAYS_SERVER) {
@@ -363,10 +333,8 @@ class AgenticStore {
 						)
 						.map((t) => toolsStore.getPermissionKey(t.definition.function.name)!)
 						.filter((k): k is string => k !== null);
-
 					permissionsStore.allowTools(serverToolKeys);
 				}
-
 				resolve(decision);
 			});
 
@@ -374,7 +342,6 @@ class AgenticStore {
 				'abort',
 				() => {
 					const resolver = this._permissionResolvers.get(conversationId);
-
 					if (resolver) {
 						this._permissionResolvers.delete(conversationId);
 						this._pendingPermissions.set(conversationId, null);
@@ -393,7 +360,6 @@ class AgenticStore {
 			if (signal?.aborted) {
 				this._pendingContinueRequests.set(conversationId, false);
 				resolve(false);
-
 				return;
 			}
 
@@ -406,7 +372,6 @@ class AgenticStore {
 				'abort',
 				() => {
 					const resolver = this._continueResolvers.get(conversationId);
-
 					if (resolver) {
 						this._continueResolvers.delete(conversationId);
 						this._pendingContinueRequests.set(conversationId, false);
@@ -419,7 +384,7 @@ class AgenticStore {
 	}
 
 	async runAgenticFlow(params: AgenticFlowParams): Promise<AgenticFlowResult> {
-		const { callbacks, conversationId, messages, options = {}, perChatOverrides, signal } = params;
+		const { conversationId, messages, options = {}, callbacks, signal, perChatOverrides } = params;
 
 		// Clear any pending permissions/continue requests for this conversation when starting a new flow
 		this._pendingPermissions.set(conversationId, null);
@@ -434,11 +399,9 @@ class AgenticStore {
 		}
 
 		const agenticConfig = this.getConfig(config(), perChatOverrides);
-
 		if (!agenticConfig.enabled) return { handled: false };
 
 		const hasMcpServers = mcpStore.hasEnabledServers(perChatOverrides);
-
 		if (hasMcpServers) {
 			const initialized = await mcpStore.ensureInitialized(perChatOverrides);
 
@@ -448,7 +411,6 @@ class AgenticStore {
 		}
 
 		const tools = toolsStore.getEnabledToolsForLLM();
-
 		if (tools.length === 0) {
 			return { handled: false };
 		}
@@ -462,48 +424,42 @@ class AgenticStore {
 						return ChatService.convertDbMessageToApiChatMessageData(
 							msg as DatabaseMessage & { extra?: DatabaseMessageExtra[] }
 						);
-
 					return msg as ApiChatMessageData;
 				})
 			)
 		).filter((msg: { role: ChatRole; content: string | ApiChatMessageContentPart[] }) => {
 			if (msg.role === MessageRole.SYSTEM) {
 				const content = typeof msg.content === 'string' ? msg.content : '';
-
 				return content.trim().length > 0;
 			}
-
 			return true;
 		});
 
 		this.updateSession(conversationId, {
-			currentTurn: 0,
 			isRunning: true,
-			lastError: null,
-			totalToolCalls: 0
+			currentTurn: 0,
+			totalToolCalls: 0,
+			lastError: null
 		});
 
 		if (hasMcpServers) mcpStore.acquireConnection();
 
 		try {
 			await this.executeAgenticLoop({
-				agenticConfig,
-				callbacks,
 				conversationId,
 				messages: normalizedMessages,
 				options,
-				signal,
-				tools
+				tools,
+				agenticConfig,
+				callbacks,
+				signal
 			});
-
 			return { handled: true };
 		} catch (error) {
 			const normalizedError = error instanceof Error ? error : new Error(String(error));
-
 			this.updateSession(conversationId, { lastError: normalizedError });
 			callbacks.onError?.(normalizedError);
-
-			return { error: normalizedError, handled: true };
+			return { handled: true, error: normalizedError };
 		} finally {
 			this.updateSession(conversationId, { isRunning: false });
 
@@ -521,45 +477,44 @@ class AgenticStore {
 		conversationId: string;
 		messages: ApiChatMessageData[];
 		options: AgenticFlowOptions;
-		tools: ReturnType<typeof toolsStore.getEnabledToolsForLLM>;
+		tools: ReturnType<typeof mcpStore.getToolDefinitionsForLLM>;
 		agenticConfig: AgenticConfig;
 		callbacks: AgenticFlowCallbacks;
 		signal?: AbortSignal;
 	}): Promise<void> {
-		const { agenticConfig, callbacks, conversationId, messages, options, signal, tools } = params;
+		const { conversationId, messages, options, tools, agenticConfig, callbacks, signal } = params;
 		const {
-			createAssistantMessage,
-			createToolResultMessage,
-			onAssistantTurnComplete,
-			onAttachments,
 			onChunk,
-			onCompletionId,
-			onFlowComplete,
-			onModel,
 			onReasoningChunk,
-			onTimings,
 			onToolCallsStreaming,
-			onTurnComplete,
-			updateToolResultMessage
+			onAttachments,
+			onModel,
+			onCompletionId,
+			onAssistantTurnComplete,
+			createToolResultMessage,
+			createAssistantMessage,
+			onFlowComplete,
+			onTimings,
+			onTurnComplete
 		} = callbacks;
-		const sessionMessages: AgenticMessage[] = toAgenticMessages(messages);
 
+		const sessionMessages: AgenticMessage[] = toAgenticMessages(messages);
 		let capturedTimings: ChatMessageTimings | undefined;
 		let totalToolCallCount = 0;
 
 		const agenticTimings: ChatMessageAgenticTimings = {
-			llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
-			perTurn: [],
-			toolCalls: [],
+			turns: 0,
 			toolCallsCount: 0,
 			toolsMs: 0,
-			turns: 0
+			toolCalls: [],
+			perTurn: [],
+			llm: { predicted_n: 0, predicted_ms: 0, prompt_n: 0, prompt_ms: 0 }
 		};
 		const maxTurns = agenticConfig.maxTurns;
+
 		const effectiveModel = options.model || modelsStore.models[0]?.model || '';
 
 		let turn = 0;
-
 		while (true) {
 			if (turn >= maxTurns) {
 				// Turn limit reached - ask user whether to continue
@@ -570,7 +525,6 @@ class AgenticStore {
 
 				if (!shouldContinue || signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 					return;
 				}
 
@@ -583,7 +537,6 @@ class AgenticStore {
 
 			if (signal?.aborted) {
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 				return;
 			}
 
@@ -600,10 +553,10 @@ class AgenticStore {
 			let turnTimings: ChatMessageTimings | undefined;
 
 			const turnStats: ChatMessageAgenticTurnStats = {
-				llm: { predicted_ms: 0, predicted_n: 0, prompt_ms: 0, prompt_n: 0 },
+				turn: turn + 1,
+				llm: { predicted_n: 0, predicted_ms: 0, prompt_n: 0, prompt_ms: 0 },
 				toolCalls: [],
-				toolsMs: 0,
-				turn: turn + 1
+				toolsMs: 0
 			};
 
 			try {
@@ -611,41 +564,25 @@ class AgenticStore {
 					sessionMessages as ApiChatMessageData[],
 					{
 						...options,
+						stream: true,
+						tools: tools.length > 0 ? tools : undefined,
 						onChunk: (chunk: string) => {
 							turnContent += chunk;
 							onChunk?.(chunk);
 						},
-						onComplete: () => {
-							/* Completion handled after sendMessage resolves */
-						},
-						onCompletionId,
-						onError: (error: Error) => {
-							throw error;
-						},
-						onModel,
 						onReasoningChunk: (chunk: string) => {
 							turnReasoningContent += chunk;
 							onReasoningChunk?.(chunk);
 						},
-						onTimings: (timings?: ChatMessageTimings, progress?: ChatMessagePromptProgress) => {
-							onTimings?.(timings, progress);
-
-							if (timings) {
-								capturedTimings = timings;
-								turnTimings = timings;
-							}
-						},
 						onToolCallChunk: (serialized: string) => {
 							try {
 								turnToolCalls = JSON.parse(serialized) as ApiChatCompletionToolCall[];
-
 								onToolCallsStreaming?.(turnToolCalls);
 
 								if (turnToolCalls.length > 0 && turnToolCalls[0]?.function) {
 									const name = turnToolCalls[0].function.name || '';
 									const args = turnToolCalls[0].function.arguments || '';
 									const argsLengthBucket = Math.floor(args.length / 100);
-
 									if (
 										name !== lastStreamingToolCallName ||
 										argsLengthBucket !== lastStreamingToolCallArgsLength
@@ -653,7 +590,7 @@ class AgenticStore {
 										lastStreamingToolCallName = name;
 										lastStreamingToolCallArgsLength = argsLengthBucket;
 										this.updateSession(conversationId, {
-											streamingToolCall: { arguments: args, name }
+											streamingToolCall: { name, arguments: args }
 										});
 									}
 								}
@@ -661,8 +598,21 @@ class AgenticStore {
 								/* Ignore parse errors during streaming */
 							}
 						},
-						stream: true,
-						tools: tools.length > 0 ? tools : undefined
+						onModel,
+						onCompletionId,
+						onTimings: (timings?: ChatMessageTimings, progress?: ChatMessagePromptProgress) => {
+							onTimings?.(timings, progress);
+							if (timings) {
+								capturedTimings = timings;
+								turnTimings = timings;
+							}
+						},
+						onComplete: () => {
+							/* Completion handled after sendMessage resolves */
+						},
+						onError: (error: Error) => {
+							throw error;
+						}
 					},
 					conversationId,
 					signal
@@ -690,12 +640,9 @@ class AgenticStore {
 						undefined
 					);
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 					return;
 				}
-
 				const normalizedError = error instanceof Error ? error : new Error('LLM stream error');
-
 				// preserve partial output as is, the outer error dialog informs the user separately
 				await onAssistantTurnComplete?.(
 					turnContent,
@@ -704,24 +651,7 @@ class AgenticStore {
 					undefined
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 				throw normalizedError;
-			}
-
-			// If the abort landed while ChatService.sendMessage was still resolving, the
-			// outer catch above never fires because ChatService swallows the AbortError
-			// and returns normally. Bail out here so a half-received tool_call (truncated
-			// arguments JSON) is not persisted as if it were complete.
-			if (signal?.aborted) {
-				await onAssistantTurnComplete?.(
-					turnContent,
-					turnReasoningContent || undefined,
-					this.buildFinalTimings(capturedTimings, agenticTimings),
-					undefined
-				);
-				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
-				return;
 			}
 
 			// === Steering check: if a user message was queued during this turn, exit the flow.
@@ -735,7 +665,6 @@ class AgenticStore {
 					turnToolCalls.length > 0 ? this.normalizeToolCalls(turnToolCalls) : undefined
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 				return;
 			}
 
@@ -761,7 +690,6 @@ class AgenticStore {
 
 			// Normalize and save assistant turn with tool calls
 			const normalizedCalls = this.normalizeToolCalls(turnToolCalls);
-
 			if (normalizedCalls.length === 0) {
 				await onAssistantTurnComplete?.(
 					turnContent,
@@ -770,7 +698,6 @@ class AgenticStore {
 					undefined
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 				return;
 			}
 
@@ -787,9 +714,9 @@ class AgenticStore {
 
 			// Add assistant message to session history
 			sessionMessages.push({
+				role: MessageRole.ASSISTANT,
 				content: turnContent || undefined,
 				reasoning_content: turnReasoningContent || undefined,
-				role: MessageRole.ASSISTANT,
 				tool_calls: normalizedCalls
 			});
 
@@ -799,7 +726,6 @@ class AgenticStore {
 
 				if (signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 					return;
 				}
 
@@ -811,23 +737,21 @@ class AgenticStore {
 					for (let j = i; j < normalizedCalls.length; j++) {
 						const remainingCall = normalizedCalls[j];
 						const interruptedContent = 'Tool execution was interrupted by a new user message.';
-
 						if (createToolResultMessage) {
 							await createToolResultMessage(remainingCall.id, interruptedContent);
 						}
-
 						sessionMessages.push({
-							content: interruptedContent,
 							role: MessageRole.TOOL,
-							tool_call_id: remainingCall.id
+							tool_call_id: remainingCall.id,
+							content: interruptedContent
 						});
 					}
-
 					break;
 				}
 
 				const toolName = toolCall.function.name;
 				const serverLabel = toolsStore.getToolServerLabel(toolName);
+
 				// Ask for permission before executing the tool
 				const permission = await this.requestPermission(
 					conversationId,
@@ -841,90 +765,38 @@ class AgenticStore {
 
 				if (signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 					return;
 				}
 
 				const toolStartTime = performance.now();
 				const toolSource = toolsStore.getToolSource(toolName);
 
-				let result = '';
+				let result: string;
 				let toolSuccess = true;
-				let createdToolResultMessageId: string | null = null;
-
-				// Streaming tools (currently only exec_shell_command): mark
-				// the session so the matching renderer can switch to live mode.
-				// Cleared unconditionally below.
-				this.updateSession(conversationId, { executingToolCallId: toolCall.id });
 
 				if (permission === ToolPermissionDecision.DENY) {
 					result = 'Tool execution was denied by the user.';
 					toolSuccess = false;
 				} else {
 					try {
-						if (
-							toolSource === ToolSource.BUILTIN &&
-							toolName === BuiltInTool.EXEC_SHELL_COMMAND &&
-							createToolResultMessage &&
-							updateToolResultMessage
-						) {
+						if (toolSource === ToolSource.BUILTIN) {
 							const args = this.parseToolArguments(toolCall.function.arguments);
-							const cwd = conversationsStore.activeConversation?.cwd;
-							const msg = await createToolResultMessage(toolCall.id, '', undefined, cwd);
-
-							createdToolResultMessageId = msg.id;
-
-							let accumulated = '';
-
-							for await (const ev of ToolsService.streamTool(toolName, args, signal, cwd)) {
-								if (ev.chunk !== null) {
-									accumulated += ev.chunk;
-									await updateToolResultMessage(msg.id, accumulated);
-								}
-
-								if (ev.done) {
-									if (ev.error) {
-										accumulated = accumulated
-											? `${accumulated}\nError: ${ev.error}`
-											: `Error: ${ev.error}`;
-										await updateToolResultMessage(msg.id, accumulated);
-										toolSuccess = false;
-									}
-
-									break;
-								}
-							}
-							result = accumulated;
-						} else if (toolSource === ToolSource.BUILTIN) {
-							const args = this.parseToolArguments(toolCall.function.arguments);
-							const cwd = conversationsStore.activeConversation?.cwd;
-							const executionResult = await ToolsService.executeTool(toolName, args, signal, cwd);
+							const executionResult = await ToolsService.executeTool(toolName, args, signal);
 
 							result = executionResult.content;
 
 							if (executionResult.isError) toolSuccess = false;
 						} else if (toolSource === ToolSource.FRONTEND) {
 							const args = this.parseToolArguments(toolCall.function.arguments);
-							const executionResult =
-								toolName === BuiltInTool.READ_MEDIA
-									? await ReadMediaService.executeTool(
-											args,
-											{
-												audio: modelsStore.modelSupportsAudio(effectiveModel),
-												vision: modelsStore.modelSupportsVision(effectiveModel)
-											},
-											signal,
-											conversationsStore.activeConversation?.cwd
-										)
-									: await SandboxService.executeTool(toolName, args, signal);
+							const executionResult = await SandboxService.executeTool(toolName, args, signal);
 
 							result = executionResult.content;
 
 							if (executionResult.isError) toolSuccess = false;
 						} else {
 							const mcpCall: MCPToolCall = {
-								function: { arguments: toolCall.function.arguments, name: toolName },
-								id: toolCall.id
+								id: toolCall.id,
+								function: { name: toolName, arguments: toolCall.function.arguments }
 							};
 							const executionResult = await mcpStore.executeTool(mcpCall, signal);
 
@@ -932,31 +804,18 @@ class AgenticStore {
 						}
 					} catch (error) {
 						if (isAbortError(error)) {
-							this.updateSession(conversationId, { executingToolCallId: null });
 							onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 							return;
 						}
-
-						// Carry the partial stream contents already mirrored to the UI -
-						// they show up as live output even if the stream broke off mid-run.
-						result = result
-							? `${result}\nError: ${error instanceof Error ? error.message : String(error)}`
-							: `Error: ${error instanceof Error ? error.message : String(error)}`;
+						result = `Error: ${error instanceof Error ? error.message : String(error)}`;
 						toolSuccess = false;
-
-						if (createdToolResultMessageId && updateToolResultMessage) {
-							await updateToolResultMessage(createdToolResultMessageId, result);
-						}
 					}
 				}
 
-				this.updateSession(conversationId, { executingToolCallId: null });
-
 				const toolDurationMs = performance.now() - toolStartTime;
 				const toolTiming: ChatMessageToolCallTiming = {
-					duration_ms: Math.round(toolDurationMs),
 					name: toolCall.function.name,
+					duration_ms: Math.round(toolDurationMs),
 					success: toolSuccess
 				};
 
@@ -968,27 +827,14 @@ class AgenticStore {
 
 				if (signal?.aborted) {
 					onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 					return;
 				}
 
-				const { attachments, cleanedResult } = this.extractBase64Attachments(result);
+				const { cleanedResult, attachments } = this.extractBase64Attachments(result);
 
-				// For streaming tools the result message was created empty
-				// at the start of execution and updated in place as chunks
-				// arrived via updateToolResultMessage. Skip the second
-				// create call - just attach any base64 attachments found in
-				// the final accumulator (rare, since chunks usually don't
-				// carry image data URIs) and emit the attachments callback.
+				// Create the tool result message in the DB
 				let toolResultMessage: DatabaseMessage | undefined;
-
-				if (createdToolResultMessageId) {
-					toolResultMessage = { id: createdToolResultMessageId } as DatabaseMessage;
-
-					if (attachments.length > 0 && updateToolResultMessage) {
-						await updateToolResultMessage(createdToolResultMessageId, cleanedResult, attachments);
-					}
-				} else if (createToolResultMessage) {
+				if (createToolResultMessage) {
 					toolResultMessage = await createToolResultMessage(
 						toolCall.id,
 						cleanedResult,
@@ -1002,29 +848,16 @@ class AgenticStore {
 
 				// Build content parts for session history (including images for vision models)
 				const contentParts: ApiChatMessageContentPart[] = [
-					{ text: cleanedResult, type: ContentPartType.TEXT }
+					{ type: ContentPartType.TEXT, text: cleanedResult }
 				];
-
 				for (const attachment of attachments) {
-					if (attachment.type === AttachmentType.AUDIO) {
-						if (modelsStore.modelSupportsAudio(effectiveModel)) {
-							contentParts.push({
-								input_audio: {
-									data: (attachment as DatabaseMessageExtraAudioFile).base64Data,
-									format: getAudioInputFormat(
-										(attachment as DatabaseMessageExtraAudioFile).mimeType
-									)
-								},
-								type: ContentPartType.INPUT_AUDIO
-							});
-						}
-					} else if (attachment.type === AttachmentType.IMAGE) {
+					if (attachment.type === AttachmentType.IMAGE) {
 						if (modelsStore.modelSupportsVision(effectiveModel)) {
 							contentParts.push({
+								type: ContentPartType.IMAGE_URL,
 								image_url: {
 									url: (attachment as DatabaseMessageExtraImageFile).base64Url
-								},
-								type: ContentPartType.IMAGE_URL
+								}
 							});
 						} else {
 							console.info(
@@ -1035,9 +868,9 @@ class AgenticStore {
 				}
 
 				sessionMessages.push({
-					content: contentParts.length === 1 ? cleanedResult : contentParts,
 					role: MessageRole.TOOL,
-					tool_call_id: toolCall.id
+					tool_call_id: toolCall.id,
+					content: contentParts.length === 1 ? cleanedResult : contentParts
 				});
 			}
 
@@ -1045,7 +878,6 @@ class AgenticStore {
 				agenticTimings.perTurn!.push(turnStats);
 
 				const intermediateTimings = this.buildFinalTimings(capturedTimings, agenticTimings);
-
 				if (intermediateTimings) onTurnComplete?.(intermediateTimings);
 			}
 
@@ -1055,7 +887,6 @@ class AgenticStore {
 					'[AgenticStore] Steering message detected after tool execution, exiting agentic flow'
 				);
 				onFlowComplete?.(this.buildFinalTimings(capturedTimings, agenticTimings));
-
 				return;
 			}
 
@@ -1068,27 +899,25 @@ class AgenticStore {
 		agenticTimings: ChatMessageAgenticTimings
 	): ChatMessageTimings | undefined {
 		if (agenticTimings.toolCallsCount === 0) return capturedTimings;
-
 		return {
-			agentic: agenticTimings,
-			cache_n: capturedTimings?.cache_n,
-			predicted_ms: capturedTimings?.predicted_ms,
 			predicted_n: capturedTimings?.predicted_n,
+			predicted_ms: capturedTimings?.predicted_ms,
+			prompt_n: capturedTimings?.prompt_n,
 			prompt_ms: capturedTimings?.prompt_ms,
-			prompt_n: capturedTimings?.prompt_n
+			cache_n: capturedTimings?.cache_n,
+			agentic: agenticTimings
 		};
 	}
 
 	private normalizeToolCalls(toolCalls: ApiChatCompletionToolCall[]): AgenticToolCallList {
 		if (!toolCalls) return [];
-
 		return toolCalls.map((call, index) => ({
-			function: {
-				arguments: call?.function?.arguments ?? '',
-				name: call?.function?.name ?? ''
-			},
 			id: call?.id ?? `tool_${index}`,
-			type: (call?.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION
+			type: (call?.type as ToolCallType.FUNCTION) ?? ToolCallType.FUNCTION,
+			function: {
+				name: call?.function?.name ?? '',
+				arguments: call?.function?.arguments ?? ''
+			}
 		}));
 	}
 
@@ -1097,18 +926,17 @@ class AgenticStore {
 		attachments: DatabaseMessageExtra[];
 	} {
 		if (!result.trim()) {
-			return { attachments: [], cleanedResult: result };
+			return { cleanedResult: result, attachments: [] };
 		}
 
-		const lines = result.split(NEWLINE);
+		const lines = result.split(NEWLINE_SEPARATOR);
 		const attachments: DatabaseMessageExtra[] = [];
-
 		let attachmentIndex = 0;
 
 		const cleanedLines = lines.map((line) => {
 			const trimmedLine = line.trim();
-			const match = trimmedLine.match(DATA_URI_BASE64_REGEX);
 
+			const match = trimmedLine.match(DATA_URI_BASE64_REGEX);
 			if (!match) {
 				return line;
 			}
@@ -1123,20 +951,8 @@ class AgenticStore {
 			attachmentIndex += 1;
 			const name = this.buildAttachmentName(mimeType, attachmentIndex);
 
-			if (mimeType.startsWith(MIME_TYPE_PREFIXES.IMAGE)) {
-				attachments.push({ base64Url: trimmedLine, name, type: AttachmentType.IMAGE });
-
-				return `[Attachment saved: ${name}]`;
-			}
-
-			if (mimeType.startsWith(MimeTypePrefix.AUDIO)) {
-				// audio extras hold the bare base64, the input_audio part has no room for a data URI
-				attachments.push({
-					base64Data,
-					mimeType,
-					name,
-					type: AttachmentType.AUDIO
-				});
+			if (mimeType.startsWith(MimeTypePrefix.IMAGE)) {
+				attachments.push({ type: AttachmentType.IMAGE, name, base64Url: trimmedLine });
 
 				return `[Attachment saved: ${name}]`;
 			}
@@ -1144,13 +960,11 @@ class AgenticStore {
 			return line;
 		});
 
-		return { attachments, cleanedResult: cleanedLines.join(NEWLINE) };
+		return { cleanedResult: cleanedLines.join(NEWLINE_SEPARATOR), attachments };
 	}
 
 	private buildAttachmentName(mimeType: string, index: number): string {
-		const extension = mimeType.startsWith(MimeTypePrefix.AUDIO)
-			? (AUDIO_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_AUDIO_EXTENSION)
-			: (IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION);
+		const extension = IMAGE_MIME_TO_EXTENSION[mimeType] ?? DEFAULT_IMAGE_EXTENSION;
 
 		return `${MCP_ATTACHMENT_NAME_PREFIX}-${Date.now()}-${index}.${extension}`;
 	}
@@ -1220,8 +1034,4 @@ export function agenticClearSteeringMessage(conversationId: string) {
 
 export function agenticIsAnyRunning() {
 	return agenticStore.isAnyRunning;
-}
-
-export function agenticExecutingToolCallId(conversationId: string) {
-	return agenticStore.executingToolCallId(conversationId);
 }

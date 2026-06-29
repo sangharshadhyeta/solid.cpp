@@ -1,5 +1,4 @@
 export {
-	AttachmentLabel,
 	AttachmentType,
 	AttachmentMenuItemId,
 	AttachmentItemEnabledWhen,
@@ -7,17 +6,10 @@ export {
 	AttachmentItemVisibleWhen
 } from './attachment.enums';
 
-export {
-	AgenticSectionType,
-	ContinueIntentKind,
-	DiffLineKind,
-	ToolResultKind,
-	ToolCallType
-} from './agentic.enums';
+export { AgenticSectionType, ContinueIntentKind, ToolCallType } from './agentic.enums';
 
 export {
 	ChatMessageStatsView,
-	ChatMessageStatisticsMode,
 	StreamConnectionState,
 	ContentPartType,
 	ConversationSelectionMode,
@@ -25,12 +17,8 @@ export {
 	MessageRole,
 	MessageType,
 	PdfViewMode,
-	ReasoningFormat,
-	ChatFormCommandAction,
-	FileMentionEntryType
+	ReasoningFormat
 } from './chat.enums';
-
-export { SessionRecordType } from './conversation-import.enums';
 
 export { ReasoningEffort } from './reasoning-effort.enums';
 
@@ -44,13 +32,13 @@ export {
 	FileExtensionAudio,
 	FileExtensionPdf,
 	FileExtensionText,
+	MimeTypePrefix,
+	MimeTypeIncludes,
+	UriPattern,
 	MimeTypeApplication,
 	MimeTypeAudio,
 	MimeTypeVideo,
 	MimeTypeImage,
-	MimeTypePrefix,
-	MimeTypeIncludes,
-	UriPattern,
 	MimeTypeText,
 	SpecialFileType
 } from './files.enums';
@@ -75,12 +63,6 @@ export { ColorMode, HtmlInputType, McpPromptVariant, TooltipSide, UrlProtocol } 
 
 export { KeyboardKey } from './keyboard.enums';
 
-export {
-	BuiltInTool,
-	GlobSearchType,
-	ToolSource,
-	ToolPermissionDecision,
-	ToolResponseField
-} from './tools.enums';
+export { ToolSource, ToolPermissionDecision, ToolResponseField } from './tools.enums';
 
 export { SplashOrientation } from './splash.enums';

@@ -24,16 +24,13 @@ export function useMessageEditContext(options: UseMessageEditContextOptions) {
 
 	async function handleSaveEdit() {
 		const trimmed = editedContent.trim();
-
 		if (!trimmed && editedExtras.length === 0 && editedUploadedFiles.length === 0) return;
 
 		let finalExtras: DatabaseMessageExtra[] = $state.snapshot(editedExtras);
-
 		if (editedUploadedFiles.length > 0) {
 			const plainFiles = $state.snapshot(editedUploadedFiles);
 			const result = await parseFilesToMessageExtras(plainFiles);
 			const newExtras = result?.extras || [];
-
 			finalExtras = [...finalExtras, ...newExtras];
 		}
 
@@ -46,7 +43,9 @@ export function useMessageEditContext(options: UseMessageEditContextOptions) {
 	}
 
 	setMessageEditContext({
-		cancel: handleCancelEdit,
+		get isEditing() {
+			return isEditing;
+		},
 		get editedContent() {
 			return editedContent;
 		},
@@ -56,20 +55,24 @@ export function useMessageEditContext(options: UseMessageEditContextOptions) {
 		get editedUploadedFiles() {
 			return editedUploadedFiles;
 		},
-		get isEditing() {
-			return isEditing;
-		},
-		get messageRole() {
-			return MessageRole.USER;
-		},
 		get originalContent() {
 			return options.getContent();
 		},
 		get originalExtras() {
 			return options.getExtras();
 		},
-		save: handleSaveEdit,
-		saveOnly: handleSaveEdit,
+		get showSaveOnlyOption() {
+			return options.showSaveOnlyOption ?? false;
+		},
+		get showBranchAfterEditOption() {
+			return false;
+		},
+		get shouldBranchAfterEdit() {
+			return false;
+		},
+		get messageRole() {
+			return MessageRole.USER;
+		},
 		setContent: (c: string) => {
 			editedContent = c;
 		},
@@ -79,24 +82,18 @@ export function useMessageEditContext(options: UseMessageEditContextOptions) {
 		setUploadedFiles: (f: ChatUploadedFile[]) => {
 			editedUploadedFiles = f;
 		},
-		get shouldBranchAfterEdit() {
-			return false;
-		},
-		get showBranchAfterEditOption() {
-			return false;
-		},
-		get showSaveOnlyOption() {
-			return options.showSaveOnlyOption ?? false;
-		},
+		save: handleSaveEdit,
+		saveOnly: handleSaveEdit,
+		cancel: handleCancelEdit,
 		startEdit: handleEdit
 	});
 
 	return {
-		handleCancelEdit,
-		handleEdit,
-		handleSaveEdit,
 		get isEditing() {
 			return isEditing;
-		}
+		},
+		handleEdit,
+		handleSaveEdit,
+		handleCancelEdit
 	};
 }

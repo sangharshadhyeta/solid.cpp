@@ -1,7 +1,6 @@
 <script lang="ts">
 	import { Settings } from '@lucide/svelte';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
-	import type { SettingsSection, SettingsSectionTitle } from '$lib/types';
+	import type { SettingsSection, SettingsSectionTitle } from '$lib/constants';
 
 	interface Props {
 		sections: SettingsSection[];
@@ -10,7 +9,7 @@
 		onSectionChange?: (section: SettingsSectionTitle) => void;
 	}
 
-	let { getHref, isActive, onSectionChange, sections }: Props = $props();
+	let { sections, isActive, getHref, onSectionChange }: Props = $props();
 </script>
 
 <div class="sticky top-2 hidden w-64 flex-col self-start bg-background py-4 md:flex gap-6">
@@ -31,7 +30,7 @@
 						: 'text-muted-foreground'}"
 					href={getHref(section)}
 				>
-					<section.icon class={ICON_CLASS_DEFAULT} />
+					<section.icon class="h-4 w-4" />
 					<span class="ml-2">{section.title}</span>
 				</a>
 			{:else}
@@ -43,7 +42,7 @@
 						: 'text-muted-foreground'}"
 					onclick={() => onSectionChange?.(section.title)}
 				>
-					<section.icon class={ICON_CLASS_DEFAULT} />
+					<section.icon class="h-4 w-4" />
 					<span class="ml-2">{section.title}</span>
 				</button>
 			{/if}

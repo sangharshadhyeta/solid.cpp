@@ -7,7 +7,7 @@
 		showTooltip?: boolean;
 	}
 
-	let { class: className = '', showTooltip = true, text }: Props = $props();
+	let { text, class: className = '', showTooltip = true }: Props = $props();
 
 	let textElement: HTMLSpanElement | undefined = $state();
 	let isTruncated = $state(false);
@@ -23,7 +23,6 @@
 			checkTruncation();
 
 			const observer = new ResizeObserver(checkTruncation);
-
 			observer.observe(textElement);
 
 			return () => observer.disconnect();

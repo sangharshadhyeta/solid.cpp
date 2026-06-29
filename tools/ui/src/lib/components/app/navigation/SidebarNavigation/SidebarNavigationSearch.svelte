@@ -9,10 +9,10 @@
 	}
 
 	let {
-		class: className,
-		onInput,
+		value = $bindable(''),
 		placeholder = 'Search conversations...',
-		value = $bindable('')
+		onInput,
+		class: className
 	}: Props = $props();
 </script>
 

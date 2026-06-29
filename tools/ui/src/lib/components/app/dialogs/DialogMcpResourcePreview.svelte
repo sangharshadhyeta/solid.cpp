@@ -1,18 +1,18 @@
 <script lang="ts">
-	import { Download } from '@lucide/svelte';
-	import { ActionIconCopyToClipboard, SyntaxHighlightedCode } from '$lib/components/app';
-	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
-	import { DEFAULT_RESOURCE_FILENAME, MIME_TYPE_SUBSTRINGS } from '$lib/constants';
-	import { MimeTypeText } from '$lib/enums';
+	import { Download } from '@lucide/svelte';
+	import { Button } from '$lib/components/ui/button';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import type { DatabaseMessageExtraMcpResource } from '$lib/types';
+	import { SyntaxHighlightedCode, ActionIconCopyToClipboard } from '$lib/components/app';
 	import {
-		downloadResourceContent,
 		getLanguageFromFilename,
 		isCodeResource,
-		isImageResource
+		isImageResource,
+		downloadResourceContent
 	} from '$lib/utils';
+	import { MimeTypeIncludes, MimeTypeText } from '$lib/enums';
+	import { DEFAULT_RESOURCE_FILENAME } from '$lib/constants';
+	import type { DatabaseMessageExtraMcpResource } from '$lib/types';
 
 	interface Props {
 		open: boolean;
@@ -20,19 +20,15 @@
 		extra: DatabaseMessageExtraMcpResource;
 	}
 
-	let { extra, onOpenChange, open = $bindable() }: Props = $props();
+	let { open = $bindable(), onOpenChange, extra }: Props = $props();
 
 	const serverName = $derived(mcpStore.getServerDisplayName(extra.serverName));
 	const favicon = $derived(mcpStore.getServerFavicon(extra.serverName));
 
 	function getLanguage(): string {
-		if (extra.mimeType?.includes(MIME_TYPE_SUBSTRINGS.JSON)) return MIME_TYPE_SUBSTRINGS.JSON;
-
-		if (extra.mimeType?.includes(MIME_TYPE_SUBSTRINGS.JAVASCRIPT))
-			return MIME_TYPE_SUBSTRINGS.JAVASCRIPT;
-
-		if (extra.mimeType?.includes(MIME_TYPE_SUBSTRINGS.TYPESCRIPT))
-			return MIME_TYPE_SUBSTRINGS.TYPESCRIPT;
+		if (extra.mimeType?.includes(MimeTypeIncludes.JSON)) return MimeTypeIncludes.JSON;
+		if (extra.mimeType?.includes(MimeTypeIncludes.JAVASCRIPT)) return MimeTypeIncludes.JAVASCRIPT;
+		if (extra.mimeType?.includes(MimeTypeIncludes.TYPESCRIPT)) return MimeTypeIncludes.TYPESCRIPT;
 
 		const name = extra.name || extra.uri || '';
 

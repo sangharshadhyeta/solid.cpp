@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { Button, type ButtonSize, type ButtonVariant } from '$lib/components/ui/button';
+	import { Button, type ButtonVariant, type ButtonSize } from '$lib/components/ui/button';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { TooltipSide } from '$lib/enums';
 	import type { Component } from 'svelte';
+	import { TooltipSide } from '$lib/enums';
 
 	interface Props {
 		ariaLabel?: string;
@@ -20,18 +20,18 @@
 	}
 
 	let {
-		ariaLabel,
+		icon,
+		tooltip,
+		variant = 'ghost',
+		href = '',
+		size = 'sm',
 		class: className = '',
 		disabled = false,
-		href = '',
-		icon,
 		iconSize = 'h-3 w-3',
-		onclick,
-		size = 'sm',
-		stopPropagationOnClick = false,
-		tooltip,
 		tooltipSide = TooltipSide.TOP,
-		variant = 'ghost'
+		stopPropagationOnClick = false,
+		onclick,
+		ariaLabel
 	}: Props = $props();
 
 	let innerWidth = $state(0);
@@ -66,14 +66,7 @@
 		<Tooltip.Trigger>
 			<!-- prevent another nested button element -->
 			{#snippet child({ props })}
-				{#if disabled}
-					<!-- disabled buttons have pointer-events:none; wrap in a span so the tooltip hover surface stays alive -->
-					<span {...props}>
-						{@render button({})}
-					</span>
-				{:else}
-					{@render button(props)}
-				{/if}
+				{@render button(props)}
 			{/snippet}
 		</Tooltip.Trigger>
 

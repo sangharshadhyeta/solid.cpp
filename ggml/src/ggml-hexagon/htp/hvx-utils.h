@@ -19,6 +19,5 @@
 #include "hvx-base.h"
 #include "hvx-pow.h"
 #include "hvx-log.h"
-#include "hvx-norm.h"
 
 #endif /* HVX_UTILS_H */

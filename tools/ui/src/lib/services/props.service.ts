@@ -20,7 +20,6 @@ export class PropsService {
 	 */
 	static async fetch(autoload = false): Promise<ApiLlamaCppServerProps> {
 		const params: Record<string, string> = {};
-
 		if (!autoload) {
 			params.autoload = 'false';
 		}
@@ -39,7 +38,6 @@ export class PropsService {
 	 */
 	static async fetchForModel(modelId: string, autoload = false): Promise<ApiLlamaCppServerProps> {
 		const params: Record<string, string> = { model: modelId };
-
 		if (!autoload) {
 			params.autoload = 'false';
 		}

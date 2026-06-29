@@ -1,24 +1,23 @@
 <script lang="ts">
-	import { Braces, FolderOpen, Loader2, Plus } from '@lucide/svelte';
-	import {
-		McpResourcePreview,
-		McpResourcesBrowser,
-		McpResourceTemplateForm
-	} from '$lib/components/app';
-	import { Button } from '$lib/components/ui/button';
+	import { FolderOpen, Plus, Loader2, Braces } from '@lucide/svelte';
+	import { toast } from 'svelte-sonner';
 	import * as Dialog from '$lib/components/ui/dialog';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import { Button } from '$lib/components/ui/button';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import {
 		mcpResources,
-		mcpResourceStore,
-		mcpTotalResourceCount
+		mcpTotalResourceCount,
+		mcpResourceStore
 	} from '$lib/stores/mcp-resources.svelte';
-	import type { MCPResourceContent, MCPResourceInfo, MCPResourceTemplateInfo } from '$lib/types';
+	import {
+		McpResourcesBrowser,
+		McpResourcePreview,
+		McpResourceTemplateForm
+	} from '$lib/components/app';
 	import { getResourceDisplayName } from '$lib/utils';
+	import type { MCPResourceInfo, MCPResourceContent, MCPResourceTemplateInfo } from '$lib/types';
 	import { SvelteSet } from 'svelte/reactivity';
-	import { toast } from 'svelte-sonner';
 
 	interface Props {
 		open?: boolean;
@@ -27,7 +26,7 @@
 		preSelectedUri?: string;
 	}
 
-	let { onAttach, onOpenChange, open = $bindable(false), preSelectedUri }: Props = $props();
+	let { open = $bindable(false), onOpenChange, onAttach, preSelectedUri }: Props = $props();
 
 	let selectedResources = new SvelteSet<string>();
 	let lastSelectedUri = $state<string | null>(null);
@@ -144,17 +143,16 @@
 				if (mcpResourceStore.isAttached(templatePreviewUri)) {
 					toast.info('Resource already attached');
 					handleOpenChange(false);
-
 					return;
 				}
 
 				const resourceInfo: MCPResourceInfo = {
+					uri: templatePreviewUri,
 					name: templatePreviewUri.split('/').pop() || templatePreviewUri,
-					serverName: selectedTemplate.serverName,
-					uri: templatePreviewUri
+					serverName: selectedTemplate.serverName
 				};
-				const attachment = mcpResourceStore.addAttachment(resourceInfo);
 
+				const attachment = mcpResourceStore.addAttachment(resourceInfo);
 				mcpResourceStore.updateAttachmentContent(attachment.id, templatePreviewContent);
 
 				toast.success(`Resource attached: ${resourceInfo.name}`);
@@ -216,7 +214,6 @@
 		return allResources.sort((a, b) => {
 			const aName = getResourceDisplayName(a);
 			const bName = getResourceDisplayName(b);
-
 			return aName.localeCompare(bName);
 		});
 	}
@@ -292,7 +289,7 @@
 				{#if selectedTemplate && !templatePreviewContent}
 					<div class="flex h-full flex-col">
 						<div class="mb-3 flex items-center gap-2">
-							<Braces class="{ICON_CLASS_DEFAULT} text-muted-foreground" />
+							<Braces class="h-4 w-4 text-muted-foreground" />
 
 							<span class="text-sm font-medium">
 								{selectedTemplate.title || selectedTemplate.name}
@@ -341,9 +338,9 @@
 					<!-- Template resolved: show preview -->
 					<McpResourcePreview
 						resource={{
+							uri: templatePreviewUri ?? '',
 							name: templatePreviewUri?.split('/').pop() || (templatePreviewUri ?? ''),
-							serverName: selectedTemplate?.serverName || '',
-							uri: templatePreviewUri ?? ''
+							serverName: selectedTemplate?.serverName || ''
 						}}
 						preloadedContent={templatePreviewContent}
 					/>
@@ -374,9 +371,9 @@
 			{#if hasTemplateResult}
 				<Button onclick={handleAttachTemplateResource} disabled={isAttaching}>
 					{#if isAttaching}
-						<Loader2 class="mr-2 {ICON_CLASS_DEFAULT} animate-spin" />
+						<Loader2 class="mr-2 h-4 w-4 animate-spin" />
 					{:else}
-						<Plus class="mr-2 {ICON_CLASS_DEFAULT}" />
+						<Plus class="mr-2 h-4 w-4" />
 					{/if}
 
 					Attach Resource
@@ -384,9 +381,9 @@
 			{:else}
 				<Button onclick={handleAttach} disabled={selectedResources.size === 0 || isAttaching}>
 					{#if isAttaching}
-						<Loader2 class="mr-2 {ICON_CLASS_DEFAULT} animate-spin" />
+						<Loader2 class="mr-2 h-4 w-4 animate-spin" />
 					{:else}
-						<Plus class="mr-2 {ICON_CLASS_DEFAULT}" />
+						<Plus class="mr-2 h-4 w-4" />
 					{/if}
 
 					Attach {selectedResources.size > 0 ? `(${selectedResources.size})` : 'Resource'}

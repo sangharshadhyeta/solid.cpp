@@ -1,49 +1,62 @@
 <script lang="ts">
-	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
-	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
+	import { Wrench, Loader2, Brain } from '@lucide/svelte';
 	import {
-		ChatMessageActionCardContinueRequest,
-		ChatMessageActionCardPermissionRequest,
 		ChatMessageStatistics,
-		MarkdownContent
+		CollapsibleContentBlock,
+		MarkdownContent,
+		SyntaxHighlightedCode,
+		ChatMessageActionCardPermissionRequest,
+		ChatMessageActionCardContinueRequest
 	} from '$lib/components/app';
-	import { AgenticSectionType, ChatMessageStatsView, ToolPermissionDecision } from '$lib/enums';
+
 	import {
-		agenticExecutingToolCallId,
-		agenticLastError,
-		agenticPendingContinueRequest,
-		agenticPendingPermissionRequest,
-		agenticResolveContinue,
-		agenticResolvePermission
-	} from '$lib/stores/agentic.svelte';
-	import { config } from '$lib/stores/settings.svelte';
+		AgenticSectionType,
+		ChatMessageStatsView,
+		FileTypeText,
+		ToolPermissionDecision
+	} from '$lib/enums';
 	import type {
 		ChatMessageAgenticTimings,
 		ChatMessageAgenticTurnStats,
 		DatabaseMessage
 	} from '$lib/types';
-	import { type AgenticSection, deriveAgenticSections } from '$lib/utils';
+	import {
+		deriveAgenticSections,
+		formatJsonPretty,
+		parseToolResultWithImages,
+		type AgenticSection,
+		type ToolResultLine
+	} from '$lib/utils';
+	import {
+		agenticPendingPermissionRequest,
+		agenticResolvePermission,
+		agenticPendingContinueRequest,
+		agenticResolveContinue,
+		agenticLastError
+	} from '$lib/stores/agentic.svelte';
+	import { config } from '$lib/stores/settings.svelte';
 
 	interface Props {
 		message: DatabaseMessage;
 		toolMessages?: DatabaseMessage[];
 		isStreaming?: boolean;
 		isLastAssistantMessage?: boolean;
+		highlightTurns?: boolean;
 	}
 
 	let {
-		isLastAssistantMessage = false,
-		isStreaming = false,
 		message,
-		toolMessages = []
+		toolMessages = [],
+		isStreaming = false,
+		isLastAssistantMessage = false,
+		highlightTurns = false
 	}: Props = $props();
 
 	let expandedStates: Record<number, boolean> = $state({});
 
-	const showThoughtInProgress = $derived(Boolean(config().showThoughtInProgress));
-	const alwaysShowToolCallContent = $derived(Boolean(config().alwaysShowToolCallContent));
-	const showMessageStats = $derived(Boolean(config().showMessageStats));
-	const showAgenticTurnStats = $derived(showMessageStats && Boolean(config().showAgenticTurnStats));
+	const showToolCallInProgress = $derived(config().showToolCallInProgress as boolean);
+	const showThoughtInProgress = $derived(config().showThoughtInProgress as boolean);
+	const renderThinkingAsMarkdown = $derived(config().renderThinkingAsMarkdown as boolean);
 
 	const hasReasoningError = $derived(
 		isLastAssistantMessage ? !!agenticLastError(message.convId) : false
@@ -55,11 +68,11 @@
 		isStreaming && isLastAssistantMessage ? agenticPendingPermissionRequest(message.convId) : null
 	);
 
+	// Reset dismissed when pendingPermission changes (new request or cleared)
 	let prevPendingRef: typeof pendingPermission = null;
 	$effect(() => {
 		if (pendingPermission !== prevPendingRef) {
 			prevPendingRef = pendingPermission;
-
 			if (pendingPermission) {
 				permissionDismissed = false;
 			}
@@ -81,7 +94,6 @@
 	$effect(() => {
 		if (pendingContinue !== prevContinueRef) {
 			prevContinueRef = pendingContinue;
-
 			if (pendingContinue) {
 				continueDismissed = false;
 			}
@@ -95,31 +107,33 @@
 
 	const sections = $derived(deriveAgenticSections(message, toolMessages, [], isStreaming));
 
-	const currentlyExecutingToolCallId = $derived(
-		isStreaming ? agenticExecutingToolCallId(message.convId) : null
+	// Parse tool results with images
+	const sectionsParsed = $derived(
+		sections.map((section) => ({
+			...section,
+			parsedLines: section.toolResult
+				? parseToolResultWithImages(section.toolResult, section.toolResultExtras || message?.extra)
+				: ([] as ToolResultLine[])
+		}))
 	);
 
-	type TurnGroup = {
-		sections: AgenticSection[];
-		flatIndices: number[];
-	};
-
-	const turnGroups: TurnGroup[] = $derived.by(() => {
-		const groups: TurnGroup[] = [];
-
-		let currentTurn: AgenticSection[] = [];
+	// Group flat sections into agentic turns
+	// A new turn starts when a non-tool section follows a tool section
+	const turnGroups = $derived.by(() => {
+		const turns: { sections: (typeof sectionsParsed)[number][]; flatIndices: number[] }[] = [];
+		let currentTurn: (typeof sectionsParsed)[number][] = [];
 		let currentIndices: number[] = [];
 		let prevWasTool = false;
 
-		for (let i = 0; i < sections.length; i++) {
-			const section = sections[i];
+		for (let i = 0; i < sectionsParsed.length; i++) {
+			const section = sectionsParsed[i];
 			const isTool =
 				section.type === AgenticSectionType.TOOL_CALL ||
 				section.type === AgenticSectionType.TOOL_CALL_PENDING ||
 				section.type === AgenticSectionType.TOOL_CALL_STREAMING;
 
 			if (!isTool && prevWasTool && currentTurn.length > 0) {
-				groups.push({ flatIndices: currentIndices, sections: currentTurn });
+				turns.push({ sections: currentTurn, flatIndices: currentIndices });
 				currentTurn = [];
 				currentIndices = [];
 			}
@@ -130,19 +144,18 @@
 		}
 
 		if (currentTurn.length > 0) {
-			groups.push({ flatIndices: currentIndices, sections: currentTurn });
+			turns.push({ sections: currentTurn, flatIndices: currentIndices });
 		}
 
-		return groups;
+		return turns;
 	});
 
 	function getDefaultExpanded(section: AgenticSection): boolean {
 		if (
-			section.type === AgenticSectionType.TOOL_CALL ||
 			section.type === AgenticSectionType.TOOL_CALL_PENDING ||
 			section.type === AgenticSectionType.TOOL_CALL_STREAMING
 		) {
-			return alwaysShowToolCallContent;
+			return showToolCallInProgress;
 		}
 
 		if (section.type === AgenticSectionType.REASONING_PENDING) {
@@ -168,54 +181,189 @@
 
 	function buildTurnAgenticTimings(stats: ChatMessageAgenticTurnStats): ChatMessageAgenticTimings {
 		return {
-			llm: stats.llm,
-			toolCalls: stats.toolCalls,
+			turns: 1,
 			toolCallsCount: stats.toolCalls.length,
 			toolsMs: stats.toolsMs,
-			turns: 1
+			toolCalls: stats.toolCalls,
+			llm: stats.llm
 		};
 	}
 </script>
 
-{#snippet renderSection(section: AgenticSection, index: number)}
+{#snippet renderSection(section: (typeof sectionsParsed)[number], index: number)}
 	{#if section.type === AgenticSectionType.TEXT}
 		<div class="agentic-text">
 			<MarkdownContent content={section.content} attachments={message?.extra} />
 		</div>
-	{:else if section.type === AgenticSectionType.REASONING || section.type === AgenticSectionType.REASONING_PENDING}
-		<ChatMessageReasoningBlock
-			{section}
+	{:else if section.type === AgenticSectionType.TOOL_CALL_STREAMING}
+		{@const streamingIcon = isStreaming ? Loader2 : Loader2}
+		{@const streamingIconClass = isStreaming ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
+
+		<CollapsibleContentBlock
 			open={isExpanded(index, section)}
+			class="my-2"
+			icon={streamingIcon}
+			iconClass={streamingIconClass}
+			title={section.toolName || 'Tool call'}
+			subtitle={isStreaming ? '' : 'incomplete'}
 			{isStreaming}
-			{hasReasoningError}
-			attachments={message?.extra}
 			onToggle={() => toggleExpanded(index, section)}
-		/>
-	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING || section.type === AgenticSectionType.TOOL_CALL_STREAMING}
-		<ChatMessageToolCallBlock
-			{section}
+		>
+			<div class="pt-3">
+				<div class="my-3 flex items-center gap-2 text-xs text-muted-foreground">
+					<span>Arguments:</span>
+
+					{#if isStreaming}
+						<Loader2 class="h-3 w-3 animate-spin" />
+					{/if}
+				</div>
+				{#if section.toolArgs}
+					<SyntaxHighlightedCode
+						code={formatJsonPretty(section.toolArgs)}
+						language={FileTypeText.JSON}
+						maxHeight="20rem"
+						class="text-xs"
+					/>
+				{:else if isStreaming}
+					<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">
+						Receiving arguments...
+					</div>
+				{:else}
+					<div
+						class="rounded bg-yellow-500/10 p-2 text-xs text-yellow-600 italic dark:text-yellow-400"
+					>
+						Response was truncated
+					</div>
+				{/if}
+			</div>
+		</CollapsibleContentBlock>
+	{:else if section.type === AgenticSectionType.TOOL_CALL || section.type === AgenticSectionType.TOOL_CALL_PENDING}
+		{@const isPending = section.type === AgenticSectionType.TOOL_CALL_PENDING}
+		{@const toolIcon = isPending ? Loader2 : Wrench}
+		{@const toolIconClass = isPending ? 'h-4 w-4 animate-spin' : 'h-4 w-4'}
+
+		<CollapsibleContentBlock
 			open={isExpanded(index, section)}
-			{isStreaming}
-			isExecuting={section.toolCallId !== undefined &&
-				section.toolCallId === currentlyExecutingToolCallId}
-			attachments={message?.extra}
+			class="my-2"
+			icon={toolIcon}
+			iconClass={toolIconClass}
+			title={section.toolName || ''}
+			subtitle={isPending ? 'executing...' : undefined}
+			isStreaming={isPending}
 			onToggle={() => toggleExpanded(index, section)}
-		/>
+		>
+			{#if section.toolArgs && section.toolArgs !== '{}'}
+				<div class="pt-3">
+					<div class="my-3 text-xs text-muted-foreground">Arguments:</div>
+
+					<SyntaxHighlightedCode
+						code={formatJsonPretty(section.toolArgs)}
+						language={FileTypeText.JSON}
+						maxHeight="20rem"
+						class="text-xs"
+					/>
+				</div>
+			{/if}
+
+			<div class="pt-3">
+				<div class="my-3 flex items-center gap-2 text-xs text-muted-foreground">
+					<span>Result:</span>
+
+					{#if isPending}
+						<Loader2 class="h-3 w-3 animate-spin" />
+					{/if}
+				</div>
+				{#if isPending}
+					<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">
+						Waiting for result...
+					</div>
+				{:else if section.toolResult}
+					<div class="overflow-auto rounded-lg border border-border bg-muted p-4">
+						{#each section.parsedLines as line, i (i)}
+							<div class="font-mono text-xs leading-relaxed whitespace-pre-wrap">
+								{line.text}
+							</div>
+							{#if line.image}
+								<img
+									src={line.image.base64Url}
+									alt={line.image.name}
+									class="mt-2 mb-2 h-auto max-w-full rounded-lg"
+									loading="lazy"
+								/>
+							{/if}
+						{/each}
+					</div>
+				{:else}
+					<div class="rounded bg-muted/30 p-2 text-xs text-muted-foreground italic">No output</div>
+				{/if}
+			</div>
+		</CollapsibleContentBlock>
+	{:else if section.type === AgenticSectionType.REASONING}
+		{@const reasoningSubtitle = section.wasInterrupted
+			? hasReasoningError
+				? 'Error'
+				: 'Cancelled'
+			: isStreaming
+				? ''
+				: undefined}
+
+		<CollapsibleContentBlock
+			open={isExpanded(index, section)}
+			class="my-2"
+			icon={Brain}
+			title="Reasoning"
+			subtitle={reasoningSubtitle}
+			rawContent={section.content}
+			onToggle={() => toggleExpanded(index, section)}
+		>
+			<div class="pt-3">
+				{#if renderThinkingAsMarkdown}
+					<MarkdownContent content={section.content} attachments={message?.extra} />
+				{:else}
+					<div class="text-xs leading-relaxed break-words whitespace-pre-wrap">
+						{section.content}
+					</div>
+				{/if}
+			</div>
+		</CollapsibleContentBlock>
+	{:else if section.type === AgenticSectionType.REASONING_PENDING}
+		{@const reasoningTitle = isStreaming ? 'Reasoning...' : 'Reasoning'}
+		{@const reasoningSubtitle = isStreaming ? '' : hasReasoningError ? 'Error' : 'Cancelled'}
+
+		<CollapsibleContentBlock
+			open={isExpanded(index, section)}
+			class="my-2"
+			icon={Brain}
+			title={reasoningTitle}
+			subtitle={reasoningSubtitle}
+			rawContent={section.content}
+			{isStreaming}
+			onToggle={() => toggleExpanded(index, section)}
+		>
+			<div class="pt-3">
+				{#if renderThinkingAsMarkdown}
+					<MarkdownContent content={section.content} attachments={message?.extra} />
+				{:else}
+					<div class="text-xs leading-relaxed break-words whitespace-pre-wrap">
+						{section.content}
+					</div>
+				{/if}
+			</div>
+		</CollapsibleContentBlock>
 	{/if}
 {/snippet}
 
-<div class="agentic-content gap-2">
-	{#if turnGroups.length > 1}
+<div class="agentic-content">
+	{#if highlightTurns && turnGroups.length > 1}
 		{#each turnGroups as turn, turnIndex (turnIndex)}
 			{@const turnStats = message?.timings?.agentic?.perTurn?.[turnIndex]}
-
-			<div class="agentic-turn group/turn grid gap-2">
+			<div class="agentic-turn my-2 hover:bg-muted/80 dark:hover:bg-muted/30">
+				<span class="agentic-turn-label">Turn {turnIndex + 1}</span>
 				{#each turn.sections as section, sIdx (turn.flatIndices[sIdx])}
 					{@render renderSection(section, turn.flatIndices[sIdx])}
 				{/each}
-
-				{#if turnStats && showAgenticTurnStats}
-					<div class="turn-stats transition-opacity duration-150 mt-1 mb-4">
+				{#if turnStats}
+					<div class="turn-stats">
 						<ChatMessageStatistics
 							promptTokens={turnStats.llm.prompt_n}
 							promptMs={turnStats.llm.prompt_ms}
@@ -232,7 +380,7 @@
 			</div>
 		{/each}
 	{:else}
-		{#each sections as section, index (index)}
+		{#each sectionsParsed as section, index (index)}
 			{@render renderSection(section, index)}
 		{/each}
 	{/if}
@@ -254,20 +402,39 @@
 	.agentic-content {
 		display: flex;
 		flex-direction: column;
+		gap: 0.5rem;
 		width: 100%;
 		max-width: 48rem;
-	}
-
-	.agentic-content > :global(*),
-	.agentic-turn > :global(*) {
-		min-width: 0;
 	}
 
 	.agentic-text {
 		width: 100%;
 	}
 
+	.agentic-turn {
+		position: relative;
+		border: 1.5px dashed var(--muted-foreground);
+		border-radius: 0.75rem;
+		padding: 1rem;
+		transition: background 0.1s;
+	}
+
+	.agentic-turn-label {
+		position: absolute;
+		top: -1rem;
+		left: 0.75rem;
+		padding: 0 0.375rem;
+		background: var(--background);
+		font-size: 0.7rem;
+		font-weight: 500;
+		color: var(--muted-foreground);
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+	}
+
 	.turn-stats {
+		margin-top: 0.75rem;
+		padding-top: 0.5rem;
 		border-top: 1px solid hsl(var(--muted) / 0.5);
 	}
 </style>

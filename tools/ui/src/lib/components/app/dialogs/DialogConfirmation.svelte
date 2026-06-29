@@ -1,7 +1,7 @@
 <script lang="ts">
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
-	import { KeyboardKey } from '$lib/enums';
 	import type { Component, Snippet } from 'svelte';
+	import { KeyboardKey } from '$lib/enums';
 
 	interface Props {
 		open: boolean;
@@ -18,17 +18,17 @@
 	}
 
 	let {
-		cancelText = 'Cancel',
-		children,
-		confirmText = 'Confirm',
-		description,
-		icon,
-		onCancel,
-		onConfirm,
-		onKeydown,
 		open = $bindable(),
 		title,
-		variant = 'default'
+		description,
+		confirmText = 'Confirm',
+		cancelText = 'Cancel',
+		variant = 'default',
+		icon,
+		onConfirm,
+		onCancel,
+		onKeydown,
+		children
 	}: Props = $props();
 
 	function handleKeydown(event: KeyboardEvent) {
@@ -37,7 +37,6 @@
 
 			onConfirm();
 		}
-
 		onKeydown?.(event);
 	}
 

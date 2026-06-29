@@ -5,7 +5,6 @@
 
 struct ggml_cuda_topk_moe_args {
     bool sigmoid{};
-    bool sqrt_softplus{};
     bool softmax{};
     bool delayed_softmax{};
     bool prob_bias{};

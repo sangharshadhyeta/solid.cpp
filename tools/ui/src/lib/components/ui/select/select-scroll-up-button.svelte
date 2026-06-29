@@ -1,11 +1,11 @@
 <script lang="ts">
 	import ChevronUpIcon from '@lucide/svelte/icons/chevron-up';
-	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils.js';
 	import { Select as SelectPrimitive } from 'bits-ui';
+	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils.js';
 
 	let {
-		class: className,
 		ref = $bindable(null),
+		class: className,
 		...restProps
 	}: WithoutChildrenOrChild<SelectPrimitive.ScrollUpButtonProps> = $props();
 </script>

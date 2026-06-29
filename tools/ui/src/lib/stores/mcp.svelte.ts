@@ -12,70 +12,72 @@
  * - Lifecycle management (initialize, shutdown)
  * - Multi-server coordination
  * - Tool name conflict detection and resolution
+ * - OpenAI-compatible tool definition generation
  * - Automatic tool-to-server routing
  * - Health checks
- *
- * MCP connection state and raw `Tool[]` per server are owned here; the
- * OpenAI-compatible wire format for those tools is built in `toolsStore`
- * (see {@link toolsStore.mcpEntries} / {@link toolsStore.getEnabledToolsForLLM}).
  *
  * @see MCPService in services/mcp.service.ts for protocol operations
  */
 
-import type { ListChangedHandlers } from '@modelcontextprotocol/sdk/types.js';
 import { browser } from '$app/environment';
 import { SETTINGS_KEYS } from '$lib/constants';
+import { MCPService } from '$lib/services/mcp.service';
+import { config, settingsStore } from '$lib/stores/settings.svelte';
+import { mcpResourceStore } from '$lib/stores/mcp-resources.svelte';
+import { serverStore } from '$lib/stores/server.svelte';
+import { mode } from 'mode-watcher';
 import {
-	CACHE,
+	parseMcpServerSettings,
+	detectMcpTransportFromUrl,
+	uuid,
+	extractRootDomain
+} from '$lib/utils';
+import {
+	MCPConnectionPhase,
+	MCPLogLevel,
+	HealthCheckStatus,
+	MCPRefType,
+	ColorMode,
+	UrlProtocol,
+	JsonSchemaType,
+	ToolCallType
+} from '$lib/enums';
+import {
+	DEFAULT_CACHE_TTL_MS,
 	DEFAULT_MCP_CONFIG,
 	EXPECTED_THEMED_ICON_PAIR_COUNT,
 	MCP_ALLOWED_ICON_MIME_TYPES,
-	MCP_RECONNECT,
-	MCP_SERVER_ID_PREFIX
+	MCP_SERVER_ID_PREFIX,
+	MCP_RECONNECT_INITIAL_DELAY,
+	MCP_RECONNECT_BACKOFF_MULTIPLIER,
+	MCP_RECONNECT_MAX_DELAY,
+	MCP_RECONNECT_ATTEMPT_TIMEOUT_MS
 } from '$lib/constants';
-import {
-	ColorMode,
-	HealthCheckStatus,
-	MCPConnectionPhase,
-	MCPLogLevel,
-	MCPRefType,
-	UrlProtocol
-} from '$lib/enums';
-import { MCPService } from '$lib/services/mcp.service';
-import { mcpResourceStore } from '$lib/stores/mcp-resources.svelte';
-import { serverStore } from '$lib/stores/server.svelte';
-import { config, settingsStore } from '$lib/stores/settings.svelte';
 import type {
-	ClientCapabilities,
-	GetPromptResult,
-	HealthCheckParams,
-	HealthCheckState,
-	MCPCapabilitiesInfo,
+	MCPToolCall,
+	OpenAIToolDefinition,
+	ServerStatus,
+	ToolExecutionResult,
 	MCPClientConfig,
 	MCPConnection,
+	HealthCheckParams,
+	ServerCapabilities,
+	ClientCapabilities,
+	MCPCapabilitiesInfo,
 	MCPConnectionLog,
 	MCPPromptInfo,
-	MCPResourceAttachment,
-	MCPResourceContent,
-	MCPResourceIcon,
-	MCPServerConfig,
-	MCPServerDisplayInfo,
-	MCPServerSettingsEntry,
-	MCPToolCall,
-	ServerCapabilities,
-	ServerStatus,
+	GetPromptResult,
 	Tool,
-	ToolExecutionResult
+	HealthCheckState,
+	MCPServerSettingsEntry,
+	MCPServerConfig,
+	MCPResourceIcon,
+	MCPResourceAttachment,
+	MCPResourceContent
 } from '$lib/types';
+import type { ListChangedHandlers } from '@modelcontextprotocol/sdk/types.js';
 import type { DatabaseMessageExtraMcpResource, McpServerOverride } from '$lib/types/database';
 import type { SettingsConfigType } from '$lib/types/settings';
-import {
-	detectMcpTransportFromUrl,
-	extractRootDomain,
-	parseMcpServerSettings,
-	uuid
-} from '$lib/utils';
-import { mode } from 'mode-watcher';
 
 class MCPStore {
 	private _isInitializing = $state(false);
@@ -116,10 +118,8 @@ class MCPStore {
 		}
 
 		let parsed: unknown;
-
 		if (typeof rawServers === 'string') {
 			const trimmed = rawServers.trim();
-
 			if (!trimmed) {
 				return [];
 			}
@@ -134,7 +134,6 @@ class MCPStore {
 		} else {
 			parsed = rawServers;
 		}
-
 		if (!Array.isArray(parsed)) {
 			return [];
 		}
@@ -144,26 +143,17 @@ class MCPStore {
 			const headers = typeof entry?.headers === 'string' ? entry.headers.trim() : undefined;
 
 			return {
-				displayName: (entry as { displayName?: string })?.displayName,
-				enabled: Boolean((entry as { enabled?: unknown })?.enabled),
-				headers: headers || undefined,
 				id: this.#generateServerId((entry as { id?: unknown })?.id, index),
-				name: (entry as { name?: string })?.name,
+				enabled: Boolean((entry as { enabled?: unknown })?.enabled),
 				url,
+				name: (entry as { name?: string })?.name,
+				requestTimeoutSeconds:
+					(entry as { requestTimeoutSeconds?: number })?.requestTimeoutSeconds ??
+					DEFAULT_MCP_CONFIG.requestTimeoutSeconds,
+				headers: headers || undefined,
 				useProxy: Boolean((entry as { useProxy?: unknown })?.useProxy)
 			} satisfies MCPServerSettingsEntry;
 		});
-	}
-
-	/**
-	 * Request timeout in milliseconds, read live from the global setting
-	 * so a change in Settings applies to every server immediately.
-	 */
-	#requestTimeoutMs(): number {
-		const seconds =
-			Number(config().mcpRequestTimeoutSeconds) || DEFAULT_MCP_CONFIG.requestTimeoutSeconds;
-
-		return Math.round(seconds * 1000);
 	}
 
 	/**
@@ -178,11 +168,9 @@ class MCPStore {
 		}
 
 		let headers: Record<string, string> | undefined;
-
 		if (entry.headers) {
 			try {
 				const parsed = JSON.parse(entry.headers);
-
 				if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
 					headers = parsed as Record<string, string>;
 			} catch {
@@ -191,30 +179,26 @@ class MCPStore {
 		}
 
 		return {
-			handshakeTimeoutMs: connectionTimeoutMs,
-			headers,
-			requestTimeoutMs: this.#requestTimeoutMs(),
-			transport: detectMcpTransportFromUrl(entry.url),
 			url: entry.url,
+			transport: detectMcpTransportFromUrl(entry.url),
+			handshakeTimeoutMs: connectionTimeoutMs,
+			requestTimeoutMs: Math.round(entry.requestTimeoutSeconds * 1000),
+			headers,
 			useProxy: entry.useProxy
 		};
 	}
 
 	/**
 	 * Checks if a server is enabled for a given chat.
-	 * A per-chat override wins when present; a server without one resolves
-	 * to its own `enabled` flag in `mcpServers`.
+	 * Only per-chat overrides (persisted in localStorage for new chats,
+	 * or in IndexedDB for existing conversations) control enabled state.
 	 */
 	#checkServerEnabled(
 		server: MCPServerSettingsEntry,
 		perChatOverrides?: McpServerOverride[]
 	): boolean {
-		// Per-chat overrides win when present; missing entries inherit the
-		// server's own `enabled` flag so partial override lists are not all
-		// treated as disabled.
 		const override = perChatOverrides?.find((o) => o.serverId === server.id);
-
-		return override?.enabled ?? server.enabled;
+		return override?.enabled ?? false;
 	}
 
 	/**
@@ -225,7 +209,6 @@ class MCPStore {
 		perChatOverrides?: McpServerOverride[]
 	): MCPClientConfig | undefined {
 		const rawServers = this.#parseServerSettings(cfg.mcpServers);
-
 		if (!rawServers.length) {
 			return undefined;
 		}
@@ -234,9 +217,7 @@ class MCPStore {
 
 		for (const [index, entry] of rawServers.entries()) {
 			if (!this.#checkServerEnabled(entry, perChatOverrides)) continue;
-
 			const normalized = this.#buildServerConfig(entry);
-
 			if (normalized) servers[this.#generateServerId(entry.id, index)] = normalized;
 		}
 
@@ -245,10 +226,10 @@ class MCPStore {
 		}
 
 		return {
+			protocolVersion: DEFAULT_MCP_CONFIG.protocolVersion,
 			capabilities: DEFAULT_MCP_CONFIG.capabilities,
 			clientInfo: DEFAULT_MCP_CONFIG.clientInfo,
-			protocolVersion: DEFAULT_MCP_CONFIG.protocolVersion,
-			requestTimeoutMs: this.#requestTimeoutMs(),
+			requestTimeoutMs: Math.round(DEFAULT_MCP_CONFIG.requestTimeoutSeconds * 1000),
 			servers
 		};
 	}
@@ -261,26 +242,26 @@ class MCPStore {
 		clientCaps?: ClientCapabilities
 	): MCPCapabilitiesInfo {
 		return {
-			client: {
-				elicitation: clientCaps?.elicitation
-					? { form: !!clientCaps.elicitation.form, url: !!clientCaps.elicitation.url }
-					: undefined,
-				roots: clientCaps?.roots ? { listChanged: clientCaps.roots.listChanged } : undefined,
-				sampling: !!clientCaps?.sampling,
-				tasks: !!clientCaps?.tasks
-			},
 			server: {
-				completions: !!serverCaps?.completions,
-				logging: !!serverCaps?.logging,
+				tools: serverCaps?.tools ? { listChanged: serverCaps.tools.listChanged } : undefined,
 				prompts: serverCaps?.prompts ? { listChanged: serverCaps.prompts.listChanged } : undefined,
 				resources: serverCaps?.resources
 					? {
-							listChanged: serverCaps.resources.listChanged,
-							subscribe: serverCaps.resources.subscribe
+							subscribe: serverCaps.resources.subscribe,
+							listChanged: serverCaps.resources.listChanged
 						}
 					: undefined,
-				tasks: !!serverCaps?.tasks,
-				tools: serverCaps?.tools ? { listChanged: serverCaps.tools.listChanged } : undefined
+				logging: !!serverCaps?.logging,
+				completions: !!serverCaps?.completions,
+				tasks: !!serverCaps?.tasks
+			},
+			client: {
+				roots: clientCaps?.roots ? { listChanged: clientCaps.roots.listChanged } : undefined,
+				sampling: !!clientCaps?.sampling,
+				elicitation: clientCaps?.elicitation
+					? { form: !!clientCaps.elicitation.form, url: !!clientCaps.elicitation.url }
+					: undefined,
+				tasks: !!clientCaps?.tasks
 			}
 		};
 	}
@@ -311,7 +292,6 @@ class MCPStore {
 
 	get isEnabled(): boolean {
 		const mcpConfig = this.#buildMcpClientConfig(config());
-
 		return (
 			mcpConfig !== null && mcpConfig !== undefined && Object.keys(mcpConfig.servers).length > 0
 		);
@@ -360,8 +340,8 @@ class MCPStore {
 	}
 
 	clearHealthCheck(serverId: string): void {
+		// eslint-disable-next-line @typescript-eslint/no-unused-vars
 		const { [serverId]: _removed, ...rest } = this._healthChecks;
-
 		this._healthChecks = rest;
 	}
 
@@ -385,39 +365,14 @@ class MCPStore {
 		return this.connections;
 	}
 
-	/**
-	 * Resolves the raw label for a server: user-defined display name first,
-	 * then server-reported title or name when the health check succeeded,
-	 * then the configured name (admin baseline or legacy data), then URL.
-	 */
-	#serverBaseLabel(server: MCPServerDisplayInfo): string {
-		if (server.displayName) return server.displayName;
-
+	getServerLabel(server: MCPServerSettingsEntry): string {
 		const healthState = this.getHealthCheckState(server.id);
 
 		if (healthState?.status === HealthCheckStatus.SUCCESS)
 			return (
 				healthState.serverInfo?.title || healthState.serverInfo?.name || server.name || server.url
 			);
-
-		return server.name || server.url;
-	}
-
-	/**
-	 * Returns the display label for a server, suffixed with a positional
-	 * counter when several configured servers resolve to the same base label
-	 * (e.g. two endpoints of the same host reporting an identical name).
-	 * Numbering follows config order, so it is stable across renders.
-	 */
-	getServerLabel(server: MCPServerDisplayInfo): string {
-		const label = this.#serverBaseLabel(server);
-		const twins = this.getServers().filter((s) => this.#serverBaseLabel(s) === label);
-
-		if (twins.length < 2) return label;
-
-		const position = twins.findIndex((s) => s.id === server.id);
-
-		return position < 0 ? label : `${label} (${position + 1})`;
+		return server.url;
 	}
 
 	getServerById(serverId: string): MCPServerSettingsEntry | undefined {
@@ -430,7 +385,6 @@ class MCPStore {
 	 */
 	getServerDisplayName(serverId: string): string {
 		const server = this.getServerById(serverId);
-
 		return server ? this.getServerLabel(server) : serverId;
 	}
 
@@ -465,18 +419,16 @@ class MCPStore {
 
 		const validIcons = icons.filter((icon) => {
 			if (!icon.src || !this.#isValidIconUri(icon.src)) return false;
-
 			if (icon.mimeType && !MCP_ALLOWED_ICON_MIME_TYPES.has(icon.mimeType)) return false;
-
 			return true;
 		});
 
 		if (validIcons.length === 0) return null;
 
 		const preferredTheme = isDark ? ColorMode.DARK : ColorMode.LIGHT;
+
 		// 1. Prefer icon explicitly matching the current color scheme
 		const themedIcon = validIcons.find((icon) => icon.theme === preferredTheme);
-
 		if (themedIcon) return themedIcon.src;
 
 		// 2. Handle universal icons (no theme specified)
@@ -503,14 +455,12 @@ class MCPStore {
 	 */
 	getServerFavicon(serverId: string): string | null {
 		const server = this.getServerById(serverId);
-
 		if (!server) {
 			return null;
 		}
 
 		const isDark = mode.current === ColorMode.DARK;
 		const healthState = this.getHealthCheckState(serverId);
-
 		if (healthState.status === HealthCheckStatus.SUCCESS && healthState.serverInfo?.icons) {
 			const mcpIconUrl = this.#getMcpIconUrl(healthState.serverInfo.icons, isDark);
 
@@ -519,18 +469,23 @@ class MCPStore {
 			}
 		}
 
-		return this.#getServerFaviconFallback(server.url);
+		// Fallback: try favicon from root domain
+		const fallbackUrl = this.#getServerFaviconFallback(server.url);
+		if (fallbackUrl) {
+			return fallbackUrl;
+		}
+
+		return null;
 	}
 
 	/**
 	 * Construct a fallback favicon URL from the MCP server URL.
-	 * e.g. https://mcp.example.com/sse -> https://example.com/favicon.ico
+	 * e.g. https://mcp.exa.ai/mcp -> https://exa.ai/favicon.ico
 	 */
 	#getServerFaviconFallback(serverUrl: string): string | null {
 		try {
 			const url = new URL(serverUrl);
 			const rootDomain = extractRootDomain(url);
-
 			if (!rootDomain) return null;
 
 			const origin = `${url.protocol}//${rootDomain}`;
@@ -538,7 +493,6 @@ class MCPStore {
 
 			for (const path of candidates) {
 				const faviconUrl = `${origin}/${path}`;
-
 				if (this.#isValidIconUri(faviconUrl)) {
 					return faviconUrl;
 				}
@@ -550,28 +504,46 @@ class MCPStore {
 		return null;
 	}
 
+	isAnyServerLoading(): boolean {
+		return this.getServers().some((s) => {
+			const state = this.getHealthCheckState(s.id);
+
+			return (
+				state.status === HealthCheckStatus.IDLE || state.status === HealthCheckStatus.CONNECTING
+			);
+		});
+	}
+
+	getServersSorted(): MCPServerSettingsEntry[] {
+		const servers = this.getServers();
+		if (this.isAnyServerLoading()) {
+			return servers;
+		}
+
+		return [...servers].sort((a, b) =>
+			this.getServerLabel(a).localeCompare(this.getServerLabel(b))
+		);
+	}
+
 	addServer(
-		serverData: Omit<MCPServerSettingsEntry, 'id'> & { id?: string }
-	): MCPServerSettingsEntry {
+		serverData: Omit<MCPServerSettingsEntry, 'id' | 'requestTimeoutSeconds'> & { id?: string }
+	): void {
 		const servers = this.getServers();
 		const newServer: MCPServerSettingsEntry = {
-			displayName: serverData.displayName,
-			enabled: serverData.enabled,
-			headers: serverData.headers?.trim() || undefined,
 			id: serverData.id || (uuid() ?? `server-${Date.now()}`),
-			name: serverData.name,
+			enabled: serverData.enabled,
 			url: serverData.url.trim(),
+			name: serverData.name,
+			headers: serverData.headers?.trim() || undefined,
+			requestTimeoutSeconds:
+				Number(config().mcpRequestTimeoutSeconds) || DEFAULT_MCP_CONFIG.requestTimeoutSeconds,
 			useProxy: serverData.useProxy
 		};
-
 		settingsStore.updateConfig(SETTINGS_KEYS.MCP_SERVERS, JSON.stringify([...servers, newServer]));
-
-		return newServer;
 	}
 
 	updateServer(id: string, updates: Partial<MCPServerSettingsEntry>): void {
 		const servers = this.getServers();
-
 		settingsStore.updateConfig(
 			SETTINGS_KEYS.MCP_SERVERS,
 			JSON.stringify(
@@ -582,7 +554,6 @@ class MCPStore {
 
 	removeServer(id: string): void {
 		const servers = this.getServers();
-
 		settingsStore.updateConfig(
 			SETTINGS_KEYS.MCP_SERVERS,
 			JSON.stringify(servers.filter((s) => s.id !== id))
@@ -612,13 +583,11 @@ class MCPStore {
 
 		const mcpConfig = this.#buildMcpClientConfig(config(), perChatOverrides);
 		const signature = mcpConfig ? JSON.stringify(mcpConfig) : null;
-
 		if (!signature) {
 			await this.shutdown();
 
 			return false;
 		}
-
 		if (this.isInitialized && this.configSignature === signature) {
 			return true;
 		}
@@ -628,22 +597,20 @@ class MCPStore {
 		}
 
 		if (this.connections.size > 0 || this.initPromise) await this.shutdown();
-
 		return this.initialize(signature, mcpConfig!);
 	}
 
 	private async initialize(signature: string, mcpConfig: MCPClientConfig): Promise<boolean> {
-		this.updateState({ error: null, isInitializing: true });
+		this.updateState({ isInitializing: true, error: null });
 		this.configSignature = signature;
 
 		const serverEntries = Object.entries(mcpConfig.servers);
 
 		if (serverEntries.length === 0) {
-			this.updateState({ connectedServers: [], isInitializing: false, toolCount: 0 });
+			this.updateState({ isInitializing: false, toolCount: 0, connectedServers: [] });
 
 			return false;
 		}
-
 		this.initPromise = this.doInitialize(signature, mcpConfig, serverEntries);
 
 		return this.initPromise;
@@ -677,10 +644,9 @@ class MCPStore {
 					listChangedHandlers
 				);
 
-				return { connection, name };
+				return { name, connection };
 			})
 		);
-
 		if (this.configSignature !== signature) {
 			for (const result of results) {
 				if (result.status === 'fulfilled')
@@ -689,10 +655,9 @@ class MCPStore {
 
 			return false;
 		}
-
 		for (const result of results) {
 			if (result.status === 'fulfilled') {
-				const { connection, name } = result.value;
+				const { name, connection } = result.value;
 
 				this.connections.set(name, connection);
 
@@ -701,7 +666,6 @@ class MCPStore {
 						console.warn(
 							`[MCPStore] Tool name conflict: "${tool.name}" exists in "${this.toolsIndex.get(tool.name)}" and "${name}". Using tool from "${name}".`
 						);
-
 					this.toolsIndex.set(tool.name, name);
 				}
 			} else {
@@ -710,13 +674,12 @@ class MCPStore {
 		}
 
 		const successCount = this.connections.size;
-
 		if (successCount === 0 && serverEntries.length > 0) {
 			this.updateState({
-				connectedServers: [],
-				error: 'All MCP server connections failed',
 				isInitializing: false,
-				toolCount: 0
+				error: 'All MCP server connections failed',
+				toolCount: 0,
+				connectedServers: []
 			});
 			this.initPromise = null;
 
@@ -724,10 +687,10 @@ class MCPStore {
 		}
 
 		this.updateState({
-			connectedServers: Array.from(this.connections.keys()),
-			error: null,
 			isInitializing: false,
-			toolCount: this.toolsIndex.size
+			error: null,
+			toolCount: this.toolsIndex.size,
+			connectedServers: Array.from(this.connections.keys())
 		});
 		this.initPromise = null;
 
@@ -736,24 +699,21 @@ class MCPStore {
 
 	private createListChangedHandlers(serverName: string): ListChangedHandlers {
 		return {
-			prompts: {
-				onChanged: (error: Error | null) => {
-					if (error) {
-						console.warn(`[MCPStore][${serverName}] Prompts list changed error:`, error);
-
-						return;
-					}
-				}
-			},
 			tools: {
 				onChanged: (error: Error | null, tools: Tool[] | null) => {
 					if (error) {
 						console.warn(`[MCPStore][${serverName}] Tools list changed error:`, error);
-
 						return;
 					}
-
 					this.handleToolsListChanged(serverName, tools ?? []);
+				}
+			},
+			prompts: {
+				onChanged: (error: Error | null) => {
+					if (error) {
+						console.warn(`[MCPStore][${serverName}] Prompts list changed error:`, error);
+						return;
+					}
 				}
 			}
 		};
@@ -761,7 +721,6 @@ class MCPStore {
 
 	private handleToolsListChanged(serverName: string, tools: Tool[]): void {
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			return;
 		}
@@ -777,7 +736,6 @@ class MCPStore {
 				console.warn(
 					`[MCPStore] Tool name conflict after list change: "${tool.name}" exists in "${this.toolsIndex.get(tool.name)}" and "${serverName}". Using tool from "${serverName}".`
 				);
-
 			this.toolsIndex.set(tool.name, serverName);
 		}
 		this.updateState({ toolCount: this.toolsIndex.size });
@@ -794,7 +752,6 @@ class MCPStore {
 	 */
 	async releaseConnection(shutdownIfUnused = false): Promise<void> {
 		this.activeFlowCount = Math.max(0, this.activeFlowCount - 1);
-
 		if (shutdownIfUnused && this.activeFlowCount === 0) {
 			await this.shutdown();
 		}
@@ -827,10 +784,10 @@ class MCPStore {
 		this.serverConfigs.clear();
 		this.configSignature = null;
 		this.updateState({
-			connectedServers: [],
-			error: null,
 			isInitializing: false,
-			toolCount: 0
+			error: null,
+			toolCount: 0,
+			connectedServers: []
 		});
 	}
 
@@ -845,14 +802,12 @@ class MCPStore {
 	 */
 	private async reconnectServer(serverName: string): Promise<void> {
 		const serverConfig = this.serverConfigs.get(serverName);
-
 		if (!serverConfig) {
 			throw new Error(`[MCPStore] No config found for ${serverName}, cannot reconnect`);
 		}
 
 		// Disconnect stale connection (clears old transport + session ID)
 		const oldConnection = this.connections.get(serverName);
-
 		if (oldConnection) {
 			await MCPService.disconnect(oldConnection).catch(console.warn);
 			this.connections.delete(serverName);
@@ -906,7 +861,6 @@ class MCPStore {
 		}
 
 		const serverConfig = this.serverConfigs.get(serverName);
-
 		if (!serverConfig) {
 			console.error(`[MCPStore] No config found for ${serverName}, cannot reconnect`);
 
@@ -914,7 +868,7 @@ class MCPStore {
 		}
 
 		this.reconnectingServers.add(serverName);
-		let backoff = MCP_RECONNECT.INITIAL_DELAY;
+		let backoff = MCP_RECONNECT_INITIAL_DELAY;
 		// Flag set by the phase callback when a DISCONNECTED event fires while
 		// reconnectingServers still holds this server (see JSDoc above).
 		let needsReconnect = false;
@@ -933,10 +887,10 @@ class MCPStore {
 							() =>
 								reject(
 									new Error(
-										`Reconnect attempt timed out after ${MCP_RECONNECT.ATTEMPT_TIMEOUT_MS}ms`
+										`Reconnect attempt timed out after ${MCP_RECONNECT_ATTEMPT_TIMEOUT_MS}ms`
 									)
 								),
-							MCP_RECONNECT.ATTEMPT_TIMEOUT_MS
+							MCP_RECONNECT_ATTEMPT_TIMEOUT_MS
 						)
 					);
 
@@ -962,6 +916,7 @@ class MCPStore {
 						},
 						listChangedHandlers
 					);
+
 					const connection = await Promise.race([connectPromise, timeoutPromise]);
 
 					// Replace old connection with new one
@@ -973,16 +928,14 @@ class MCPStore {
 					}
 
 					console.log(`[MCPStore][${serverName}] Reconnected successfully`);
-
 					break;
 				} catch (error) {
 					console.warn(`[MCPStore][${serverName}] Reconnection failed:`, error);
-					backoff = Math.min(backoff * MCP_RECONNECT.BACKOFF_MULTIPLIER, MCP_RECONNECT.MAX_DELAY);
+					backoff = Math.min(backoff * MCP_RECONNECT_BACKOFF_MULTIPLIER, MCP_RECONNECT_MAX_DELAY);
 				}
 			}
 		} finally {
 			this.reconnectingServers.delete(serverName);
-
 			// If the phase callback signalled a disconnect while this function held
 			// the guard, kick off a fresh reconnect now that the guard is released.
 			if (needsReconnect) {
@@ -992,6 +945,73 @@ class MCPStore {
 				this.autoReconnect(serverName);
 			}
 		}
+	}
+
+	getToolDefinitionsForLLM(): OpenAIToolDefinition[] {
+		const tools: OpenAIToolDefinition[] = [];
+
+		for (const connection of this.connections.values()) {
+			for (const tool of connection.tools) {
+				const rawSchema = (tool.inputSchema as Record<string, unknown>) ?? {
+					type: JsonSchemaType.OBJECT,
+					properties: {},
+					required: []
+				};
+
+				tools.push({
+					type: ToolCallType.FUNCTION as const,
+					function: {
+						name: tool.name,
+						description: tool.description,
+						parameters: this.normalizeSchemaProperties(rawSchema)
+					}
+				});
+			}
+		}
+
+		return tools;
+	}
+
+	private normalizeSchemaProperties(schema: Record<string, unknown>): Record<string, unknown> {
+		if (!schema || typeof schema !== 'object') {
+			return schema;
+		}
+
+		const normalized = { ...schema };
+		if (normalized.properties && typeof normalized.properties === 'object') {
+			const props = normalized.properties as Record<string, Record<string, unknown>>;
+			const normalizedProps: Record<string, Record<string, unknown>> = {};
+			for (const [key, prop] of Object.entries(props)) {
+				if (!prop || typeof prop !== 'object') {
+					normalizedProps[key] = prop;
+					continue;
+				}
+				const normalizedProp = { ...prop };
+				if (!normalizedProp.type && normalizedProp.default !== undefined) {
+					const defaultVal = normalizedProp.default;
+					if (typeof defaultVal === 'string') normalizedProp.type = 'string';
+					else if (typeof defaultVal === 'number')
+						normalizedProp.type = Number.isInteger(defaultVal) ? 'integer' : 'number';
+					else if (typeof defaultVal === 'boolean') normalizedProp.type = 'boolean';
+					else if (Array.isArray(defaultVal)) normalizedProp.type = 'array';
+					else if (typeof defaultVal === 'object' && defaultVal !== null)
+						normalizedProp.type = 'object';
+				}
+				if (normalizedProp.properties)
+					Object.assign(
+						normalizedProp,
+						this.normalizeSchemaProperties(normalizedProp as Record<string, unknown>)
+					);
+				if (normalizedProp.items && typeof normalizedProp.items === 'object')
+					normalizedProp.items = this.normalizeSchemaProperties(
+						normalizedProp.items as Record<string, unknown>
+					);
+				normalizedProps[key] = normalizedProp;
+			}
+			normalized.properties = normalizedProps;
+		}
+
+		return normalized;
 	}
 
 	getToolNames(): string[] {
@@ -1004,47 +1024,6 @@ class MCPStore {
 
 	getToolServer(toolName: string): string | undefined {
 		return this.toolsIndex.get(toolName);
-	}
-
-	/**
-	 * Resolve which configured MCP server owns a given tool name. Looks at
-	 * active connections first (fast path), then falls back to per-server
-	 * health-check data so server-side MCP proxies (where llama-server
-	 * executes MCP tools but the browser does not hold a direct connection)
-	 * still resolve tool names to their owning server.
-	 */
-	findServerForTool(toolName: string): string | undefined {
-		const fromIndex = this.toolsIndex.get(toolName);
-
-		if (fromIndex) return fromIndex;
-
-		for (const server of this.getServers()) {
-			const health = this._healthChecks[server.id];
-
-			if (!health || health.status !== HealthCheckStatus.SUCCESS) continue;
-
-			if (health.tools.some((tool) => tool.name === toolName)) {
-				return server.id;
-			}
-		}
-
-		return undefined;
-	}
-
-	/**
-	 * Resolve the favicon URL for an MCP server by one of its tool names.
-	 * Returns `null` if the tool is not provided by any configured MCP server,
-	 * or if the owning server has no icon to show.
-	 * Pair with {@link getServerFavicon} for direct server-id lookup.
-	 */
-	getServerFaviconForTool(toolName: string | undefined): string | null {
-		if (!toolName) return null;
-
-		const serverId = this.findServerForTool(toolName);
-
-		if (!serverId) return null;
-
-		return this.getServerFavicon(serverId);
 	}
 
 	hasPromptsSupport(): boolean {
@@ -1063,28 +1042,44 @@ class MCPStore {
 	 * the user actually sends a message or uses prompts.
 	 * @param perChatOverrides - Per-chat server overrides to filter by enabled servers.
 	 *                          If provided (even empty array), only checks enabled servers.
-	 *                          If undefined, falls back to each server's own `enabled` flag.
+	 *                          If undefined, checks all servers with successful health checks.
 	 */
 	hasPromptsCapability(perChatOverrides?: McpServerOverride[]): boolean {
-		let enabledServerIds: Set<string>;
-
+		// If perChatOverrides is provided (even empty array), filter by enabled servers
 		if (perChatOverrides !== undefined) {
-			enabledServerIds = new Set(perChatOverrides.filter((o) => o.enabled).map((o) => o.serverId));
-		} else {
-			enabledServerIds = new Set(
-				this.getServers()
-					.filter((s) => s.enabled)
-					.map((s) => s.id)
+			const enabledServerIds = new Set(
+				perChatOverrides.filter((o) => o.enabled).map((o) => o.serverId)
 			);
-		}
 
-		if (enabledServerIds.size === 0) {
+			// No enabled servers = no capability
+			if (enabledServerIds.size === 0) {
+				return false;
+			}
+
+			// Check health check states for enabled servers with prompts capability
+			for (const [serverId, state] of Object.entries(this._healthChecks)) {
+				if (!enabledServerIds.has(serverId)) continue;
+				if (
+					state.status === HealthCheckStatus.SUCCESS &&
+					state.capabilities?.server?.prompts !== undefined
+				) {
+					return true;
+				}
+			}
+
+			// Also check active connections as fallback
+			for (const [serverName, connection] of this.connections) {
+				if (!enabledServerIds.has(serverName)) continue;
+				if (connection.serverCapabilities?.prompts) {
+					return true;
+				}
+			}
+
 			return false;
 		}
 
-		for (const [serverId, state] of Object.entries(this._healthChecks)) {
-			if (!enabledServerIds.has(serverId)) continue;
-
+		// No overrides provided - check all servers (global mode)
+		for (const state of Object.values(this._healthChecks)) {
 			if (
 				state.status === HealthCheckStatus.SUCCESS &&
 				state.capabilities?.server?.prompts !== undefined
@@ -1093,9 +1088,7 @@ class MCPStore {
 			}
 		}
 
-		for (const [serverName, connection] of this.connections) {
-			if (!enabledServerIds.has(serverName)) continue;
-
+		for (const connection of this.connections.values()) {
 			if (connection.serverCapabilities?.prompts) {
 				return true;
 			}
@@ -1114,15 +1107,15 @@ class MCPStore {
 
 			for (const prompt of prompts) {
 				results.push({
-					arguments: prompt.arguments?.map((arg) => ({
-						description: arg.description,
-						name: arg.name,
-						required: arg.required
-					})),
-					description: prompt.description,
 					name: prompt.name,
+					description: prompt.description,
+					title: prompt.title,
 					serverName,
-					title: prompt.title
+					arguments: prompt.arguments?.map((arg) => ({
+						name: arg.name,
+						description: arg.description,
+						required: arg.required
+					}))
 				});
 			}
 		}
@@ -1136,7 +1129,6 @@ class MCPStore {
 		args?: Record<string, string>
 	): Promise<GetPromptResult> {
 		const connection = this.connections.get(serverName);
-
 		if (!connection) throw new Error(`Server "${serverName}" not found for prompt "${promptName}"`);
 
 		return MCPService.getPrompt(connection, promptName, args);
@@ -1144,28 +1136,26 @@ class MCPStore {
 
 	async executeTool(toolCall: MCPToolCall, signal?: AbortSignal): Promise<ToolExecutionResult> {
 		const toolName = toolCall.function.name;
-		const serverName = this.toolsIndex.get(toolName);
 
+		const serverName = this.toolsIndex.get(toolName);
 		if (!serverName) throw new Error(`Unknown tool: ${toolName}`);
 
 		const connection = this.connections.get(serverName);
-
 		if (!connection) throw new Error(`Server "${serverName}" is not connected`);
 
 		const args = this.parseToolArguments(toolCall.function.arguments);
 
 		try {
-			return await MCPService.callTool(connection, { arguments: args, name: toolName }, signal);
+			return await MCPService.callTool(connection, { name: toolName, arguments: args }, signal);
 		} catch (error) {
 			// Session expired (server restarted) - reconnect and retry once
 			if (MCPService.isSessionExpiredError(error)) {
 				await this.reconnectServer(serverName);
 
 				const newConnection = this.connections.get(serverName);
-
 				if (!newConnection) throw new Error(`Failed to reconnect to "${serverName}"`);
 
-				return MCPService.callTool(newConnection, { arguments: args, name: toolName }, signal);
+				return MCPService.callTool(newConnection, { name: toolName, arguments: args }, signal);
 			}
 
 			throw error;
@@ -1178,24 +1168,20 @@ class MCPStore {
 		signal?: AbortSignal
 	): Promise<ToolExecutionResult> {
 		const serverName = this.toolsIndex.get(toolName);
-
 		if (!serverName) throw new Error(`Unknown tool: ${toolName}`);
-
 		const connection = this.connections.get(serverName);
-
 		if (!connection) throw new Error(`Server "${serverName}" is not connected`);
 
 		try {
-			return await MCPService.callTool(connection, { arguments: args, name: toolName }, signal);
+			return await MCPService.callTool(connection, { name: toolName, arguments: args }, signal);
 		} catch (error) {
 			if (MCPService.isSessionExpiredError(error)) {
 				await this.reconnectServer(serverName);
 
 				const newConnection = this.connections.get(serverName);
-
 				if (!newConnection) throw new Error(`Failed to reconnect to "${serverName}"`);
 
-				return MCPService.callTool(newConnection, { arguments: args, name: toolName }, signal);
+				return MCPService.callTool(newConnection, { name: toolName, arguments: args }, signal);
 			}
 
 			throw error;
@@ -1205,14 +1191,12 @@ class MCPStore {
 	private parseToolArguments(args: string | Record<string, unknown>): Record<string, unknown> {
 		if (typeof args === 'string') {
 			const trimmed = args.trim();
-
 			if (trimmed === '') {
 				return {};
 			}
 
 			try {
 				const parsed = JSON.parse(trimmed);
-
 				if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
 					throw new Error(
 						`Tool arguments must be an object, got ${Array.isArray(parsed) ? 'array' : typeof parsed}`
@@ -1238,20 +1222,17 @@ class MCPStore {
 		argumentValue: string
 	): Promise<{ values: string[]; total?: number; hasMore?: boolean } | null> {
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			console.warn(`[MCPStore] Server "${serverName}" is not connected`);
-
 			return null;
 		}
-
 		if (!connection.serverCapabilities?.completions) {
 			return null;
 		}
 
 		return MCPService.complete(
 			connection,
-			{ name: promptName, type: MCPRefType.PROMPT },
+			{ type: MCPRefType.PROMPT, name: promptName },
 			{ name: argumentName, value: argumentValue }
 		);
 	}
@@ -1270,7 +1251,6 @@ class MCPStore {
 
 		if (!connection) {
 			console.warn(`[MCPStore] Server "${serverName}" is not connected`);
-
 			return null;
 		}
 
@@ -1316,7 +1296,6 @@ class MCPStore {
 
 		try {
 			const parsed = JSON.parse(headersJson);
-
 			if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed))
 				return parsed as Record<string, string>;
 		} catch {
@@ -1331,6 +1310,7 @@ class MCPStore {
 			id: string;
 			enabled: boolean;
 			url: string;
+			requestTimeoutSeconds: number;
 			headers?: string;
 		}[],
 		skipIfChecked = true,
@@ -1345,10 +1325,8 @@ class MCPStore {
 		}
 
 		const BATCH_SIZE = 5;
-
 		for (let i = 0; i < serversToCheck.length; i += BATCH_SIZE) {
 			const batch = serversToCheck.slice(i, i + BATCH_SIZE);
-
 			await Promise.allSettled(batch.map((server) => this.runHealthCheck(server, promoteToActive)));
 		}
 	}
@@ -1370,7 +1348,6 @@ class MCPStore {
 	async runHealthCheck(server: HealthCheckParams, promoteToActive = false): Promise<void> {
 		// Check if we already have an active connection for this server
 		const existingConnection = this.connections.get(server.id);
-
 		if (existingConnection) {
 			// Reuse existing connection - just refresh tools list
 			try {
@@ -1379,23 +1356,21 @@ class MCPStore {
 					existingConnection.serverCapabilities,
 					existingConnection.clientCapabilities
 				);
-
 				this.updateHealthCheck(server.id, {
-					capabilities,
-					connectionTimeMs: existingConnection.connectionTimeMs,
-					instructions: existingConnection.instructions,
-					logs: [],
-					protocolVersion: existingConnection.protocolVersion,
-					serverInfo: existingConnection.serverInfo,
 					status: HealthCheckStatus.SUCCESS,
 					tools: tools.map((tool) => ({
-						description: tool.description,
 						name: tool.name,
+						description: tool.description,
 						title: tool.title
 					})),
-					transportType: existingConnection.transportType
+					serverInfo: existingConnection.serverInfo,
+					capabilities,
+					transportType: existingConnection.transportType,
+					protocolVersion: existingConnection.protocolVersion,
+					instructions: existingConnection.instructions,
+					connectionTimeMs: existingConnection.connectionTimeMs,
+					logs: []
 				});
-
 				return;
 			} catch (error) {
 				console.warn(
@@ -1409,35 +1384,33 @@ class MCPStore {
 
 		const trimmedUrl = server.url.trim();
 		const logs: MCPConnectionLog[] = [];
-
 		let currentPhase: MCPConnectionPhase = MCPConnectionPhase.IDLE;
 
 		if (!trimmedUrl) {
 			this.updateHealthCheck(server.id, {
-				logs: [],
+				status: HealthCheckStatus.ERROR,
 				message: 'Please enter a server URL first.',
-				status: HealthCheckStatus.ERROR
+				logs: []
 			});
-
 			return;
 		}
 
 		this.updateHealthCheck(server.id, {
-			logs: [],
+			status: HealthCheckStatus.CONNECTING,
 			phase: MCPConnectionPhase.TRANSPORT_CREATING,
-			status: HealthCheckStatus.CONNECTING
+			logs: []
 		});
 
-		const timeoutMs = this.#requestTimeoutMs();
+		const timeoutMs = Math.round(server.requestTimeoutSeconds * 1000);
 		const headers = this.parseHeaders(server.headers);
 
 		try {
 			const serverConfig: MCPServerConfig = {
-				handshakeTimeoutMs: DEFAULT_MCP_CONFIG.connectionTimeoutMs,
-				headers,
-				requestTimeoutMs: timeoutMs,
-				transport: detectMcpTransportFromUrl(trimmedUrl),
 				url: trimmedUrl,
+				transport: detectMcpTransportFromUrl(trimmedUrl),
+				handshakeTimeoutMs: DEFAULT_MCP_CONFIG.connectionTimeoutMs,
+				requestTimeoutMs: timeoutMs,
+				headers,
 				useProxy: server.useProxy
 			};
 
@@ -1453,9 +1426,9 @@ class MCPStore {
 					currentPhase = phase;
 					logs.push(log);
 					this.updateHealthCheck(server.id, {
-						logs: [...logs],
+						status: HealthCheckStatus.CONNECTING,
 						phase,
-						status: HealthCheckStatus.CONNECTING
+						logs: [...logs]
 					});
 
 					// Handle WebSocket disconnection
@@ -1467,26 +1440,28 @@ class MCPStore {
 					}
 				}
 			);
+
 			const tools = connection.tools.map((tool) => ({
-				description: tool.description,
 				name: tool.name,
+				description: tool.description,
 				title: tool.title
 			}));
+
 			const capabilities = this.#buildCapabilitiesInfo(
 				connection.serverCapabilities,
 				connection.clientCapabilities
 			);
 
 			this.updateHealthCheck(server.id, {
-				capabilities,
-				connectionTimeMs: connection.connectionTimeMs,
-				instructions: connection.instructions,
-				logs,
-				protocolVersion: connection.protocolVersion,
-				serverInfo: connection.serverInfo,
 				status: HealthCheckStatus.SUCCESS,
 				tools,
-				transportType: connection.transportType
+				serverInfo: connection.serverInfo,
+				capabilities,
+				transportType: connection.transportType,
+				protocolVersion: connection.protocolVersion,
+				instructions: connection.instructions,
+				connectionTimeMs: connection.connectionTimeMs,
+				logs
 			});
 
 			// Promote to active connection or disconnect
@@ -1500,18 +1475,18 @@ class MCPStore {
 
 			if (logs.at(-1)?.phase !== MCPConnectionPhase.ERROR) {
 				logs.push({
-					level: MCPLogLevel.ERROR,
-					message: `Connection failed: ${message}`,
+					timestamp: new Date(),
 					phase: MCPConnectionPhase.ERROR,
-					timestamp: new Date()
+					message: `Connection failed: ${message}`,
+					level: MCPLogLevel.ERROR
 				});
 			}
 
 			this.updateHealthCheck(server.id, {
-				logs,
+				status: HealthCheckStatus.ERROR,
 				message,
 				phase: currentPhase,
-				status: HealthCheckStatus.ERROR
+				logs
 			});
 		}
 	}
@@ -1528,7 +1503,6 @@ class MCPStore {
 					`[MCPStore] Tool name conflict during promotion: "${tool.name}" exists in "${this.toolsIndex.get(tool.name)}" and "${serverId}". Using tool from "${serverId}".`
 				);
 			}
-
 			this.toolsIndex.set(tool.name, serverId);
 		}
 
@@ -1537,8 +1511,8 @@ class MCPStore {
 
 		// Update state
 		this.updateState({
-			connectedServers: Array.from(this.connections.keys()),
-			toolCount: this.toolsIndex.size
+			toolCount: this.toolsIndex.size,
+			connectedServers: Array.from(this.connections.keys())
 		});
 	}
 
@@ -1547,10 +1521,10 @@ class MCPStore {
 
 		for (const [name, connection] of this.connections) {
 			statuses.push({
-				error: undefined,
-				isConnected: true,
 				name,
-				toolCount: connection.tools.length
+				isConnected: true,
+				toolCount: connection.tools.length,
+				error: undefined
 			});
 		}
 
@@ -1571,9 +1545,9 @@ class MCPStore {
 		for (const [serverName, connection] of this.connections) {
 			if (connection.instructions) {
 				results.push({
-					instructions: connection.instructions,
 					serverName,
-					serverTitle: connection.serverInfo?.title || connection.serverInfo?.name
+					serverTitle: connection.serverInfo?.title || connection.serverInfo?.name,
+					instructions: connection.instructions
 				});
 			}
 		}
@@ -1595,9 +1569,9 @@ class MCPStore {
 		for (const [serverId, state] of Object.entries(this._healthChecks)) {
 			if (state.status === HealthCheckStatus.SUCCESS && state.instructions) {
 				results.push({
-					instructions: state.instructions,
 					serverId,
-					serverTitle: state.serverInfo?.title || state.serverInfo?.name
+					serverTitle: state.serverInfo?.title || state.serverInfo?.name,
+					instructions: state.instructions
 				});
 			}
 		}
@@ -1632,28 +1606,43 @@ class MCPStore {
 	 * the user actually sends a message or uses prompts.
 	 * @param perChatOverrides - Per-chat server overrides to filter by enabled servers.
 	 *                          If provided (even empty array), only checks enabled servers.
-	 *                          If undefined, falls back to each server's own `enabled` flag.
+	 *                          If undefined, checks all servers with successful health checks.
 	 */
 	hasResourcesCapability(perChatOverrides?: McpServerOverride[]): boolean {
-		let enabledServerIds: Set<string>;
-
+		// If perChatOverrides is provided (even empty array), filter by enabled servers
 		if (perChatOverrides !== undefined) {
-			enabledServerIds = new Set(perChatOverrides.filter((o) => o.enabled).map((o) => o.serverId));
-		} else {
-			enabledServerIds = new Set(
-				this.getServers()
-					.filter((s) => s.enabled)
-					.map((s) => s.id)
+			const enabledServerIds = new Set(
+				perChatOverrides.filter((o) => o.enabled).map((o) => o.serverId)
 			);
-		}
+			// No enabled servers = no capability
+			if (enabledServerIds.size === 0) {
+				return false;
+			}
 
-		if (enabledServerIds.size === 0) {
+			// Check health check states for enabled servers with resources capability
+			for (const [serverId, state] of Object.entries(this._healthChecks)) {
+				if (!enabledServerIds.has(serverId)) continue;
+				if (
+					state.status === HealthCheckStatus.SUCCESS &&
+					state.capabilities?.server?.resources !== undefined
+				) {
+					return true;
+				}
+			}
+
+			// Also check active connections as fallback
+			for (const [serverName, connection] of this.connections) {
+				if (!enabledServerIds.has(serverName)) continue;
+				if (MCPService.supportsResources(connection)) {
+					return true;
+				}
+			}
+
 			return false;
 		}
 
-		for (const [serverId, state] of Object.entries(this._healthChecks)) {
-			if (!enabledServerIds.has(serverId)) continue;
-
+		// No overrides provided - check all servers (global mode)
+		for (const state of Object.values(this._healthChecks)) {
 			if (
 				state.status === HealthCheckStatus.SUCCESS &&
 				state.capabilities?.server?.resources !== undefined
@@ -1662,9 +1651,7 @@ class MCPStore {
 			}
 		}
 
-		for (const [serverName, connection] of this.connections) {
-			if (!enabledServerIds.has(serverName)) continue;
-
+		for (const connection of this.connections.values()) {
 			if (MCPService.supportsResources(connection)) {
 				return true;
 			}
@@ -1674,21 +1661,14 @@ class MCPStore {
 	}
 
 	/**
-	 * Get list of enabled servers that support resources.
+	 * Get list of servers that support resources.
 	 * Checks active connections first, then health check state as fallback.
 	 */
 	getServersWithResources(): string[] {
-		const enabledServerIds = new Set(
-			this.getServers()
-				.filter((s) => s.enabled)
-				.map((s) => s.id)
-		);
 		const servers: string[] = [];
 
 		// Check active connections
 		for (const [name, connection] of this.connections) {
-			if (!enabledServerIds.has(name)) continue;
-
 			if (MCPService.supportsResources(connection) && !servers.includes(name)) {
 				servers.push(name);
 			}
@@ -1696,8 +1676,6 @@ class MCPStore {
 
 		// Also check health check states for servers not yet connected
 		for (const [serverId, state] of Object.entries(this._healthChecks)) {
-			if (!enabledServerIds.has(serverId)) continue;
-
 			if (
 				!servers.includes(serverId) &&
 				state.status === HealthCheckStatus.SUCCESS &&
@@ -1717,7 +1695,6 @@ class MCPStore {
 	 */
 	async fetchAllResources(forceRefresh: boolean = false): Promise<void> {
 		const serversWithResources = this.getServersWithResources();
-
 		if (serversWithResources.length === 0) {
 			return;
 		}
@@ -1726,7 +1703,6 @@ class MCPStore {
 		if (!forceRefresh) {
 			const allServersCached = serversWithResources.every((serverName) => {
 				const serverRes = mcpResourceStore.getServerResources(serverName);
-
 				if (!serverRes || !serverRes.lastFetched) {
 					return false;
 				}
@@ -1734,7 +1710,7 @@ class MCPStore {
 				// Cache is valid for 5 minutes
 				const age = Date.now() - serverRes.lastFetched.getTime();
 
-				return age < CACHE.DEFAULT_TTL_MS;
+				return age < DEFAULT_CACHE_TTL_MS;
 			});
 
 			if (allServersCached) {
@@ -1761,10 +1737,8 @@ class MCPStore {
 	 */
 	async fetchServerResources(serverName: string): Promise<void> {
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			console.warn(`[MCPStore] No connection found for server: ${serverName}`);
-
 			return;
 		}
 
@@ -1783,7 +1757,6 @@ class MCPStore {
 			mcpResourceStore.setServerResources(serverName, resources, templates);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-
 			mcpResourceStore.setServerError(serverName, message);
 			console.error(`[MCPStore][${serverName}] Failed to fetch resources:`, error);
 		}
@@ -1796,14 +1769,12 @@ class MCPStore {
 	async readResource(uri: string): Promise<MCPResourceContent[] | null> {
 		// Check cache first
 		const cached = mcpResourceStore.getCachedContent(uri);
-
 		if (cached) {
 			return cached.content;
 		}
 
 		// Find which server has this resource
 		const serverName = mcpResourceStore.findServerForUri(uri);
-
 		if (!serverName) {
 			console.error(`[MCPStore] No server found for resource URI: ${uri}`);
 
@@ -1811,7 +1782,6 @@ class MCPStore {
 		}
 
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			console.error(`[MCPStore] No connection found for server: ${serverName}`);
 
@@ -1839,7 +1809,6 @@ class MCPStore {
 	 */
 	async subscribeToResource(uri: string): Promise<boolean> {
 		const serverName = mcpResourceStore.findServerForUri(uri);
-
 		if (!serverName) {
 			console.error(`[MCPStore] No server found for resource URI: ${uri}`);
 
@@ -1847,7 +1816,6 @@ class MCPStore {
 		}
 
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			console.error(`[MCPStore] No connection found for server: ${serverName}`);
 
@@ -1875,7 +1843,6 @@ class MCPStore {
 	 */
 	async unsubscribeFromResource(uri: string): Promise<boolean> {
 		const serverName = mcpResourceStore.findServerForUri(uri);
-
 		if (!serverName) {
 			console.error(`[MCPStore] No server found for resource URI: ${uri}`);
 
@@ -1883,7 +1850,6 @@ class MCPStore {
 		}
 
 		const connection = this.connections.get(serverName);
-
 		if (!connection) {
 			console.error(`[MCPStore] No connection found for server: ${serverName}`);
 
@@ -1908,7 +1874,6 @@ class MCPStore {
 	 */
 	async attachResource(uri: string): Promise<MCPResourceAttachment | null> {
 		const resourceInfo = mcpResourceStore.findResourceByUri(uri);
-
 		if (!resourceInfo) {
 			console.error(`[MCPStore] Resource not found: ${uri}`);
 
@@ -1934,7 +1899,6 @@ class MCPStore {
 			}
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
-
 			mcpResourceStore.updateAttachmentError(attachment.id, message);
 		}
 
@@ -1968,11 +1932,9 @@ class MCPStore {
 	 */
 	consumeResourceAttachmentsAsExtras(): DatabaseMessageExtraMcpResource[] {
 		const extras = mcpResourceStore.toMessageExtras();
-
 		if (extras.length > 0) {
 			mcpResourceStore.clearAttachments();
 		}
-
 		return extras;
 	}
 }

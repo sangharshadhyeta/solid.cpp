@@ -12,7 +12,7 @@
 		onOpenChange?: (open: boolean) => void;
 	}
 
-	let { fileErrorData, onOpenChange, open = $bindable() }: Props = $props();
+	let { open = $bindable(), fileErrorData, onOpenChange }: Props = $props();
 
 	function handleOpenChange(newOpen: boolean) {
 		open = newOpen;

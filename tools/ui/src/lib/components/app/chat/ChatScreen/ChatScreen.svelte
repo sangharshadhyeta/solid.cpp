@@ -1,43 +1,52 @@
 <script lang="ts">
-	import ChatScreenActionScrollDown from './ChatScreenActionScrollDown.svelte';
-	import ChatScreenDialogsAndAlerts from './ChatScreenDialogsAndAlerts.svelte';
-	import ChatScreenGreeting from './ChatScreenGreeting.svelte';
 	import { page } from '$app/state';
 	import {
+		ChatScreenForm,
 		ChatMessages,
 		ChatScreenDragOverlay,
-		ChatScreenForm,
-		ChatScreenServerError,
+		ChatScreenProcessingInfo,
 		ChatScreenStreamResumeStatus,
-		ServerLoadingSplash
+		ServerLoadingSplash,
+		ChatScreenServerError
 	} from '$lib/components/app';
-	import { LANDING_SETTLE_MAX_MS, LANDING_STABLE_FRAMES, ROUTES } from '$lib/constants';
+	import { setProcessingInfoContext } from '$lib/contexts';
 	import { createAutoScrollController } from '$lib/hooks/use-auto-scroll.svelte';
 	import { useChatScreenActiveModel } from '$lib/hooks/use-chat-screen-active-model.svelte';
 	import { useChatScreenDragAndDrop } from '$lib/hooks/use-chat-screen-drag-and-drop.svelte';
 	import { useChatScreenFileUpload } from '$lib/hooks/use-chat-screen-file-upload.svelte';
 	import { useChatScreenScroll } from '$lib/hooks/use-chat-screen-scroll.svelte';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
+	import { device } from '$lib/stores/device.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
 	import {
 		chatStore,
 		errorDialog,
+		isLoading,
 		isChatStreaming,
 		isEditing,
-		isLoading
+		activeProcessingState
 	} from '$lib/stores/chat.svelte';
 	import {
-		activeConversation,
+		conversationsStore,
 		activeMessages,
-		conversationsStore
+		activeConversation
 	} from '$lib/stores/conversations.svelte';
-	import { device } from '$lib/stores/device.svelte';
-	import { serverError, serverLoading } from '$lib/stores/server.svelte';
 	import { config } from '$lib/stores/settings.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { serverLoading, serverError } from '$lib/stores/server.svelte';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
-	import { onDestroy, onMount, tick } from 'svelte';
+	import { onDestroy, onMount } from 'svelte';
+	import ChatScreenGreeting from './ChatScreenGreeting.svelte';
+	import ChatScreenActionScrollDown from './ChatScreenActionScrollDown.svelte';
+	import ChatScreenDialogsAndAlerts from './ChatScreenDialogsAndAlerts.svelte';
+	import { ROUTES } from '$lib/constants';
 
 	let { showCenteredEmpty = false } = $props();
+
+	setProcessingInfoContext({
+		get showProcessingInfo() {
+			return showProcessingInfo;
+		}
+	});
 
 	let disableAutoScroll = $derived(Boolean(config().disableAutoScroll) || isMobile.current);
 	let isMobileUserScrolledUp = $state(false);
@@ -54,13 +63,15 @@
 	let isServerLoading = $derived(serverLoading());
 	let hasPropsError = $derived(!!serverError());
 	let isCurrentConversationLoading = $derived(isLoading() || isChatStreaming());
+	let showProcessingInfo = $derived(
+		isCurrentConversationLoading ||
+			(config().keepStatsVisible && !!page.params.id) ||
+			activeProcessingState() !== null
+	);
 	let chatFormBottomPosition = $derived.by(() => {
 		if (!isMobile.current) return '1rem';
-
 		if (device.isStandalone) return '1.5rem';
-
 		if (device.isIOSSafari) return '0.25rem';
-
 		return '0.5rem';
 	});
 
@@ -68,12 +79,12 @@
 	const scroll = useChatScreenScroll(autoScroll);
 	const activeModel = useChatScreenActiveModel();
 	const fileUpload = useChatScreenFileUpload({
-		activeModelId: () => activeModel.activeModelId,
 		capabilities: () => ({
+			hasVision: activeModel.hasVisionModality,
 			hasAudio: activeModel.hasAudioModality,
-			hasVideo: activeModel.hasVideoModality,
-			hasVision: activeModel.hasVisionModality
-		})
+			hasVideo: activeModel.hasVideoModality
+		}),
+		activeModelId: () => activeModel.activeModelId
 	});
 	const dragAndDrop = useChatScreenDragAndDrop({
 		onDrop: fileUpload.handleFileUpload
@@ -90,12 +101,10 @@
 		if (!isMobile.current) return;
 
 		const container = scroll.chatScrollContainer;
-
 		if (!container) return;
 
 		const distanceFromBottom =
 			container.scrollHeight - container.clientHeight - container.scrollTop;
-
 		isMobileUserScrolledUp = distanceFromBottom > 300;
 	}
 
@@ -118,72 +127,19 @@
 		if (result?.emptyFiles && result.emptyFiles.length > 0) {
 			emptyFileNames = result.emptyFiles;
 			showEmptyFileDialog = true;
-
 			if (files) {
 				const emptyFileNamesSet = new Set(result.emptyFiles);
-
 				fileUpload.uploadedFiles = fileUpload.uploadedFiles.filter(
 					(file) => !emptyFileNamesSet.has(file.name)
 				);
 			}
-
 			return false;
 		}
 
 		handleSendLikeScroll();
 
 		await chatStore.sendMessage(message, result?.extras);
-
 		return true;
-	}
-
-	let lastScrolledConversationId: string | null = null;
-
-	// Lands at the bottom of a conversation the first time its messages
-	// render, whether the route comes from another conversation or from a
-	// non-conversation route. The page keeps growing after the first pin
-	// without DOM mutations (content-visibility size realizations, syntax
-	// highlight passes), so the instant pin repeats every frame until the
-	// height settles, bailing out on user scroll or conversation change.
-	async function handleMessagesReady(messageCount: number) {
-		if (messageCount === 0) return;
-
-		const id = activeConversation()?.id ?? null;
-
-		if (!id || id === lastScrolledConversationId) return;
-
-		lastScrolledConversationId = id;
-		await tick();
-		autoScroll.scrollToBottom();
-
-		const container = scroll.chatScrollContainer;
-
-		if (!container) return;
-
-		const started = performance.now();
-
-		let stableFrames = 0;
-		let lastHeight = container.scrollHeight;
-
-		const settle = () => {
-			if (autoScroll.userScrolledUp) return;
-
-			if (activeConversation()?.id !== id) return;
-
-			autoScroll.scrollToBottom();
-			const height = container.scrollHeight;
-
-			stableFrames = height === lastHeight ? stableFrames + 1 : 0;
-			lastHeight = height;
-
-			if (stableFrames >= LANDING_STABLE_FRAMES) return;
-
-			if (performance.now() - started > LANDING_SETTLE_MAX_MS) return;
-
-			requestAnimationFrame(settle);
-		};
-
-		requestAnimationFrame(settle);
 	}
 
 	function handleSendLikeScroll() {
@@ -193,7 +149,6 @@
 
 		setTimeout(() => {
 			const container = scroll.chatScrollContainer;
-
 			if (!container) return;
 
 			const lastUserBubble = container.querySelector(
@@ -206,17 +161,16 @@
 				const baseHeight = container.scrollHeight - innerHeight;
 
 				container.scrollTo({
-					behavior: 'smooth',
-					top: bubbleHeight > 0 ? baseHeight - bubbleHeight : baseHeight
+					top: bubbleHeight > 0 ? baseHeight - bubbleHeight : baseHeight,
+					behavior: 'smooth'
 				});
 			} else if (lastUserBubble) {
 				// On desktop, place the last user message near the top of the viewport
 				const topPadding = 24;
 				const bubbleRect = lastUserBubble.getBoundingClientRect();
-
 				container.scrollTo({
-					behavior: 'smooth',
-					top: Math.max(0, container.scrollTop + bubbleRect.top - topPadding)
+					top: Math.max(0, container.scrollTop + bubbleRect.top - topPadding),
+					behavior: 'smooth'
 				});
 			} else {
 				autoScroll.scrollToBottom();
@@ -240,16 +194,13 @@
 		if (draft.message || draft.files.length > 0) {
 			chatStore.savePendingDraft(draft.message, draft.files);
 		}
-
 		await chatStore.addSystemPrompt();
 	}
 
 	$effect(() => {
 		const shouldDisableAutoScroll =
 			config().disableAutoScroll || (isMobile.current && isCurrentConversationLoading);
-
 		autoScroll.setDisabled(shouldDisableAutoScroll);
-
 		if (!shouldDisableAutoScroll) {
 			autoScroll.enable();
 		}
@@ -257,7 +208,6 @@
 
 	onMount(() => {
 		const pendingDraft = chatStore.consumePendingDraft();
-
 		if (pendingDraft) {
 			initialMessage = pendingDraft.message;
 			fileUpload.uploadedFiles = pendingDraft.files;
@@ -289,7 +239,6 @@
 	onscroll={(e) => {
 		scroll.handleScroll(e);
 		handleMobileScroll();
-
 		if (e.isTrusted && Date.now() > mobileScrollDownHintLockedUntil) {
 			mobileScrollDownHint = false;
 		}
@@ -311,7 +260,6 @@
 		{#if !isEmpty}
 			<ChatMessages
 				messages={activeMessages()}
-				onMessagesReady={handleMessagesReady}
 				onUserAction={() => {
 					handleSendLikeScroll();
 				}}
@@ -344,11 +292,15 @@
 						onclick={() => {
 							mobileScrollDownHint = false;
 							scroll.chatScrollContainer?.scrollTo({
-								behavior: 'smooth',
-								top: scroll.chatScrollContainer.scrollHeight
+								top: scroll.chatScrollContainer.scrollHeight,
+								behavior: 'smooth'
 							});
 						}}
 					/>
+				{/if}
+
+				{#if showProcessingInfo}
+					<ChatScreenProcessingInfo />
 				{/if}
 			</div>
 

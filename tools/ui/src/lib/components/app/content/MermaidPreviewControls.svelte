@@ -1,9 +1,8 @@
 <script lang="ts">
 	import { Download } from '@lucide/svelte';
-	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
 	import ZoomInIcon from '@lucide/svelte/icons/zoom-in';
 	import ZoomOutIcon from '@lucide/svelte/icons/zoom-out';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+	import RotateCcwIcon from '@lucide/svelte/icons/rotate-ccw';
 
 	interface Props {
 		scale: number;
@@ -13,15 +12,13 @@
 		onResetView: () => void;
 	}
 
-	let { onResetView, onZoomIn, onZoomOut, scale, svgHtml }: Props = $props();
+	let { scale, svgHtml, onZoomIn, onZoomOut, onResetView }: Props = $props();
 
 	function downloadSvg() {
 		if (!svgHtml) return;
-
 		const blob = new Blob([svgHtml], { type: 'image/svg+xml' });
 		const url = URL.createObjectURL(blob);
 		const a = document.createElement('a');
-
 		a.href = url;
 		a.download = 'diagram.svg';
 		a.click();
@@ -39,7 +36,7 @@
 			title="Zoom out"
 			aria-label="Zoom out"
 		>
-			<ZoomOutIcon class="mermaid-preview-btn-icon {ICON_CLASS_DEFAULT}" />
+			<ZoomOutIcon class="mermaid-preview-btn-icon h-4 w-4" />
 		</button>
 		<span
 			class="mermaid-preview-zoom-label min-w-[3.5rem] px-0.5 text-center text-xs font-medium text-muted-foreground tabular-nums select-none"
@@ -51,7 +48,7 @@
 			title="Zoom in"
 			aria-label="Zoom in"
 		>
-			<ZoomInIcon class="mermaid-preview-btn-icon {ICON_CLASS_DEFAULT}" />
+			<ZoomInIcon class="mermaid-preview-btn-icon h-4 w-4" />
 		</button>
 		<div class="mermaid-preview-controls-separator mx-1 h-5 w-px bg-border/50"></div>
 
@@ -61,7 +58,7 @@
 			title="Reset view"
 			aria-label="Reset view"
 		>
-			<RotateCcwIcon class="mermaid-preview-btn-icon {ICON_CLASS_DEFAULT}" />
+			<RotateCcwIcon class="mermaid-preview-btn-icon h-4 w-4" />
 		</button>
 		<div class="mermaid-preview-controls-separator mx-1 h-5 w-px bg-border/50"></div>
 
@@ -71,7 +68,7 @@
 			title="Download SVG"
 			aria-label="Download SVG"
 		>
-			<Download class="mermaid-preview-btn-icon {ICON_CLASS_DEFAULT}" />
+			<Download class="mermaid-preview-btn-icon h-4 w-4" />
 		</button>
 	</div>
 </div>

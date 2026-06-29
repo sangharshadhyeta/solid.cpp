@@ -16,7 +16,6 @@ if (browser) {
 	import('pdfjs-dist/build/pdf.worker.min.mjs?raw')
 		.then((workerModule) => {
 			const workerBlob = new Blob([workerModule.default], { type: 'application/javascript' });
-
 			pdfjs.GlobalWorkerOptions.workerSrc = URL.createObjectURL(workerBlob);
 		})
 		.catch(() => {
@@ -32,7 +31,6 @@ if (browser) {
 async function getFileAsBuffer(file: File): Promise<ArrayBuffer> {
 	return new Promise((resolve, reject) => {
 		const reader = new FileReader();
-
 		reader.onload = (event) => {
 			if (event.target?.result) {
 				resolve(event.target.result as ArrayBuffer);
@@ -61,6 +59,7 @@ export async function convertPDFToText(file: File): Promise<string> {
 		const buffer = await getFileAsBuffer(file);
 		const pdf = await pdfjs.getDocument({ data: buffer }).promise;
 		const numPages = pdf.numPages;
+
 		const textContentPromises: Promise<TextContent>[] = [];
 
 		for (let i = 1; i <= numPages; i++) {
@@ -76,7 +75,6 @@ export async function convertPDFToText(file: File): Promise<string> {
 		return textItems.join('\n');
 	} catch (error) {
 		console.error('Error converting PDF to text:', error);
-
 		throw new Error(
 			`Failed to convert PDF to text: ${error instanceof Error ? error.message : 'Unknown error'}`
 		);
@@ -113,11 +111,10 @@ export async function convertPDFToImage(file: File, scale: number = 1.5): Promis
 			}
 
 			const task = page.render({
-				canvas: canvas,
 				canvasContext: ctx,
-				viewport: viewport
+				viewport: viewport,
+				canvas: canvas
 			});
-
 			pages.push(
 				task.promise.then(() => {
 					return canvas.toDataURL(MimeTypeImage.PNG);
@@ -128,7 +125,6 @@ export async function convertPDFToImage(file: File, scale: number = 1.5): Promis
 		return await Promise.all(pages);
 	} catch (error) {
 		console.error('Error converting PDF to images:', error);
-
 		throw new Error(
 			`Failed to convert PDF to images: ${error instanceof Error ? error.message : 'Unknown error'}`
 		);

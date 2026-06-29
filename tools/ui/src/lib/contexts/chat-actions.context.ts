@@ -1,5 +1,5 @@
-import { CONTEXT_KEY_CHAT_ACTIONS } from '$lib/constants';
 import { getContext, setContext } from 'svelte';
+import { CONTEXT_KEY_CHAT_ACTIONS } from '$lib/constants';
 
 export interface ChatActionsContext {
 	copy: (message: DatabaseMessage) => void;

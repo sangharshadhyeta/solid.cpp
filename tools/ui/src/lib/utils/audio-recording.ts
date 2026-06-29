@@ -23,9 +23,9 @@ export class AudioRecorder {
 		try {
 			this.stream = await navigator.mediaDevices.getUserMedia({
 				audio: {
-					autoGainControl: true,
 					echoCancellation: true,
-					noiseSuppression: true
+					noiseSuppression: true,
+					autoGainControl: true
 				}
 			});
 
@@ -37,7 +37,6 @@ export class AudioRecorder {
 			this.recordingState = true;
 		} catch (error) {
 			console.error('Failed to start recording:', error);
-
 			throw new Error('Failed to access microphone. Please check permissions.');
 		}
 	}
@@ -50,7 +49,6 @@ export class AudioRecorder {
 
 			if (!recorder || recorder.state === 'inactive') {
 				reject(new Error('No active recording to stop'));
-
 				return;
 			}
 
@@ -158,19 +156,18 @@ export async function convertToWav(audioBlob: Blob): Promise<Blob> {
 		}
 
 		const arrayBuffer = await audioBlob.arrayBuffer();
+
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any
 		const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
 
 		try {
 			const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-
 			return audioBufferToWav(audioBuffer);
 		} finally {
 			audioContext.close();
 		}
 	} catch (error) {
 		console.error('Failed to convert audio to WAV:', error);
-
 		return audioBlob;
 	}
 }
@@ -184,8 +181,10 @@ function audioBufferToWav(buffer: AudioBuffer): Blob {
 	const byteRate = sampleRate * blockAlign;
 	const dataSize = length * blockAlign;
 	const bufferSize = 44 + dataSize;
+
 	const arrayBuffer = new ArrayBuffer(bufferSize);
 	const view = new DataView(arrayBuffer);
+
 	const writeString = (offset: number, string: string) => {
 		for (let i = 0; i < string.length; i++) {
 			view.setUint8(offset + i, string.charCodeAt(i));
@@ -208,22 +207,17 @@ function audioBufferToWav(buffer: AudioBuffer): Blob {
 
 	// Cache channel arrays, write PCM via Int16Array (native little-endian, matches WAV)
 	const channels: Float32Array[] = new Array(numberOfChannels);
-
 	for (let c = 0; c < numberOfChannels; c++) {
 		channels[c] = buffer.getChannelData(c);
 	}
 
 	const pcm = new Int16Array(arrayBuffer, 44, length * numberOfChannels);
-
 	let p = 0;
-
 	for (let i = 0; i < length; i++) {
 		for (let c = 0; c < numberOfChannels; c++) {
 			let s = channels[c][i];
-
 			if (s > 1) s = 1;
 			else if (s < -1) s = -1;
-
 			pcm[p++] = s * 0x7fff;
 		}
 	}
@@ -243,8 +237,8 @@ export function createAudioFile(audioBlob: Blob, filename?: string): File {
 	const defaultFilename = `recording-${timestamp}.${extension}`;
 
 	return new File([audioBlob], filename || defaultFilename, {
-		lastModified: Date.now(),
-		type: audioBlob.type
+		type: audioBlob.type,
+		lastModified: Date.now()
 	});
 }
 

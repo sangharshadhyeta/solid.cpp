@@ -1,5 +1,4 @@
 <script lang="ts">
-	import ModelLoadHighlight from './ModelLoadHighlight.svelte';
 	import {
 		CircleAlert,
 		Heart,
@@ -11,10 +10,10 @@
 		RotateCw
 	} from '@lucide/svelte';
 	import { ActionIcon, ModelId } from '$lib/components/app';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+	import ModelLoadHighlight from './ModelLoadHighlight.svelte';
+	import type { ModelOption } from '$lib/types/models';
 	import { ServerModelStatus } from '$lib/enums';
 	import { modelsStore, routerModels } from '$lib/stores/models.svelte';
-	import type { ModelOption } from '$lib/types/models';
 	import { modelLoadFraction, modelLoadProgressText } from '$lib/utils';
 
 	interface Props {
@@ -30,21 +29,20 @@
 	}
 
 	let {
-		hideOrgName = false,
-		isFav,
-		isHighlighted,
+		option,
 		isSelected,
-		onInfoClick,
-		onKeyDown,
-		onMouseEnter,
+		isHighlighted,
+		isFav,
+		hideOrgName = false,
 		onSelect,
-		option
+		onMouseEnter,
+		onKeyDown,
+		onInfoClick
 	}: Props = $props();
 
 	let currentRouterModels = $derived(routerModels());
 	let serverStatus = $derived.by(() => {
 		const model = currentRouterModels.find((m) => m.id === option.model);
-
 		return (model?.status?.value as ServerModelStatus) ?? null;
 	});
 	let isOperationInProgress = $derived(modelsStore.isModelOperationInProgress(option.model));
@@ -63,10 +61,9 @@
 <div
 	class={[
 		'group relative flex w-full items-center gap-2 rounded-sm p-2 text-left text-sm transition focus:outline-none',
-		'cursor-pointer',
-		isSelected && 'bg-accent/50 text-accent-foreground',
-		isHighlighted && 'bg-accent',
-		!isSelected && !isHighlighted && 'hover:bg-muted',
+		'cursor-pointer hover:bg-muted focus:bg-muted',
+		(isSelected || isHighlighted) && 'bg-accent text-accent-foreground',
+		!(isSelected || isHighlighted) && 'hover:bg-accent hover:text-accent-foreground',
 		isLoaded ? 'text-popover-foreground' : 'text-muted-foreground'
 	]}
 	role="option"
@@ -124,7 +121,7 @@
 
 		{#if isLoading}
 			<div class="flex w-4 items-center justify-center [@media(pointer:coarse)]:w-5">
-				<Loader2 class="{ICON_CLASS_DEFAULT} animate-spin text-muted-foreground" />
+				<Loader2 class="h-4 w-4 animate-spin text-muted-foreground" />
 			</div>
 		{:else if isFailed}
 			<div class="flex w-4 items-center justify-center [@media(pointer:coarse)]:w-auto">

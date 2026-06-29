@@ -1,13 +1,13 @@
+import type { MessageRole } from '$lib/enums';
+import { ToolCallType } from '$lib/enums';
 import type {
 	ApiChatCompletionRequest,
 	ApiChatCompletionToolCall,
 	ApiChatMessageContentPart,
 	ApiChatMessageData
 } from './api';
-import type { ChatMessagePromptProgress, ChatMessageTimings } from './chat';
+import type { ChatMessageTimings, ChatMessagePromptProgress } from './chat';
 import type { DatabaseMessage, DatabaseMessageExtra, McpServerOverride } from './database';
-import type { MessageRole } from '$lib/enums';
-import { ToolCallType } from '$lib/enums';
 
 /**
  * Agentic orchestration configuration.
@@ -15,6 +15,7 @@ import { ToolCallType } from '$lib/enums';
 export interface AgenticConfig {
 	enabled: boolean;
 	maxTurns: number;
+	maxToolPreviewLines: number;
 }
 
 /**
@@ -69,11 +70,6 @@ export interface AgenticSession {
 	lastError: Error | null;
 	streamingToolCall: { name: string; arguments: string } | null;
 	pendingPermissionRequest: { toolName: string; serverLabel: string } | null;
-	/** ID of the tool call whose output is currently being streamed back
-	 *  (e.g. exec_shell_command outputting to /tools?stream=true). Lets the
-	 *  matching tool renderer flip into live-update mode while chunks
-	 *  arrive; cleared when the tool's terminal event lands. */
-	executingToolCallId: string | null;
 }
 
 /**
@@ -109,18 +105,8 @@ export interface AgenticFlowCallbacks {
 	createToolResultMessage?: (
 		toolCallId: string,
 		content: string,
-		extras?: DatabaseMessageExtra[],
-		toolCwd?: string
-	) => Promise<DatabaseMessage>;
-	/** Update an already-created tool result message. Used while a streaming
-	 *  tool (e.g. exec_shell_command) accumulates output chunks before its
-	 *  terminal event; the same message is rewritten in place so the chat UI
-	 *  sees the partial output live. */
-	updateToolResultMessage?: (
-		messageId: string,
-		content: string,
 		extras?: DatabaseMessageExtra[]
-	) => Promise<void>;
+	) => Promise<DatabaseMessage>;
 	/** Create a new assistant message for the next agentic turn */
 	createAssistantMessage?: () => Promise<DatabaseMessage>;
 	/** Entire agentic flow is complete */

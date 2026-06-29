@@ -2,7 +2,6 @@
 	import { Mic, Square } from '@lucide/svelte';
 	import { Button } from '$lib/components/ui/button';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 
 	interface Props {
 		class?: string;
@@ -37,9 +36,9 @@
 				<span class="sr-only">{isRecording ? 'Stop recording' : 'Start recording'}</span>
 
 				{#if isRecording}
-					<Square class="{ICON_CLASS_DEFAULT} animate-pulse fill-white" />
+					<Square class="h-4 w-4 animate-pulse fill-white" />
 				{:else}
-					<Mic class={ICON_CLASS_DEFAULT} />
+					<Mic class="h-4 w-4" />
 				{/if}
 			</Button>
 		</Tooltip.Trigger>

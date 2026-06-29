@@ -18,16 +18,13 @@ async function loadVersion() {
 
 	if (import.meta.env.DEV) {
 		version = 'dev';
-
 		return;
 	}
 
 	try {
 		const res = await fetch(`${base}/_app/version.json`, { cache: 'no-store' });
-
 		if (res.ok) {
 			const data = await res.json();
-
 			version = data.version ?? '';
 		}
 	} catch {

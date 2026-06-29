@@ -6,6 +6,5 @@
  */
 export function mountSvgShadow(host: HTMLElement, markup: string, style: string): void {
 	const root = host.shadowRoot ?? host.attachShadow({ mode: 'open' });
-
 	root.innerHTML = markup ? `<style>${style}</style>${markup}` : '';
 }

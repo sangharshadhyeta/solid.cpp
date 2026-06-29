@@ -1,19 +1,18 @@
 <script lang="ts">
-	import { Button, type ButtonVariant } from '$lib/components/ui/button';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import type { Component } from 'svelte';
+	import { Button, type ButtonVariant } from '$lib/components/ui/button';
 
 	let {
-		buttonClass,
-		buttonText,
-		buttonVariant,
+		title,
 		description,
 		IconComponent,
+		buttonText,
 		onclick,
-		summary,
-		title,
 		titleClass,
-		wrapperClass
+		buttonVariant,
+		buttonClass,
+		wrapperClass,
+		summary
 	}: {
 		title: string;
 		description: string;
@@ -37,7 +36,7 @@
 	<p class="mb-4 text-sm text-muted-foreground">{description}</p>
 
 	<Button class={sectionButtonClass} {onclick} variant={sectionButtonVariant}>
-		<IconComponent class="mr-2 {ICON_CLASS_DEFAULT}" />
+		<IconComponent class="mr-2 h-4 w-4" />
 
 		{buttonText}
 	</Button>

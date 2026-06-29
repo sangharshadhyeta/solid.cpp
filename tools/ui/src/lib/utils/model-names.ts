@@ -1,5 +1,3 @@
-import { FILE_PATH_SEPARATOR_REGEX } from '$lib/constants';
-
 /**
  * Normalizes a model name by extracting the filename from a path, but preserves Hugging Face repository format.
  *
@@ -26,7 +24,7 @@ export function normalizeModelName(modelName: string): string {
 		return '';
 	}
 
-	const segments = trimmed.split(FILE_PATH_SEPARATOR_REGEX);
+	const segments = trimmed.split(/[\\/]/);
 
 	// If we have exactly 2 segments (one slash), treat it as Hugging Face repo format
 	// and preserve the full "org/model" format

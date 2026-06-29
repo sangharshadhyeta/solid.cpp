@@ -1,42 +1,42 @@
 <script module lang="ts">
-	import jpgAsset from './fixtures/assets/1.jpg?url';
-	import pdfAsset from './fixtures/assets/example.pdf?raw';
-	import svgAsset from './fixtures/assets/hf-logo.svg?url';
 	import { defineMeta } from '@storybook/addon-svelte-csf';
 	import ChatScreenForm from '$lib/components/app/chat/ChatScreen/ChatScreenForm.svelte';
 	import { expect } from 'storybook/test';
+	import jpgAsset from './fixtures/assets/1.jpg?url';
+	import svgAsset from './fixtures/assets/hf-logo.svg?url';
+	import pdfAsset from './fixtures/assets/example.pdf?raw';
 
 	const { Story } = defineMeta({
+		title: 'Components/ChatScreen/ChatScreenForm',
 		component: ChatScreenForm,
 		parameters: {
 			layout: 'centered'
-		},
-		title: 'Components/ChatScreen/ChatScreenForm'
+		}
 	});
 
 	let fileAttachments = $state([
 		{
-			file: new File([''], '1.jpg', { type: 'image/jpeg' }),
 			id: '1',
 			name: '1.jpg',
-			preview: jpgAsset,
+			type: 'image/jpeg',
 			size: 44891,
-			type: 'image/jpeg'
+			preview: jpgAsset,
+			file: new File([''], '1.jpg', { type: 'image/jpeg' })
 		},
 		{
-			file: new File([''], 'hf-logo.svg', { type: 'image/svg+xml' }),
 			id: '2',
 			name: 'hf-logo.svg',
-			preview: svgAsset,
+			type: 'image/svg+xml',
 			size: 1234,
-			type: 'image/svg+xml'
+			preview: svgAsset,
+			file: new File([''], 'hf-logo.svg', { type: 'image/svg+xml' })
 		},
 		{
-			file: new File([pdfAsset], 'example.pdf', { type: 'application/pdf' }),
 			id: '3',
 			name: 'example.pdf',
+			type: 'application/pdf',
 			size: 351048,
-			type: 'application/pdf'
+			file: new File([pdfAsset], 'example.pdf', { type: 'application/pdf' })
 		}
 	]);
 </script>
@@ -62,7 +62,6 @@
 		await expect(textarea).toHaveValue(text);
 
 		const fileInput = document.querySelector('input[type="file"]');
-
 		await expect(fileInput).not.toHaveAttribute('accept');
 	}}
 />

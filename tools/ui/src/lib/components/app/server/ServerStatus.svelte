@@ -2,9 +2,8 @@
 	import { AlertTriangle, Server } from '@lucide/svelte';
 	import { Badge } from '$lib/components/ui/badge';
 	import { Button } from '$lib/components/ui/button';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+	import { serverProps, serverLoading, serverError } from '$lib/stores/server.svelte';
 	import { singleModelName } from '$lib/stores/models.svelte';
-	import { serverError, serverLoading, serverProps } from '$lib/stores/server.svelte';
 
 	interface Props {
 		class?: string;
@@ -20,9 +19,7 @@
 
 	function getStatusColor() {
 		if (loading) return 'bg-yellow-500';
-
 		if (error) return 'bg-red-500';
-
 		if (serverData) return 'bg-green-500';
 
 		return 'bg-gray-500';
@@ -30,9 +27,7 @@
 
 	function getStatusText() {
 		if (loading) return 'Connecting...';
-
 		if (error) return 'Connection Error';
-
 		if (serverData) return 'Connected';
 
 		return 'Unknown';
@@ -62,7 +57,7 @@
 
 	{#if showActions && error}
 		<Button variant="outline" size="sm" class="text-destructive">
-			<AlertTriangle class={ICON_CLASS_DEFAULT} />
+			<AlertTriangle class="h-4 w-4" />
 
 			{error}
 		</Button>

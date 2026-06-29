@@ -2,8 +2,8 @@
 	import {
 		ChatAttachmentsListItemMcpPrompt,
 		ChatAttachmentsListItemMcpResource,
-		ChatAttachmentsListItemThumbnailFile,
-		ChatAttachmentsListItemThumbnailImage
+		ChatAttachmentsListItemThumbnailImage,
+		ChatAttachmentsListItemThumbnailFile
 	} from '$lib/components/app';
 	import { AttachmentType } from '$lib/enums';
 	import type {
@@ -49,10 +49,10 @@
 		return {
 			id,
 			resource: {
+				uri: extra.uri,
 				name: extra.name,
-				serverName: extra.serverName,
 				title: extra.name,
-				uri: extra.uri
+				serverName: extra.serverName
 			}
 		};
 	}
@@ -64,12 +64,12 @@
 			? (item.attachment as DatabaseMessageExtraMcpPrompt)
 			: item.uploadedFile?.mcpPrompt
 				? {
-						arguments: item.uploadedFile.mcpPrompt.arguments,
-						content: item.textContent ?? '',
+						type: AttachmentType.MCP_PROMPT as const,
 						name: item.name,
-						promptName: item.uploadedFile.mcpPrompt.promptName,
 						serverName: item.uploadedFile.mcpPrompt.serverName,
-						type: AttachmentType.MCP_PROMPT as const
+						promptName: item.uploadedFile.mcpPrompt.promptName,
+						content: item.textContent ?? '',
+						arguments: item.uploadedFile.mcpPrompt.arguments
 					}
 				: null}
 	{#if mcpPrompt}

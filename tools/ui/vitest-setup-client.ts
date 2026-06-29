@@ -6,13 +6,9 @@ import { beforeEach, vi } from 'vitest';
 // Mock fetch for API calls during client tests.
 // In test environment there is no backend server, so we intercept
 // the specific endpoints the app uses and return valid mock data.
-// The passthrough target is captured once at module load: capturing it
-// inside beforeEach grabs the previous test's spy (vi.spyOn returns the
-// existing spy), making the default branch recurse on itself as soon as
-// a test fetches a URL outside the mocked set.
-const originalFetch = globalThis.fetch.bind(globalThis);
-
 beforeEach(() => {
+	const originalFetch = globalThis.fetch;
+
 	vi.spyOn(globalThis, 'fetch').mockImplementation(
 		async (input: RequestInfo | URL, init?: RequestInit) => {
 			const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
@@ -21,12 +17,12 @@ beforeEach(() => {
 			if (url.includes('/server')) {
 				return new Response(
 					JSON.stringify({
-						git_branch: 'test',
-						git_commit: 'test',
 						mode: 'router',
-						version: 'test'
+						version: 'test',
+						git_commit: 'test',
+						git_branch: 'test'
 					}),
-					{ headers: { 'Content-Type': 'application/json' }, status: 200 }
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
 
@@ -34,28 +30,28 @@ beforeEach(() => {
 			if (/\/v1\/models|\/models\b/.test(url)) {
 				return new Response(
 					JSON.stringify({
+						object: 'list',
 						data: [
 							{
-								created: 0,
 								id: 'test-model.gguf',
-								in_cache: false,
-								meta: {},
 								object: 'model',
 								owned_by: 'llamacpp',
+								created: 0,
+								in_cache: false,
 								path: 'models/test-model.gguf',
-								status: { value: 'unloaded' }
+								status: { value: 'unloaded' },
+								meta: {}
 							}
 						],
 						models: [
 							{
-								details: {},
 								model: 'test-model.gguf',
-								name: 'Test Model'
+								name: 'Test Model',
+								details: {}
 							}
-						],
-						object: 'list'
+						]
 					}),
-					{ headers: { 'Content-Type': 'application/json' }, status: 200 }
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
 
@@ -65,15 +61,15 @@ beforeEach(() => {
 					JSON.stringify({
 						default_generation_settings: { n_ctx: 2048 }
 					}),
-					{ headers: { 'Content-Type': 'application/json' }, status: 200 }
+					{ status: 200, headers: { 'Content-Type': 'application/json' } }
 				);
 			}
 
 			// Mock /tools endpoint (used for built-in tools list)
 			if (url.includes('/tools')) {
 				return new Response(JSON.stringify([]), {
-					headers: { 'Content-Type': 'application/json' },
-					status: 200
+					status: 200,
+					headers: { 'Content-Type': 'application/json' }
 				});
 			}
 

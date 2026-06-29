@@ -1,8 +1,8 @@
 <script lang="ts">
-	import ChatFormActionAddButton from './ChatFormActionAddButton.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
 	import ChatFormActionAddDropdown from './ChatFormActionAddDropdown.svelte';
 	import ChatFormActionAddSheet from './ChatFormActionAddSheet.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import ChatFormActionAddButton from './ChatFormActionAddButton.svelte';
 
 	interface Props {
 		disabled?: boolean;
@@ -21,9 +21,9 @@
 	let {
 		disabled = false,
 		hasAudioModality = false,
+		hasVideoModality = false,
 		hasMcpPromptsSupport = false,
 		hasMcpResourcesSupport = false,
-		hasVideoModality = false,
 		hasVisionModality = false,
 		onFileUpload,
 		onMcpPromptClick,

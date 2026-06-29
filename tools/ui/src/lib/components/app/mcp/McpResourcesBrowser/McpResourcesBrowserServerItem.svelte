@@ -1,19 +1,18 @@
 <script lang="ts">
-	import {
-		buildResourceTree,
-		countTreeResources,
-		type ResourceTreeNode,
-		sortTreeChildren
-	} from './mcp-resources-browser';
-	import { Braces, ChevronDown, ChevronRight, FolderOpen, Loader2 } from '@lucide/svelte';
-	import { McpServerIdentity } from '$lib/components/app/mcp';
+	import { FolderOpen, ChevronDown, ChevronRight, Loader2, Braces } from '@lucide/svelte';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import * as Collapsible from '$lib/components/ui/collapsible';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import type { MCPResourceInfo, MCPResourceTemplateInfo, MCPServerResources } from '$lib/types';
-	import { getDisplayName, getResourceIcon } from '$lib/utils';
 	import { SvelteSet } from 'svelte/reactivity';
+	import {
+		type ResourceTreeNode,
+		buildResourceTree,
+		countTreeResources,
+		sortTreeChildren
+	} from './mcp-resources-browser';
+	import { getDisplayName, getResourceIcon } from '$lib/utils';
+	import { McpServerIdentity } from '$lib/components/app/mcp';
 
 	interface Props {
 		serverName: string;
@@ -31,18 +30,18 @@
 	}
 
 	let {
-		expandedFolders,
-		isExpanded,
-		onSelect,
-		onTemplateSelect,
-		onToggle,
-		onToggleFolder,
-		onToggleServer,
-		searchQuery = '',
-		selectedTemplateUri,
-		selectedUris,
 		serverName,
-		serverRes
+		serverRes,
+		isExpanded,
+		selectedUris,
+		selectedTemplateUri,
+		expandedFolders,
+		onToggleServer,
+		onToggleFolder,
+		onSelect,
+		onToggle,
+		onTemplateSelect,
+		searchQuery = ''
 	}: Props = $props();
 
 	let serverDisplayName = $derived(mcpStore.getServerDisplayName(serverName));
@@ -55,14 +54,14 @@
 
 	const templateInfos = $derived<MCPResourceTemplateInfo[]>(
 		serverRes.templates.map((t) => ({
-			annotations: t.annotations,
-			description: t.description,
-			icons: t.icons,
-			mimeType: t.mimeType,
+			uriTemplate: t.uriTemplate,
 			name: t.name,
-			serverName,
 			title: t.title,
-			uriTemplate: t.uriTemplate
+			description: t.description,
+			mimeType: t.mimeType,
+			serverName,
+			annotations: t.annotations,
+			icons: t.icons
 		}))
 	);
 
@@ -123,7 +122,7 @@
 					checked={isSelected}
 					onCheckedChange={(checked: boolean | 'indeterminate') =>
 						handleCheckboxChange(resource, checked === true)}
-					class={ICON_CLASS_DEFAULT}
+					class="h-4 w-4"
 				/>
 			{/if}
 
@@ -161,7 +160,7 @@
 				<McpServerIdentity
 					displayName={serverDisplayName}
 					faviconUrl={serverFaviconUrl}
-					iconClass={ICON_CLASS_DEFAULT}
+					iconClass="h-4 w-4"
 					showVersion={false}
 				/>
 			</div>

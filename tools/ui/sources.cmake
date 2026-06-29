@@ -8,7 +8,6 @@ set(UI_SOURCE_GLOBS
 set(UI_SOURCE_FILES
     package.json
     package-lock.json
-    src/.gitignore
     vite.config.ts
     svelte.config.js
     tsconfig.json

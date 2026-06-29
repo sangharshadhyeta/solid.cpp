@@ -5,12 +5,6 @@ export enum ChatMessageStatsView {
 	SUMMARY = 'summary'
 }
 
-export enum ChatMessageStatisticsMode {
-	SWITCHABLE = 'switchable',
-	READING = 'reading',
-	GENERATION = 'generation'
-}
-
 /**
  * Connection state of a streamed completion, drives the resume status indicator.
  */
@@ -77,15 +71,4 @@ export enum ConversationSelectionMode {
 export enum PdfViewMode {
 	TEXT = 'text',
 	PAGES = 'pages'
-}
-
-export enum ChatFormCommandAction {
-	PROMPT = 'prompt',
-	CWD = 'cwd',
-	MODEL = 'model'
-}
-
-export enum FileMentionEntryType {
-	FILE = 'file',
-	DIRECTORY = 'directory'
 }

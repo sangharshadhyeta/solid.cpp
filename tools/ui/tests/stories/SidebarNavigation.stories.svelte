@@ -5,11 +5,11 @@
 	import { screen } from 'storybook/test';
 
 	const { Story } = defineMeta({
+		title: 'Components/SidebarNavigation',
 		component: SidebarNavigation,
 		parameters: {
 			layout: 'centered'
-		},
-		title: 'Components/SidebarNavigation'
+		}
 	});
 </script>
 
@@ -17,34 +17,34 @@
 	// Mock conversations for the sidebar
 	const mockConversations: DatabaseConversation[] = [
 		{
-			currNode: 'msg-1',
 			id: 'conv-1',
+			name: 'Getting Started with AI',
 			lastModified: Date.now() - 1000 * 60 * 5, // 5 minutes ago
-			name: 'Getting Started with AI'
+			currNode: 'msg-1'
 		},
 		{
-			currNode: 'msg-2',
 			id: 'conv-2',
+			name: 'Python Programming Help',
 			lastModified: Date.now() - 1000 * 60 * 60 * 2, // 2 hours ago
-			name: 'Python Programming Help'
+			currNode: 'msg-2'
 		},
 		{
-			currNode: 'msg-3',
 			id: 'conv-3',
+			name: 'Creative Writing Ideas',
 			lastModified: Date.now() - 1000 * 60 * 60 * 24, // 1 day ago
-			name: 'Creative Writing Ideas'
+			currNode: 'msg-3'
 		},
 		{
-			currNode: 'msg-4',
 			id: 'conv-4',
+			name: 'This is a very long conversation title that should be truncated properly when displayed',
 			lastModified: Date.now() - 1000 * 60 * 60 * 24 * 3, // 3 days ago
-			name: 'This is a very long conversation title that should be truncated properly when displayed'
+			currNode: 'msg-4'
 		},
 		{
-			currNode: 'msg-5',
 			id: 'conv-5',
+			name: 'Math Problem Solving',
 			lastModified: Date.now() - 1000 * 60 * 60 * 24 * 7, // 1 week ago
-			name: 'Math Problem Solving'
+			currNode: 'msg-5'
 		}
 	];
 </script>
@@ -81,10 +81,8 @@
 
 		// Expand sidebar first, then click Search in the expanded button list
 		const logoTrigger = screen.getByRole('button', { name: /expand navigation/i });
-
 		await userEvent.click(logoTrigger);
 		const searchTrigger = screen.getByText('Search');
-
 		userEvent.click(searchTrigger);
 	}}
 >
@@ -99,7 +97,6 @@
 	play={async () => {
 		// Mock empty conversations store
 		const { conversationsStore } = await import('$lib/stores/conversations.svelte');
-
 		conversationsStore.conversations = [];
 	}}
 >

@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { AlertCircle, Loader2 } from '@lucide/svelte';
-	import { X } from '@lucide/svelte';
-	import { ActionIcon } from '$lib/components/app';
-	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { Loader2, AlertCircle } from '@lucide/svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import type { MCPResourceAttachment } from '$lib/types';
-	import { getResourceDisplayName, getResourceIcon } from '$lib/utils';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import { ActionIcon } from '$lib/components/app';
+	import { X } from '@lucide/svelte';
+	import { getResourceIcon, getResourceDisplayName } from '$lib/utils';
 
 	interface Props {
 		attachment: MCPResourceAttachment;
@@ -24,7 +24,6 @@
 
 	function getStatusClass(attachment: MCPResourceAttachment): string {
 		if (attachment.error) return 'border-red-500/50 bg-red-500/10';
-
 		if (attachment.loading) return 'border-border/50 bg-muted/30';
 
 		return 'border-border/50 bg-muted/30';
