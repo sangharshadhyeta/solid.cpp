@@ -6,52 +6,57 @@
 //
 // Run: npx vitest bench --project=unit tests/unit/agentic-hotpath.bench.ts
 
-import { classifyToolResult, parseToolResultWithMedia } from '$lib/utils/agentic';
-import { detectIncompleteCodeBlock, highlightCode } from '$lib/utils/code';
-import { computeLineDiff } from '$lib/utils/compute-line-diff';
-import { preprocessLaTeX } from '$lib/utils/latex-protection';
-import { parsePartialJsonArgs } from '$lib/utils/parse-partial-json-args';
-import { extractSearchQuery, extractSearchResults } from '$lib/utils/search-results';
-import { all as lowlightAll } from 'lowlight';
-import rehypeHighlight from 'rehype-highlight';
-import rehypeKatex from 'rehype-katex';
-import rehypeStringify from 'rehype-stringify';
+import { bench, describe } from 'vitest';
+
 import { remark } from 'remark';
 import remarkBreaks from 'remark-breaks';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import remarkRehype from 'remark-rehype';
-import { bench, describe } from 'vitest';
+import rehypeKatex from 'rehype-katex';
+import rehypeHighlight from 'rehype-highlight';
+import rehypeStringify from 'rehype-stringify';
+import { all as lowlightAll } from 'lowlight';
+
+import { computeLineDiff } from '$lib/utils/compute-line-diff';
+import { extractSearchResults, extractSearchQuery } from '$lib/utils/search-results';
+import { parsePartialJsonArgs } from '$lib/utils/parse-partial-json-args';
+import { highlightCode, detectIncompleteCodeBlock } from '$lib/utils/code';
+import { classifyToolResult, parseToolResultWithImages } from '$lib/utils/agentic';
+import { preprocessLaTeX } from '$lib/utils/latex-protection';
 
 // --- fixtures -------------------------------------------------------------
 
 function lines(n: number, seed: string): string {
 	const out: string[] = [];
-
 	for (let i = 0; i < n; i++) out.push(`${seed} line ${i} const value_${i} = compute(${i});`);
-
 	return out.join('\n');
 }
 
 const SHELL_OUTPUT_1KB = lines(12, 'out');
 const SHELL_OUTPUT_200KB = lines(2600, 'out');
 const SHELL_OUTPUT_2MB = lines(26000, 'out');
+
 // Realistic exec_shell_command result: the exit-code marker is the final line,
 // which is what the un-anchored EXIT_CODE regex has to scan the whole blob for.
 const SHELL_2MB_WITH_EXIT = `${SHELL_OUTPUT_2MB}\n[exit code: 0]`;
+
 const EDIT_OLD_400 = lines(400, 'old');
 const EDIT_NEW_400 = lines(400, 'new');
 const EDIT_OLD_50 = lines(50, 'old');
 const EDIT_NEW_50 = lines(50, 'new');
+
 const WRITE_FILE_ARGS = JSON.stringify({
-	content: lines(1500, 'src'),
-	path: '/src/lib/thing.ts'
+	path: '/src/lib/thing.ts',
+	content: lines(1500, 'src')
 });
+
 const MARKDOWN_50KB = Array.from(
 	{ length: 400 },
 	(_, i) =>
 		`## Section ${i}\n\nSome **bold** prose with a [link](https://example.com) and \`inline\` code.\n\n- bullet one\n- bullet two\n\n\`\`\`ts\nconst x${i} = ${i};\n\`\`\`\n`
 ).join('\n');
+
 const CODE_BLOCK_5KB = lines(60, 'code');
 
 // --- A: computeLineDiff (O(m*n) LCS, allocates a full matrix) --------------
@@ -74,9 +79,7 @@ describe('computeLineDiff', () => {
 function buildProcessor() {
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	let proc: any = remark().use(remarkGfm);
-
 	proc = proc.use(remarkMath).use(remarkBreaks).use(remarkRehype).use(rehypeKatex);
-
 	return proc.use(rehypeHighlight, { languages: lowlightAll }).use(rehypeStringify, {
 		allowDangerousHtml: true
 	});
@@ -106,6 +109,7 @@ describe('markdown parse scaling (whole-string reparse per frame)', () => {
 			{ length: Math.ceil((kb * 1024) / 64) },
 			(_, i) => `The quick brown fox jumps over the lazy dog. Sentence ${i}.`
 		).join(' ');
+
 	const MD_3KB = prose(3);
 	const MD_11KB = prose(11);
 	const MD_26KB = prose(26);
@@ -135,6 +139,7 @@ describe('other whole-string passes per frame', () => {
 			{ length: Math.ceil((kb * 1024) / 64) },
 			(_, i) => `The quick brown fox jumps over the lazy dog. Sentence ${i}.`
 		).join(' ');
+
 	const MD_3KB = prose(3);
 	const MD_11KB = prose(11);
 	const MD_26KB = prose(26);
@@ -200,17 +205,17 @@ describe('exit-code regex', () => {
 
 // --- per-line result parsers ----------------------------------------------
 
-describe('parseToolResultWithMedia', () => {
+describe('parseToolResultWithImages', () => {
 	bench('1KB', () => {
-		parseToolResultWithMedia(SHELL_OUTPUT_1KB, []);
+		parseToolResultWithImages(SHELL_OUTPUT_1KB, []);
 	});
 
 	bench('200KB', () => {
-		parseToolResultWithMedia(SHELL_OUTPUT_200KB, []);
+		parseToolResultWithImages(SHELL_OUTPUT_200KB, []);
 	});
 
 	bench('2MB', () => {
-		parseToolResultWithMedia(SHELL_OUTPUT_2MB, []);
+		parseToolResultWithImages(SHELL_OUTPUT_2MB, []);
 	});
 });
 

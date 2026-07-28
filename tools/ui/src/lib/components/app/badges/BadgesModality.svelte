@@ -7,7 +7,7 @@
 		class?: string;
 	}
 
-	let { class: className = '', modalities }: Props = $props();
+	let { modalities, class: className = '' }: Props = $props();
 </script>
 
 {#each modalities as modality (modality)}

@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
-	import type { Component, Snippet } from 'svelte';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import type { Snippet, Component } from 'svelte';
 
 	interface Props {
 		icon: Component<{ class?: string }>;
@@ -8,7 +8,7 @@
 		actions: Snippet;
 	}
 
-	let { actions, icon: IconComponent, message }: Props = $props();
+	let { icon: IconComponent, message, actions }: Props = $props();
 </script>
 
 <div class="my-2 rounded-lg border border-border bg-card p-3">

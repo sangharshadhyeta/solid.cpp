@@ -1,14 +1,14 @@
 import { convertPDFToImage, convertPDFToText } from './pdf-processing';
 import { isSvgMimeType, svgBase64UrlToPngDataURL } from './svg-to-png';
-import { isLikelyTextFile, readFileAsText } from './text-files';
 import { isWebpMimeType, webpBase64UrlToPngDataURL } from './webp-to-png';
+import { FileTypeCategory, AttachmentType, SpecialFileType } from '$lib/enums';
 import { SETTINGS_KEYS } from '$lib/constants';
-import { AttachmentType, FileTypeCategory, SpecialFileType } from '$lib/enums';
-import { modelsStore } from '$lib/stores/models.svelte';
 import { config, settingsStore } from '$lib/stores/settings.svelte';
-import type { ChatUploadedFile, DatabaseMessageExtra, FileProcessingResult } from '$lib/types';
+import { modelsStore } from '$lib/stores/models.svelte';
 import { getFileTypeCategory } from '$lib/utils';
+import { readFileAsText, isLikelyTextFile } from './text-files';
 import { toast } from 'svelte-sonner';
+import type { FileProcessingResult, ChatUploadedFile, DatabaseMessageExtra } from '$lib/types';
 
 function readFileAsBase64(file: File): Promise<string> {
 	return new Promise((resolve, reject) => {
@@ -18,7 +18,6 @@ function readFileAsBase64(file: File): Promise<string> {
 			// Extract base64 data without the data URL prefix
 			const dataUrl = reader.result as string;
 			const base64 = dataUrl.split(',')[1];
-
 			resolve(base64);
 		};
 
@@ -38,13 +37,13 @@ export async function parseFilesToMessageExtras(
 	for (const file of files) {
 		if (file.type === SpecialFileType.MCP_PROMPT && file.mcpPrompt) {
 			extras.push({
-				arguments: file.mcpPrompt.arguments,
-				content: file.textContent ?? '',
+				type: AttachmentType.MCP_PROMPT,
 				name: file.name,
-				promptName: file.mcpPrompt.promptName,
-				serverName: file.mcpPrompt.serverName,
 				size: file.size,
-				type: AttachmentType.MCP_PROMPT
+				serverName: file.mcpPrompt.serverName,
+				promptName: file.mcpPrompt.promptName,
+				content: file.textContent ?? '',
+				arguments: file.mcpPrompt.arguments
 			});
 
 			continue;
@@ -69,10 +68,10 @@ export async function parseFilesToMessageExtras(
 				}
 
 				extras.push({
-					base64Url,
+					type: AttachmentType.IMAGE,
 					name: file.name,
 					size: file.size,
-					type: AttachmentType.IMAGE
+					base64Url
 				});
 			}
 		} else if (getFileTypeCategory(file.type) === FileTypeCategory.AUDIO) {
@@ -81,11 +80,11 @@ export async function parseFilesToMessageExtras(
 				const base64Data = await readFileAsBase64(file.file);
 
 				extras.push({
-					base64Data: base64Data,
-					mimeType: file.type,
+					type: AttachmentType.AUDIO,
 					name: file.name,
 					size: file.size,
-					type: AttachmentType.AUDIO
+					base64Data: base64Data,
+					mimeType: file.type
 				});
 			} catch (error) {
 				console.error(`Failed to process audio file ${file.name}:`, error);
@@ -96,11 +95,11 @@ export async function parseFilesToMessageExtras(
 				const base64Data = await readFileAsBase64(file.file);
 
 				extras.push({
-					base64Data: base64Data,
-					mimeType: file.type,
+					type: AttachmentType.VIDEO,
 					name: file.name,
 					size: file.size,
-					type: AttachmentType.VIDEO
+					base64Data: base64Data,
+					mimeType: file.type
 				});
 			} catch (error) {
 				console.error(`Failed to process video file ${file.name}:`, error);
@@ -150,13 +149,13 @@ export async function parseFilesToMessageExtras(
 						);
 
 						extras.push({
-							base64Data: base64Data,
+							type: AttachmentType.PDF,
+							name: file.name,
+							size: file.size,
 							content: `PDF file with ${images.length} pages`,
 							images: images,
-							name: file.name,
 							processedAsImages: true,
-							size: file.size,
-							type: AttachmentType.PDF
+							base64Data: base64Data
 						});
 					} catch (imageError) {
 						console.warn(
@@ -168,12 +167,12 @@ export async function parseFilesToMessageExtras(
 						const content = await convertPDFToText(file.file);
 
 						extras.push({
-							base64Data: base64Data,
-							content: content,
+							type: AttachmentType.PDF,
 							name: file.name,
-							processedAsImages: false,
 							size: file.size,
-							type: AttachmentType.PDF
+							content: content,
+							processedAsImages: false,
+							base64Data: base64Data
 						});
 					}
 				} else {
@@ -186,12 +185,12 @@ export async function parseFilesToMessageExtras(
 					});
 
 					extras.push({
-						base64Data: base64Data,
-						content: content,
+						type: AttachmentType.PDF,
 						name: file.name,
-						processedAsImages: false,
 						size: file.size,
-						type: AttachmentType.PDF
+						content: content,
+						processedAsImages: false,
+						base64Data: base64Data
 					});
 				}
 			} catch (error) {
@@ -207,10 +206,10 @@ export async function parseFilesToMessageExtras(
 					emptyFiles.push(file.name);
 				} else if (isLikelyTextFile(content)) {
 					extras.push({
-						content: content,
+						type: AttachmentType.TEXT,
 						name: file.name,
 						size: file.size,
-						type: AttachmentType.TEXT
+						content: content
 					});
 				} else {
 					console.warn(`File ${file.name} appears to be binary and will be skipped`);
@@ -221,5 +220,5 @@ export async function parseFilesToMessageExtras(
 		}
 	}
 
-	return { emptyFiles, extras };
+	return { extras, emptyFiles };
 }

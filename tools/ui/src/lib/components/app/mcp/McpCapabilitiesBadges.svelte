@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { Database, FileText, ListChecks, MessageSquare, Sparkles, Wrench } from '@lucide/svelte';
-	import { Badge } from '$lib/components/ui/badge';
+	import { Wrench, Database, MessageSquare, FileText, Sparkles, ListChecks } from '@lucide/svelte';
 	import type { MCPCapabilitiesInfo } from '$lib/types';
+	import { Badge } from '$lib/components/ui/badge';
 
 	interface Props {
 		capabilities?: MCPCapabilitiesInfo;

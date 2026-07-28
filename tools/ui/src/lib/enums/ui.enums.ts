@@ -24,7 +24,6 @@ export enum McpPromptVariant {
  */
 export enum UrlProtocol {
 	DATA = 'data:',
-	FILE = 'file:',
 	HTTP = 'http:',
 	HTTPS = 'https:',
 	WEBSOCKET = 'ws:',

@@ -100,6 +100,8 @@ add_library(${TARGET}
     sampling.h
     speculative.cpp
     speculative.h
+    suffix-tree.cpp
+    suffix-tree.h
     subproc.cpp
     subproc.h
     trie.cpp
@@ -121,8 +123,8 @@ add_library(${TARGET}
     )
 
 set_target_properties(${TARGET} PROPERTIES
-    VERSION ${LLAMA_VERSION_BASE}
-    SOVERSION ${LLAMA_VERSION_MAJOR}
+    VERSION ${LLAMA_INSTALL_VERSION}
+    SOVERSION 0
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 

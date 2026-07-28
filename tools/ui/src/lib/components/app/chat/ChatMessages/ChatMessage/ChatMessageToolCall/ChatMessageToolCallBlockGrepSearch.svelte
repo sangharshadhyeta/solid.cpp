@@ -1,9 +1,8 @@
 <script lang="ts">
+	import { XCircle } from '@lucide/svelte';
+	import { type AgenticSection } from '$lib/utils';
 	import { parseGrepSearchMeta } from './parsers/grep-search';
 	import ToolCallBlock from './ToolCallBlock.svelte';
-	import { XCircle } from '@lucide/svelte';
-	import { toolsStore } from '$lib/stores/tools.svelte';
-	import { abbreviateHome, type AgenticSection } from '$lib/utils';
 
 	interface Props {
 		section: AgenticSection;
@@ -12,10 +11,9 @@
 		onToggle?: () => void;
 	}
 
-	let { isStreaming, onToggle, open, section }: Props = $props();
+	let { section, open, isStreaming, onToggle }: Props = $props();
 
 	const grepMeta = $derived(parseGrepSearchMeta(section));
-	const home = $derived(toolsStore.serverHome);
 </script>
 
 <ToolCallBlock {section} {open} {isStreaming} meta={grepMeta} {onToggle}>
@@ -24,7 +22,7 @@
 			<span class="text-muted-foreground">Search for&nbsp;</span>
 			<span class="font-mono">{grepMeta.pattern}</span>
 			<span class="text-muted-foreground">&nbsp;in&nbsp;</span>
-			<span class="font-mono" title={grepMeta.path}>{abbreviateHome(grepMeta.path, home)}</span>
+			<span class="font-mono">{grepMeta.path}</span>
 		{/if}
 	{/snippet}
 

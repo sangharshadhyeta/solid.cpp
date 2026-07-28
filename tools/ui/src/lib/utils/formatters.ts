@@ -1,9 +1,9 @@
 import {
-	MEDIUM_DURATION_THRESHOLD,
 	MS_PER_SECOND,
-	SECONDS_PER_HOUR,
 	SECONDS_PER_MINUTE,
-	SHORT_DURATION_THRESHOLD
+	SECONDS_PER_HOUR,
+	SHORT_DURATION_THRESHOLD,
+	MEDIUM_DURATION_THRESHOLD
 } from '$lib/constants';
 
 /**
@@ -15,7 +15,6 @@ import {
  */
 export function formatFileSize(bytes: number | unknown): string {
 	if (typeof bytes !== 'number') return 'Unknown';
-
 	if (bytes === 0) return '0 Bytes';
 
 	const k = 1024;
@@ -71,7 +70,6 @@ export function formatNumber(num: number | unknown): string {
 export function formatJsonPretty(jsonString: string): string {
 	try {
 		const parsed = JSON.parse(jsonString);
-
 		return JSON.stringify(parsed, null, 2);
 	} catch {
 		return jsonString;
@@ -86,8 +84,8 @@ export function formatJsonPretty(jsonString: string): string {
  */
 export function formatTime(date: Date): string {
 	return date.toLocaleTimeString('en-US', {
-		hour: '2-digit',
 		hour12: false,
+		hour: '2-digit',
 		minute: '2-digit',
 		second: '2-digit'
 	});
@@ -116,6 +114,7 @@ export function formatPerformanceTime(ms: number): string {
 	const hours = Math.floor(totalSeconds / SECONDS_PER_HOUR);
 	const minutes = Math.floor((totalSeconds % SECONDS_PER_HOUR) / SECONDS_PER_MINUTE);
 	const seconds = Math.floor(totalSeconds % SECONDS_PER_MINUTE);
+
 	const parts: string[] = [];
 
 	if (hours > 0) {
@@ -150,6 +149,5 @@ export function formatAttachmentText(
 	extra?: string
 ): string {
 	const header = extra ? `${name} (${extra})` : name;
-
 	return `\n\n--- ${label}: ${header} ---\n${content}`;
 }

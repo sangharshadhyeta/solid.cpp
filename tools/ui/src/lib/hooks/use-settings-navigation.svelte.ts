@@ -1,7 +1,7 @@
-import { beforeNavigate } from '$app/navigation';
 import { page } from '$app/state';
-import { ROUTES } from '$lib/constants';
+import { beforeNavigate } from '$app/navigation';
 import { settingsReferrer } from '$lib/stores/settings-referrer.svelte';
+import { ROUTES } from '$lib/constants/routes';
 
 export interface ChatSettings {
 	reset: () => void;
@@ -12,9 +12,10 @@ export function useSettingsNavigation() {
 		activePanel: 'chat' as 'chat' | 'settings' | 'mcp',
 		chatSettingsRef: undefined as ChatSettings | undefined
 	});
+
 	const isSettingsRoute = $derived(!!page.route.id?.startsWith('/settings'));
 
-	beforeNavigate(({ from, to }) => {
+	beforeNavigate(({ to, from }) => {
 		if (to?.route?.id?.startsWith('/settings') && !from?.route?.id?.startsWith('/settings')) {
 			settingsReferrer.url = window.location.hash || ROUTES.START;
 		}
@@ -34,12 +35,12 @@ export function useSettingsNavigation() {
 	});
 
 	return {
-		get isSettingsRoute() {
-			return isSettingsRoute;
-		},
-
 		get panel() {
 			return subroute;
+		},
+
+		get isSettingsRoute() {
+			return isSettingsRoute;
 		}
 	};
 }

@@ -6,30 +6,29 @@
 // ~41ms/section/token for a 200KB result). These tests pin the fix: closed means
 // not rendered, and opening still mounts the body.
 
-import CollapsibleLazyBodyHarness from './components/CollapsibleLazyBodyHarness.svelte';
-import { tick } from 'svelte';
-import { describe, expect, it } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { render } from 'vitest-browser-svelte';
+import { tick } from 'svelte';
+import CollapsibleLazyBodyHarness from './components/CollapsibleLazyBodyHarness.svelte';
 
 const MARKER = 'collapsible-body-marker';
 
 describe('collapsible wrappers render their body lazily', () => {
 	for (const variant of ['content', 'terminal'] as const) {
 		it(`${variant}: body is absent while closed and present once open`, async () => {
-			const screen = render(CollapsibleLazyBodyHarness, { open: false, variant });
-
+			const screen = render(CollapsibleLazyBodyHarness, { variant, open: false });
 			await tick();
 
 			expect(document.body.textContent).not.toContain(MARKER);
 
-			await screen.rerender({ open: true, variant });
+			await screen.rerender({ variant, open: true });
 			await tick();
 
 			expect(document.body.textContent).toContain(MARKER);
 
 			// And it unmounts again on close, so a collapsed block stops costing
 			// anything during streaming.
-			await screen.rerender({ open: false, variant });
+			await screen.rerender({ variant, open: false });
 			await tick();
 
 			expect(document.body.textContent).not.toContain(MARKER);

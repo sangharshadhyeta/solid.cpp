@@ -3,9 +3,9 @@
 	import type { HTMLAttributes } from 'svelte/elements';
 
 	let {
-		children,
-		class: className,
 		ref = $bindable(null),
+		class: className,
+		children,
 		...restProps
 	}: WithElementRef<HTMLAttributes<HTMLDivElement>> = $props();
 </script>

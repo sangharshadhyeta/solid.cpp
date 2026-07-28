@@ -1,5 +1,5 @@
-import { tryParseToolResultObject } from '$lib/utils';
 import { describe, expect, it } from 'vitest';
+import { tryParseToolResultObject } from '$lib/utils';
 
 describe('tryParseToolResultObject', () => {
 	it('returns null when no result is provided', () => {
@@ -9,8 +9,8 @@ describe('tryParseToolResultObject', () => {
 
 	it('returns the parsed object when the result is JSON', () => {
 		expect(tryParseToolResultObject('{"result":"ok","bytes":42}')).toEqual({
-			bytes: 42,
-			result: 'ok'
+			result: 'ok',
+			bytes: 42
 		});
 	});
 

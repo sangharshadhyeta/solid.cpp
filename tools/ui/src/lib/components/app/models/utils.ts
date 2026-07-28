@@ -1,5 +1,5 @@
-import type { ModelOption } from '$lib/types/models';
 import { SvelteMap } from 'svelte/reactivity';
+import type { ModelOption } from '$lib/types/models';
 
 export interface ModelItem {
 	option: ModelOption;
@@ -19,7 +19,6 @@ export interface GroupedModelOptions {
 
 export function filterModelOptions(options: ModelOption[], searchTerm: string): ModelOption[] {
 	const term = searchTerm.trim().toLowerCase();
-
 	if (!term) return options;
 
 	return options.filter(
@@ -38,45 +37,39 @@ export function groupModelOptions(
 ): GroupedModelOptions {
 	// Loaded models
 	const loaded: ModelItem[] = [];
-
 	for (let i = 0; i < filteredOptions.length; i++) {
 		if (isModelLoaded(filteredOptions[i].model)) {
-			loaded.push({ flatIndex: i, option: filteredOptions[i] });
+			loaded.push({ option: filteredOptions[i], flatIndex: i });
 		}
 	}
 
 	// Favorites (excluding loaded)
 	const loadedModelIds = new Set(loaded.map((item) => item.option.model));
 	const favorites: ModelItem[] = [];
-
 	for (let i = 0; i < filteredOptions.length; i++) {
 		if (
 			favoriteIds.has(filteredOptions[i].model) &&
 			!loadedModelIds.has(filteredOptions[i].model)
 		) {
-			favorites.push({ flatIndex: i, option: filteredOptions[i] });
+			favorites.push({ option: filteredOptions[i], flatIndex: i });
 		}
 	}
 
 	// Available models grouped by org (excluding loaded and favorites)
 	const available: OrgGroup[] = [];
 	const orgGroups = new SvelteMap<string, ModelItem[]>();
-
 	for (let i = 0; i < filteredOptions.length; i++) {
 		const option = filteredOptions[i];
-
 		if (loadedModelIds.has(option.model) || favoriteIds.has(option.model)) continue;
 
 		const key = option.parsedId?.orgName ?? '';
-
 		if (!orgGroups.has(key)) orgGroups.set(key, []);
-
-		orgGroups.get(key)!.push({ flatIndex: i, option });
+		orgGroups.get(key)!.push({ option, flatIndex: i });
 	}
 
 	for (const [orgName, items] of orgGroups) {
-		available.push({ items, orgName: orgName || null });
+		available.push({ orgName: orgName || null, items });
 	}
 
-	return { available, favorites, loaded };
+	return { loaded, favorites, available };
 }

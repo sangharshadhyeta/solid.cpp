@@ -3,39 +3,39 @@
 	import ModelsSelectorList from '$lib/components/app/models/ModelsSelectorList.svelte';
 	import ModelsSelectorOption from '$lib/components/app/models/ModelsSelectorOption.svelte';
 	import type { GroupedModelOptions, ModelItem } from '$lib/components/app/models/utils';
-	import { ServerModelStatus } from '$lib/enums';
 	import { modelsStore } from '$lib/stores/models.svelte';
+	import { ServerModelStatus } from '$lib/enums';
 
 	const { Story } = defineMeta({
+		title: 'Components/ModelsSelector',
 		parameters: {
 			layout: 'centered'
-		},
-		title: 'Components/ModelsSelector'
+		}
 	});
 
 	const mockModel = (id: string, name: string, orgName?: string, tags?: string[]): ModelOption => ({
-		capabilities: [],
 		id,
-		model: orgName ? `${orgName}/${name}` : name,
 		name,
+		model: orgName ? `${orgName}/${name}` : name,
+		capabilities: [],
 		parsedId: {
-			activatedParams: null,
-			modelName: name,
-			orgName: orgName ?? null,
-			params: null,
-			quantization: null,
 			raw: orgName ? `${orgName}/${name}` : name,
+			orgName: orgName ?? null,
+			modelName: name,
+			params: null,
+			activatedParams: null,
+			quantization: null,
 			tags: tags ?? []
 		},
 		tags
 	});
 
 	const mockRouterEntry = (modelName: string, status: ServerModelStatus): ApiModelDataEntry => ({
-		created: Date.now(),
 		id: modelName,
-		in_cache: true,
 		object: 'model',
 		owned_by: 'llamacpp',
+		created: Date.now(),
+		in_cache: true,
 		path: `/models/${modelName}`,
 		status: { value: status }
 	});
@@ -60,58 +60,57 @@
 	mockModelsStore();
 
 	const loadedModels: ModelItem[] = [
-		{ flatIndex: 0, option: mockModel('llama3.1-8b', 'Llama-3.1-8B-Instruct', 'meta') },
-		{ flatIndex: 1, option: mockModel('mistral-7b', 'Mistral-7B-v0.3', 'mistralai') }
+		{ option: mockModel('llama3.1-8b', 'Llama-3.1-8B-Instruct', 'meta'), flatIndex: 0 },
+		{ option: mockModel('mistral-7b', 'Mistral-7B-v0.3', 'mistralai'), flatIndex: 1 }
 	];
 
 	const favoriteModels: ModelItem[] = [
-		{ flatIndex: 2, option: mockModel('qwen2.5-7b', 'Qwen2.5-7B-Instruct', 'Qwen') },
-		{ flatIndex: 3, option: mockModel('llama3.2-3b', 'Llama-3.2-3B-Instruct', 'meta') }
+		{ option: mockModel('qwen2.5-7b', 'Qwen2.5-7B-Instruct', 'Qwen'), flatIndex: 2 },
+		{ option: mockModel('llama3.2-3b', 'Llama-3.2-3B-Instruct', 'meta'), flatIndex: 3 }
 	];
 
 	const availableModels: ModelItem[] = [
 		{
-			flatIndex: 4,
-			option: mockModel('deepseek-coder-6.7b', 'DeepSeek-Coder-6.7B', 'deepseek', ['coding'])
+			option: mockModel('deepseek-coder-6.7b', 'DeepSeek-Coder-6.7B', 'deepseek', ['coding']),
+			flatIndex: 4
 		},
-		{ flatIndex: 5, option: mockModel('gemma-2-9b', 'Gemma-2-9B-IT', 'google') },
-		{ flatIndex: 6, option: mockModel('phi-3-mini', 'Phi-3-mini-4k', 'microsoft') },
-		{ flatIndex: 7, option: mockModel('codellama-7b', 'CodeLlama-7B', 'codellama', ['coding']) },
-		{ flatIndex: 8, option: mockModel('neural-chat-7b', 'Neural-Chat-7B-v3-3', 'intel') }
+		{ option: mockModel('gemma-2-9b', 'Gemma-2-9B-IT', 'google'), flatIndex: 5 },
+		{ option: mockModel('phi-3-mini', 'Phi-3-mini-4k', 'microsoft'), flatIndex: 6 },
+		{ option: mockModel('codellama-7b', 'CodeLlama-7B', 'codellama', ['coding']), flatIndex: 7 },
+		{ option: mockModel('neural-chat-7b', 'Neural-Chat-7B-v3-3', 'intel'), flatIndex: 8 }
 	];
 
 	const groupedOptions: GroupedModelOptions = {
+		loaded: loadedModels,
+		favorites: favoriteModels,
 		available: [
 			{
-				items: [availableModels[0]],
-				orgName: 'deepseek'
+				orgName: 'deepseek',
+				items: [availableModels[0]]
 			},
 			{
-				items: [availableModels[1]],
-				orgName: 'google'
+				orgName: 'google',
+				items: [availableModels[1]]
 			},
 			{
-				items: [availableModels[2]],
-				orgName: 'microsoft'
+				orgName: 'microsoft',
+				items: [availableModels[2]]
 			},
 			{
-				items: [availableModels[3]],
-				orgName: 'codellama'
+				orgName: 'codellama',
+				items: [availableModels[3]]
 			},
 			{
-				items: [availableModels[4]],
-				orgName: 'intel'
+				orgName: 'intel',
+				items: [availableModels[4]]
 			}
-		],
-		favorites: favoriteModels,
-		loaded: loadedModels
+		]
 	};
 
 	function handleSelect(modelId: string) {
 		const opt = [...loadedModels, ...favoriteModels, ...availableModels].find(
 			(m) => m.option.id === modelId
 		);
-
 		if (opt) {
 			selectedModel = opt.option.model;
 			activeId = modelId;
@@ -135,9 +134,9 @@
 	<div class="w-80 rounded-lg border border-border bg-popover p-2 shadow-md">
 		<ModelsSelectorList
 			groups={{
-				available: [],
+				loaded: [loadedModels[0]],
 				favorites: [],
-				loaded: [loadedModels[0]]
+				available: []
 			}}
 			currentModel={null}
 			activeId={null}
@@ -151,9 +150,9 @@
 	<div class="w-80 rounded-lg border border-border bg-popover p-2 shadow-md">
 		<ModelsSelectorList
 			groups={{
-				available: [],
+				loaded: [],
 				favorites: favoriteModels,
-				loaded: []
+				available: []
 			}}
 			currentModel={null}
 			activeId={null}

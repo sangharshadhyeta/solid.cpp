@@ -107,8 +107,7 @@ enum subprocess_error_e {
   subprocess_error_permission_denied = -5,
   subprocess_error_no_memory = -6,
   subprocess_error_pipe = -7,
-  subprocess_error_spawn = -8,
-  subprocess_error_not_supported = -9
+  subprocess_error_spawn = -8
 };
 
 #if defined(__cplusplus)
@@ -273,39 +272,6 @@ subprocess_weak int subprocess_alive(struct subprocess_s *const process);
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#endif
-
-/* Whether subprocess_create_ex can honour process_cwd. glibc only gained
-   posix_spawn_file_actions_addchdir_np in 2.29, and macOS in 10.15; the SDKs
-   mark it unavailable on iOS, tvOS and watchOS, where the undefined version
-   macro folds to 0 and so answers correctly. Define this yourself to override
-   the detection, for instance on musl older than 1.1.24. */
-#if !defined(SUBPROCESS_HAVE_CWD)
-#if defined(__GLIBC__)
-#if __GLIBC_PREREQ(2, 29)
-#define SUBPROCESS_HAVE_CWD 1
-#else
-#define SUBPROCESS_HAVE_CWD 0
-#endif
-#elif defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED < 101500
-#define SUBPROCESS_HAVE_CWD 0
-#else
-#define SUBPROCESS_HAVE_CWD 1
-#endif
-#endif
-
-/* Whether posix_spawn reports a failed exec back to the caller. glibc only
-   started doing so in 2.24; before that the child silently exits with 127. */
-#if !defined(SUBPROCESS_SPAWN_REPORTS_EXEC_ERRORS)
-#if defined(__GLIBC__)
-#if __GLIBC_PREREQ(2, 24)
-#define SUBPROCESS_SPAWN_REPORTS_EXEC_ERRORS 1
-#else
-#define SUBPROCESS_SPAWN_REPORTS_EXEC_ERRORS 0
-#endif
-#else
-#define SUBPROCESS_SPAWN_REPORTS_EXEC_ERRORS 1
-#endif
 #endif
 
 #if defined(_WIN32)
@@ -573,8 +539,6 @@ int subprocess_error_from_errno(int error) {
   case ENFILE:
   case ENOMEM:
     return subprocess_error_no_memory;
-  case ENOSYS:
-    return subprocess_error_not_supported;
   default:
     return subprocess_error_unknown;
   }
@@ -689,7 +653,6 @@ int subprocess_create_ex(const char *const commandLine[], int options,
   int wide_len;
   int i, j;
   int need_quoting;
-  subprocess_size_t bs_run;
   unsigned long flags = 0;
   unsigned long last_error = 0;
   int result = subprocess_error_unknown;
@@ -943,29 +906,25 @@ int subprocess_create_ex(const char *const commandLine[], int options,
     len++;
 
     // Quote the argument if it has a space in it
-    need_quoting = strpbrk(commandLine[i], "\t\v ") != SUBPROCESS_NULL ||
-                   commandLine[i][0] == SUBPROCESS_NULL;
-    if (need_quoting)
+    if (strpbrk(commandLine[i], "\t\v ") != SUBPROCESS_NULL ||
+        commandLine[i][0] == SUBPROCESS_NULL)
       len += 2;
 
-    bs_run = 0;
     for (j = 0; '\0' != commandLine[i][j]; j++) {
-      len++;
-
-      if ('\\' == commandLine[i][j]) {
-        bs_run++;
-      } else {
-        if ('"' == commandLine[i][j]) {
-          // Duplicate the preceding run and escape the quote.
-          len += bs_run + 1;
+      switch (commandLine[i][j]) {
+      default:
+        break;
+      case '\\':
+        if (commandLine[i][j + 1] == '"') {
+          len++;
         }
-        bs_run = 0;
-      }
-    }
 
-    if (need_quoting) {
-      // Duplicate trailing slashes before the generated closing quote.
-      len += bs_run;
+        break;
+      case '"':
+        len++;
+        break;
+      }
+      len++;
     }
   }
 
@@ -990,29 +949,22 @@ int subprocess_create_ex(const char *const commandLine[], int options,
       commandLineCombined[len++] = '"';
     }
 
-    for (j = 0; '\0' != commandLine[i][j];) {
-      bs_run = 0;
-      while ('\\' == commandLine[i][j]) {
-        bs_run++;
-        j++;
-      }
+    for (j = 0; '\0' != commandLine[i][j]; j++) {
+      switch (commandLine[i][j]) {
+      default:
+        break;
+      case '\\':
+        if (commandLine[i][j + 1] == '"') {
+          commandLineCombined[len++] = '\\';
+        }
 
-      if ('"' == commandLine[i][j]) {
-        // 2n + 1 slashes preserve n slashes and escape the quote.
-        bs_run = (bs_run * 2) + 1;
-      } else if ('\0' == commandLine[i][j] && need_quoting) {
-        // 2n slashes preserve n slashes before the closing quote.
-        bs_run *= 2;
-      }
-
-      while (bs_run > 0) {
+        break;
+      case '"':
         commandLineCombined[len++] = '\\';
-        bs_run--;
+        break;
       }
 
-      if ('\0' != commandLine[i][j]) {
-        commandLineCombined[len++] = commandLine[i][j++];
-      }
+      commandLineCombined[len++] = commandLine[i][j];
     }
     if (need_quoting) {
       commandLineCombined[len++] = '"';
@@ -1253,10 +1205,8 @@ cleanup:
 
   // Set working directory
   if (process_cwd) {
-#if defined(__NetBSD__) || (defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 260000)
+#if defined(__APPLE__) && MAC_OS_X_VERSION_MIN_REQUIRED >= 260000
     posix_error = posix_spawn_file_actions_addchdir(&actions, process_cwd);
-#elif !SUBPROCESS_HAVE_CWD
-    posix_error = ENOSYS;
 #else
 #if defined(__APPLE__) && defined(__clang__)
 #pragma clang diagnostic push
@@ -1379,17 +1329,6 @@ cleanup:
       goto cleanup;
     }
   } else {
-#if !SUBPROCESS_SPAWN_REPORTS_EXEC_ERRORS
-    /* posix_spawn cannot tell us the exec failed, so check up front */
-    if (0 != access(commandLine[0], X_OK)) {
-      saved_errno = errno;
-      result = subprocess_error_from_errno(saved_errno);
-      if (subprocess_error_unknown == result) {
-        result = subprocess_error_spawn;
-      }
-      goto cleanup;
-    }
-#endif
     posix_error = posix_spawn(&child, commandLine[0], &actions,
                               SUBPROCESS_NULL,
                               SUBPROCESS_CONST_CAST(char *const *, commandLine),

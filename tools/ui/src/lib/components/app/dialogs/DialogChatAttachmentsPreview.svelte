@@ -1,9 +1,9 @@
 <script lang="ts">
-	import { X } from '@lucide/svelte';
-	import { ChatAttachmentsPreview } from '$lib/components/app';
-	import * as DialogUI from '$lib/components/ui/dialog';
-	import { KeyboardKey } from '$lib/enums';
 	import { Dialog } from 'bits-ui';
+	import { X } from '@lucide/svelte';
+	import * as DialogUI from '$lib/components/ui/dialog';
+	import { ChatAttachmentsPreview } from '$lib/components/app';
+	import { KeyboardKey } from '$lib/enums';
 
 	interface Props {
 		open: boolean;
@@ -14,11 +14,11 @@
 	}
 
 	let {
-		activeModelId,
-		attachments = [],
 		open = $bindable(false),
-		previewFocusIndex = 0,
-		uploadedFiles = []
+		uploadedFiles = [],
+		attachments = [],
+		activeModelId,
+		previewFocusIndex = 0
 	}: Props = $props();
 
 	function handleClose() {
@@ -59,7 +59,6 @@
 		}
 
 		document.addEventListener('keydown', handleKeyDown);
-
 		return () => document.removeEventListener('keydown', handleKeyDown);
 	});
 </script>

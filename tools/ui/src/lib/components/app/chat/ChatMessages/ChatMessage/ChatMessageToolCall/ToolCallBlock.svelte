@@ -11,11 +11,12 @@
 
 	import { Loader2, Wrench } from '@lucide/svelte';
 	import { CollapsibleContentBlock } from '$lib/components/app';
-	import { ICON_CLASS_DEFAULT, ICON_CLASS_SPIN } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT, ICON_CLASS_SPIN } from '$lib/constants/css-classes';
 	import { AgenticSectionType } from '$lib/enums';
+	import { getBuiltinToolUi } from '$lib/constants/built-in-tools';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import { type AgenticSection, type BuiltinToolUiEntry, getBuiltinToolUi } from '$lib/utils';
 	import type { Component, Snippet } from 'svelte';
+	import type { AgenticSection, BuiltinToolUiEntry } from '$lib/utils';
 
 	type ToolCallBlockMetaWithError = TMeta & { errorMessage?: string };
 
@@ -63,17 +64,17 @@
 	}
 
 	let {
-		children,
-		extraLiveStreaming = false,
+		section,
+		open,
 		isStreaming,
 		meta,
-		onToggle,
-		open,
-		section,
+		extraLiveStreaming = false,
 		spinIconWhenActive = false,
+		wrapper: Wrapper = CollapsibleContentBlock,
 		title,
 		titleSnippet,
-		wrapper: Wrapper = CollapsibleContentBlock
+		onToggle,
+		children
 	}: Props = $props();
 
 	const isPending = $derived(section.type === AgenticSectionType.TOOL_CALL_PENDING);
@@ -97,15 +98,11 @@
 		showSpinner || (toolUi?.icon ?? null) || !mcpServerFavicon ? null : mcpServerFavicon
 	);
 
-	// No subtitle while the call is in flight - the spinner already
-	// signals activity; only terminal states get a pill.
 	function subtitleFor(errorMessage?: string): string | undefined {
-		if (showSpinner) return undefined;
-
+		if (extraLiveStreaming) return 'streaming...';
+		if (showSpinner) return 'executing...';
 		if (errorMessage) return 'failed';
-
 		if (isStreamingCall && !isStreaming) return 'incomplete';
-
 		return undefined;
 	}
 
@@ -124,9 +121,9 @@
 	{onToggle}
 >
 	{@render children(meta, {
-		isCodeStreaming,
-		isPending,
 		isStreaming,
-		isStreamingCall
+		isPending,
+		isStreamingCall,
+		isCodeStreaming
 	})}
 </Wrapper>

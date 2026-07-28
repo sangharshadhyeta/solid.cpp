@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ArrowUp, Edit, Trash2 } from '@lucide/svelte';
 	import { ActionIcon, ChatMessageEditForm, ChatMessageUserBubble } from '$lib/components/app';
+	import { ArrowUp, Edit, Trash2 } from '@lucide/svelte';
 	import { useMessageEditContext } from '$lib/hooks/use-message-edit-context.svelte';
 
 	interface Props {
@@ -16,9 +16,9 @@
 		class: className = '',
 		content,
 		extras = [],
-		onDelete,
+		onSendImmediately,
 		onEdit,
-		onSendImmediately
+		onDelete
 	}: Props = $props();
 
 	const editCtx = useMessageEditContext({

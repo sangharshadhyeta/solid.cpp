@@ -5,11 +5,8 @@ const CRITICAL_THRESHOLD = 95;
 
 export function colorLevelFromPercent(percent: number | null): ColorLevel {
 	if (percent === null) return 'neutral';
-
 	if (percent >= CRITICAL_THRESHOLD) return 'critical';
-
 	if (percent >= WARNING_THRESHOLD) return 'warning';
-
 	return 'ok';
 }
 

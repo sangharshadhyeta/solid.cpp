@@ -1,14 +1,14 @@
 <script lang="ts">
+	import { tick } from 'svelte';
 	import { Plus, Trash2 } from '@lucide/svelte';
 	import { Input } from '$lib/components/ui/input';
-	import { KEY_VALUE_PAIR_KEY_MAX_LENGTH, KEY_VALUE_PAIR_VALUE_MAX_LENGTH } from '$lib/constants';
-	import type { KeyValuePair } from '$lib/types';
 	import {
 		autoResizeTextarea,
 		sanitizeKeyValuePairKey,
 		sanitizeKeyValuePairValue
 	} from '$lib/utils';
-	import { tick } from 'svelte';
+	import { KEY_VALUE_PAIR_KEY_MAX_LENGTH, KEY_VALUE_PAIR_VALUE_MAX_LENGTH } from '$lib/constants';
+	import type { KeyValuePair } from '$lib/types';
 
 	interface Props {
 		class?: string;
@@ -23,15 +23,15 @@
 	}
 
 	let {
-		addButtonLabel = 'Add',
 		class: className = '',
-		emptyMessage = 'No items configured.',
-		keyPlaceholder = 'Key',
-		onPairsChange,
 		pairs,
+		onPairsChange,
+		keyPlaceholder = 'Key',
+		valuePlaceholder = 'Value',
+		addButtonLabel = 'Add',
+		emptyMessage = 'No items configured.',
 		sectionLabel,
-		sectionLabelOptional = true,
-		valuePlaceholder = 'Value'
+		sectionLabelOptional = true
 	}: Props = $props();
 
 	// Pre-allocate the ref array so `bind:ref={keyInputRefs[index]}` never reads `undefined`
@@ -43,7 +43,6 @@
 		// Capture the target index before mutating so deletions earlier in the
 		// list can't make keyInputRefs.length drift past the newly-appended row.
 		const newIndex = pairs.length;
-
 		onPairsChange([...pairs, { key: '', value: '' }]);
 		await tick();
 		keyInputRefs[newIndex]?.focus();
@@ -63,7 +62,6 @@
 
 	function trimPairKey(index: number, key: string) {
 		const trimmed = key.trim();
-
 		if (trimmed === key) return;
 
 		const newPairs = [...pairs];
@@ -82,7 +80,6 @@
 
 	function trimPairValue(index: number, value: string) {
 		const trimmed = value.trim();
-
 		if (trimmed === value) return;
 
 		const newPairs = [...pairs];

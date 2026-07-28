@@ -1,7 +1,5 @@
 #include "build-info.h"
 
-#include "llama.h"
-
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -79,12 +77,12 @@ static const command cmds[] = {
 
 #undef UPDATE_HIDDEN
 
-static int version(int /*argc*/, char ** /*argv*/) {
-    llama_print_build_info(llama_version());
+static int version(int argc, char ** argv) {
+    printf("%s\n", llama_build_info());
     return 0;
 }
 
-static int licenses(int /*argc*/, char ** /*argv*/) {
+static int licenses(int argc, char ** argv) {
     for (int i = 0; LICENSES[i]; ++i) {
         printf("%s\n", LICENSES[i]);
     }

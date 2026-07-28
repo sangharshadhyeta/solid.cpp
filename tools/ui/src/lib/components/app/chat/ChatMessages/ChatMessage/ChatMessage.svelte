@@ -1,22 +1,23 @@
 <script lang="ts">
 	import { goto } from '$app/navigation';
+	import { getChatActionsContext, setMessageEditContext } from '$lib/contexts';
+	import { chatStore, pendingEditMessageId } from '$lib/stores/chat.svelte';
+	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import { DatabaseService } from '$lib/services/database.service';
+	import { SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
+	import { REASONING_TAGS } from '$lib/constants/agentic';
+	import { MessageRole, AttachmentType, AgenticSectionType } from '$lib/enums';
 	import {
 		ChatMessageAssistant,
-		ChatMessageMcpPrompt,
-		ChatMessageSynthetic,
+		ChatMessageUser,
 		ChatMessageSystem,
-		ChatMessageUser
+		ChatMessageMcpPrompt
 	} from '$lib/components/app/chat';
-	import { REASONING_TAGS, ROUTES, SYSTEM_MESSAGE_PLACEHOLDER } from '$lib/constants';
-	import { getChatActionsContext, setMessageEditContext } from '$lib/contexts';
-	import { AgenticSectionType, AttachmentType, MessageRole } from '$lib/enums';
-	import { DatabaseService } from '$lib/services/database.service';
-	import { chatStore, pendingEditMessageId } from '$lib/stores/chat.svelte';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
-	import type { DatabaseMessageExtraMcpPrompt } from '$lib/types';
-	import { deriveAgenticSections } from '$lib/utils';
 	import { parseFilesToMessageExtras } from '$lib/utils/browser-only';
+	import { deriveAgenticSections } from '$lib/utils';
+	import type { DatabaseMessageExtraMcpPrompt } from '$lib/types';
+	import { ROUTES } from '$lib/constants/routes';
 
 	interface Props {
 		class?: string;
@@ -30,12 +31,12 @@
 
 	let {
 		class: className = '',
+		message,
+		toolMessages = [],
 		isLastAssistantMessage = false,
 		isLastUserMessage = false,
-		message,
 		nextAssistantMessage = null,
-		siblingInfo = null,
-		toolMessages = []
+		siblingInfo = null
 	}: Props = $props();
 
 	const chatActions = getChatActionsContext();
@@ -55,10 +56,6 @@
 			: message.content
 	);
 
-	// Synthetic cwd-change messages render with the folder-row UI instead
-	// of a user bubble. The persisted flag is the single source of truth.
-	let isSynthetic = $derived(Boolean(message.isSynthetic));
-
 	let rawEditContent = $derived.by(() => {
 		if (message.role !== MessageRole.ASSISTANT) return undefined;
 
@@ -70,12 +67,10 @@
 				case AgenticSectionType.REASONING:
 				case AgenticSectionType.REASONING_PENDING:
 					parts.push(`${REASONING_TAGS.START}\n${section.content}\n${REASONING_TAGS.END}`);
-
 					break;
 
 				case AgenticSectionType.TEXT:
 					parts.push(section.content);
-
 					break;
 
 				case AgenticSectionType.TOOL_CALL:
@@ -115,7 +110,9 @@
 	let showBranchAfterEditOption = $derived(message.role === MessageRole.ASSISTANT);
 
 	setMessageEditContext({
-		cancel: handleCancelEdit,
+		get isEditing() {
+			return isEditing;
+		},
 		get editedContent() {
 			return editedContent;
 		},
@@ -125,12 +122,6 @@
 		get editedUploadedFiles() {
 			return editedUploadedFiles;
 		},
-		get isEditing() {
-			return isEditing;
-		},
-		get messageRole() {
-			return message.role;
-		},
 		get originalContent() {
 			return message.role === MessageRole.ASSISTANT
 				? (rawEditContent ?? message.content)
@@ -139,40 +130,42 @@
 		get originalExtras() {
 			return message.extra || [];
 		},
+		get showSaveOnlyOption() {
+			return showSaveOnlyOption;
+		},
+		get showBranchAfterEditOption() {
+			return showBranchAfterEditOption;
+		},
+		get shouldBranchAfterEdit() {
+			return shouldBranchAfterEdit;
+		},
+		get messageRole() {
+			return message.role;
+		},
 		get rawEditContent() {
 			return rawEditContent;
 		},
-		save: handleSaveEdit,
-		saveOnly: handleSaveEditOnly,
 		setContent: (content: string) => {
 			editedContent = content;
 		},
 		setExtras: (extras: DatabaseMessageExtra[]) => {
 			editedExtras = extras;
 		},
-		setShouldBranchAfterEdit: (value: boolean) => {
-			shouldBranchAfterEdit = value;
-		},
 		setUploadedFiles: (files: ChatUploadedFile[]) => {
 			editedUploadedFiles = files;
 		},
-		get shouldBranchAfterEdit() {
-			return shouldBranchAfterEdit;
+		setShouldBranchAfterEdit: (value: boolean) => {
+			shouldBranchAfterEdit = value;
 		},
-		get showBranchAfterEditOption() {
-			return showBranchAfterEditOption;
-		},
-		get showSaveOnlyOption() {
-			return showSaveOnlyOption;
-		},
+		save: handleSaveEdit,
+		saveOnly: handleSaveEditOnly,
+		cancel: handleCancelEdit,
 		startEdit: handleEdit
 	});
 
 	let mcpPromptExtra = $derived.by(() => {
 		if (message.role !== MessageRole.USER) return null;
-
 		if (message.content.trim()) return null;
-
 		if (!message.extra || message.extra.length !== 1) return null;
 
 		const extra = message.extra[0];
@@ -240,7 +233,6 @@
 
 	function handleEdit() {
 		isEditing = true;
-
 		// Clear temporary placeholder content for system messages
 		if (message.role === MessageRole.SYSTEM && message.content === SYSTEM_MESSAGE_PLACEHOLDER) {
 			editedContent = '';
@@ -284,7 +276,6 @@
 	// After the system message flow ends, hand focus to the main chat form
 	function focusMainChatForm() {
 		if (isMobile.current) return;
-
 		document.querySelector<HTMLTextAreaElement>('.chat-screen-form-wrapper textarea')?.focus();
 	}
 
@@ -296,29 +287,23 @@
 			// If content is empty, remove without deleting children
 			if (!newContent) {
 				const conversationDeleted = await chatStore.removeSystemPromptPlaceholder(message.id);
-
 				isEditing = false;
-
 				if (conversationDeleted) {
 					goto(ROUTES.START);
 				} else {
 					focusMainChatForm();
 				}
-
 				return;
 			}
 
 			await DatabaseService.updateMessage(message.id, { content: newContent });
 			const index = conversationsStore.findMessageIndex(message.id);
-
 			if (index !== -1) {
 				conversationsStore.updateMessageAtIndex(index, { content: newContent });
 			}
-
 			focusMainChatForm();
 		} else if (message.role === MessageRole.USER) {
 			const finalExtras = await getMergedExtras();
-
 			chatActions.editWithBranching(message, editedContent.trim(), finalExtras);
 		} else {
 			// For assistant messages, preserve exact content including trailing whitespace
@@ -335,7 +320,6 @@
 		if (message.role === MessageRole.USER) {
 			// For user messages, trim to avoid accidental whitespace
 			const finalExtras = await getMergedExtras();
-
 			chatActions.editUserMessagePreserveResponses(message, editedContent.trim(), finalExtras);
 		}
 
@@ -360,7 +344,7 @@
 	}
 </script>
 
-<div class="chat-message" class:chat-message--synthetic={isSynthetic}>
+<div class="chat-message">
 	{#if message.role === MessageRole.SYSTEM}
 		<ChatMessageSystem
 			bind:textareaElement
@@ -391,8 +375,6 @@
 			{showDeleteDialog}
 			{siblingInfo}
 		/>
-	{:else if isSynthetic}
-		<ChatMessageSynthetic {message} class={className} />
 	{:else if message.role === MessageRole.USER}
 		<ChatMessageUser
 			class={className}
@@ -440,17 +422,7 @@
 	 * once known; 500px sizes messages that have never been rendered.
 	 */
 	.chat-message {
-		--chat-message-intrinsic-size: 500px;
 		content-visibility: auto;
-		contain-intrinsic-size: auto var(--chat-message-intrinsic-size);
-	}
-
-	/*
-	 * Synthetic rows (e.g. the working-directory change) are small, so an
-	 * accurate placeholder keeps the injected row from inflating the
-	 * auto-scroll offset; the 500px default is for ordinary bubbles.
-	 */
-	.chat-message--synthetic {
-		--chat-message-intrinsic-size: 40px;
+		contain-intrinsic-size: auto 500px;
 	}
 </style>

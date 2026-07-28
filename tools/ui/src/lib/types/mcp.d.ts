@@ -1,19 +1,19 @@
-import type { MimeTypeUnion } from './common';
+import type { MCPConnectionPhase, MCPLogLevel, HealthCheckStatus } from '$lib/enums/mcp.enums';
+import type { ToolSource } from '$lib/enums/tools.enums';
 import type {
-	CallToolResult,
 	Client,
 	ClientCapabilities as SDKClientCapabilities,
-	GetPromptResult,
-	Implementation as SDKImplementation,
-	Prompt,
-	PromptMessage,
 	ServerCapabilities as SDKServerCapabilities,
+	Implementation as SDKImplementation,
 	Tool,
+	CallToolResult,
+	Prompt,
+	GetPromptResult,
+	PromptMessage,
 	Transport
 } from '@modelcontextprotocol/sdk';
+import type { MimeTypeUnion } from './common';
 import type { ColorMode } from '$lib/enums';
-import type { HealthCheckStatus, MCPConnectionPhase, MCPLogLevel } from '$lib/enums/mcp.enums';
-import type { ToolSource } from '$lib/enums/tools.enums';
 
 export type { Tool, CallToolResult, Prompt, GetPromptResult, PromptMessage };
 export type ClientCapabilities = SDKClientCapabilities;
@@ -292,7 +292,6 @@ export interface ServerBuiltinToolInfo {
 	permissions: {
 		write: boolean;
 	};
-	uses_cwd: boolean;
 	definition: OpenAIToolDefinition;
 }
 

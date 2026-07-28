@@ -1,32 +1,30 @@
 <script lang="ts">
-	import { File, FolderOpen, MessageSquare, Zap } from '@lucide/svelte';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import type { Snippet } from 'svelte';
+	import * as Tooltip from '$lib/components/ui/tooltip';
+	import * as Sheet from '$lib/components/ui/sheet';
+	import * as Collapsible from '$lib/components/ui/collapsible';
+	import { File, MessageSquare, Zap, FolderOpen } from '@lucide/svelte';
+	import { Switch } from '$lib/components/ui/switch';
+	import { Checkbox } from '$lib/components/ui/checkbox';
+	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
+	import { ATTACHMENT_FILE_ITEMS } from '$lib/constants/attachment-menu';
+	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
+	import { useToolsPanel } from '$lib/hooks/use-tools-panel.svelte';
+	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
+	import { conversationsStore } from '$lib/stores/conversations.svelte';
+	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { McpLogo } from '$lib/components/app';
 	import {
-		Check,
+		PencilRuler,
 		ChevronDown,
 		ChevronRight,
 		Lightbulb,
 		LightbulbOff,
-		PencilRuler
+		Check
 	} from '@lucide/svelte';
-	import { McpLogo } from '$lib/components/app';
-	import { Checkbox } from '$lib/components/ui/checkbox';
-	import * as Collapsible from '$lib/components/ui/collapsible';
-	import * as Sheet from '$lib/components/ui/sheet';
-	import { Switch } from '$lib/components/ui/switch';
-	import * as Tooltip from '$lib/components/ui/tooltip';
-	import {
-		ATTACHMENT_FILE_ITEMS,
-		ICON_CLASS_DEFAULT,
-		TOOLTIP_DELAY_DURATION
-	} from '$lib/constants';
 	import { HealthCheckStatus } from '$lib/enums';
 	import { AttachmentAction } from '$lib/enums/attachment.enums';
-	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';
-	import { useReasoningMenu } from '$lib/hooks/use-reasoning-menu.svelte';
-	import { useToolsPanel } from '$lib/hooks/use-tools-panel.svelte';
-	import { conversationsStore } from '$lib/stores/conversations.svelte';
-	import { mcpStore } from '$lib/stores/mcp.svelte';
-	import type { Snippet } from 'svelte';
 
 	interface Props {
 		class?: string;
@@ -47,14 +45,14 @@
 		class: className = '',
 		disabled = false,
 		hasAudioModality = false,
+		hasVisionModality = false,
+		hasVideoModality = false,
 		hasMcpPromptsSupport = false,
 		hasMcpResourcesSupport = false,
-		hasVideoModality = false,
-		hasVisionModality = false,
 		onFileUpload,
+		onSystemPromptClick,
 		onMcpPromptClick,
 		onMcpResourcesClick,
-		onSystemPromptClick,
 		trigger
 	}: Props = $props();
 
@@ -66,13 +64,13 @@
 
 	const attachmentMenu = useAttachmentMenu(
 		() => ({
+			hasVisionModality,
 			hasAudioModality,
-			hasMcpPromptsSupport,
-			hasMcpResourcesSupport,
 			hasVideoModality,
-			hasVisionModality
+			hasMcpPromptsSupport,
+			hasMcpResourcesSupport
 		}),
-		() => ({ onFileUpload, onMcpPromptClick, onMcpResourcesClick, onSystemPromptClick }),
+		() => ({ onFileUpload, onSystemPromptClick, onMcpPromptClick, onMcpResourcesClick }),
 		() => {
 			sheetOpen = false;
 		}

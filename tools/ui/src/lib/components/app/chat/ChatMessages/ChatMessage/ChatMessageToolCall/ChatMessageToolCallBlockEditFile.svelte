@@ -1,10 +1,9 @@
 <script lang="ts">
-	import { parseEditFileMeta } from './parsers/edit-file';
-	import ToolCallBlock from './ToolCallBlock.svelte';
 	import { XCircle } from '@lucide/svelte';
 	import { MAX_HEIGHT_CODE_BLOCK, RESULT_STAT_SEPARATOR } from '$lib/constants';
-	import { toolsStore } from '$lib/stores/tools.svelte';
-	import { abbreviateHome, type AgenticSection, computeLineDiff, prefixFor } from '$lib/utils';
+	import { computeLineDiff, prefixFor, type AgenticSection } from '$lib/utils';
+	import { parseEditFileMeta } from './parsers/edit-file';
+	import ToolCallBlock from './ToolCallBlock.svelte';
 
 	interface Props {
 		section: AgenticSection;
@@ -13,10 +12,9 @@
 		onToggle?: () => void;
 	}
 
-	let { isStreaming, onToggle, open, section }: Props = $props();
+	let { section, open, isStreaming, onToggle }: Props = $props();
 
 	const editFileMeta = $derived(parseEditFileMeta(section));
-	const home = $derived(toolsStore.serverHome);
 	const editDiffs = $derived(
 		(editFileMeta?.edits ?? []).map((edit) => computeLineDiff(edit.oldText, edit.newText))
 	);
@@ -25,9 +23,7 @@
 <ToolCallBlock {section} {open} {isStreaming} meta={editFileMeta} {onToggle}>
 	{#snippet titleSnippet()}
 		<span class="text-muted-foreground">Edit file </span>
-		<span class="font-mono" title={editFileMeta?.filePath}
-			>{abbreviateHome(editFileMeta?.filePath ?? '', home)}</span
-		>
+		<span class="font-mono">{editFileMeta?.filePath}</span>
 		{#if editFileMeta?.errorMessage}
 			<span class="ml-1 text-xs italic text-muted-foreground/70">(failed)</span>
 		{/if}

@@ -7,8 +7,8 @@
  * as reactive getters so validation tracks the model in real time.
  */
 
-import { filterFilesByModalities, isFileTypeSupported } from '$lib/utils';
 import { processFilesToChatUploaded } from '$lib/utils/browser-only';
+import { isFileTypeSupported, filterFilesByModalities } from '$lib/utils';
 
 interface UseChatScreenFileUploadOptions {
 	capabilities: () => { hasVision: boolean; hasAudio: boolean; hasVideo: boolean };
@@ -27,8 +27,8 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 	let showFileErrorDialog = $state(false);
 	let fileErrorData = $state<FileErrorData>({
 		generallyUnsupported: [],
-		modalityReasons: {},
 		modalityUnsupported: [],
+		modalityReasons: {},
 		supportedTypes: []
 	});
 
@@ -44,26 +44,24 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 			}
 		}
 
-		const { modalityReasons, supportedFiles, unsupportedFiles } = filterFilesByModalities(
+		const { supportedFiles, unsupportedFiles, modalityReasons } = filterFilesByModalities(
 			generallySupported,
 			options.capabilities()
 		);
+
 		const allUnsupportedFiles = [...generallyUnsupported, ...unsupportedFiles];
 
 		if (allUnsupportedFiles.length > 0) {
 			const supportedTypes: string[] = ['text files', 'PDFs'];
 			const caps = options.capabilities();
-
 			if (caps.hasVision) supportedTypes.push('images');
-
 			if (caps.hasAudio) supportedTypes.push('audio files');
-
 			if (caps.hasVideo) supportedTypes.push('video files');
 
 			fileErrorData = {
 				generallyUnsupported,
-				modalityReasons,
 				modalityUnsupported: unsupportedFiles,
+				modalityReasons,
 				supportedTypes
 			};
 			showFileErrorDialog = true;
@@ -74,7 +72,6 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 				supportedFiles,
 				options.activeModelId() ?? undefined
 			);
-
 			uploadedFiles = [...uploadedFiles, ...processed];
 		}
 	}
@@ -88,20 +85,20 @@ export function useChatScreenFileUpload(options: UseChatScreenFileUploadOptions)
 	}
 
 	return {
-		fileErrorData,
-		handleFileRemove,
-		handleFileUpload,
+		get uploadedFiles() {
+			return uploadedFiles;
+		},
+		set uploadedFiles(value) {
+			uploadedFiles = value;
+		},
 		get showFileErrorDialog() {
 			return showFileErrorDialog;
 		},
 		set showFileErrorDialog(value) {
 			showFileErrorDialog = value;
 		},
-		get uploadedFiles() {
-			return uploadedFiles;
-		},
-		set uploadedFiles(value) {
-			uploadedFiles = value;
-		}
+		fileErrorData,
+		handleFileUpload,
+		handleFileRemove
 	};
 }

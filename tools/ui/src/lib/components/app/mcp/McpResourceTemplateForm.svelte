@@ -1,14 +1,14 @@
 <script lang="ts">
-	import { InputWithSuggestions } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
-	import { MIN_AUTOCOMPLETE_INPUT_LENGTH } from '$lib/constants';
+	import { InputWithSuggestions } from '$lib/components/app';
 	import { KeyboardKey } from '$lib/enums';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
+	import { MIN_AUTOCOMPLETE_INPUT_LENGTH } from '$lib/constants';
 	import type { MCPResourceTemplateInfo } from '$lib/types';
 	import {
 		debounce,
-		expandTemplate,
 		extractTemplateVariables,
+		expandTemplate,
 		isTemplateComplete
 	} from '$lib/utils';
 
@@ -18,7 +18,7 @@
 		onCancel: () => void;
 	}
 
-	let { onCancel, onResolve, template }: Props = $props();
+	let { template, onResolve, onCancel }: Props = $props();
 
 	const variables = $derived(extractTemplateVariables(template.uriTemplate));
 

@@ -1,8 +1,8 @@
 <script lang="ts">
-	import { Pencil } from '@lucide/svelte';
 	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
+	import { Pencil } from '@lucide/svelte';
 
 	interface Props {
 		open: boolean;
@@ -13,11 +13,11 @@
 	}
 
 	let {
-		currentTitle,
-		onCancel,
-		onConfirm,
 		open = $bindable(),
-		value = $bindable('')
+		currentTitle,
+		value = $bindable(''),
+		onConfirm,
+		onCancel
 	}: Props = $props();
 
 	let inputRef = $state<HTMLInputElement | null>(null);
@@ -42,9 +42,7 @@
 
 	function handleSubmit(event: Event) {
 		event.preventDefault();
-
 		if (!canSubmit) return;
-
 		value = value.trim();
 		onConfirm();
 	}

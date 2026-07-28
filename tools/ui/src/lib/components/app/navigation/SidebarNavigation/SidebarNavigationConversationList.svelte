@@ -1,9 +1,9 @@
 <script lang="ts">
+	import { Pin } from '@lucide/svelte';
+	import { buildConversationTree } from '$lib/stores/conversations.svelte';
 	import SidebarNavigationConversationItem from './SidebarNavigationConversationItem.svelte';
 	import SidebarNavigationSearchResults from './SidebarNavigationSearchResults.svelte';
 	import SidebarNavigationSelectionBar from './SidebarNavigationSelectionBar.svelte';
-	import { Pin } from '@lucide/svelte';
-	import { buildConversationTree } from '$lib/stores/conversations.svelte';
 
 	interface Props {
 		class: string;
@@ -34,31 +34,31 @@
 	}
 
 	let {
-		allSelectedArePinned,
-		allVisibleSelected,
 		class: className,
-		currentChatId,
 		filteredConversations,
+		currentChatId,
 		isSearchModeActive,
+		searchQuery,
 		isSelectionMode = false,
-		onBulkDelete,
-		onBulkExport,
-		onBulkPinToggle,
-		onCloseSelection,
-		onDelete,
-		onEdit,
-		onEnterSelectionMode,
-		onRowMouseDown,
+		selectedIds = new Set<string>(),
 		onSelect,
-		onSelectAllToggle,
-		onSelectionClick,
+		onEdit,
+		onDelete,
 		onStop,
 		onToggleSelect,
-		pinStateIsMixed,
-		searchQuery,
-		selectedIds = new Set<string>(),
+		onEnterSelectionMode,
+		onSelectionClick,
+		onRowMouseDown,
+		visibleCount,
+		allVisibleSelected,
 		someVisibleSelected,
-		visibleCount
+		allSelectedArePinned,
+		pinStateIsMixed,
+		onSelectAllToggle,
+		onBulkPinToggle,
+		onBulkExport,
+		onBulkDelete,
+		onCloseSelection
 	}: Props = $props();
 
 	let conversationTree = $derived(buildConversationTree(filteredConversations));
@@ -111,11 +111,11 @@
 					<li class="group/item relative mb-1 p-0">
 						<SidebarNavigationConversationItem
 							conversation={{
+								id: conversation.id,
+								name: conversation.name,
+								lastModified: conversation.lastModified,
 								currNode: conversation.currNode,
 								forkedFromConversationId: conversation.forkedFromConversationId,
-								id: conversation.id,
-								lastModified: conversation.lastModified,
-								name: conversation.name,
 								pinned: conversation.pinned
 							}}
 							{depth}
@@ -151,11 +151,11 @@
 						<li class="group/item relative mb-1 p-0">
 							<SidebarNavigationConversationItem
 								conversation={{
+									id: conversation.id,
+									name: conversation.name,
+									lastModified: conversation.lastModified,
 									currNode: conversation.currNode,
 									forkedFromConversationId: conversation.forkedFromConversationId,
-									id: conversation.id,
-									lastModified: conversation.lastModified,
-									name: conversation.name,
 									pinned: conversation.pinned
 								}}
 								{depth}

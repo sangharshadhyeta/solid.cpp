@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { cn, type WithElementRef } from '$lib/components/ui/utils';
 	import type { HTMLInputAttributes, HTMLInputTypeAttribute } from 'svelte/elements';
+	import { cn, type WithElementRef } from '$lib/components/ui/utils';
 
 	type InputType = Exclude<HTMLInputTypeAttribute, 'file'>;
 
@@ -10,11 +10,11 @@
 	>;
 
 	let {
-		class: className,
-		files = $bindable(),
 		ref = $bindable(null),
-		type,
 		value = $bindable(),
+		type,
+		files = $bindable(),
+		class: className,
 		...restProps
 	}: Props = $props();
 </script>

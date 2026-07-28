@@ -1,6 +1,6 @@
-import TestWrapper from './components/TestWrapper.svelte';
-import { describe, expect, it } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { render } from 'vitest-browser-svelte';
+import TestWrapper from './components/TestWrapper.svelte';
 
 describe('/+page.svelte', () => {
 	it('should render page without throwing', async () => {

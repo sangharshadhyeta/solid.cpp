@@ -1,7 +1,9 @@
 <script lang="ts">
-	import ContextGaugeDial from './ContextGaugeDial.svelte';
-	import { useContextGauge } from '$lib/hooks/use-context-gauge.svelte';
+	import { untrack } from 'svelte';
+	import { activeConversation, activeMessages } from '$lib/stores/conversations.svelte';
 	import { chatStore, isChatStreaming, isLoading } from '$lib/stores/chat.svelte';
+	import { useContextGauge } from '$lib/hooks/use-context-gauge.svelte';
+	import ContextGaugeDial from './ContextGaugeDial.svelte';
 	import {
 		gaugeTriggerClick,
 		gaugeTriggerEnter,
@@ -9,28 +11,22 @@
 		gaugeTriggerLeave,
 		gaugeTriggerPointerDown
 	} from '$lib/stores/context-gauge-popup.svelte';
-	import { activeConversation, activeMessages } from '$lib/stores/conversations.svelte';
-	import { untrack } from 'svelte';
 
 	const gauge = useContextGauge();
 
 	$effect(() => {
 		const conv = activeConversation();
-
 		untrack(() => chatStore.setActiveProcessingConversation(conv?.id ?? null));
 	});
 
 	$effect(() => {
 		const conv = activeConversation();
 		const messages = activeMessages() as DatabaseMessage[];
-
 		if (!conv) return;
-
 		if (isLoading() || isChatStreaming()) return;
 
 		if (messages.length === 0) {
 			untrack(() => chatStore.clearProcessingState(conv.id));
-
 			return;
 		}
 

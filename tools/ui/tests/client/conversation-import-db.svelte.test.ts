@@ -1,21 +1,21 @@
-import { MessageRole, MessageType } from '$lib/enums';
-import { DatabaseService } from '$lib/services/database.service';
-import type { ExportedConversation } from '$lib/types/database';
 import { afterEach, describe, expect, it } from 'vitest';
+import { DatabaseService } from '$lib/services/database.service';
+import { MessageRole, MessageType } from '$lib/enums';
+import type { ExportedConversation } from '$lib/types/database';
 
 function makeSession(id: string): ExportedConversation {
 	return {
-		conv: { currNode: `${id}-msg`, id, lastModified: 0, name: `Chat ${id}` },
+		conv: { id, currNode: `${id}-msg`, lastModified: 0, name: `Chat ${id}` },
 		messages: [
 			{
-				children: [],
-				content: `hello from ${id}`,
-				convId: id,
 				id: `${id}-msg`,
-				parent: null,
-				role: MessageRole.USER,
+				convId: id,
+				type: MessageType.TEXT,
 				timestamp: 0,
-				type: MessageType.TEXT
+				role: MessageRole.USER,
+				content: `hello from ${id}`,
+				parent: null,
+				children: []
 			}
 		]
 	} as unknown as ExportedConversation;
@@ -23,7 +23,6 @@ function makeSession(id: string): ExportedConversation {
 
 afterEach(async () => {
 	const conversations = await DatabaseService.getAllConversations();
-
 	await DatabaseService.bulkDeleteConversations(conversations.map((conv) => conv.id));
 });
 

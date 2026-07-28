@@ -1,28 +1,29 @@
 <script lang="ts">
-	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
-	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
 	import {
-		ChatMessageActionCardContinueRequest,
-		ChatMessageActionCardPermissionRequest,
 		ChatMessageStatistics,
-		MarkdownContent
+		MarkdownContent,
+		ChatMessageActionCardPermissionRequest,
+		ChatMessageActionCardContinueRequest
 	} from '$lib/components/app';
+
 	import { AgenticSectionType, ChatMessageStatsView, ToolPermissionDecision } from '$lib/enums';
-	import {
-		agenticExecutingToolCallId,
-		agenticLastError,
-		agenticPendingContinueRequest,
-		agenticPendingPermissionRequest,
-		agenticResolveContinue,
-		agenticResolvePermission
-	} from '$lib/stores/agentic.svelte';
-	import { config } from '$lib/stores/settings.svelte';
 	import type {
 		ChatMessageAgenticTimings,
 		ChatMessageAgenticTurnStats,
 		DatabaseMessage
 	} from '$lib/types';
-	import { type AgenticSection, deriveAgenticSections } from '$lib/utils';
+	import { deriveAgenticSections, type AgenticSection } from '$lib/utils';
+	import {
+		agenticPendingPermissionRequest,
+		agenticResolvePermission,
+		agenticPendingContinueRequest,
+		agenticResolveContinue,
+		agenticLastError,
+		agenticExecutingToolCallId
+	} from '$lib/stores/agentic.svelte';
+	import { config } from '$lib/stores/settings.svelte';
+	import ChatMessageReasoningBlock from './ChatMessageReasoningBlock.svelte';
+	import ChatMessageToolCallBlock from './ChatMessage/ChatMessageToolCall/ChatMessageToolCallBlock.svelte';
 
 	interface Props {
 		message: DatabaseMessage;
@@ -32,14 +33,15 @@
 	}
 
 	let {
-		isLastAssistantMessage = false,
-		isStreaming = false,
 		message,
-		toolMessages = []
+		toolMessages = [],
+		isStreaming = false,
+		isLastAssistantMessage = false
 	}: Props = $props();
 
 	let expandedStates: Record<number, boolean> = $state({});
 
+	const renderThinkingAsMarkdown = $derived(config().renderThinkingAsMarkdown as boolean);
 	const showThoughtInProgress = $derived(Boolean(config().showThoughtInProgress));
 	const alwaysShowToolCallContent = $derived(Boolean(config().alwaysShowToolCallContent));
 	const showMessageStats = $derived(Boolean(config().showMessageStats));
@@ -59,7 +61,6 @@
 	$effect(() => {
 		if (pendingPermission !== prevPendingRef) {
 			prevPendingRef = pendingPermission;
-
 			if (pendingPermission) {
 				permissionDismissed = false;
 			}
@@ -81,7 +82,6 @@
 	$effect(() => {
 		if (pendingContinue !== prevContinueRef) {
 			prevContinueRef = pendingContinue;
-
 			if (pendingContinue) {
 				continueDismissed = false;
 			}
@@ -106,7 +106,6 @@
 
 	const turnGroups: TurnGroup[] = $derived.by(() => {
 		const groups: TurnGroup[] = [];
-
 		let currentTurn: AgenticSection[] = [];
 		let currentIndices: number[] = [];
 		let prevWasTool = false;
@@ -119,7 +118,7 @@
 				section.type === AgenticSectionType.TOOL_CALL_STREAMING;
 
 			if (!isTool && prevWasTool && currentTurn.length > 0) {
-				groups.push({ flatIndices: currentIndices, sections: currentTurn });
+				groups.push({ sections: currentTurn, flatIndices: currentIndices });
 				currentTurn = [];
 				currentIndices = [];
 			}
@@ -130,7 +129,7 @@
 		}
 
 		if (currentTurn.length > 0) {
-			groups.push({ flatIndices: currentIndices, sections: currentTurn });
+			groups.push({ sections: currentTurn, flatIndices: currentIndices });
 		}
 
 		return groups;
@@ -168,11 +167,11 @@
 
 	function buildTurnAgenticTimings(stats: ChatMessageAgenticTurnStats): ChatMessageAgenticTimings {
 		return {
-			llm: stats.llm,
-			toolCalls: stats.toolCalls,
+			turns: 1,
 			toolCallsCount: stats.toolCalls.length,
 			toolsMs: stats.toolsMs,
-			turns: 1
+			toolCalls: stats.toolCalls,
+			llm: stats.llm
 		};
 	}
 </script>
@@ -187,6 +186,7 @@
 			{section}
 			open={isExpanded(index, section)}
 			{isStreaming}
+			{renderThinkingAsMarkdown}
 			{hasReasoningError}
 			attachments={message?.extra}
 			onToggle={() => toggleExpanded(index, section)}

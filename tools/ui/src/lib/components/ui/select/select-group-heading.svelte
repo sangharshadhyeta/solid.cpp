@@ -1,12 +1,12 @@
 <script lang="ts">
-	import { cn } from '$lib/components/ui/utils.js';
 	import { Select as SelectPrimitive } from 'bits-ui';
+	import { cn } from '$lib/components/ui/utils.js';
 	import type { ComponentProps } from 'svelte';
 
 	let {
-		children,
-		class: className,
 		ref = $bindable(null),
+		class: className,
+		children,
 		...restProps
 	}: ComponentProps<typeof SelectPrimitive.GroupHeading> = $props();
 </script>

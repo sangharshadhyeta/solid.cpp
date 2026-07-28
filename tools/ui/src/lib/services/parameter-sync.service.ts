@@ -1,7 +1,7 @@
-import { SETTINGS_KEYS, SYNCABLE_PARAMETERS } from '$lib/constants';
-import { ParameterSource, SyncableParameterType } from '$lib/enums';
-import type { ParameterInfo, ParameterRecord, ParameterValue } from '$lib/types';
 import { normalizeFloatingPoint } from '$lib/utils';
+import { SETTINGS_KEYS, SYNCABLE_PARAMETERS } from '$lib/constants';
+import type { ParameterRecord, ParameterInfo, ParameterValue } from '$lib/types';
+import { SyncableParameterType, ParameterSource } from '$lib/enums';
 
 export class ParameterSyncService {
 	/**
@@ -42,7 +42,6 @@ export class ParameterSyncService {
 					const value = (serverParams as unknown as Record<string, ParameterValue>)[
 						param.serverKey
 					];
-
 					if (value !== undefined) {
 						// Apply precision rounding to avoid JavaScript floating-point issues
 						extracted[param.key] = this.roundFloatingPoint(value);
@@ -121,14 +120,15 @@ export class ParameterSyncService {
 	): ParameterInfo {
 		const hasPropsDefault = propsDefaults[key] !== undefined;
 		const isUserOverride = userOverrides.has(key);
+
 		// Simple logic: either using default (from props) or custom (user override)
 		const source = isUserOverride ? ParameterSource.CUSTOM : ParameterSource.DEFAULT;
 
 		return {
-			serverDefault: hasPropsDefault ? propsDefaults[key] : undefined, // Keep same field name for compatibility
+			value: currentValue,
 			source,
-			userOverride: isUserOverride ? currentValue : undefined,
-			value: currentValue
+			serverDefault: hasPropsDefault ? propsDefaults[key] : undefined, // Keep same field name for compatibility
+			userOverride: isUserOverride ? currentValue : undefined
 		};
 	}
 
@@ -160,7 +160,6 @@ export class ParameterSyncService {
 	 */
 	static validateServerParameter(key: string, value: ParameterValue): boolean {
 		const param = SYNCABLE_PARAMETERS.find((p) => p.key === key);
-
 		if (!param) return false;
 
 		switch (param.type) {
@@ -208,8 +207,8 @@ export class ParameterSyncService {
 			if (serverValue !== undefined) {
 				diff[key] = {
 					current: currentValue,
-					differs: currentValue !== serverValue,
-					server: serverValue
+					server: serverValue,
+					differs: currentValue !== serverValue
 				};
 			}
 		}

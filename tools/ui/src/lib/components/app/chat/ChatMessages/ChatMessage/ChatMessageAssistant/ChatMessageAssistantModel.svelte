@@ -1,8 +1,8 @@
 <script lang="ts">
 	import { ModelBadge, ModelsSelectorDropdown } from '$lib/components/app';
-	import { ServerModelStatus } from '$lib/enums';
-	import { modelsStore } from '$lib/stores/models.svelte';
 	import { copyToClipboard } from '$lib/utils';
+	import { modelsStore } from '$lib/stores/models.svelte';
+	import { ServerModelStatus } from '$lib/enums';
 
 	interface Props {
 		displayedModel: string | null;
@@ -11,7 +11,7 @@
 		onRegenerate: (modelOverride?: string) => void;
 	}
 
-	let { displayedModel, isLoading, isRouter, onRegenerate }: Props = $props();
+	let { displayedModel, isRouter, isLoading, onRegenerate }: Props = $props();
 
 	let pendingModel = $state<string | null>(null);
 
@@ -38,7 +38,6 @@
 			}
 
 			onRegenerate(modelName);
-
 			return true;
 		}}
 	/>

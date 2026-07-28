@@ -8,7 +8,7 @@
 		onConfirm: () => void;
 	}
 
-	let { displayName, onConfirm, onOpenChange, open = $bindable() }: Props = $props();
+	let { open = $bindable(), displayName, onOpenChange, onConfirm }: Props = $props();
 </script>
 
 <AlertDialog.Root bind:open {onOpenChange}>

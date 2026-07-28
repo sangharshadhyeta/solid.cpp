@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { McpServerForm } from '$lib/components/app/mcp';
 	import { Button } from '$lib/components/ui/button';
+	import { McpServerForm } from '$lib/components/app/mcp';
 	import { parseHeadersToArray } from '$lib/utils';
 
 	interface Props {
@@ -14,12 +14,12 @@
 	}
 
 	let {
-		onCancel,
-		onSave,
 		serverId,
-		serverLabel = '',
 		serverUrl,
-		serverUseProxy = false
+		serverUseProxy = false,
+		serverLabel = '',
+		onSave,
+		onCancel
 	}: Props = $props();
 
 	let editUrl = $derived(serverUrl);
@@ -29,10 +29,8 @@
 
 	let urlError = $derived.by(() => {
 		if (!editUrl.trim()) return 'URL is required';
-
 		try {
 			new URL(editUrl);
-
 			return null;
 		} catch {
 			return 'Invalid URL format';

@@ -1,5 +1,5 @@
-import { modelsStore } from '$lib/stores/models.svelte';
 import { serverStore } from '$lib/stores/server.svelte';
+import { modelsStore } from '$lib/stores/models.svelte';
 
 /**
  * Mock server properties for Storybook testing
@@ -8,17 +8,16 @@ import { serverStore } from '$lib/stores/server.svelte';
 export function mockServerProps(props: Partial<ApiLlamaCppServerProps>): void {
 	// Reset any pointer-events from previous tests (dropdown cleanup)
 	const body = document.querySelector('body');
-
 	if (body) body.style.pointerEvents = '';
 
 	// Directly set the props for testing purposes
 	(serverStore as unknown as { props: ApiLlamaCppServerProps }).props = {
-		modalities: {
-			audio: props.modalities?.audio ?? false,
-			video: props.modalities?.video ?? false,
-			vision: props.modalities?.vision ?? false
-		},
 		model_path: props.model_path || 'test-model',
+		modalities: {
+			vision: props.modalities?.vision ?? false,
+			audio: props.modalities?.audio ?? false,
+			video: props.modalities?.video ?? false
+		},
 		...props
 	} as ApiLlamaCppServerProps;
 
@@ -42,8 +41,8 @@ export function mockServerProps(props: Partial<ApiLlamaCppServerProps>): void {
 	(modelsStore as any).models = [
 		{
 			id: 'test-model',
-			model: 'test-model',
-			name: 'Test Model'
+			name: 'Test Model',
+			model: 'test-model'
 		}
 	];
 
@@ -57,12 +56,12 @@ export function mockServerProps(props: Partial<ApiLlamaCppServerProps>): void {
  */
 export function resetServerStore(): void {
 	(serverStore as unknown as { props: ApiLlamaCppServerProps }).props = {
+		model_path: '',
 		modalities: {
+			vision: false,
 			audio: false,
-			video: false,
-			vision: false
-		},
-		model_path: ''
+			video: false
+		}
 	} as ApiLlamaCppServerProps;
 	(serverStore as unknown as { error: string }).error = '';
 	(serverStore as unknown as { loading: boolean }).loading = false;
@@ -72,16 +71,16 @@ export function resetServerStore(): void {
  * Common mock configurations for Storybook stories
  */
 export const mockConfigs = {
+	visionOnly: {
+		modalities: { vision: true, audio: false }
+	},
 	audioOnly: {
-		modalities: { audio: true, vision: false }
+		modalities: { vision: false, audio: true }
 	},
 	bothModalities: {
-		modalities: { audio: true, vision: true }
+		modalities: { vision: true, audio: true }
 	},
 	noModalities: {
-		modalities: { audio: false, video: false, vision: false }
-	},
-	visionOnly: {
-		modalities: { audio: false, vision: true }
+		modalities: { vision: false, audio: false, video: false }
 	}
 } as const;

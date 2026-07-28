@@ -1,10 +1,11 @@
 import {
-	LEADING_SLASHES_REGEX,
 	TEMPLATE_EXPRESSION_REGEX,
 	URI_SCHEME_SEPARATOR,
-	URI_TEMPLATE_SYMBOLS,
+	URI_TEMPLATE_OPERATORS,
+	URI_TEMPLATE_SEPARATORS,
 	VARIABLE_EXPLODE_MODIFIER_REGEX,
-	VARIABLE_PREFIX_MODIFIER_REGEX
+	VARIABLE_PREFIX_MODIFIER_REGEX,
+	LEADING_SLASHES_REGEX
 } from '../constants';
 
 /**
@@ -24,7 +25,6 @@ import {
  */
 export function normalizeResourceUri(uri: string): string {
 	const schemeEnd = uri.indexOf(URI_SCHEME_SEPARATOR);
-
 	if (schemeEnd === -1) return uri;
 
 	const scheme = uri.substring(0, schemeEnd);
@@ -65,7 +65,6 @@ export function extractTemplateVariables(template: string): UriTemplateVariable[
 	const seen = new Set<string>();
 
 	let match;
-
 	TEMPLATE_EXPRESSION_REGEX.lastIndex = 0;
 
 	while ((match = TEMPLATE_EXPRESSION_REGEX.exec(template)) !== null) {
@@ -118,6 +117,7 @@ export function expandTemplate(template: string, values: Record<string, string>)
 						.replace(VARIABLE_PREFIX_MODIFIER_REGEX, '')
 						.trim()
 				);
+
 			const expandedParts = varNames
 				.map((name: string) => values[name] ?? '')
 				.filter((v: string) => v !== '');
@@ -125,59 +125,60 @@ export function expandTemplate(template: string, values: Record<string, string>)
 			if (expandedParts.length === 0) return '';
 
 			switch (operator) {
-				case URI_TEMPLATE_SYMBOLS.RESERVED:
+				case URI_TEMPLATE_OPERATORS.RESERVED:
 					// Reserved expansion: no encoding
-					return expandedParts.join(URI_TEMPLATE_SYMBOLS.COMMA);
-				case URI_TEMPLATE_SYMBOLS.FRAGMENT:
+					return expandedParts.join(URI_TEMPLATE_SEPARATORS.COMMA);
+				case URI_TEMPLATE_OPERATORS.FRAGMENT:
 					// Fragment expansion
-					return URI_TEMPLATE_SYMBOLS.FRAGMENT + expandedParts.join(URI_TEMPLATE_SYMBOLS.COMMA);
-				case URI_TEMPLATE_SYMBOLS.PATH_SEGMENT:
-					// Path segments
 					return (
-						URI_TEMPLATE_SYMBOLS.PATH_SEGMENT +
-						expandedParts.join(URI_TEMPLATE_SYMBOLS.PATH_SEGMENT)
+						URI_TEMPLATE_OPERATORS.FRAGMENT + expandedParts.join(URI_TEMPLATE_SEPARATORS.COMMA)
 					);
-				case URI_TEMPLATE_SYMBOLS.LABEL:
+				case URI_TEMPLATE_OPERATORS.PATH_SEGMENT:
+					// Path segments
+					return URI_TEMPLATE_SEPARATORS.SLASH + expandedParts.join(URI_TEMPLATE_SEPARATORS.SLASH);
+				case URI_TEMPLATE_OPERATORS.LABEL:
 					// Label expansion
-					return URI_TEMPLATE_SYMBOLS.LABEL + expandedParts.join(URI_TEMPLATE_SYMBOLS.LABEL);
-				case URI_TEMPLATE_SYMBOLS.PATH_PARAM:
+					return (
+						URI_TEMPLATE_SEPARATORS.PERIOD + expandedParts.join(URI_TEMPLATE_SEPARATORS.PERIOD)
+					);
+				case URI_TEMPLATE_OPERATORS.PATH_PARAM:
 					// Path-style parameters
 					return varNames
 						.filter((_: string, i: number) => expandedParts[i])
 						.map(
 							(name: string, i: number) =>
-								`${URI_TEMPLATE_SYMBOLS.PATH_PARAM}${name}=${expandedParts[i]}`
+								`${URI_TEMPLATE_SEPARATORS.SEMICOLON}${name}=${expandedParts[i]}`
 						)
 						.join('');
-				case URI_TEMPLATE_SYMBOLS.FORM_QUERY:
+				case URI_TEMPLATE_OPERATORS.FORM_QUERY:
 					// Form-style query
 					return (
-						URI_TEMPLATE_SYMBOLS.FORM_QUERY +
+						URI_TEMPLATE_SEPARATORS.QUERY_PREFIX +
 						varNames
 							.filter((_: string, i: number) => expandedParts[i])
 							.map(
 								(name: string, i: number) =>
 									`${encodeURIComponent(name)}=${encodeURIComponent(expandedParts[i])}`
 							)
-							.join(URI_TEMPLATE_SYMBOLS.FORM_CONTINUATION)
+							.join(URI_TEMPLATE_SEPARATORS.QUERY_CONTINUATION)
 					);
-				case URI_TEMPLATE_SYMBOLS.FORM_CONTINUATION:
+				case URI_TEMPLATE_OPERATORS.FORM_CONTINUATION:
 					// Form-style query continuation
 					return (
-						URI_TEMPLATE_SYMBOLS.FORM_CONTINUATION +
+						URI_TEMPLATE_SEPARATORS.QUERY_CONTINUATION +
 						varNames
 							.filter((_: string, i: number) => expandedParts[i])
 							.map(
 								(name: string, i: number) =>
 									`${encodeURIComponent(name)}=${encodeURIComponent(expandedParts[i])}`
 							)
-							.join(URI_TEMPLATE_SYMBOLS.COMMA)
+							.join(URI_TEMPLATE_SEPARATORS.COMMA)
 					);
 				default:
 					// Simple string expansion (default operator)
 					return expandedParts
 						.map((v: string) => encodeURIComponent(v))
-						.join(URI_TEMPLATE_SYMBOLS.COMMA);
+						.join(URI_TEMPLATE_SEPARATORS.COMMA);
 			}
 		}
 	);

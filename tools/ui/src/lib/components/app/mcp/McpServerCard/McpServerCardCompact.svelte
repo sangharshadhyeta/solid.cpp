@@ -1,7 +1,7 @@
 <script lang="ts">
 	import * as Card from '$lib/components/ui/card';
-	import type { RecommendedMCPServer } from '$lib/types';
 	import { mode } from 'mode-watcher';
+	import type { RecommendedMCPServer } from '$lib/types';
 
 	interface Props {
 		server: RecommendedMCPServer;
@@ -10,13 +10,12 @@
 		dimmed?: boolean;
 	}
 
-	let { dimmed = false, onClick, selected = false, server }: Props = $props();
+	let { server, onClick, selected = false, dimmed = false }: Props = $props();
 
 	let activeIconUrl = $derived.by(() => {
 		const isDark = mode.current === 'dark';
 
 		if (isDark && server.iconUrlDark) return server.iconUrlDark;
-
 		if (!isDark && server.iconUrlLight) return server.iconUrlLight;
 
 		return server.iconUrl;

@@ -21,17 +21,17 @@
 	}
 
 	let {
-		children,
+		open = $bindable(false),
 		class: className = '',
 		icon: IconComponent,
 		iconClass = ICON_CLASS_DEFAULT,
 		iconUrl = null,
-		onToggle,
-		open = $bindable(false),
-		shimmerTitle = false,
-		subtitle,
 		title = '',
-		titleSnippet
+		titleSnippet,
+		subtitle,
+		shimmerTitle = false,
+		onToggle,
+		children
 	}: Props = $props();
 
 	function hideBrokenIcon(event: Event) {

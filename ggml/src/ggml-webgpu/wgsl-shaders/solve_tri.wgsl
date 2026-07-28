@@ -29,6 +29,7 @@ struct Params {
 
     k: u32,
     ne2: u32,
+    ne3: u32,
 };
 
 @group(0) @binding(3)

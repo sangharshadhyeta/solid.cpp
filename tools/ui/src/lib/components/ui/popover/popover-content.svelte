@@ -1,18 +1,18 @@
 <script lang="ts">
+	import { Popover as PopoverPrimitive } from 'bits-ui';
 	import PopoverPortal from './popover-portal.svelte';
 	import { cn, type WithoutChildrenOrChild } from '$lib/components/ui/utils.js';
-	import { Popover as PopoverPrimitive } from 'bits-ui';
 	import type { ComponentProps } from 'svelte';
 
 	let {
-		align = 'center',
-		avoidCollisions = true,
-		class: className,
-		collisionPadding = 8,
-		portalProps,
 		ref = $bindable(null),
-		side,
+		class: className,
 		sideOffset = 4,
+		side,
+		align = 'center',
+		collisionPadding = 8,
+		avoidCollisions = true,
+		portalProps,
 		...restProps
 	}: PopoverPrimitive.ContentProps & {
 		portalProps?: WithoutChildrenOrChild<ComponentProps<typeof PopoverPortal>>;

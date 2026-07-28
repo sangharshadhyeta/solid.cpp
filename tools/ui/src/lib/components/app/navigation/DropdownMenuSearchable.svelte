@@ -1,7 +1,7 @@
 <script lang="ts">
-	import { SearchInput } from '$lib/components/app';
-	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
 	import type { Snippet } from 'svelte';
+	import * as DropdownMenu from '$lib/components/ui/dropdown-menu';
+	import { SearchInput } from '$lib/components/app';
 
 	interface Props {
 		placeholder?: string;
@@ -15,14 +15,14 @@
 	}
 
 	let {
-		children,
-		emptyMessage = 'No items found',
-		footer,
-		isEmpty = false,
+		placeholder = 'Search...',
+		searchValue = $bindable(''),
 		onSearchChange,
 		onSearchKeyDown,
-		placeholder = 'Search...',
-		searchValue = $bindable('')
+		emptyMessage = 'No items found',
+		isEmpty = false,
+		children,
+		footer
 	}: Props = $props();
 </script>
 

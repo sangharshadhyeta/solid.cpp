@@ -4,9 +4,9 @@
 // parser keeps the original raw-text fallback for MCP servers that
 // emit unparseable output.
 
-import { parseToolArgs } from './_shared';
 import { BuiltInTool } from '$lib/enums';
-import { type AgenticSection, splitSearchSummaryList } from '$lib/utils';
+import { splitSearchSummaryList, type AgenticSection } from '$lib/utils';
+import { parseToolArgs } from './_shared';
 
 export type FileGlobSearchMeta = {
 	path: string;
@@ -19,13 +19,11 @@ export type FileGlobSearchMeta = {
 
 export function parseFileGlobSearchMeta(section: AgenticSection): FileGlobSearchMeta | null {
 	const args = parseToolArgs(BuiltInTool.FILE_GLOB_SEARCH, section);
-
 	if (!args) return null;
 
 	const path = typeof args.path === 'string' ? args.path : '';
 	const include = typeof args.include === 'string' && args.include ? args.include : '**';
 	const exclude = typeof args.exclude === 'string' && args.exclude ? args.exclude : undefined;
-
 	if (!path) return null;
 
 	let matches: string[] = [];
@@ -33,21 +31,17 @@ export function parseFileGlobSearchMeta(section: AgenticSection): FileGlobSearch
 	let errorMessage: string | undefined;
 
 	const toolResultString = section.toolResult;
-
 	if (toolResultString) {
 		try {
 			const parsed: unknown = JSON.parse(toolResultString);
-
 			if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
 				const obj = parsed as Record<string, unknown>;
-
 				if (typeof obj.error === 'string') {
 					errorMessage = obj.error;
 				} else if (typeof obj.plain_text_response === 'string') {
 					const split = splitSearchSummaryList(obj.plain_text_response, (total) => {
 						totalMatches = total;
 					});
-
 					matches = split.lines;
 				}
 			}
@@ -56,10 +50,9 @@ export function parseFileGlobSearchMeta(section: AgenticSection): FileGlobSearch
 			const split = splitSearchSummaryList(toolResultString, (total) => {
 				totalMatches = total;
 			});
-
 			matches = split.lines;
 		}
 	}
 
-	return { errorMessage, exclude, include, matches, path, totalMatches };
+	return { path, include, exclude, matches, totalMatches, errorMessage };
 }

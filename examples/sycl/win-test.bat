@@ -19,7 +19,6 @@ set "MODEL_FILE=..\models\llama-2-7b.Q4_0.gguf"
 set "NGL=99"
 set "CONTEXT=4096"
 set "GGML_SYCL_DEVICE=-1"
-set "SYCL_DEVICES=SYCL0"
 set "SPLIT_MODE=layer"
 set "LOG_VERBOSE=3"
 
@@ -38,21 +37,6 @@ if /I "%~1"=="-c" (
 if /I "%~1"=="--context" (
   if "%~2"=="" goto missing_value
   set "CONTEXT=%~2"
-  shift
-  shift
-  goto parse_args
-)
-
-if /I "%~1"=="-d" (
-  if "%~2"=="" goto missing_value
-  set "SYCL_DEVICES=%~2"
-  shift
-  shift
-  goto parse_args
-)
-if /I "%~1"=="--device" (
-  if "%~2"=="" goto missing_value
-  set "SYCL_DEVICES=%~2"
   shift
   shift
   goto parse_args
@@ -167,7 +151,6 @@ echo This script processes files with specified options.
 echo.
 echo Options:
 echo   -h, --help    Display this help message and exit.
-echo   -d, --device ^<value^>    Set SYCL devices (default: SYCL0).
 echo   -c, --context ^<value^>    Set context length. Bigger need more memory.
 echo   -p, --promote ^<value^>    Prompt to start generation with.
 echo   -m, --model   ^<value^>    Full model file path.
@@ -199,21 +182,19 @@ REM Support malloc device memory more than 4GB.
 set "UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=1"
 echo UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS=%UR_L0_ENABLE_RELAXED_ALLOCATION_LIMITS%
 
-echo ONEAPI_DEVICE_SELECTOR=%ONEAPI_DEVICE_SELECTOR%
-
 if not "%GGML_SYCL_DEVICE%"=="-1" (
   echo Use %GGML_SYCL_DEVICE% as main GPU
   REM Use single GPU only.
   set "GPUS_SETTING=-mg %GGML_SYCL_DEVICE% -sm %SPLIT_MODE%"
-  )
-else (
-  echo Use Intel GPUs: %SYCL_DEVICES%
+  echo ONEAPI_DEVICE_SELECTOR=%ONEAPI_DEVICE_SELECTOR%
+) else (
+  echo Use all Intel GPUs, including iGPU ^& dGPU
   set "GPUS_SETTING=-sm %SPLIT_MODE%"
 )
 
-echo run cmd: ZES_ENABLE_SYSMAN=1 %BIN_FILE% -m %MODEL_FILE% -no-cnv -p "%INPUT_PROMPT%" -n 200 -e -ngl %NGL% -s %SEED% -c %CONTEXT% %GPUS_SETTING% -lv %LOG_VERBOSE% --device %SYCL_DEVICES% --mmap
+echo run cmd: ZES_ENABLE_SYSMAN=1 %BIN_FILE% -m %MODEL_FILE% -no-cnv -p "%INPUT_PROMPT%" -n 200 -e -ngl %NGL% -s %SEED% -c %CONTEXT% %GPUS_SETTING% -lv %LOG_VERBOSE% --mmap
 set "ZES_ENABLE_SYSMAN=1"
-%BIN_FILE% -m "%MODEL_FILE%" -no-cnv -p "%INPUT_PROMPT%" -n 200 -e -ngl %NGL% -s %SEED% -c %CONTEXT% %GPUS_SETTING% -lv %LOG_VERBOSE% --device "%SYCL_DEVICES%" --mmap
+%BIN_FILE% -m "%MODEL_FILE%" -no-cnv -p "%INPUT_PROMPT%" -n 200 -e -ngl %NGL% -s %SEED% -c %CONTEXT% %GPUS_SETTING% -lv %LOG_VERBOSE% --mmap
 
 endlocal
 

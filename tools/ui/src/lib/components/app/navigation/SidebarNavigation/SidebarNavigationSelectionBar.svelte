@@ -20,18 +20,18 @@
 	}
 
 	let {
-		allVisibleSelected,
 		class: className = '',
-		onBulkDelete,
-		onBulkExport,
-		onBulkPinToggle,
-		onClose,
-		onSelectAllToggle,
-		pinStateIsMixed,
 		selectedCount,
-		someSelectedPinned,
+		visibleCount,
+		allVisibleSelected,
 		someVisibleSelected,
-		visibleCount
+		someSelectedPinned,
+		pinStateIsMixed,
+		onSelectAllToggle,
+		onBulkPinToggle,
+		onBulkExport,
+		onBulkDelete,
+		onClose
 	}: Props = $props();
 
 	let showDeleteDialog = $state(false);

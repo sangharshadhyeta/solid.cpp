@@ -18,8 +18,6 @@ add_library(mtmd
             mtmd-image.cpp
             mtmd.h
             mtmd-helper.cpp
-            mtmd-helper-gen.cpp
-            mtmd-helper-common.h
             mtmd-helper.h
             clip.cpp
             clip.h
@@ -43,7 +41,6 @@ add_library(mtmd
             models/kimivl.cpp
             models/kimik25.cpp
             models/nemotron-v2-vl.cpp
-            models/muse-glimmer.cpp
             models/llama4.cpp
             models/llava.cpp
             models/minicpmv.cpp
@@ -55,11 +52,6 @@ add_library(mtmd
             models/mimovl.cpp
             models/qwen3a.cpp
             models/mimo-audio.cpp
-            models/qwen3tts-spkenc.cpp
-            models/qwen3tts-gen.cpp
-            models/pockettts-seanet.cpp
-            models/pockettts-spkenc.cpp
-            models/pockettts-gen.cpp
             models/step3vl.cpp
             models/siglip.cpp
             models/whisper-enc.cpp
@@ -72,8 +64,8 @@ add_library(mtmd
             )
 
 set_target_properties(mtmd PROPERTIES
-    VERSION ${LLAMA_VERSION_BASE}
-    SOVERSION ${LLAMA_VERSION_MAJOR}
+    VERSION ${LLAMA_INSTALL_VERSION}
+    SOVERSION 0
     MACHO_CURRENT_VERSION 0 # keep macOS linker from seeing oversized version number
 )
 

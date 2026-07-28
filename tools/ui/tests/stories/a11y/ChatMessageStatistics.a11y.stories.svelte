@@ -4,30 +4,30 @@
 	import { expect } from 'storybook/test';
 
 	const { Story } = defineMeta({
+		title: 'Components/ChatMessageStatistics/Accessibility',
 		component: ChatMessageStatistics,
 		parameters: {
 			layout: 'centered'
 		},
-		tags: ['!dev'],
-		title: 'Components/ChatMessageStatistics/Accessibility'
+		tags: ['!dev']
 	});
 </script>
 
 <Story
 	name="ViewButtonsSingleTabStop"
 	args={{
+		promptTokens: 100,
+		promptMs: 500,
+		predictedTokens: 200,
+		predictedMs: 1000,
 		agenticTimings: {
-			llm: { predicted_ms: 1000, predicted_n: 200, prompt_ms: 500, prompt_n: 100 },
+			turns: 1,
 			toolCallsCount: 1,
 			toolsMs: 500,
-			turns: 1
+			llm: { predicted_n: 200, predicted_ms: 1000, prompt_n: 100, prompt_ms: 500 }
 		},
 		hideSummary: false,
-		isLive: false,
-		predictedMs: 1000,
-		predictedTokens: 200,
-		promptMs: 500,
-		promptTokens: 100
+		isLive: false
 	}}
 	play={async ({ canvas, userEvent }) => {
 		const reading = await canvas.findByRole('button', { name: 'Reading' });

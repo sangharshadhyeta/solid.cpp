@@ -1,7 +1,4 @@
 <script lang="ts">
-	import { RefreshCw } from '@lucide/svelte';
-	import { goto } from '$app/navigation';
-	import { page } from '$app/state';
 	import {
 		SettingsChatDesktopSidebar,
 		SettingsChatFields,
@@ -10,29 +7,32 @@
 		SettingsChatToolsTab,
 		SettingsFooter
 	} from '$lib/components/app/settings';
-	import { Button } from '$lib/components/ui/button';
+	import { config, settingsStore } from '$lib/stores/settings.svelte';
 	import {
 		NUMERIC_FIELDS,
 		POSITIVE_INTEGER_FIELDS,
 		SETTINGS_CHAT_SECTIONS,
 		SETTINGS_SECTION_TITLES
 	} from '$lib/constants';
-	import { setChatSettingsConfigContext } from '$lib/contexts';
-	import { ColorMode } from '$lib/enums/ui.enums';
+	import type { SettingsSection } from '$lib/types';
 	import { RouterService } from '$lib/services/router.service';
+	import { setMode } from 'mode-watcher';
+	import { ColorMode } from '$lib/enums/ui.enums';
+	import { fade } from 'svelte/transition';
+	import { goto } from '$app/navigation';
+	import { Button } from '$lib/components/ui/button';
+	import { RefreshCw } from '@lucide/svelte';
+	import { page } from '$app/state';
+	import { setChatSettingsConfigContext } from '$lib/contexts';
+	import { settingsReferrer } from '$lib/stores/settings-referrer.svelte';
 	import { modelsStore } from '$lib/stores/models.svelte';
 	import { isRouterMode } from '$lib/stores/server.svelte';
-	import { config, settingsStore } from '$lib/stores/settings.svelte';
-	import { settingsReferrer } from '$lib/stores/settings-referrer.svelte';
-	import type { SettingsSection } from '$lib/types';
-	import { setMode } from 'mode-watcher';
-	import { fade } from 'svelte/transition';
 	interface Props {
 		initialSection?: string;
 		getSectionHref?: (section: SettingsSection) => string;
 	}
 
-	let { getSectionHref, initialSection }: Props = $props();
+	let { initialSection, getSectionHref }: Props = $props();
 
 	let activeSlug = $derived(
 		initialSection ?? (page.params as Record<string, string | undefined>).section ?? 'general'
@@ -87,7 +87,6 @@
 			} catch (error) {
 				alert('Invalid JSON in custom parameters. Please check the format and try again.');
 				console.error(error);
-
 				return;
 			}
 		}
@@ -97,22 +96,14 @@
 		for (const field of NUMERIC_FIELDS) {
 			if (processedConfig[field] !== undefined && processedConfig[field] !== '') {
 				const numValue = Number(processedConfig[field]);
-
 				if (!isNaN(numValue)) {
 					if ((POSITIVE_INTEGER_FIELDS as readonly string[]).includes(field)) {
-						const entryByMinMax = SETTINGS_CHAT_SECTIONS.flatMap(
-							(section) => section.fields ?? []
-						).find((entry) => entry.key === field);
-						const lo = entryByMinMax?.min ?? 1;
-						const hi = entryByMinMax?.max ?? Number.POSITIVE_INFINITY;
-
-						processedConfig[field] = Math.max(lo, Math.min(hi, Math.round(numValue)));
+						processedConfig[field] = Math.max(1, Math.round(numValue));
 					} else {
 						processedConfig[field] = numValue;
 					}
 				} else {
 					alert(`Invalid numeric value for ${field}. Please enter a valid number.`);
-
 					return;
 				}
 			}
@@ -127,11 +118,11 @@
 	}
 
 	setChatSettingsConfigContext({
-		handleConfigChange,
-		handleThemeChange,
 		get localConfig() {
 			return localConfig;
-		}
+		},
+		handleConfigChange,
+		handleThemeChange
 	});
 </script>
 

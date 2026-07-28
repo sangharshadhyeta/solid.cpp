@@ -10,6 +10,10 @@
  * avoiding the need to stringify and re-parse HTML.
  */
 
+import type { Plugin } from 'unified';
+import type { Root, Element, ElementContent } from 'hast';
+import { visit } from 'unist-util-visit';
+import { CODE_BLOCK_SCROLL_CONTAINER_CLASS, CODE_BLOCK_WRAPPER_CLASS } from '$lib/constants';
 import {
 	createBlockHeader,
 	createCopyButton,
@@ -17,10 +21,6 @@ import {
 	createWrapper,
 	generateBlockId
 } from './code-block-utils';
-import { CODE_BLOCK_CLASS } from '$lib/constants';
-import type { Element, ElementContent, Root } from 'hast';
-import type { Plugin } from 'unified';
-import { visit } from 'unist-util-visit';
 
 declare global {
 	interface Window {
@@ -30,7 +30,6 @@ declare global {
 
 function extractLanguage(codeElement: Element): string {
 	const className = codeElement.properties?.className;
-
 	if (!Array.isArray(className)) return 'text';
 
 	for (const cls of className) {
@@ -78,8 +77,8 @@ export const rehypeEnhanceCodeBlocks: Plugin<[], Root> = () => {
 			const wrapper = createWrapper(
 				header,
 				node,
-				CODE_BLOCK_CLASS.WRAPPER,
-				CODE_BLOCK_CLASS.SCROLL_CONTAINER
+				CODE_BLOCK_WRAPPER_CLASS,
+				CODE_BLOCK_SCROLL_CONTAINER_CLASS
 			);
 
 			// Replace pre with wrapper in parent

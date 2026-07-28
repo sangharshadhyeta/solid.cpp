@@ -1,12 +1,13 @@
 <script lang="ts">
-	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { browser } from '$app/environment';
+
 	import { SearchInput, SidebarNavigationSearchResults } from '$lib/components/app';
-	import { ROUTES } from '$lib/constants';
+	import { ROUTES } from '$lib/constants/routes';
 	import { RouterService } from '$lib/services/router.service';
+	import { conversationsStore, conversations } from '$lib/stores/conversations.svelte';
 	import { chatStore } from '$lib/stores/chat.svelte';
-	import { conversations, conversationsStore } from '$lib/stores/conversations.svelte';
 	import { isMobile } from '$lib/stores/viewport.svelte';
 
 	let searchQuery = $state('');
@@ -16,9 +17,7 @@
 
 	let filteredConversations = $derived.by(() => {
 		const query = searchQuery.trim().toLowerCase();
-
 		if (query.length === 0) return [];
-
 		return conversations().filter((c) => c.name.toLowerCase().includes(query));
 	});
 
@@ -36,11 +35,9 @@
 
 	async function handleEditConversation(id: string) {
 		const conversation = conversations().find((c) => c.id === id);
-
 		if (!conversation) return;
 
 		const newName = window.prompt('Rename conversation', conversation.name);
-
 		if (newName && newName.trim()) {
 			await conversationsStore.updateConversationName(id, newName.trim());
 		}
@@ -48,13 +45,11 @@
 
 	async function handleDeleteConversation(id: string) {
 		const conversation = conversations().find((c) => c.id === id);
-
 		if (!conversation) return;
 
 		const confirmed = window.confirm(
 			`Delete "${conversation.name}"? This action cannot be undone.`
 		);
-
 		if (!confirmed) return;
 
 		await conversationsStore.deleteConversation(id, { deleteWithForks: false });

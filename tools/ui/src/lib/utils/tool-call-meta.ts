@@ -15,14 +15,11 @@ export function tryParseToolResultObject(
 	toolResultString: string | undefined
 ): Record<string, unknown> | null {
 	if (!toolResultString) return null;
-
 	try {
 		const parsed: unknown = JSON.parse(toolResultString);
-
 		if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
 			return parsed as Record<string, unknown>;
 		}
-
 		return null;
 	} catch {
 		return null;

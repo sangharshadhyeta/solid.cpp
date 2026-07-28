@@ -1,10 +1,10 @@
 <script lang="ts">
-	import SearchInput from '$lib/components/app/forms/SearchInput.svelte';
 	import { Button } from '$lib/components/ui/button';
 	import { Checkbox } from '$lib/components/ui/checkbox';
+	import SearchInput from '$lib/components/app/forms/SearchInput.svelte';
 	import { ScrollArea } from '$lib/components/ui/scroll-area';
-	import { useMarqueeSelection } from '$lib/hooks/use-marquee-selection.svelte';
 	import { SvelteSet } from 'svelte/reactivity';
+	import { useMarqueeSelection } from '$lib/hooks/use-marquee-selection.svelte';
 
 	interface Props {
 		conversations: DatabaseConversation[];
@@ -17,11 +17,11 @@
 
 	let {
 		conversations,
-		isOpen = true,
 		messageCountMap = new Map(),
 		mode,
 		onCancel,
-		onConfirm
+		onConfirm,
+		isOpen = true
 	}: Props = $props();
 
 	let searchQuery = $state('');
@@ -34,7 +34,6 @@
 	let filteredConversations = $derived(
 		conversations.filter((conv) => {
 			const name = conv.name || 'Untitled conversation';
-
 			return name.toLowerCase().includes(searchQuery.toLowerCase());
 		})
 	);
@@ -51,26 +50,23 @@
 	);
 
 	const marquee = useMarqueeSelection({
-		enabled: () => isOpen,
+		selectedIds: () => selectedIds,
 		orderedIds: () => orderedIds,
-		selectedIds: () => selectedIds
+		enabled: () => isOpen
 	});
 
 	function toggleAll() {
 		const newSet = new SvelteSet(selectedIds);
-
 		if (allSelected) {
 			filteredConversations.forEach((conv) => newSet.delete(conv.id));
 		} else {
 			filteredConversations.forEach((conv) => newSet.add(conv.id));
 		}
-
 		selectedIds = newSet;
 	}
 
 	function handleConfirm() {
 		const selected = conversations.filter((conv) => selectedIds.has(conv.id));
-
 		onConfirm(selected);
 	}
 

@@ -1,22 +1,22 @@
 <script lang="ts">
-	import { Search } from '@lucide/svelte';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
+	import { Search } from '@lucide/svelte';
 	import { ActionIcon, KeyboardShortcutInfo, SearchInput } from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
 	import {
-		ICON_CLASS_DEFAULT,
-		ICON_STRIP_TRANSITION_DELAY_MULTIPLIER,
 		ICON_STRIP_TRANSITION_DURATION,
+		ICON_STRIP_TRANSITION_DELAY_MULTIPLIER,
 		ROUTES,
 		SIDEBAR_ACTIONS_ITEMS
 	} from '$lib/constants';
-	import { TooltipSide } from '$lib/enums';
 	import { isMobile } from '$lib/stores/viewport.svelte';
-	import type { Component } from 'svelte';
-	import { onMount } from 'svelte';
-	import { circIn } from 'svelte/easing';
+	import { TooltipSide } from '$lib/enums';
 	import { fade } from 'svelte/transition';
+	import { circIn } from 'svelte/easing';
+	import { onMount } from 'svelte';
+	import type { Component } from 'svelte';
 
 	interface Props {
 		class: string;
@@ -32,10 +32,10 @@
 		class: className,
 		isExpandedMode = false,
 		isSearchModeActive = $bindable(false),
-		onNewChat,
-		onSearchClick,
+		searchQuery = $bindable(''),
 		onSearchDeactivated,
-		searchQuery = $bindable('')
+		onSearchClick,
+		onNewChat
 	}: Props = $props();
 
 	let initialized = $state(false);
@@ -118,8 +118,8 @@
 					? undefined
 					: onSearchClick}
 			{@const itemTransition = {
-				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
+				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				easing: circIn
 			}}
 
@@ -166,8 +166,8 @@
 					? undefined
 					: onSearchClick}
 			{@const itemTransition = {
-				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				duration: ICON_STRIP_TRANSITION_DURATION,
+				delay: !initialized ? i * ICON_STRIP_TRANSITION_DELAY_MULTIPLIER : 0,
 				easing: circIn
 			}}
 

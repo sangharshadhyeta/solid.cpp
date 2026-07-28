@@ -12,7 +12,6 @@ export function parseHeadersToArray(headersJson: string): { key: string; value: 
 
 	try {
 		const parsed = JSON.parse(headersJson);
-
 		if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
 			return Object.entries(parsed).map(([key, value]) => ({
 				key,

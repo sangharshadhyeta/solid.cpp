@@ -1,5 +1,5 @@
-import type { Element, ElementContent, Root, Text } from 'hast';
 import type { Plugin } from 'unified';
+import type { Root, Element, ElementContent, Text } from 'hast';
 import { visit } from 'unist-util-visit';
 
 /**
@@ -17,11 +17,9 @@ export interface DiagramPreData {
  */
 function extractText(node: ElementContent): string {
 	if (node.type === 'text') return node.value;
-
 	if (node.type === 'element') {
 		return (node.children ?? []).map(extractText).join('');
 	}
-
 	return '';
 }
 
@@ -59,7 +57,6 @@ export function createPreTransform(
 				if (!codeElement) return;
 
 				const className = codeElement.properties?.className;
-
 				if (!Array.isArray(className)) return;
 
 				const matches = className.some(
@@ -76,15 +73,15 @@ export function createPreTransform(
 				if (contentGuard && !contentGuard(text)) return;
 
 				const pre: Element = {
-					children: [{ type: 'text', value: text } as Text],
-					// Keep the highlighted code element so the block can offer a source
-					// view that matches the app code blocks without re highlighting.
-					data: { sourceCode: codeElement } satisfies DiagramPreData,
+					type: 'element',
+					tagName: 'pre',
 					properties: {
 						className: [targetClass]
 					},
-					tagName: 'pre',
-					type: 'element'
+					children: [{ type: 'text', value: text } as Text],
+					// Keep the highlighted code element so the block can offer a source
+					// view that matches the app code blocks without re highlighting.
+					data: { sourceCode: codeElement } satisfies DiagramPreData
 				};
 
 				(parent.children as ElementContent[])[index] = pre;

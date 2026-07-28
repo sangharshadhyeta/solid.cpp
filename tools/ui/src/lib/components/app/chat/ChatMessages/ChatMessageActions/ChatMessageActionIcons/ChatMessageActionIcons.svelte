@@ -1,14 +1,14 @@
 <script lang="ts">
-	import { ArrowRight, Copy, Edit, GitBranch, RefreshCw, Trash2 } from '@lucide/svelte';
+	import { Edit, Copy, RefreshCw, Trash2, ArrowRight, GitBranch } from '@lucide/svelte';
 	import {
 		ActionIcon,
 		ChatMessageActionIconsBranchingControls,
 		DialogConfirmation
 	} from '$lib/components/app';
+	import { Switch } from '$lib/components/ui/switch';
 	import { Checkbox } from '$lib/components/ui/checkbox';
 	import Input from '$lib/components/ui/input/input.svelte';
 	import Label from '$lib/components/ui/label/label.svelte';
-	import { Switch } from '$lib/components/ui/switch';
 	import { MessageRole } from '$lib/enums';
 	import { activeConversation } from '$lib/stores/conversations.svelte';
 
@@ -42,21 +42,21 @@
 		actionsPosition,
 		deletionInfo,
 		justify,
+		onCopy,
+		onEdit,
 		onConfirmDelete,
 		onContinue,
-		onCopy,
 		onDelete,
-		onEdit,
 		onForkConversation,
 		onNavigateToSibling,
-		onRawOutputToggle,
-		onRegenerate,
 		onShowDeleteDialogChange,
-		rawOutputEnabled = false,
+		onRegenerate,
 		role,
+		siblingInfo = null,
 		showDeleteDialog,
 		showRawOutputSwitch = false,
-		siblingInfo = null
+		rawOutputEnabled = false,
+		onRawOutputToggle
 	}: Props = $props();
 
 	let showForkDialog = $state(false);
@@ -77,7 +77,7 @@
 	}
 
 	function handleConfirmFork() {
-		onForkConversation?.({ includeAttachments: forkIncludeAttachments, name: forkName.trim() });
+		onForkConversation?.({ name: forkName.trim(), includeAttachments: forkIncludeAttachments });
 		showForkDialog = false;
 	}
 </script>

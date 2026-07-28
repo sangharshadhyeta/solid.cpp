@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { X } from '@lucide/svelte';
 	import { ActionIcon } from '$lib/components/app';
+	import { X } from '@lucide/svelte';
 
 	interface Props {
 		class?: string;
@@ -20,9 +20,9 @@
 		height = 'h-16',
 		id,
 		imageClass = '',
-		name,
 		onclick,
 		onRemove,
+		name,
 		preview,
 		readonly = false,
 		width = 'w-auto'

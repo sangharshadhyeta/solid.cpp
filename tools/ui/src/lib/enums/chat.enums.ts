@@ -78,14 +78,3 @@ export enum PdfViewMode {
 	TEXT = 'text',
 	PAGES = 'pages'
 }
-
-export enum ChatFormCommandAction {
-	PROMPT = 'prompt',
-	CWD = 'cwd',
-	MODEL = 'model'
-}
-
-export enum FileMentionEntryType {
-	FILE = 'file',
-	DIRECTORY = 'directory'
-}

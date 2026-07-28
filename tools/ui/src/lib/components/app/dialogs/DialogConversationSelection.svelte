@@ -1,6 +1,6 @@
 <script lang="ts">
-	import { ConversationSelection } from '$lib/components/app';
 	import * as Dialog from '$lib/components/ui/dialog';
+	import { ConversationSelection } from '$lib/components/app';
 
 	interface Props {
 		conversations: DatabaseConversation[];

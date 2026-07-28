@@ -24,13 +24,12 @@ export function parseExecShellCommandExitStatus(
 	if (!toolResultString) return undefined;
 
 	const match = toolResultString.match(EXIT_CODE_TAIL_REGEX);
-
 	if (!match) return undefined;
 
 	return {
 		code: Number.parseInt(match[1], 10),
-		rawText: match[0],
-		timedOut: match[0].includes('exit due to timed out')
+		timedOut: match[0].includes('exit due to timed out'),
+		rawText: match[0]
 	};
 }
 
@@ -44,6 +43,5 @@ export function isExitCodeSummaryLine(
 	status: ExecShellExitStatus | undefined
 ): boolean {
 	if (!status) return false;
-
 	return lineText.trim() === status.rawText.trim();
 }

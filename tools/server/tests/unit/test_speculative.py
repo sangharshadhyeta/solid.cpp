@@ -25,32 +25,33 @@ def fixture_create_server():
 
 def test_with_and_without_draft():
     global server
-    request = {
-        "prompt": "I believe the meaning of life is",
-        "temperature": 0.2,
-        "top_k": 5,
-        "seed": 4242,
-        "n_predict": 16,
-        "return_tokens": True,
-    }
-
     server.model_draft = None  # disable draft model
     server.spec_type = None
     server.start()
-    res = server.make_request("POST", "/completion", data=request)
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    })
     assert res.status_code == 200
-    tokens_no_draft = res.body["tokens"]
+    content_no_draft = res.body["content"]
     server.stop()
 
     # create new server with draft model
     create_server()
     server.start()
-    res = server.make_request("POST", "/completion", data=request)
+    res = server.make_request("POST", "/completion", data={
+        "prompt": "I believe the meaning of life is",
+        "temperature": 0.0,
+        "top_k": 1,
+        "n_predict": 16,
+    })
     assert res.status_code == 200
     assert res.body["timings"]["draft_n"] > 0
-    tokens_draft = res.body["tokens"]
+    content_draft = res.body["content"]
 
-    assert tokens_no_draft == tokens_draft
+    assert content_no_draft == content_draft
 
 
 def test_different_draft_min_draft_max():

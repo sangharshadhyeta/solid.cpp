@@ -1,18 +1,18 @@
+import { describe, it, expect } from 'vitest';
 import { MessageRole } from '$lib/enums';
-import type { DatabaseMessage } from '$lib/types/database';
 import { deriveAgenticSections } from '$lib/utils/agentic';
-import { describe, expect, it } from 'vitest';
+import type { DatabaseMessage } from '$lib/types/database';
 
 function makeAssistant(overrides: Partial<DatabaseMessage> = {}): DatabaseMessage {
 	return {
-		children: [],
-		content: overrides.content ?? '',
-		convId: 'conv-1',
 		id: overrides.id ?? 'ast-1',
-		parent: null,
-		role: MessageRole.ASSISTANT,
-		timestamp: Date.now(),
+		convId: 'conv-1',
 		type: 'text',
+		timestamp: Date.now(),
+		role: MessageRole.ASSISTANT,
+		content: overrides.content ?? '',
+		parent: null,
+		children: [],
 		...overrides
 	} as DatabaseMessage;
 }
@@ -24,10 +24,8 @@ function makeAssistant(overrides: Partial<DatabaseMessage> = {}): DatabaseMessag
 // onAssistantTurnComplete(...undefined).
 function buildApiToolCalls(message: DatabaseMessage): unknown[] | undefined {
 	if (!message.toolCalls) return undefined;
-
 	try {
 		const parsed = JSON.parse(message.toolCalls);
-
 		return Array.isArray(parsed) && parsed.length > 0 ? parsed : undefined;
 	} catch {
 		return undefined;
@@ -44,15 +42,16 @@ describe('partial tool call cleanup', () => {
 			content: 'partial reasoning',
 			toolCalls: JSON.stringify([
 				{
-					function: {
-						arguments: '{"command":`grep -n \\"read_to\\" ` /Users',
-						name: 'exec_shell_command'
-					},
 					id: 'call_1',
-					type: 'function'
+					type: 'function',
+					function: {
+						name: 'exec_shell_command',
+						arguments: '{"command":`grep -n \\"read_to\\" ` /Users'
+					}
 				}
 			])
 		});
+
 		const apiToolCalls = buildApiToolCalls(message);
 
 		// The bug: even though arguments are invalid, the outer array parses and
@@ -60,7 +59,6 @@ describe('partial tool call cleanup', () => {
 		// own for the server to execute the tool.
 		expect(apiToolCalls).toBeDefined();
 		const args = (apiToolCalls![0] as { function: { arguments: string } }).function.arguments;
-
 		expect(() => JSON.parse(args)).toThrow();
 	});
 
@@ -73,8 +71,8 @@ describe('partial tool call cleanup', () => {
 			content: 'partial reasoning',
 			toolCalls: ''
 		});
-		const apiToolCalls = buildApiToolCalls(clearedMessage);
 
+		const apiToolCalls = buildApiToolCalls(clearedMessage);
 		expect(apiToolCalls).toBeUndefined();
 	});
 
@@ -88,8 +86,8 @@ describe('partial tool call cleanup', () => {
 			reasoningContent: 'thinking about read_to',
 			toolCalls: ''
 		});
-		const sections = deriveAgenticSections(cleared);
 
+		const sections = deriveAgenticSections(cleared);
 		expect(sections).toHaveLength(1);
 		expect(sections[0].type).toBe('reasoning');
 		expect(sections.some((s) => s.type.includes('tool_call'))).toBe(false);

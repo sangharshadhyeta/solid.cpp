@@ -1,11 +1,11 @@
 <script lang="ts">
-	import { BookOpenText, Clock, Gauge, Layers, Sparkles, WholeWord, Wrench } from '@lucide/svelte';
+	import { Clock, Gauge, WholeWord, BookOpenText, Sparkles, Wrench, Layers } from '@lucide/svelte';
 	import { ChatMessageStatisticsBadge } from '$lib/components/app';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { DEFAULT_PERFORMANCE_TIME, MS_PER_SECOND } from '$lib/constants';
-	import { ChatMessageStatisticsMode, ChatMessageStatsView } from '$lib/enums';
+	import { ChatMessageStatsView, ChatMessageStatisticsMode } from '$lib/enums';
 	import type { ChatMessageAgenticTimings } from '$lib/types/chat';
 	import { formatPerformanceTime } from '$lib/utils';
+	import { MS_PER_SECOND, DEFAULT_PERFORMANCE_TIME } from '$lib/constants';
 	import type { Component } from 'svelte';
 
 	interface Props {
@@ -23,17 +23,17 @@
 	}
 
 	let {
-		agenticTimings,
-		hideSummary = false,
-		initialView = ChatMessageStatsView.GENERATION,
+		predictedTokens,
+		predictedMs,
+		promptTokens,
+		promptMs,
 		isLive = false,
 		isProcessingPrompt = false,
-		mode = ChatMessageStatisticsMode.SWITCHABLE,
+		initialView = ChatMessageStatsView.GENERATION,
+		agenticTimings,
 		onActiveViewChange,
-		predictedMs,
-		predictedTokens,
-		promptMs,
-		promptTokens
+		hideSummary = false,
+		mode = ChatMessageStatisticsMode.SWITCHABLE
 	}: Props = $props();
 
 	let isSwitchable = $derived(mode === ChatMessageStatisticsMode.SWITCHABLE);
@@ -168,35 +168,35 @@
 		<div class="inline-flex items-center rounded-sm bg-muted-foreground/15 p-0.5">
 			{#if hasPromptStats || isLive}
 				{@render viewButton({
+					view: ChatMessageStatsView.READING,
 					icon: BookOpenText,
 					label: 'Reading',
-					tooltipText: 'Processing',
-					view: ChatMessageStatsView.READING
+					tooltipText: 'Processing'
 				})}
 			{/if}
 
 			{@render viewButton({
-				disabled: isGenerationDisabled,
+				view: ChatMessageStatsView.GENERATION,
 				icon: Sparkles,
 				label: 'Generation',
 				tooltipText: isGenerationDisabled ? 'Waiting for tokens...' : 'Generation',
-				view: ChatMessageStatsView.GENERATION
+				disabled: isGenerationDisabled
 			})}
 
 			{#if hasAgenticStats}
 				{@render viewButton({
+					view: ChatMessageStatsView.TOOLS,
 					icon: Wrench,
 					label: 'Tools',
-					tooltipText: 'Tool calls',
-					view: ChatMessageStatsView.TOOLS
+					tooltipText: 'Tool calls'
 				})}
 
 				{#if !hideSummary}
 					{@render viewButton({
+						view: ChatMessageStatsView.SUMMARY,
 						icon: Layers,
 						label: 'Summary',
-						tooltipText: 'Agentic summary',
-						view: ChatMessageStatsView.SUMMARY
+						tooltipText: 'Agentic summary'
 					})}
 				{/if}
 			{/if}

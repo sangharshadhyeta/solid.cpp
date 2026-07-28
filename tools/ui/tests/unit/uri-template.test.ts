@@ -1,22 +1,20 @@
-import { URI_TEMPLATE_SYMBOLS } from '../../src/lib/constants/uri-template.constants';
+import { describe, it, expect } from 'vitest';
 import {
-	expandTemplate,
 	extractTemplateVariables,
+	expandTemplate,
 	isTemplateComplete,
 	normalizeResourceUri
 } from '../../src/lib/utils/uri-template';
-import { describe, expect, it } from 'vitest';
+import { URI_TEMPLATE_OPERATORS } from '../../src/lib/constants/uri-template';
 
 describe('extractTemplateVariables', () => {
 	it('extracts simple variables', () => {
 		const vars = extractTemplateVariables('file:///{path}');
-
 		expect(vars).toEqual([{ name: 'path', operator: '' }]);
 	});
 
 	it('extracts multiple variables', () => {
 		const vars = extractTemplateVariables('db://{schema}/{table}');
-
 		expect(vars).toEqual([
 			{ name: 'schema', operator: '' },
 			{ name: 'table', operator: '' }
@@ -25,13 +23,11 @@ describe('extractTemplateVariables', () => {
 
 	it('extracts variables with operators', () => {
 		const vars = extractTemplateVariables('http://example.com{+path}');
-
-		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_SYMBOLS.RESERVED }]);
+		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_OPERATORS.RESERVED }]);
 	});
 
 	it('extracts comma-separated variable lists', () => {
 		const vars = extractTemplateVariables('{x,y,z}');
-
 		expect(vars).toEqual([
 			{ name: 'x', operator: '' },
 			{ name: 'y', operator: '' },
@@ -41,37 +37,31 @@ describe('extractTemplateVariables', () => {
 
 	it('deduplicates variable names', () => {
 		const vars = extractTemplateVariables('{name}/{name}');
-
 		expect(vars).toEqual([{ name: 'name', operator: '' }]);
 	});
 
 	it('handles fragment expansion', () => {
 		const vars = extractTemplateVariables('http://example.com/page{#section}');
-
-		expect(vars).toEqual([{ name: 'section', operator: URI_TEMPLATE_SYMBOLS.FRAGMENT }]);
+		expect(vars).toEqual([{ name: 'section', operator: URI_TEMPLATE_OPERATORS.FRAGMENT }]);
 	});
 
 	it('handles path segment expansion', () => {
 		const vars = extractTemplateVariables('http://example.com{/path}');
-
-		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_SYMBOLS.PATH_SEGMENT }]);
+		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_OPERATORS.PATH_SEGMENT }]);
 	});
 
 	it('returns empty array for template without variables', () => {
 		const vars = extractTemplateVariables('http://example.com/static');
-
 		expect(vars).toEqual([]);
 	});
 
 	it('strips explode modifier', () => {
 		const vars = extractTemplateVariables('{list*}');
-
 		expect(vars).toEqual([{ name: 'list', operator: '' }]);
 	});
 
 	it('strips prefix modifier', () => {
 		const vars = extractTemplateVariables('{value:5}');
-
 		expect(vars).toEqual([{ name: 'value', operator: '' }]);
 	});
 });
@@ -79,13 +69,11 @@ describe('extractTemplateVariables', () => {
 describe('expandTemplate', () => {
 	it('expands simple variable', () => {
 		const result = expandTemplate('file:///{path}', { path: 'src/main.rs' });
-
 		expect(result).toBe('file:///src%2Fmain.rs');
 	});
 
 	it('expands reserved variable (no encoding)', () => {
 		const result = expandTemplate('file:///{+path}', { path: 'src/main.rs' });
-
 		expect(result).toBe('file:///src/main.rs');
 	});
 
@@ -94,13 +82,11 @@ describe('expandTemplate', () => {
 			schema: 'public',
 			table: 'users'
 		});
-
 		expect(result).toBe('db://public/users');
 	});
 
 	it('leaves empty for missing variables', () => {
 		const result = expandTemplate('{missing}', {});
-
 		expect(result).toBe('');
 	});
 
@@ -108,19 +94,16 @@ describe('expandTemplate', () => {
 		const result = expandTemplate('http://example.com/page{#section}', {
 			section: 'intro'
 		});
-
 		expect(result).toBe('http://example.com/page#intro');
 	});
 
 	it('expands path segments', () => {
 		const result = expandTemplate('http://example.com{/path}', { path: 'docs' });
-
 		expect(result).toBe('http://example.com/docs');
 	});
 
 	it('expands query parameters', () => {
 		const result = expandTemplate('http://example.com{?q}', { q: 'search term' });
-
 		expect(result).toBe('http://example.com?q=search%20term');
 	});
 
@@ -129,13 +112,11 @@ describe('expandTemplate', () => {
 			q: 'search term',
 			sort: 'descending'
 		});
-
 		expect(result).toBe('http://example.com?q=search%20term&sort=descending');
 	});
 
 	it('keeps static parts unchanged', () => {
 		const result = expandTemplate('http://example.com/static', {});
-
 		expect(result).toBe('http://example.com/static');
 	});
 });

@@ -1,17 +1,17 @@
 <script lang="ts">
+	import { ICON_CLASS_DEFAULT, ICON_CLASS_SPIN } from '$lib/constants/css-classes';
 	import { Globe, Loader2 } from '@lucide/svelte';
 	import { CollapsibleContentBlock } from '$lib/components/app';
 	import * as HoverCard from '$lib/components/ui/hover-card';
-	import { ICON_CLASS_DEFAULT, ICON_CLASS_SPIN } from '$lib/constants';
 	import { AgenticSectionType } from '$lib/enums';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
 	import {
-		type AgenticSection,
-		extractSearchQuery,
 		extractSearchResults,
+		extractSearchQuery,
 		faviconForUrl,
 		sanitizeExternalUrl,
-		type SearchResult
+		type SearchResult,
+		type AgenticSection
 	} from '$lib/utils';
 
 	interface Props {
@@ -21,7 +21,7 @@
 		onToggle?: () => void;
 	}
 
-	let { isStreaming = false, onToggle, open = $bindable(false), section }: Props = $props();
+	let { section, open = $bindable(false), isStreaming = false, onToggle }: Props = $props();
 
 	const isPending = $derived(section.type === AgenticSectionType.TOOL_CALL_PENDING);
 	const isStreamingCall = $derived(section.type === AgenticSectionType.TOOL_CALL_STREAMING);
@@ -43,7 +43,6 @@
 	// retrospective.
 	const title = $derived.by(() => {
 		const verb = showSpinner ? 'Searching' : 'Searched';
-
 		return query ? `${verb} web for "${query}"` : `${verb} web`;
 	});
 
@@ -53,16 +52,13 @@
 
 	function formatPublishDate(iso: string | undefined): string | null {
 		if (!iso) return null;
-
 		try {
 			const date = new Date(iso);
-
 			if (Number.isNaN(date.getTime())) return iso;
-
 			return date.toLocaleDateString(undefined, {
-				day: 'numeric',
+				year: 'numeric',
 				month: 'short',
-				year: 'numeric'
+				day: 'numeric'
 			});
 		} catch {
 			return iso;

@@ -3,8 +3,9 @@
 
 import 'vite-plugin-pwa/pwa-assets';
 import 'vite-plugin-pwa/svelte';
-import { ModelModality, ServerModelStatus, ServerRole } from '$lib/enums';
+
 // Import chat types from dedicated module
+
 import type {
 	// API types
 	ApiChatCompletionRequest,
@@ -12,56 +13,58 @@ import type {
 	ApiChatCompletionStreamChunk,
 	ApiChatCompletionToolCall,
 	ApiChatCompletionToolCallDelta,
-	ApiChatMessageContentPart,
 	ApiChatMessageData,
+	ApiChatMessageContentPart,
 	ApiContextSizeError,
 	ApiErrorResponse,
 	ApiLlamaCppServerProps,
 	ApiModelDataEntry,
-	ApiModelListResponse,
 	ApiModelLoadStage,
+	ApiModelsSseProgress,
 	ApiModelsSseData,
 	ApiModelsSseEvent,
-	ApiModelsSseProgress,
+	ApiModelListResponse,
 	ApiProcessingState,
 	ApiRouterModelMeta,
-	ApiRouterModelsListResponse,
 	ApiRouterModelsLoadRequest,
 	ApiRouterModelsLoadResponse,
 	ApiRouterModelsStatusRequest,
 	ApiRouterModelsStatusResponse,
+	ApiRouterModelsListResponse,
 	ApiRouterModelsUnloadRequest,
 	ApiRouterModelsUnloadResponse,
 	// Chat types
 	ChatAttachmentDisplayItem,
-	ChatMessagePromptProgress,
-	ChatMessageSiblingInfo,
-	ChatMessageTimings,
 	ChatMessageType,
 	ChatRole,
 	ChatUploadedFile,
+	ChatMessageSiblingInfo,
+	ChatMessagePromptProgress,
+	ChatMessageTimings,
 	// Database types
 	DatabaseConversation,
 	DatabaseMessage,
 	DatabaseMessageExtra,
 	DatabaseMessageExtraAudioFile,
-	DatabaseMessageExtraImageFile,
-	DatabaseMessageExtraLegacyContext,
-	DatabaseMessageExtraPdfFile,
-	DatabaseMessageExtraTextFile,
 	DatabaseMessageExtraVideoFile,
+	DatabaseMessageExtraImageFile,
+	DatabaseMessageExtraTextFile,
+	DatabaseMessageExtraPdfFile,
+	DatabaseMessageExtraLegacyContext,
 	ExportedConversation,
 	ExportedConversations,
-	ModelLoadProgress,
 	// Model types
 	ModelModalities,
 	ModelOption,
+	ModelLoadProgress,
 	// Settings types
 	SettingsChatServiceOptions,
-	SettingsConfigType,
 	SettingsConfigValue,
-	SettingsFieldConfig
+	SettingsFieldConfig,
+	SettingsConfigType
 } from '$lib/types';
+
+import { ServerRole, ServerModelStatus, ModelModality } from '$lib/enums';
 
 declare global {
 	// namespace App {
@@ -139,12 +142,5 @@ declare global {
 	interface Window {
 		idxThemeStyle?: number;
 		idxCodeBlock?: number;
-
-		// File System Access API - not in the DOM lib and unavailable in some browsers
-		showDirectoryPicker?: (options?: {
-			id?: string;
-			mode?: 'read' | 'readwrite';
-			startIn?: FileSystemHandle | string;
-		}) => Promise<FileSystemDirectoryHandle>;
 	}
 }
