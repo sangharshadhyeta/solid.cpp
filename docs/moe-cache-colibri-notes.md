@@ -1,3 +1,111 @@
+# START HERE - handoff summary for a fresh session (e.g. on the H200 box)
+
+If you're picking this up cold, with none of the conversation that produced
+this document: read this section first, then use the rest of the file as
+reference. Everything below is dated and sourced - treat anything not
+re-verified on the new hardware as a hypothesis carried over from a
+different GPU (RTX 3060, 12GB), not a guarantee.
+
+## What this is
+
+A working port of a community MoE expert-cache feature into llama.cpp,
+validated end-to-end with a real measured speedup. Goal: run large MoE
+models (target: GLM-5.2, 744B) fast on hardware where the model doesn't fit
+in VRAM, by keeping hot experts cached in VRAM while cold experts run on
+CPU - instead of either the whole model running slow on CPU, or needing
+enough VRAM for the whole thing.
+
+## Where the code is
+
+Branch `moe-cache-port` in this repo, based on `ggml-org/llama.cpp` master
+at commit `1f368f354`, 22 commits ahead. Remotes already configured:
+`origin` = `ggml-org/llama.cpp`, `leloch` = `leloch/llama.cpp` (source of
+the ported feature, branch `moe-cache-pr`). If this is a fresh checkout
+elsewhere, `git log --oneline` on this branch is the actual build history -
+trust it over this doc for anything code-related, since docs can drift and
+git can't.
+
+Key commits, in order: our own mmap host-pinning fix, then 4 ported commits
+from leloch/moe-cache-pr (the core feature + its rework), then a fixup
+commit for rebase drift (2 small bugs from porting across 797 commits of
+upstream drift, both documented in the commit message), then this
+documentation trail.
+
+## How to build (what worked on the sandbox RTX 3060 box)
+
+CUDA 13.3 toolkit, gcc-toolset-13 (needed specifically because the stock
+system gcc/binutils couldn't assemble AVX-VNNI instructions the CPU backend
+generates with `-march=native` - unrelated to CUDA, just a build-env
+gotcha). Configure with `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=<your
+GPU's compute capability>` (was 86 for the 3060; H200 is Hopper, compute
+capability 90 - use `-DCMAKE_CUDA_ARCHITECTURES=90` or `native`). Verify
+with `./build/bin/llama-cli --list-devices` before doing anything else.
+
+## The two gotchas that will bite you immediately - set these explicitly
+
+Do not trust the defaults. Confirmed by direct testing, not assumption:
+
+1. `--moe-cache auto` (and `on`) **never engages on a single-GPU system**,
+   full stop, regardless of free VRAM - there's a hard `automatic &&
+   devices < 2` check in the code. **Always use an explicit numeric budget**:
+   `--moe-cache <MiB>`.
+2. `GGML_CUDA_MOE_CACHE_MAX_BATCH` defaults to **1**, not 8 (8 is only the
+   max allowed value). Default 1 rejects every call except exact
+   single-token batches - even ordinary prefill gets silently rejected, no
+   error. **Set `GGML_CUDA_MOE_CACHE_MAX_BATCH=8` explicitly.**
+3. `GGML_CUDA_MOE_CACHE_RESERVE_MB` defaults to **3072 (3GB)**, sized for
+   24GB+ cards. Check actual free VRAM after model load (`nvidia-smi` while
+   the model is loaded, or read the `[moe-cache] CUDA%d prepare_budget`
+   figures if you re-add diagnostics) before assuming the default is fine -
+   on a 12GB card it left only ~47MB, blocking the cache entirely. **On the
+   H200 (141GB) this is much less likely to bite, but verify rather than
+   assume** - a 26B model with 5-10 concurrent user KV caches could still
+   eat into headroom differently than our single-user sandbox test did.
+
+**How to verify it's actually working, don't trust silence**: run with `-v`
+and grep for `[moe-cache] CUDA%d pool[` (confirms a pool was actually
+allocated) and `[moe-cache] CUDA%d hits=` (confirms real cache traffic). No
+error is printed when the cache silently fails to engage - absence of these
+two log lines, not an error message, is the failure signal. If you don't
+see them, one of the three gotchas above is still active.
+
+## What's actually validated vs. still a hypothesis
+
+**Validated by direct measurement** (RTX 3060, Gemma-4-26B-A4B, see full
+section below): the port compiles, runs, produces correct output, and
+delivers a real +54% decode speedup (27.0 -> 41.6 tok/s) with 62.1% cache
+hit rate once the three gotchas above are fixed.
+
+**Still a hypothesis, not yet measured**: everything about the GLM-5.2/H200
+target specifically - the 40+ tok/s target, the capacity math (~439GB
+model, ~429GB experts fitting in 512GB RAM), the MTP interaction, the
+concurrency behavior at 5-10 users. All reasoned from evidence (GLM-5.2's
+confirmed routing skew, other people's benchmarks on different hardware)
+but none of it has been run for real yet. That's the next step.
+
+## Recommended first moves on the H200 box
+
+1. Build (see above), confirm `--list-devices` sees the H200.
+2. Download `unsloth/GLM-5.2-GGUF` (UD-Q4_K_M, 11 shards, ~439GB total) -
+   this will take a while regardless of connection speed given the size;
+   start it early and work on other setup while it downloads.
+3. Reproduce the RTX 3060 validation methodology on GLM-5.2 before trusting
+   any tok/s number: explicit `--moe-cache <budget>`,
+   `GGML_CUDA_MOE_CACHE_MAX_BATCH=8`, a `RESERVE_MB` sized to actual free
+   VRAM after load (check with `-v`, don't assume), a clean `--moe-cache
+   off` baseline run for comparison, and `-v` to confirm real
+   `pool[`/`hits=` log lines before trusting any number.
+4. Measure hit-rate *distribution*, not just the aggregate hit rate - see
+   the "load-bearing caveat" section below on why routing skew (not just
+   the mechanism) determines whether this actually helps GLM-5.2 the way it
+   helped Gemma-4-A4B.
+5. Only after that's confirmed working: layer in native MTP (already merged
+   upstream, verified present in the unsloth GGUF - see below), then work
+   through the medium-term list (concurrency tuning, prefix caching) as
+   real usage surfaces real bottlenecks, not before.
+
+---
+
 # VALIDATED 2026-08-13: moe-cache works, real 54% speedup measured on RTX 3060
 
 First real end-to-end test on the downloaded Gemma-4-26B-A4B model. Took real
