@@ -1136,16 +1136,27 @@ against exactly this failure mode.
 - Layer 2 extension: concurrency-target-aware calibration (calibrate for
   "N concurrent users" specifically, not just solo decode speed) - real
   extension of the now-built Layer 2, not yet attempted.
-- Verify whether Colibri actually avoids the full prefill pass before the
-  first token on large contexts, and if so how (prefix/KV caching?
-  chunked prefill?) - raised by the user, not yet investigated against
-  Colibri's actual source. Transformer attention architecturally requires
-  processing the whole prompt before the first output token regardless of
-  engine, so if Colibri's first-token latency doesn't show this, it's
-  using a real technique worth identifying, not skipping something
-  fundamental - both plausible candidate techniques (automatic prefix
-  caching, chunked prefill) are already separately tracked in the vLLM
-  feature-parity backlog below, unconnected to this specific claim.
+- ~~Verify whether Colibri actually avoids the full prefill pass before the
+  first token~~ **RESOLVED, 2026-08-14, checked against actual source**
+  (`c/kv_prefix.h` in JustVugg/colibri, cloned and read directly). It
+  doesn't - the file's own comments are explicit that prefilling zero
+  tokens would leave no hidden state to sample from, and a genuinely new
+  or diverged prompt gets full prefill exactly like llama.cpp. What it
+  actually does: each conversation is pinned to a KV slot (since their
+  commit #639) with the exact token ids that state was built from
+  recorded; if the next turn's prompt prefix exactly matches those
+  recorded ids, only the new tail gets prefilled, skipping re-processing
+  of everything the previous turn already computed - exploiting that chat
+  clients resend the whole transcript every turn. All-or-nothing per
+  session (`kv_prefix_reuse` returns the full matched length or 0, no
+  partial/tree matching), any divergence anywhere falls back to full
+  prefill from scratch. Their own measured number: DeepSeek V4, a second
+  turn reusing 82% of its prompt, 320s -> 61s. This is a narrower,
+  single-session version of the same idea as "Automatic prefix caching"
+  below (vLLM/SGLang's RadixAttention shares prefixes *across* sessions
+  via a shared radix tree; this is scoped to one pinned conversation
+  slot, exact-match only) - not a new technique to add, confirms the
+  already-tracked item is the right thing to build if this is wanted.
 
 ## Explicitly decided against
 Full PagedAttention (maintainers want the narrower path), multi-LoRA
