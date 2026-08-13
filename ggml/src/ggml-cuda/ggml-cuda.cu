@@ -5469,17 +5469,23 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
 // routing) silently drops off the fast MMVQ kernel onto a slower general
 // path for this GPU+quant-type combination - a real, hardware-level
 // throughput cliff, not a placement/VRAM problem the rest of Layer 1
-// already knows how to reason about. Scoped to device 0: the CUDA
-// backend's internal device numbering doesn't map 1:1 onto the global
-// ggml_backend_dev_get() index space used by callers outside this file,
-// and single-GPU is the deployment case this warning targets first -
-// worth revisiting for tensor-split multi-GPU setups later.
-static int ggml_backend_cuda_get_mmvq_mmid_max_batch(int type) {
+// already knows how to reason about. Takes the caller's own
+// ggml_backend_dev_t (already resolved via ggml_backend_dev_get() and
+// confirmed to route to this backend's reg, since that's how the caller
+// obtained this function pointer in the first place) rather than a raw
+// index - dev->context safely recovers this backend's own device index
+// from it, so this works correctly per-GPU on tensor-split multi-GPU
+// setups too, not just the first device.
+static int ggml_backend_cuda_get_mmvq_mmid_max_batch(int type, ggml_backend_dev_t dev) {
     const auto & info = ggml_cuda_info();
-    if (info.device_count <= 0) {
+    if (!dev || info.device_count <= 0) {
         return MMVQ_MAX_BATCH_SIZE;
     }
-    return get_mmvq_mmid_max_batch((ggml_type) type, info.devices[0].cc);
+    const auto * dev_ctx = (const ggml_backend_cuda_device_context *) dev->context;
+    if (dev_ctx->device < 0 || dev_ctx->device >= info.device_count) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+    return get_mmvq_mmid_max_batch((ggml_type) type, info.devices[dev_ctx->device].cc);
 }
 
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
