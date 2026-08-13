@@ -153,6 +153,115 @@ size `GGML_CUDA_MOE_CACHE_RESERVE_MB` based on actual free VRAM after model
 load, not the 3GB default. Verify eligibility empirically (real pool[]/hits=
 log lines with `-v`), don't just assume config was accepted.
 
+**Superseded 2026-08-13 (same day, later): these three defaults were fixed
+in core code, not just documented as gotchas.** User pushback: "they removed
+it so we won't do is not the correct argument... our system should at least
+be as smart as we are doing by self." Changes in `moe-cache.cu`:
+`max_batch` default 1→8; `reserve_mb` default 3072→0 (sentinel meaning
+"compute live": `min(1024, max(128, free_mb/20))` MiB, i.e. 5% of free VRAM
+at the moment of session creation, clamped 128-1024 MiB); the single-GPU
+`automatic && devices < 2` dormancy gate relaxed to just `devices == 0` at
+all three call sites (session creation, budget check, eligibility check).
+Net effect: `--moe-cache auto` with zero env vars now does on a 12GB
+single-GPU card what previously required hand-tuning two env vars per
+piece of hardware. See the sweep results below for the A/B proof this
+actually closes the gap to manual tuning.
+
+# Autonomous calibration sweep, 2026-08-13 (RTX 3060, Gemma-4-26B-A4B)
+
+Two unsupervised sweeps run via `llama-bench`/`llama-server` while stepping
+away, testing whether the live-computed `auto` defaults above actually hold
+up across configs, and how much headroom is left in placement/concurrency.
+Scripts and raw logs: `/root/.claude/jobs/a804561e/tmp/moe_cache_sweep.sh`
+(v1) and `moe_cache_sweep_v2.sh` (v2) - not committed to the repo (job
+scratch dir), summarized here instead.
+
+## v1 (126s wall clock - budgeted 55 min, workload was just fast on this HW)
+
+**Phase 1 - `--moe-cache` mode/budget sweep, fixed safe placement (`-ncmoe
+99`, all experts CPU-resident, GPU handles cache-hit rows only), `-p 128 -n
+64 -r 3`:**
+
+| `--moe-cache` | decode tok/s |
+|---|---:|
+| `off` | 27.71 ± 0.05 |
+| `auto` (live-computed) | **48.90 ± 6.64** |
+| `512` | 30.39 ± 1.08 |
+| `1024` | 37.59 ± 1.40 |
+| `2048` | 43.60 ± 1.72 |
+| `4096` | 50.34 ± 8.29 |
+| `8192` | 50.21 ± 7.70 |
+
+**Headline finding: `auto` (48.90) lands within ~3% of the best
+hand-picked value (4096: 50.34), both within the run-to-run noise band (±7-8
+tok/s at this batch size).** The live-reserve fix isn't just "unblocked" -
+it's landing at essentially the same place a human sweeping budgets by hand
+would land, with zero tuning. This is the direct evidence for the
+self-correcting behavior that was asked for: no env vars, no per-card
+tuning, and it's not leaving the manually-tunable gains on the table.
+
+**Phase 2 - `-ncmoe` placement sweep, `--moe-cache auto`, `-p 128 -n 64 -r
+2`, pushing past the previously-assumed-safe boundary of 30:**
+
+| `-ncmoe` | decode tok/s | result |
+|---:|---:|---|
+| 30 | 46.63 ± 8.60 | ok (previous "safe" baseline) |
+| 29 | 47.55 ± 9.19 | ok |
+| 28 | 47.71 ± 8.68 | ok |
+| 26 | 49.72 ± 8.78 | ok |
+| 24 | 50.77 ± 7.91 | ok, **no OOM** |
+
+Monotonically climbing as more experts move to GPU, and the sweep stopped
+at 24 only because that was the last value scripted, not because it hit a
+wall. **This means the previously-documented "safe" placement (30) was
+conservative - there was real untested headroom below it.** v2 (below)
+pushes further to find the actual boundary.
+
+**Phase 3 - concurrent-request emulation** (`llama-server --parallel 8`,
+`--moe-cache auto`, mixed short/long/agentic-style prompts, `n_predict=60`):
+
+| concurrency | aggregate tok/s |
+|---:|---:|
+| 1 | 37.56 |
+| 2 | 70.22 |
+| 4 | 80.88 |
+| 8 | 103.07 |
+
+Near-linear 1→2 (1.87x), diminishing but still positive returns through 8.
+Healthy scaling shape for the batching to build on.
+
+**Phase 4 - variance check** (5x repeat, `auto`, `-ncmoe 99`): 52.79 ± 7.36
+tok/s. Consistent with phase 1's `auto` number within noise; ±14% run-to-run
+variance at this prompt/gen size is real and should be accounted for when
+comparing configs that differ by less than ~10-15%, not treated as
+measurement error to explain away.
+
+## v2 (launched immediately after v1, ~50 min budget) - results pending
+
+Purpose: v1 left three things unexplored that the user's original ask
+("emulate users and requests to find optimal solutions... various kinds of
+configs and loads") called for and 126s wasn't enough time to cover:
+
+1. **Where's the actual OOM boundary?** v1 stopped at `-ncmoe 24` un-OOM'd.
+   v2 pushes the joint `-ncmoe` x `--moe-cache` grid down to 4, cross-tested
+   against `auto`/4096/8192 cache budgets (placement and cache budget share
+   the same VRAM pool, so the true optimum is a joint search, not two
+   independent 1-D sweeps - this was flagged explicitly by the user: "our
+   system should at least be as smart as we are doing by self").
+2. **Does `MAX_BATCH` still matter now that it defaults to 8?** Sweep
+   2/4/8/16/32 to check whether the new default is actually the local
+   optimum or just "no longer catastrophically wrong."
+3. **Concurrency at the actual deployment target.** v1 only tested powers of
+   2 up to 8; v2 adds 5 and 10 directly (the real target is "5-10 users"),
+   extends to 16 to see where saturation sets in, and uses longer
+   `n_predict=200` generations with more agentic-style prompts to better
+   match real usage than the short 60-token test.
+
+Check `/root/.claude/jobs/a804561e/tmp/sweep-v2-results/summary.md` for
+results once complete - this doc will get a follow-up update with the
+numbers and any resulting change to the placement/cache-budget
+recommendation.
+
 # Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
 
 ## Already built, VALIDATED with real measurement
