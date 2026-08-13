@@ -55,6 +55,15 @@ struct ggml_moe_cache_api {
     // callers must check for NULL before calling, same as other optional
     // entries here.
     void (*set_max_batch_hint)(int n_seq_max);
+
+    // Aggregate hit/miss counts summed across every currently-live session's
+    // devices. Meant for calibration/benchmarking callers that create one
+    // context at a time (the common case there), not general production
+    // monitoring - with multiple concurrent sessions this sums across all of
+    // them, not just "the" one a caller might have in mind. Writes 0/0 if no
+    // session has recorded anything yet. NULL-safe like the other optional
+    // entries here.
+    void (*get_stats)(long long * out_hits, long long * out_misses);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

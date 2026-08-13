@@ -109,11 +109,6 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    if (params.moe_calibrate) {
-        common_moe_calibrate(params);
-        return 0;
-    }
-
     return llama_server(params, argc, argv);
 }
 
@@ -159,6 +154,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
             params.n_parallel = 4;
             params.kv_unified = true;
         }
+    }
+
+    // Must run after the n_parallel auto-resolution above -
+    // common_moe_calibrate() builds a real llama_context_params from
+    // params.n_parallel, and -1 ("auto", never resolved before this point)
+    // silently wraps to a huge unsigned n_seq_max and crashes the no-alloc
+    // probe with "n_seq_max must be <= 256" - found by testing --moe-calibrate
+    // together with --model-draft/--spec-type for real, not by inspection.
+    if (params.moe_calibrate) {
+        common_moe_calibrate(params);
+        return 0;
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

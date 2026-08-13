@@ -582,6 +582,21 @@ count/step size is still reasonable there).
 
 # Native MTP speculative decoding, 2026-08-13 (RTX 3060, Gemma-4-26B-A4B)
 
+> **RETRACTED 2026-08-14, see the endpoint-bias investigation section
+> below**: every number in this section and in the `--spec-draft-n-max`
+> sweep section was measured via the raw `/completion` endpoint with an
+> unformatted prompt. That endpoint bypasses this model's chat template
+> entirely, and the model (instruction/reasoning-tuned) produces
+> degenerate, highly-repetitive output on unformatted prompts -
+> independent of MTP, moe-cache, or placement. Degenerate repetitive text
+> is trivially predictable, which silently inflates both MTP acceptance
+> rate and MoE-cache hit rate. **The real content was never checked for
+> these numbers, only tok/s** - so treat every specific number below as
+> unverified until the corrected re-measurement (same section, chat-
+> templated, content verified coherent) confirms or corrects it. The
+> qualitative finding that MTP produces a real speedup on this hardware
+> does still hold - the corrected numbers are lower but still positive.
+
 ## Real measured speedup
 
 Initially thought untestable on this sandbox - hand-parsed the main GGUF's
@@ -615,6 +630,10 @@ load in this short test - doesn't fully resolve the open question below,
 just no red flag in this specific run.
 
 ## `--spec-draft-n-max` sweep - the "2" was never actually tested, it's just Unsloth's suggested starting point
+
+> **RETRACTED 2026-08-14** - same reason as above: measured via raw
+> `/completion`, content never checked, numbers unverified. See the
+> corrected re-measurement in the endpoint-bias investigation section.
 
 Same principle already applied to `-ncmoe`/`n_threads` in Layer 2: don't
 trust a suggested default, measure it. Swept n_max in {1,2,3,4,5,6,8},
@@ -722,6 +741,200 @@ running alone.
    reservation rule - "only the test tells the truth" applies here the
    same as it did to placement itself.
 
+# Endpoint-bias investigation and Layer 1/2 architecture rewrite, 2026-08-14
+
+## The saga, honestly, because the wrong turns are as instructive as the right one
+
+While verifying the first joint `--moe-calibrate` run's winning config
+(golden-section search over `-ncmoe` and `spec-draft-n-max` together, see
+below), the actual generated text was checked for the first time in this
+whole MTP investigation - and it was degenerate, repetitive garbage
+("sz-sz-sz-sz...", "tah-tah-tah..."). Every prior MTP validation in this
+doc (the "1.33-1.35x speedup" section, the n_max sweep) had only ever
+checked `predicted_per_second`, never the actual `content` - so this
+wasn't a new bug, it was a pre-existing one that had simply never been
+looked at closely enough to catch.
+
+Systematic isolation (each step a real test, not a guess):
+- Reproduced at both the calibration's chosen `ncmoe=15` and the
+  earlier-"validated" `ncmoe=23`, and at both `n_max=4` and `n_max=2`
+  (the exact value the original "coherent output" claim used) - ruled out
+  the calibration search itself as the cause.
+- Reproduced on the exact commit from *before* this session's `max_batch`
+  fix (stashed current work, checked out the old commit, rebuilt,
+  retested) - ruled out a code regression from anything built this
+  session.
+- Reproduced with `--moe-cache off` entirely - ruled out moe-cache.
+- Reproduced with no `--model-draft`/`--spec-type` at all (plain
+  generation, same placement) - **ruled out MTP entirely**.
+- At this point the working theory turned to GPU/VRAM-level corruption
+  from ~30+ ungraceful `SIGKILL`s of CUDA processes over many hours on a
+  non-ECC consumer GPU (RTX 3060 has no ECC VRAM). Checked `dmesg` for
+  Xid errors (none), `nvidia-smi` for ECC errors (none), confirmed no
+  leaked processes/shared memory, and retested in the cleanest state
+  achievable without an actual reboot - **still reproduced**. This was
+  the wrong turn: the user correctly pushed back ("hardware is perfect,
+  don't question it") rather than letting the investigation settle on an
+  unfalsifiable environmental explanation.
+- Re-read the Unsloth MTP docs page (the same one already cited above)
+  with a more targeted query and found the actual cause in the
+  "Recommended Sampling Parameters" section, plus, independently, a
+  parsing-failure log line (`common_chat_peg_parse`) from an earlier
+  diagnostic run showing the model's *real* underlying generation was
+  coherent text prefixed with stray channel-marker tokens - a strong hint
+  that pointed at chat-formatting, not generation quality, being the
+  actual point of failure.
+- Confirmed directly: the same prompt via `/completion` (raw, unformatted)
+  produced garbage; the identical request via `/v1/chat/completions`
+  (chat-template applied server-side) produced clean, coherent reasoning
+  content. Reproduced on a second prompt. Corroborated independently via
+  a GitHub Discussion search - ["Why is my Llama.cpp result so much worse
+  than for the same model on another platform?"](https://github.com/ggml-org/llama.cpp/discussions/7781)
+  describes the identical symptom as a known pattern, not something
+  specific to this setup.
+
+**Root cause**: every MTP/moe-cache test this session used the raw
+`/completion` endpoint with an unformatted prompt string. This model
+(instruction/reasoning-tuned) requires its chat template
+(`<bos><|turn>system...<|turn>user...<|turn>model\n`, applied only by
+`/v1/chat/completions`) to generate coherently at all - independent of
+MTP, moe-cache, placement, or hardware. Every throughput number measured
+this way is invalid, not just cosmetically wrong: degenerate repetitive
+text is trivially predictable, which silently inflates both MTP
+acceptance rate (repeating a token is an easy guess for the draft) and
+MoE-cache hit rate (repetitive text routes to a narrow, unrealistic set
+of experts). The corrected re-measurement below is the only one of this
+session's MTP/calibration numbers that should be trusted.
+
+## Fix: unified the calibration benchmark path, not just the prompt format
+
+`common_moe_calibrate()`'s two benchmark functions had two different,
+independent bugs:
+- The `-ncmoe` search (`common_moe_bench_candidate`, in-process
+  `llama_decode()` calls, no HTTP server) fed the model the *same* kind of
+  raw, un-chat-templated prompt.
+- The `spec-draft-n-max` search (`common_moe_bench_candidate_server`,
+  subprocess-based, added earlier this session) used the raw
+  `/completion` endpoint.
+
+Rather than patch both separately, removed the in-process benchmark
+entirely and made the subprocess+HTTP path (`common_moe_bench_candidate_server`)
+the *only* benchmark function, used by both searches and by thread
+tuning. It now:
+- Launches a real `llama-server` subprocess with `--temp 1.0 --top-p 0.95
+  --top-k 64` (this model family's documented MTP sampling
+  recommendation), a fresh port per candidate (fixes a real port-reuse
+  race found separately - see below), and `-t`/`-tb` when tuning threads.
+- Sends `/v1/chat/completions` requests (proper chat template, applied
+  server-side, exactly like a real client) for two representative
+  prompts, averaging `timings.predicted_per_second` across both.
+- One retry per candidate before treating a failure as real (single
+  subprocess runs are noisy samples - same lesson as the n_max=3
+  run-to-run variance found earlier this session).
+
+This also meant thread tuning - previously skipped whenever MTP was
+calibrated, because its old in-process benchmark had no MTP awareness and
+mixing MTP/non-MTP throughput numbers wouldn't have been a fair
+comparison - could be **re-enabled**: since every candidate now goes
+through the same real, correct path, MTP-aware thread tuning is directly
+comparable to the placement/n_max numbers above it.
+
+## Other real bugs found and fixed during this work (independent of the endpoint bug)
+
+- **`n_seq_max=-1` crash**: `--moe-calibrate`'s early-exit in
+  `tools/server/server.cpp` ran before `params.n_parallel`'s `-1` ("auto")
+  sentinel got resolved to a real value, so `cparams.n_seq_max` silently
+  wrapped to a huge unsigned value and crashed the no-alloc probe with
+  `n_seq_max must be <= 256` - which then got **mis-reported** as "model
+  has no MoE experts" because the probe's exception handler didn't log
+  the real error, just returned an empty result indistinguishable from
+  "not a MoE model." Fixed both: moved the early-exit to after
+  `n_parallel` resolution, and made the exception handler log the actual
+  exception message.
+- **Stale `tok_per_sec` reporting**: the cache/log correctly picked the
+  best `n_max`, but the reported throughput number stayed at the
+  pre-n_max-search (`-ncmoe`-only) value unless the n_max result was
+  strictly higher - meaning a genuinely-better MTP-inclusive result could
+  still get under-reported. Fixed by carrying the n_max search's own
+  winning number forward once it's known to be real.
+- **Port-reuse race**: all `n_max` candidates originally shared one port
+  for the whole search. `SIGKILL`ing a candidate's server doesn't
+  guarantee the OS releases its listening socket before the next
+  candidate tries to bind the same port (TIME_WAIT) - caused a real,
+  reproducible intermittent "failed" candidate. Fixed with a fresh port
+  per subprocess.
+
+## Corrected, validated results (2026-08-14, chat-templated, content verified coherent)
+
+Same RTX 3060 + Gemma-4-26B-A4B + MTP Q8_0 sidecar setup, full joint
+`--moe-calibrate` run with the fixed benchmark path:
+
+**`-ncmoe` golden-section search** (range [13,17], derived from Layer 1's
+live safe floor):
+
+| ncmoe | tok/s |
+|---:|---:|
+| **15 (winner)** | **51.36** |
+| 14 | 46.84 |
+| 13 | 41.81 |
+
+**`spec-draft-n-max` envelope + golden-section search** (at ncmoe=15):
+
+| n_max | tok/s |
+|---:|---:|
+| 1 | 54.93 |
+| 2 | 56.06 |
+| 4 | 54.64 |
+| 7 | 49.60 |
+| 8 | 54.10 |
+| **9 (winner)** | **54.55** |
+| 10 | 52.38 |
+| 13 | 42.48 |
+| 16 | 39.40 (envelope edge) |
+| 32 | 22.79 |
+
+**Thread tuning** (at ncmoe=15, n_max=9): n_threads=12 (all logical cores)
+won at 56.92 tok/s, beating the default of 6 - notably the *opposite* of
+this session's earlier concurrency-cliff finding (there, more threads
+made things worse) - a reminder that these levers interact differently
+under different workloads (single-sequence MTP drafting+verifying is not
+the same CPU access pattern as the earlier multi-sequence concurrency
+test) and shouldn't be assumed to generalize from one context to another.
+
+**Final winner**: `ncmoe=15, n_threads=12, spec-draft-n-max=9`, 56.92
+tok/s, cached correctly and picked up automatically on a normal launch
+(confirmed: `common_maybe_autoplace_moe_cpu` log line shows all three
+values applied). **Real coherent output confirmed** via
+`/v1/chat/completions` on two separate prompts post-calibration, e.g.
+"Photosynthesis is the process where plants use sunlight to turn carbon
+dioxide and water into food..." - and the response's own `timings` block
+now exposes `draft_n`/`draft_n_accepted` directly (155/389 ≈ 40% and
+166/291 ≈ 57% on the two test prompts) - realistic acceptance rates for
+genuinely diverse text, a strong independent corroboration that the fix
+is measuring the real thing now, not inflated-by-repetition numbers.
+
+Compare to the retracted numbers: the corrected `-ncmoe` peak (51.36) and
+`n_max` peak (56.92 combined) are noticeably *lower* than the retracted
+run's inflated figures (53.99, 71.33) - exactly the direction predicted
+by "degenerate repetitive text is trivially predictable, artificially
+inflating measured throughput." The qualitative finding (MTP gives a real
+speedup on this hardware) still holds; the specific multiplier claimed
+earlier does not, and hasn't been re-derived cleanly yet (would need a
+proper chat-templated A/B against a no-MTP baseline, not yet done as a
+dedicated re-test - the numbers above are internal to the MTP-enabled
+calibration search, not compared against a corrected non-MTP baseline).
+
+## Lesson for next time
+
+The endpoint/prompt-formatting choice is not a cosmetic detail of a test
+harness - it changes what's actually being measured, silently, in a
+direction (inflated speedup) that's easy to mistake for a good result.
+Any future benchmark of a chat/instruct-tuned model through
+`llama-server` should default to `/v1/chat/completions`, and any
+"speedup" or "hit rate" claim should have the actual generated content
+spot-checked at least once, not just the timing numbers - cheap insurance
+against exactly this failure mode.
+
 # Build list summary (updated 2026-08-13, end of day)
 
 ## Already built, VALIDATED with real measurement
@@ -749,16 +962,24 @@ running alone.
   not calibrated for a specific concurrency target - see the Layer 2
   section for the full writeup.
 - **Native MTP speculative decoding** (merged upstream, `--spec-type
-  draft-mtp --model-draft <sidecar.gguf>`). **Measured 1.33-1.35x real
-  decode speedup** on RTX 3060 + Gemma-4-26B-A4B, using Unsloth's separate
-  MTP sidecar GGUF and `--spec-draft-n-max 2` (their recommended starting
-  point - higher n_max not yet swept). Provably lossless for output
-  quality (verified output is always sampled from the target model, never
-  the draft - see the MTP section above). Confirmed the same sidecar
-  pattern exists for `unsloth/GLM-5.2-GGUF` (20% acceptance-length
-  improvement claimed for GLM-5.2's own MTP layer per public sources) -
-  directly applicable to the real deployment target once that hardware is
-  available.
+  draft-mtp --model-draft <sidecar.gguf>`). Works and gives a real
+  speedup - confirmed with coherent output and realistic (40-57%)
+  acceptance rates after fixing a serious endpoint-formatting bug (see
+  "Endpoint-bias investigation" below). **The specific "1.33-1.35x"
+  multiplier is retracted** - that number and the entire n_max sweep were
+  measured via an endpoint that bypasses the model's chat template,
+  silently inflating throughput via degenerate repetitive generation. The
+  corrected joint calibration (ncmoe=15, n_threads=12, n_max=9, 56.92
+  tok/s) is real and content-verified, but wasn't compared against a
+  matching corrected non-MTP baseline, so a clean multiplier hasn't been
+  re-derived yet - that's a small, well-scoped follow-up, not a re-open
+  of the whole investigation. Provably lossless for output quality
+  regardless (verified output is always sampled from the target model,
+  never the draft). Confirmed the same sidecar pattern exists for
+  `unsloth/GLM-5.2-GGUF` (20% acceptance-length improvement claimed for
+  GLM-5.2's own MTP layer per public sources) - directly applicable to
+  the real deployment target once that hardware is available, **using
+  `/v1/chat/completions` for any validation there, not `/completion`**.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
 - FR-Spec draft-vocab trimming for GLM's MTP (pattern proven for Qwen,
