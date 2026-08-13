@@ -45,6 +45,16 @@ struct ggml_moe_cache_api {
     // Host buffer mutation or teardown notification. Sessions cancel or finish
     // any fill that still reads the supplied range before this call returns.
     void (*invalidate)(const void * base, size_t size);
+
+    // Live hint for the default max batch size a cache-eligible MUL_MAT_ID
+    // call may have (the provider still clamps to its own structural
+    // ceiling). Callers should pass the real max concurrent sequence count
+    // (e.g. llama_context's n_seq_max) before the next session_create(), so
+    // the cache doesn't silently disable itself once real concurrency
+    // exceeds a default sized for a single interactive session. NULL-safe:
+    // callers must check for NULL before calling, same as other optional
+    // entries here.
+    void (*set_max_batch_hint)(int n_seq_max);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend-moe-cache.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -600,6 +601,14 @@ void llama_context::sched_reserve() {
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+
+    // Tell any registered MoE cache provider the real max concurrent sequence
+    // count before it builds its session, so its default batch-eligibility
+    // ceiling matches actual deployment concurrency instead of a value only
+    // ever exercised by a single interactive session.
+    if (ggml_moe_cache.set_max_batch_hint) {
+        ggml_moe_cache.set_max_batch_hint((int) n_seqs);
+    }
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
 
