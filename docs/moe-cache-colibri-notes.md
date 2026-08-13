@@ -580,6 +580,120 @@ large models like GLM-5.2 where a single load may itself take minutes -
 worth timing on the actual H200 box before assuming the current candidate
 count/step size is still reasonable there).
 
+# Native MTP speculative decoding, 2026-08-13 (RTX 3060, Gemma-4-26B-A4B)
+
+## Real measured speedup
+
+Initially thought untestable on this sandbox - hand-parsed the main GGUF's
+header directly and found no `nextn`/mtp metadata keys, so assumed the
+Unsloth quant just didn't ship an MTP head. Wrong place to look: MTP isn't
+baked into the main model's tensors, it's a **separate sidecar GGUF file**,
+loaded through the *speculative decoding* subsystem
+(`params.speculative.draft.mparams.path`), not the main model's own
+tensors. Confirmed via the HF repo listing
+(`unsloth/gemma-4-26B-A4B-it-GGUF`): a `mtp-gemma-4-26B-A4B-it.gguf`
+sidecar exists (also BF16/F16/Q8_0 variants under `MTP/`), matching our
+already-downloaded main model. Downloaded the Q8_0 variant (441 MB,
+verified against a real HF-token-authenticated, resumable, retrying curl -
+see the download-reliability note below) and tested directly.
+
+`llama-bench` doesn't support `--spec-type`/`--model-draft` at all - used
+`llama-server` for the A/B instead: `-ngl 99 -ncmoe 23 --moe-cache auto -c
+4096` baseline vs. the same plus `--model-draft <mtp file> --spec-type
+draft-mtp --spec-draft-n-max 2` (2 is Unsloth's own recommended starting
+point), same two prompts both times:
+
+| prompt | baseline | MTP-enabled | speedup |
+|---|---:|---:|---:|
+| photosynthesis explanation | 50.05 tok/s | 67.60 tok/s | **1.35x** |
+| binary search + complexity | 56.91 tok/s | 75.57 tok/s | **1.33x** |
+
+Real, consistent **~1.33-1.35x** decode speedup, in line with (conservative
+end of) Unsloth's claimed 1.4-2.2x range for `--spec-draft-n-max 2` -
+higher `n_max` values (up to 6) are worth sweeping but not tried yet.
+moe-cache showed no dispatch/collect failures under MTP's verify-batch
+load in this short test - doesn't fully resolve the open question below,
+just no red flag in this specific run.
+
+## Download reliability note (unrelated to MTP itself, but real and costly)
+
+First attempt (plain anonymous `curl -sL`) silently truncated at 193 MB of
+441 MB - reported exit 0 despite being incomplete (the redirect target is a
+time-limited signed CDN URL; something about the transfer let curl think it
+finished cleanly when it hadn't). The `hf` CLI's own download (Xet-transfer
+backend) then hung at 0 bytes for several minutes in this sandbox - killed
+it and went back to curl, this time with `-C - --retry 8 --retry-all-errors`
+plus an `Authorization: Bearer <token>` header (same token already saved
+from the main model download) for resumability. That download was also
+oddly slow (~100-150 KB/s) until an unrelated leftover diagnostic `curl`
+process (from an earlier troubleshooting command that got auto-backgrounded
+after exceeding its foreground timeout) was found still silently
+downloading the *same file to `/dev/null`* in the background, competing for
+the same limited egress bandwidth - killing that stray process roughly 6x'd
+the real download's speed (120 KB/s -> 863 KB/s). Lesson: when a
+foreground command that should have finished quickly instead needs to be
+backgrounded, track it and clean it up explicitly rather than assuming it
+died - it may still be running and consuming resources silently.
+
+## Quality-preservation clarification (came up mid-investigation, worth recording)
+
+Speculative decoding is provably lossless for output quality by
+construction - not approximately, exactly. llama.cpp's actual verification
+(`common_sampler_sample_and_accept_n` in `common/sampling.cpp`) samples a
+token from the *target* model's own distribution at each position
+independently, then checks whether the draft's guess matches that
+independently-sampled token exactly; on any mismatch it keeps the token the
+target actually sampled and discards the rest of the draft. The output is
+therefore always literally a token the target model sampled on its own -
+a higher-precision drafter cannot lift output quality above what the
+(possibly heavily-quantized) target model would produce alone. What a
+better drafter *can* do is raise the acceptance rate (more of its guesses
+match what the target independently picks), which is pure speed, not
+quality. Relevant directly to the H200/GLM-5.2 deployment given the
+1-2bit-quantized GGUF options - MTP will make an aggressively-quantized
+GLM-5.2 faster, not better than that same aggressively-quantized GLM-5.2
+running alone.
+
+## Two real gaps found, not yet fixed
+
+1. **Exact-match verification is more conservative than necessary.**
+   `common_sampler_sample_and_accept_n`'s exact-match rule rejects cases
+   the classic probabilistic accept/reject rule (`accept with probability
+   min(1, p_target(token)/p_draft(token))`, from the original speculative
+   decoding papers) would have accepted - specifically, whenever the
+   draft's guess isn't the target's own top pick but the target still
+   assigns it real probability mass. This matters more the noisier/more
+   diffuse the target's distribution is (e.g. heavy quantization), which
+   is exactly the GLM-5.2 deployment's situation. A probabilistic
+   accept/reject scheme would likely raise acceptance rate - and therefore
+   the real-world speedup - without weakening the lossless guarantee at
+   all (that guarantee is what the original algorithm's proof covers).
+   **Not verified yet**: whether `--spec-type draft-mtp` specifically
+   routes through this exact function or a different implementation -
+   check before assuming this applies unmodified to the MTP path.
+   Meaningfully bigger and more delicate than LFRU eviction - touches
+   core sampling/verification correctness code, not moe-cache.
+2. **Planner has no visibility into the drafter's VRAM footprint.**
+   `common_maybe_autoplace_moe_cpu`/`common_moe_calibrate` only probe the
+   *main* model's memory needs (`common_get_device_memory_data(path_model,
+   &mparams, &cparams, ...)`) - the draft/MTP model is loaded via a
+   completely separate `llama_model_load_from_file` +
+   `llama_init_from_model` call in `speculative.cpp`
+   (`params.speculative.draft.mparams.path`), invisible to either layer of
+   what we built. Didn't cause a visible problem here since the MTP head
+   is tiny (441 MB) relative to the 12 GB card's headroom, but the
+   principle is real and matters more on H200 where free VRAM after
+   loading a 744B model may be thin. Confirmed the drafter must run on GPU
+   to be useful at all (CPU round-tripping per token would cost more
+   latency than speculative acceptance saves) - so this isn't a "maybe
+   offload it" question, the fix has to *reserve* GPU space for it, not
+   choose whether to. Standing design direction from this session: the
+   actual split between drafter-VRAM and main-model-expert-VRAM should be
+   found empirically (extend `--moe-calibrate` to test placement
+   candidates with the drafter enabled), not via a fixed static
+   reservation rule - "only the test tells the truth" applies here the
+   same as it did to placement itself.
+
 # Build list summary (updated 2026-08-13, end of day)
 
 ## Already built, VALIDATED with real measurement
@@ -606,11 +720,19 @@ count/step size is still reasonable there).
   now built and real. Known scope limit: single-sequence decode speed only,
   not calibrated for a specific concurrency target - see the Layer 2
   section for the full writeup.
+- **Native MTP speculative decoding** (merged upstream, `--spec-type
+  draft-mtp --model-draft <sidecar.gguf>`). **Measured 1.33-1.35x real
+  decode speedup** on RTX 3060 + Gemma-4-26B-A4B, using Unsloth's separate
+  MTP sidecar GGUF and `--spec-draft-n-max 2` (their recommended starting
+  point - higher n_max not yet swept). Provably lossless for output
+  quality (verified output is always sampled from the target model, never
+  the draft - see the MTP section above). Confirmed the same sidecar
+  pattern exists for `unsloth/GLM-5.2-GGUF` (20% acceptance-length
+  improvement claimed for GLM-5.2's own MTP layer per public sources) -
+  directly applicable to the real deployment target once that hardware is
+  available.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
-- Native MTP speculative decoding (merged, PR #25980, needs enabling/testing).
-  Comparable DSpark data on Gemma-4: 1.0-1.76x, task-dependent. Likely
-  highest-value low-effort win - no external checkpoint needed.
 - FR-Spec draft-vocab trimming for GLM's MTP (pattern proven for Qwen,
   issue #25187, needs ~30-line port to glm-dsa.cpp). ~75% draft LM-head
   compute cut, lossless. Small slice of total, but cheap once ported.
