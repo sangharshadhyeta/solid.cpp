@@ -1240,12 +1240,16 @@ against exactly this failure mode.
   throughput number yet; underlying paged-KV experiment showed 26->247
   concurrent-sequence capacity jump at equal VRAM on an A10G.
 - MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
-  MIN_BATCH). Tuning fix, not a feature. Unquantified until tested at
-  real concurrency. **Not entangled with the concurrency-cliff root cause
-  after all** - that turned out to be a GPU-kernel-dispatch limit in
-  `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to
-  llama-server's MAX_BATCH/MIN_BATCH batch-gate tuning. Can be scoped
-  independently now.
+  MIN_BATCH). **Started, 2026-08-14** - see "MTP verify-batch size x
+  concurrency" under Open questions above for the full writeup. Half
+  done: moe-cache's own `MAX_BATCH` gate is now MTP-aware (was silently
+  ignoring MTP's verify-width multiplier entirely, fixed and verified).
+  Still open: whether a real throughput dip remains in the 9-31 range now
+  that the gate is correctly sized - needs its own empirical sweep, not
+  done yet. **Not entangled with the concurrency-cliff root cause after
+  all** - that turned out to be a separate GPU-kernel-dispatch limit in
+  `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to this
+  MAX_BATCH/MIN_BATCH question.
 - Suffix Decode (PR #26283, model-free spec decoding). No number found.
   Additive to MTP, best case is repetitive agentic/tool-call output.
 - ~~The still-open concurrency-cliff root cause~~ **RESOLVED, 2026-08-14**
@@ -1435,7 +1439,7 @@ here for this specific concern.
 
 # Open questions, tracked but not yet resolved
 
-## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate
+## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate - PARTIALLY RESOLVED 2026-08-14
 
 Native MTP (GLM-5.2's NextN head, PR #25980) is architecturally safer than
 the external-drafter case the RFC thread found broken - MTP runs in the
@@ -1444,24 +1448,36 @@ drafter causes the cache to see zero hits" failure mode (a device/session
 binding conflict under shared-draft-device reordering) likely doesn't
 apply here.
 
-But a different, untested risk exists specific to our deployment: the RFC
-thread found a "dead batch-size zone" - requests sized 9-31 are served by
-neither the cache (gated by `GGML_CUDA_MOE_CACHE_MAX_BATCH`, default 8)
-nor the bulk-offload path (gated by `GGML_OP_OFFLOAD_MIN_BATCH`, default
-32). MTP verify batches are small individually (block_size ~7 in the
-Gemma DSpark reference example), but with 5-10 concurrent `--parallel`
-slots each potentially drafting-and-verifying at once, the *effective*
-batch size the scheduler sees could land in that gap. Nobody in the RFC
-thread tested MTP at real multi-user concurrency, only single-stream.
+The RFC thread's "dead batch-size zone" concern - requests sized 9-31
+served by neither the cache (gated by `GGML_CUDA_MOE_CACHE_MAX_BATCH`,
+default 8) nor the bulk-offload path (gated by `GGML_OP_OFFLOAD_MIN_BATCH`,
+default 32) - turned out to be two separable questions, not one:
 
-Not resolvable from the Gemma-4/RTX-3060 sandbox test - we won't be
-running 5-10 concurrent `--parallel` slots there. Needs explicit testing
-once we have access to hardware that can actually run that concurrency
-(the real H200 deployment, or a scaled-down concurrency test earlier if
-possible). If it turns out to be a real gap, the fix is likely widening
-`MAX_BATCH` and/or lowering `MIN_BATCH` so there's no dead zone for the
-batch sizes this deployment actually produces - not a redesign, just a
-tuning gap to close once measured.
+1. **Was moe-cache's own gate MTP-aware at all? No, confirmed and fixed.**
+   `set_max_batch_hint` (llama-context.cpp) passes `n_seq_max` alone, no
+   MTP verify-width multiplier - checked directly in the source, not
+   assumed. Under MTP, the real per-step batch is `n_seq_max *
+   (n_max+1)`, so the gate was silently sized for the no-MTP case on any
+   MTP-active deployment. Fixed in `common.cpp`
+   (`common_moe_apply_mtp_aware_max_batch_hint`, alongside Layer 1):
+   explicitly sets `GGML_CUDA_MOE_CACHE_MAX_BATCH` to `n_parallel *
+   verify_width` (capped at the real ceiling, 64) when MTP is active and
+   the operator hasn't set an explicit value themselves. Verified:
+   `--parallel 8` + MTP n_max=3 went from `max-batch=8` (bug, identical
+   to the no-MTP case) to `max-batch=32` (correct); `--parallel 16` +
+   n_max=3 went from 16 to 64. Non-MTP configs unaffected.
+2. **Does a real throughput dip still exist in the 9-31 range even with
+   the gate now correctly sized?** Not yet measured - `GGML_OP_OFFLOAD_MIN_BATCH`
+   (default 32, upstream, unrelated to moe-cache) is still a flat
+   constant, so for configs where the now-correctly-computed effective
+   batch lands between the (now live, possibly-higher) `MAX_BATCH` and
+   32, a gap could still exist. Also note this is a *third*, independent
+   mechanism from the MMVQ dispatch cliff found and fixed earlier the
+   same session (`MMVQ_MAX_BATCH_SIZE`) - that one decides which GPU
+   *kernel* handles an op once it's already running on GPU; this one
+   decides whether a CPU-resident op gets bulk-offloaded to GPU at all.
+   Needs its own empirical batch-size sweep (9-31 range) before treating
+   the gap as closed or still open - not done yet.
 
 # Real deployment target (drives all priority calls above and below)
 
