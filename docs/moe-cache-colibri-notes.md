@@ -580,7 +580,7 @@ large models like GLM-5.2 where a single load may itself take minutes -
 worth timing on the actual H200 box before assuming the current candidate
 count/step size is still reasonable there).
 
-# Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
+# Build list summary (updated 2026-08-13, end of day)
 
 ## Already built, VALIDATED with real measurement
 - moe-cache core port (leloch's design). Load-bearing feature. **Measured
@@ -589,6 +589,23 @@ count/step size is still reasonable there).
   skewed routing (Qwen-A3B), consistent with our own result. GLM-5.2
   confirmed skewed (SharkWipf: 30-50% measured).
 - mmap host-pinning fix (ours). One-time load-speed win only, not decode.
+- Live `reserve_mb`/`max_batch` defaults (ours) - closed a silent
+  cache-disabling bug for any concurrent deployment (`MAX_BATCH` hardcoded
+  to 8 regardless of `--parallel`). See the concurrency-cliff investigation
+  section.
+- **Layer 1: live safe-placement auto-fit** (ours) - `-ncmoe` auto-decided
+  live at every launch only when the config as given wouldn't fit, via a
+  predictive no-alloc probe before allocation. Validated: previously-crashing
+  config now self-corrects and serves real completions; explicit `-ncmoe`
+  always left untouched; a config that already fits shows zero interference.
+- **Layer 2: `--moe-calibrate`** (ours) - empirical throughput-optimal
+  placement + thread count, cached per GPU+model+context combo. **Measured
+  40% faster than Layer 1's safe floor alone (35.35 -> 49.33 tok/s)** on the
+  RTX 3060 sandbox - this *is* the "static pre-flight capacity/hit-rate
+  planner" item that used to sit in the longer-term/exploratory list below,
+  now built and real. Known scope limit: single-sequence decode speed only,
+  not calibrated for a specific concurrency target - see the Layer 2
+  section for the full writeup.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
 - Native MTP speculative decoding (merged, PR #25980, needs enabling/testing).
@@ -608,9 +625,17 @@ count/step size is still reasonable there).
   concurrent-sequence capacity jump at equal VRAM on an A10G.
 - MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
   MIN_BATCH). Tuning fix, not a feature. Unquantified until tested at
-  real concurrency.
+  real concurrency. Note: may be entangled with the still-unresolved
+  concurrency-cliff root cause (llama-server's own slot scheduling,
+  suspected but not confirmed) - worth investigating together, not
+  assuming they're independent.
 - Suffix Decode (PR #26283, model-free spec decoding). No number found.
   Additive to MTP, best case is repetitive agentic/tool-call output.
+- The still-open concurrency-cliff root cause itself (aggregate throughput
+  collapses at concurrency=10 on the RTX 3060 sandbox, three hypotheses
+  ruled out, points at llama-server's slot scheduling - not moe-cache).
+  Not yet in any build-list bucket because it's a diagnosis gap, not a
+  scoped feature - needs investigation before it can be scoped as a build.
 
 ## Longer-term / exploratory - not yet scoped as real builds
 - Persistent cross-session usage history (Colibri-style) - avoids
@@ -619,8 +644,9 @@ count/step size is still reasonable there).
   protects against static-beats-dynamic-on-uniform-routing failure case,
   unscoped.
 - Live per-expert heatmap UI - debugging/demo value, not performance.
-- Static pre-flight capacity/hit-rate planner - planning tool, not
-  performance.
+- Layer 2 extension: concurrency-target-aware calibration (calibrate for
+  "N concurrent users" specifically, not just solo decode speed) - real
+  extension of the now-built Layer 2, not yet attempted.
 
 ## Explicitly decided against
 Full PagedAttention (maintainers want the narrower path), multi-LoRA
