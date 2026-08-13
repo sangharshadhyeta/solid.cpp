@@ -1,7 +1,10 @@
 #include "fit.h"
 #include "gguf.h"
 
+#include <algorithm>
 #include <cstring>
+#include <cstdlib>
+#include <sys/stat.h>
 
 #include "log.h"
 
@@ -176,6 +179,268 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].compute = impl[i].mb.compute;
     }
     return ret;
+}
+
+// Per-expert-tensor byte sizes for a MoE model's FFN expert weights, scanned
+// directly from GGUF tensor metadata (no weights loaded). Distinguishes the
+// gate_up-fused layout (Gemma-4, GLM-5.2, DeepSeek2, Cohere2MoE, Qwen3.5MoE
+// all use this) from the separate gate/up layout other architectures use,
+// since moe-cache sizes a distinct VRAM pool per tensor *kind* and each must
+// independently clear its own minimum-pool-size gate.
+struct common_moe_cache_expert_sizes {
+    long gate_up_or_gate_bytes = -1; // ffn_gate_up_exps (fused), or ffn_gate_exps (separate)
+    long up_bytes               = -1; // ffn_up_exps, only set when the layout is NOT fused
+    long down_bytes             = -1; // ffn_down_exps
+
+    bool valid() const { return gate_up_or_gate_bytes > 0 && down_bytes > 0; }
+    // conservative floor: both pools (gate_up-or-gate, and down; plus up if
+    // separate) must independently clear moe-cache's `expert_size * 64`
+    // minimum, so the budget needs to clear the sum of all found kinds.
+    long combined_bytes() const {
+        long sum = 0;
+        if (gate_up_or_gate_bytes > 0) sum += gate_up_or_gate_bytes;
+        if (up_bytes > 0)              sum += up_bytes;
+        if (down_bytes > 0)            sum += down_bytes;
+        return sum;
+    }
+};
+
+static long moe_cache_tensor_expert_bytes(
+        struct gguf_context * gctx, int64_t n_tensors, const char * pattern, int64_t n_expert) {
+    if (n_expert <= 0) {
+        return -1;
+    }
+    for (int64_t i = 0; i < n_tensors; i++) {
+        const char * name = gguf_get_tensor_name(gctx, i);
+        if (strstr(name, pattern)) {
+            return (long)(gguf_get_tensor_size(gctx, i) / n_expert);
+        }
+    }
+    return -1;
+}
+
+// scans one gguf file; returns a result with valid()==false if no routed-expert
+// tensors were found in this specific file (common for later shards of a
+// split GGUF that only hold dense layers, or vice versa)
+static common_moe_cache_expert_sizes common_moe_cache_expert_sizes_in_file(
+        const char * path, int64_t n_expert) {
+    common_moe_cache_expert_sizes out;
+    struct gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * gctx = gguf_init_from_file(path, ip);
+    if (!gctx) {
+        return out;
+    }
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+
+    out.gate_up_or_gate_bytes = moe_cache_tensor_expert_bytes(gctx, n_tensors, "ffn_gate_up_exps", n_expert);
+    if (out.gate_up_or_gate_bytes < 0) {
+        out.gate_up_or_gate_bytes = moe_cache_tensor_expert_bytes(gctx, n_tensors, "ffn_gate_exps", n_expert);
+        out.up_bytes              = moe_cache_tensor_expert_bytes(gctx, n_tensors, "ffn_up_exps", n_expert);
+    }
+    out.down_bytes = moe_cache_tensor_expert_bytes(gctx, n_tensors, "ffn_down_exps", n_expert);
+
+    gguf_free(gctx);
+    return out;
+}
+
+// handles split GGUFs (e.g. "-00001-of-00011.gguf") by scanning parts in
+// order until expert tensors are found, since a MoE model's expert weights
+// are not guaranteed to live in the first shard
+static common_moe_cache_expert_sizes common_moe_cache_scan_expert_sizes(
+        const char * path_model, int64_t n_expert) {
+    common_moe_cache_expert_sizes result = common_moe_cache_expert_sizes_in_file(path_model, n_expert);
+    if (result.valid()) {
+        return result;
+    }
+
+    std::string path(path_model);
+    const char * tag = strstr(path_model, "-00001-of-");
+    if (!tag) {
+        return result;
+    }
+    const int n_parts = atoi(tag + strlen("-00001-of-"));
+    for (int part = 2; part <= n_parts && !result.valid(); part++) {
+        std::string p(path_model);
+        char rep[16];
+        snprintf(rep, sizeof(rep), "-%05d-of-", part);
+        p.replace(tag - path_model, strlen("-00001-of-"), rep);
+        result = common_moe_cache_expert_sizes_in_file(p.c_str(), n_expert);
+    }
+    return result;
+}
+
+// Prints a recommended --moe-cache budget plus the GGML_CUDA_MOE_CACHE_*
+// env vars needed for it to actually engage, computed from a real no-alloc
+// device-memory probe (same one common_fit_print uses) plus a GGUF tensor
+// metadata scan for the model's per-expert byte sizes. Static, one-time
+// calculation - no running server needed, matches the moe-cache tuning
+// knobs being fixed facts about the hardware+model pairing, not something
+// that changes mid-session (see docs/moe-cache-colibri-notes.md for why
+// this is scoped as static rather than dynamic).
+void common_fit_print_moe_cache(
+        const char * path_model,
+        llama_model_params * mparams,
+        llama_context_params * cparams) {
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    auto dmd = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+    GGML_ASSERT(dmd.size() == devs.size() + 1);
+
+    if (hp_nex == 0) {
+        printf("# not a MoE model (expert_count=0) - moe-cache does not apply\n");
+        return;
+    }
+
+    common_moe_cache_expert_sizes sizes = common_moe_cache_scan_expert_sizes(path_model, hp_nex);
+    if (!sizes.valid()) {
+        printf("# WARNING: could not find routed-expert tensors in this GGUF's metadata\n"
+               "#   (checked ffn_gate_up_exps, ffn_gate_exps/ffn_up_exps, ffn_down_exps)\n"
+               "#   - unrecognized tensor naming for this architecture, no recommendation possible\n");
+        return;
+    }
+
+    const long combined_bytes = sizes.combined_bytes();
+    // matches moe-cache.cu's own `minimum_pool = expert_size * 64` gate, summed
+    // across every distinct tensor kind found (each must independently clear it)
+    const size_t minimum_needed_bytes =
+        (size_t)((sizes.gate_up_or_gate_bytes > 0 ? sizes.gate_up_or_gate_bytes * 64 : 0) +
+                 (sizes.up_bytes              > 0 ? sizes.up_bytes              * 64 : 0) +
+                 (sizes.down_bytes            > 0 ? sizes.down_bytes            * 64 : 0));
+
+    printf("# expert sizes: %s%ld KiB/expert",
+        sizes.up_bytes > 0 ? "gate=" : "gate_up=", sizes.gate_up_or_gate_bytes / 1024);
+    if (sizes.up_bytes > 0) {
+        printf(", up=%ld KiB/expert", sizes.up_bytes / 1024);
+    }
+    printf(", down=%ld KiB/expert, combined=%ld KiB/expert\n", sizes.down_bytes / 1024, combined_bytes / 1024);
+
+    if (devs.size() == 0) {
+        printf("# no GPU devices detected - moe-cache requires at least one CUDA device\n");
+        return;
+    }
+
+    // a modest, fixed safety margin for v1 - see docs/moe-cache-planner-scope.md's
+    // "open question" note on tuning this policy with more real hardware data
+    const size_t reserve_mib = 256;
+
+    for (size_t id = 0; id < devs.size(); id++) {
+        const long long expected_free = dmd[id].free - (long long) dmd[id].mb.total();
+        const long long available = expected_free - (long long)(reserve_mib << 20);
+
+        printf("\n# %s: free=%lldMiB total=%lldMiB projected_model+ctx+compute=%zuMiB expected_free_after_load=%lldMiB\n",
+            ggml_backend_dev_name(devs[id]),
+            (long long) dmd[id].free / 1024 / 1024, (long long) dmd[id].total / 1024 / 1024,
+            dmd[id].mb.total() / 1024 / 1024, expected_free / 1024 / 1024);
+
+        if (available <= 0 || (size_t) available < minimum_needed_bytes) {
+            printf("# WARNING: %s has only ~%lldMiB available after a %zuMiB reserve, but needs at least "
+                   "~%zuMiB for one cache slot per expert kind (64x the largest expert tensor).\n"
+                   "#   moe-cache will stay dormant on this device with any budget. Free VRAM first:\n"
+                   "#   lower -ngl / -ncmoe, use a smaller context, or reduce --parallel slots.\n",
+                ggml_backend_dev_name(devs[id]), std::max<long long>(available, 0), reserve_mib,
+                minimum_needed_bytes / 1024 / 1024);
+            continue;
+        }
+
+        const long long budget_mib = available / 1024 / 1024;
+        // absolute count, not a percentage: total expert count across all layers
+        // isn't available from this pass without loading the full model, and an
+        // unqualified percentage risks reading as a promise rather than a floor
+        // (see docs/moe-cache-colibri-notes.md's routing-skew section on why real
+        // hit rate depends on routing concentration, not just capacity)
+        const long long cacheable_experts = combined_bytes > 0 ? available / combined_bytes : 0;
+
+        printf("--moe-cache %lld\n", budget_mib);
+        printf("GGML_CUDA_MOE_CACHE_MAX_BATCH=8\n");
+        printf("GGML_CUDA_MOE_CACHE_RESERVE_MB=%zu\n", reserve_mib);
+        printf("# ~%lld expert-slot-equivalents cacheable at this budget (combined gate/up/down per slot)\n", cacheable_experts);
+        if (devs.size() == 1) {
+            printf("# NOTE: 1 GPU detected - --moe-cache auto/on never engage on a single GPU regardless of\n"
+                   "#   free VRAM (moe-cache.cu: automatic && devices < 2 forces dormant). The explicit\n"
+                   "#   numeric budget above is required, not optional, on this hardware.\n");
+        }
+    }
+
+    // --- placement preference: is full CPU-offload + cache likely better than
+    // a static partial GPU placement? ---
+    //
+    // Adapted from leloch/moe-cache-pr's own common_moe_cache_prefers_cpu_moe(),
+    // which lived in this file (commit e9de20cf1) before the final rework
+    // removed it as "the unsafe auto-fit gguf scanning placement rule" - not
+    // because the economics were wrong (their own measured numbers: a 754B
+    // model went 19.2 vs 14.0 tok/s, a 397B model 33.3 vs 28.2 tok/s, full
+    // CPU-offload+cache beating static partial placement both times), but
+    // because a heuristic calibrated on 6 configs is risky to ship broadly to
+    // unknown users. We don't have that constraint - this tool is being
+    // validated against our own hardware as we go, starting with one
+    // confirmed data point (RTX 3060 + Gemma-4-26B-A4B: full CPU-offload +
+    // cache measured +54% over the CPU-offload-without-cache baseline). The
+    // partial-GPU-placement-without-cache alternative has NOT yet been
+    // measured on our hardware, so the thresholds below are leloch's
+    // calibration, not yet independently re-confirmed by us - see
+    // docs/moe-cache-planner-scope.md before trusting this on new hardware.
+    {
+        size_t model_bytes = 0;
+        {
+            const char * tag = strstr(path_model, "-00001-of-");
+            int n_parts = 1;
+            if (tag) {
+                n_parts = atoi(tag + strlen("-00001-of-"));
+            }
+            for (int part = 1; part <= (n_parts > 0 ? n_parts : 1); part++) {
+                std::string p(path_model);
+                if (tag) {
+                    char rep[16];
+                    snprintf(rep, sizeof(rep), "-%05d-of-", part);
+                    p.replace(tag - path_model, strlen("-00001-of-"), rep);
+                }
+                struct stat st;
+                if (stat(p.c_str(), &st) == 0) {
+                    model_bytes += (size_t) st.st_size;
+                }
+            }
+        }
+
+        size_t usable_vram = 0;
+        for (size_t id = 0; id < devs.size(); id++) {
+            usable_vram += (size_t) std::max<int64_t>(dmd[id].free, 0);
+        }
+
+        const double spill_ratio = usable_vram > 0 ? (double) model_bytes / (double) usable_vram : 99.0;
+        const long largest_expert_kib =
+            std::max({sizes.gate_up_or_gate_bytes, sizes.up_bytes, sizes.down_bytes}) / 1024;
+
+        printf("\n# --- placement preference (leloch's calibration, not yet independently\n"
+               "#     re-validated on this hardware - see docs/moe-cache-planner-scope.md) ---\n");
+        printf("# model_bytes=%zuMiB usable_vram=%zuMiB spill_ratio=%.2f largest_expert=%ldKiB devices=%zu\n",
+            model_bytes / 1024 / 1024, usable_vram / 1024 / 1024, spill_ratio, largest_expert_kib, devs.size());
+
+        bool prefer_cpu_moe;
+        const char * reason;
+        if (spill_ratio < 1.8) {
+            prefer_cpu_moe = false;
+            reason = "spill_ratio < 1.8: model mostly fits, static placement should already do well";
+        } else if (devs.size() < 2 && largest_expert_kib < 2048) {
+            prefer_cpu_moe = false;
+            reason = "single device + small experts: leloch's data showed per-device dispatch-chain\n"
+                      "#   serialization costing 6-18% on one-GPU configs with small experts";
+        } else {
+            prefer_cpu_moe = true;
+            reason = "large spill + (multi-device or big-enough experts): leloch's measured configs\n"
+                      "#   favored full CPU-offload + cache here (754B: 19.2 vs 14.0 t/s; 397B: 33.3 vs 28.2 t/s)";
+        }
+
+        printf("# RECOMMENDATION: %s full CPU-offload (--cpu-moe / high --n-cpu-moe) + moe-cache\n",
+            prefer_cpu_moe ? "PREFER" : "DO NOT prefer");
+        printf("#   reason: %s\n", reason);
+        if (!prefer_cpu_moe) {
+            printf("#   -> try --fit-target / a partial --n-cpu-moe placement instead, and compare\n"
+                   "#      against the full-offload+cache config above empirically before trusting either.\n");
+        }
+    }
 }
 
 static void common_params_fit_impl(
