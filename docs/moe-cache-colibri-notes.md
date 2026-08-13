@@ -994,7 +994,12 @@ against exactly this failure mode.
   +54% decode speedup (27.0 -> 41.6 tok/s), 62.1% hit rate on our RTX 3060 +
   Gemma-4-26B-A4B** - see validation section above. RFC: 1.7-2.1x decode on
   skewed routing (Qwen-A3B), consistent with our own result. GLM-5.2
-  confirmed skewed (SharkWipf: 30-50% measured).
+  confirmed skewed (SharkWipf: 30-50% measured). **Independently
+  re-verified 2026-08-14 via `/v1/chat/completions`** (different placement,
+  ncmoe=15: `--moe-cache off` 39.37 tok/s vs `--moe-cache auto` 51.71
+  tok/s, **+31.3%**) - the mechanism's core value holds up under the
+  corrected, chat-templated benchmark path, not just the original
+  `/completion`-based measurement.
 - mmap host-pinning fix (ours). One-time load-speed win only, not decode.
 - Live `reserve_mb`/`max_batch` defaults (ours) - closed a silent
   cache-disabling bug for any concurrent deployment (`MAX_BATCH` hardcoded
@@ -1012,7 +1017,14 @@ against exactly this failure mode.
   planner" item that used to sit in the longer-term/exploratory list below,
   now built and real. Known scope limit: single-sequence decode speed only,
   not calibrated for a specific concurrency target - see the Layer 2
-  section for the full writeup.
+  section for the full writeup. **Re-verified 2026-08-14** (post both the
+  endpoint and golden-section search fixes): safe floor ncmoe=13 -> 41.68
+  tok/s, Layer 2's pick ncmoe=15 -> 50.70 tok/s, **+21.6%** - same
+  qualitative finding, smaller than the original 40% claim (that number
+  pre-dates both fixes). Also separately confirmed with a wider sweep
+  (ncmoe 13-30): a naively conservative ncmoe=30 only reaches 46.995
+  tok/s, so Layer 2's search is finding a real, non-obvious optimum, not
+  just validating the safe floor.
 - **Native MTP speculative decoding** (merged upstream, `--spec-type
   draft-mtp --model-draft <sidecar.gguf>`). Works and gives a real
   speedup - confirmed with coherent output and realistic acceptance
