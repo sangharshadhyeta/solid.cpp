@@ -100,6 +100,34 @@ calibrate expectations accordingly, especially for candidate #4's hit-rate
 projections, which assume a use case with a large enough cache budget to
 actually work.
 
+## Load-bearing caveat: cache value depends on routing skew, not just implementation
+
+From `ggml-org/llama.cpp` PR #26563 ("expert hot store", a third independent
+implementation of this idea, active Aug 2026) comment thread, user
+blakemartz, 2026-08-08: tested the same hot-cache approach on
+DeepSeek-V4-Flash-0731 (256 experts, top-6+1, CPU-offloaded, 2x RTX 4090).
+DeepSeek's aux-loss-free load balancing keeps routing near-uniform — after a
+1.4K-token warm pass, 209-229 of 256 experts showed warm per layer. At ~11%
+VRAM:model capacity ratio, a dynamic hot-cache can't beat ~11% hit rate on a
+uniformly-routed model. Measured: dynamic cache 12.77 tok/s vs 13.45 tok/s
+for a dead-simple static "pin N complete layers to GPU" baseline at the same
+VRAM — static won because complete layers hit 100% by construction with zero
+lookup/swap overhead, while the dynamic cache pays real bookkeeping cost for
+a hit rate that doesn't beat blind capacity.
+
+Their conclusion, and ours: the 1.7-2.1x wins reported for Qwen3.6-35B-A3B
+(this PR's headline number) likely depend specifically on Qwen's routing
+being skewed. Balanced-routing models (increasingly common via aux-loss-free
+training) may see static placement beat a dynamic cache outright.
+
+Action for our own testing: once Gemma-4-26B-A4B finishes downloading, don't
+just measure decode speedup — measure the hit-rate *distribution* across
+experts (how concentrated vs uniform). A speedup that tracks raw VRAM:model
+capacity ratio means we got a favorable model, not that the approach
+generalizes. Encouragingly, a separate data point in the same thread
+(Tropfchen, Gemma4-26A4-APEX, cold 18 tok/s -> warm 30 tok/s) suggests Gemma
+4's routing does have exploitable skew, unlike DeepSeek's.
+
 ## Already checked, no action needed
 
 **NaN-safe router argmax** (`route_trace.h`'s `rt_router_pick`): if router
