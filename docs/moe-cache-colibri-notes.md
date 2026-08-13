@@ -48,6 +48,76 @@ Not yet: read their actual moe-cache-equivalent implementation, if one
 exists, or diffed their offload heuristic against leloch's approach in
 detail.
 
+## SGLang (sgl-project/sglang) - MoE-first architecture, mixed relevance
+
+31.7k stars, active (pushed 2026-08-13, today). Three real pieces:
+
+1. **RadixAttention** - generalizes prefix caching from vLLM's fixed
+   16-token block hash to a radix tree, handling *branching* conversations
+   (agent retries, multiple tool-call paths) more naturally than exact
+   block matching. Refines our existing prefix-caching candidate above -
+   more relevant given our agentic/API-heavy usage pattern specifically.
+2. **Expert Parallelism (DeepEP/MoriEP + EPLB + DeepGEMM)** - specialized
+   all-to-all GPU communication for MoE token dispatch, dynamic expert
+   load rebalancing, and grouped-GEMM kernels for MoE's per-expert
+   batches. All about spreading experts across *multiple* GPUs - **not
+   applicable to our single H200 deployment**, this solves a different
+   problem (multi-GPU expert sharding) than ours (CPU/GPU tiering on one
+   device). Noted for completeness, not a candidate for us.
+3. **FR-Spec draft-vocab trimming** (`--speculative-token-map` in SGLang,
+   production code) - restricts a speculative drafter's LM-head to a
+   frequency-ranked vocab subset (e.g. top 32k of 100k+), cutting draft
+   compute ~75% with a lossless guarantee (target still verifies full
+   vocab). **Already proposed and implemented for llama.cpp**: issue
+   #25187 (open, created 2026-07-01, unusually mature - implemented and
+   tested on a real branch, commit 047bfa508). Reuses infrastructure
+   llama.cpp's own EAGLE-3 implementation already has for a different
+   reason (a `d2t` tensor that trims-then-scatters logits, for drafters
+   with a smaller native vocab than the target). ~30 lines, no-op for
+   existing GGUFs. **Currently implemented only for `qwen35.cpp`
+   (Qwen3.5/3.6 dense MTP) - explicitly checked and confirmed NOT yet
+   done for GLM's MTP path** (`glm4-moe.cpp`/`glm-dsa.cpp`). Directly
+   relevant to us: proven pattern, just needs extending to our target
+   architecture. Real, scoped opportunity, not speculative.
+
+## Does SGLang already do what we're building? Checked directly - no, not reliably
+
+Native SGLang GGUF support is "coming soon" per their own docs, not yet
+mature. The only path to GGUF + CPU-offload in the SGLang ecosystem is via
+the KTransformers integration, and even there, GGUF loading goes through
+what they call a "llamafile backend" - i.e. it reuses llama.cpp/llamafile's
+own GGUF-reading code, not independently-built infrastructure.
+
+Reliability check: KTransformers issue #1655 (open, filed 2025-12-02, still
+unresolved) - a user tested this exact scenario, including an actual
+unsloth GGUF (`unsloth/gpt-oss-20b-GGUF`, same publisher/format we're
+using). Results: DeepSeek R1 loaded but failed during batch capture,
+GPT-OSS failed during loading entirely. A related issue also names
+GLM-4.5-AIR (close cousin of our GLM-5.2 target) as broken with GGUF in
+their stack. No evidence found of drafter + limited-VRAM + GGUF all three
+working together in SGLang/KTransformers.
+
+**Conclusion**: what we're building isn't a solved problem sitting on a
+shelf elsewhere. SGLang is attempting something adjacent by borrowing
+llama.cpp's own format-handling to do it, and even that combination has
+real, open, unresolved bugs on exactly this class of model (large MoE,
+unsloth-quantized GGUF). llama.cpp + the moe-cache port is arguably ahead
+of SGLang specifically for GGUF + CPU-offload + native-drafter, not
+behind it - useful calibration for the value of this whole project.
+
+## Also found while researching: CUDA graphs for multi-slot decode
+
+Issue #27009 (open, **created today**, 2026-08-13) - proposes decoupling
+CUDA graph shapes from the number of active decode slots via fixed-size
+padding (dummy token ids, -inf masked padding columns, reserved dummy KV
+rows), so graphs can be captured once per bucket size and reused via
+`cudaGraphLaunch` instead of rebuilding per active-slot-count. Directly
+relevant to our open MTP x concurrency question above - if/when this
+lands, it changes how multi-slot decode batching and shapes work, which
+could interact with (help or complicate) the moe-cache batch-size gates
+we're already tracking as an open question. Brand new, unresolved, worth
+watching rather than acting on yet.
+
 ## Ollama / LM Studio - confirmed downstream, not independent sources
 
 Both wrap llama.cpp rather than implementing independent MoE-offload
