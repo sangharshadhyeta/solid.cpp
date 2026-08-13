@@ -924,6 +924,58 @@ proper chat-templated A/B against a no-MTP baseline, not yet done as a
 dedicated re-test - the numbers above are internal to the MTP-enabled
 calibration search, not compared against a corrected non-MTP baseline).
 
+## Second retraction and re-correction (2026-08-14, golden-section search bug)
+
+**The "Final winner: n_max=9, 56.92 tok/s" call above is itself retracted.**
+The `n_max` trace table right above it already contained the evidence:
+n_max=2 scored 56.06 tok/s, higher than the declared winner n_max=9's
+54.55 - golden-section search assumes a unimodal objective, the real
+curve isn't one (dips at n=7, rises again through 8-10), and the search
+silently converged on a local peak without ever reconsidering n=1/n=2,
+both of which were already sitting in its own trace from the earlier
+envelope-doubling phase. See "LFRU eviction: A/B results" bullet in the
+build list below for the full root-cause writeup - the same session that
+found and fixed this also fixed the LFRU eviction policy, both by
+`common_golden_section_search_max` / `moe-cache.cu` respectively.
+
+Fix: after golden-section search returns, validate its pick against
+every point already measured in the trace map (free - no new subprocess
+spawns, the data already exists) and take the true max instead of
+trusting the bisection blindly. Applied to both the `-ncmoe` and
+`spec-draft-n-max` searches in `common/common.cpp`.
+
+Re-ran the full joint `--moe-calibrate` with the fix, same RTX 3060 +
+Gemma-4-26B-A4B + MTP Q8_0 setup:
+
+| n_max | tok/s |
+|---:|---:|
+| 1 | 57.80 |
+| 2 | 60.10 |
+| **3 (winner, trace-validated)** | **64.92** |
+| 4 | 52.24 |
+| 7 | 50.78 |
+| 8 | 48.72 |
+| 10 | 49.25 |
+| 16 | 33.39 |
+| 32 | 22.20 |
+
+(ncmoe=15 alone, no MTP: 50.70 tok/s this run - within normal run-to-run
+noise of the earlier 51.36.) Thread tuning tried n_threads=12 this time
+too and it *lost* (48.71 vs the default n_threads=6's 64.92) - correctly
+rejected, config stayed at n_threads=6. **Final winner: `ncmoe=15,
+n_threads=6, spec-draft-n-max=3`, 64.92 tok/s** - a real **+28.1%** over
+the no-MTP baseline (50.70 tok/s), cached and auto-applied on normal
+launch (confirmed via the `common_maybe_autoplace_moe_cpu` log line).
+**Content-verified coherent** via `/v1/chat/completions` on two prompts
+post-calibration: 100/147 (68%) and 98/152 (64.5%) `draft_n_accepted` -
+healthy, realistic acceptance rates, both notably higher than the
+previous (buggy-search) run's 40%/57%, consistent with a smaller n_max
+having an easier time getting each individual draft token accepted.
+
+This replaces the 56.92 tok/s number everywhere it was cited above and
+in the build-list summary below - use 64.92 tok/s (n_max=3) as the real,
+validated figure for this hardware/model/context combination.
+
 ## Lesson for next time
 
 The endpoint/prompt-formatting choice is not a cosmetic detail of a test
@@ -963,40 +1015,32 @@ against exactly this failure mode.
   section for the full writeup.
 - **Native MTP speculative decoding** (merged upstream, `--spec-type
   draft-mtp --model-draft <sidecar.gguf>`). Works and gives a real
-  speedup - confirmed with coherent output and realistic (40-57%)
-  acceptance rates after fixing a serious endpoint-formatting bug (see
-  "Endpoint-bias investigation" below). **The specific "1.33-1.35x"
-  multiplier is retracted** - that number and the entire n_max sweep were
-  measured via an endpoint that bypasses the model's chat template,
-  silently inflating throughput via degenerate repetitive generation. The
-  corrected joint calibration (ncmoe=15, n_threads=12, n_max=9, 56.92
-  tok/s) is real and content-verified, but wasn't compared against a
-  matching corrected non-MTP baseline, so a clean multiplier hasn't been
-  re-derived yet - that's a small, well-scoped follow-up, not a re-open
-  of the whole investigation. Provably lossless for output quality
-  regardless (verified output is always sampled from the target model,
-  never the draft). Confirmed the same sidecar pattern exists for
-  `unsloth/GLM-5.2-GGUF` (20% acceptance-length improvement claimed for
-  GLM-5.2's own MTP layer per public sources) - directly applicable to
-  the real deployment target once that hardware is available, **using
-  `/v1/chat/completions` for any validation there, not `/completion`**.
-  **SECOND BUG FOUND, 2026-08-14, not yet fixed**: the golden-section
-  search's own `n_max` trace table (see "Corrected, validated results"
-  above) shows `n_max=2` scored 56.06 tok/s - *higher* than the declared
-  winner `n_max=9`'s 54.55 tok/s. Golden-section search assumes a
-  unimodal (single-peak) objective; the measured curve isn't one (it dips
-  at n=7 then rises again through n=8-10), and per-config noise is
-  already documented elsewhere in this doc as up to 65% run-to-run - so
-  the search silently converged on a local peak near where it started
-  bisecting and never revisited n=2. `common_golden_section_search_max`
-  in `common/common.cpp` needs either a full small-range grid scan with
-  repeats for `spec-draft-n-max` specifically (the range is small, ~1-32,
-  so the cost is affordable), or a validation pass that spot-checks the
-  golden-section pick against a few scattered probe points before
-  accepting it. Tracked as the next thing to fix, ahead of any further
-  throughput-number reporting - every "caveat"-tagged number in this doc
-  needs re-derivation through the fixed search before being trusted as a
-  real optimum, not just a real (but possibly non-optimal) measurement.
+  speedup - confirmed with coherent output and realistic acceptance
+  rates after fixing two serious bugs in how it was measured: the
+  endpoint-formatting bug (see "Endpoint-bias investigation" below) and
+  a golden-section search bug (see "Second retraction and re-correction"
+  above) that made the first corrected calibration land on n_max=9
+  (54.55 tok/s) when n_max=2/3 both scored higher in the search's own
+  trace. **The original "1.33-1.35x" multiplier and the intermediate
+  "n_max=9, 56.92 tok/s" number are both retracted.** Current real,
+  validated number: `ncmoe=15, n_threads=6, spec-draft-n-max=3`, **64.92
+  tok/s, +28.1% over the no-MTP baseline (50.70 tok/s)**, content-verified
+  coherent via `/v1/chat/completions` with realistic 64-68%
+  `draft_n_accepted` rates on two separate prompts. Provably lossless for
+  output quality regardless of any of this (verified output is always
+  sampled from the target model, never the draft). Confirmed the same
+  sidecar pattern exists for `unsloth/GLM-5.2-GGUF` (20%
+  acceptance-length improvement claimed for GLM-5.2's own MTP layer per
+  public sources) - directly applicable to the real deployment target
+  once that hardware is available, **using `/v1/chat/completions` for
+  any validation there, not `/completion`**.
+  Search-bug fix: `common_golden_section_search_max`'s callers
+  (`common_moe_calibrate` in `common/common.cpp`) now validate the
+  bisection's pick against every point already sitting in the trace map
+  after the search completes - free, since that data's already measured,
+  no new subprocess spawns - and take the true best-of-measured instead
+  of trusting golden-section's assumption that the objective is
+  unimodal. Applied to both the `-ncmoe` and `spec-draft-n-max` searches.
 - **LFRU eviction (SLRU + heat + decay hybrid, ours)** - replaces plain
   LRU as the CUDA-side eviction policy. Four designs A/B'd on an identical
   mixed hot/cold workload (RTX 3060, Gemma-4-26B-A4B, `-ncmoe 15
