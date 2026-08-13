@@ -1235,10 +1235,55 @@ against exactly this failure mode.
   GLM-5.2's confirmed skew.
 
 ## Medium-term - multi-user serving (5-10 agentic users)
-- Server-level cross-request prefix/KV reuse (narrower than full
-  PagedAttention - maintainer-endorsed path, discussion #21961). No
-  throughput number yet; underlying paged-KV experiment showed 26->247
-  concurrent-sequence capacity jump at equal VRAM on an A10G.
+- ~~Server-level cross-request prefix/KV reuse~~ **ALREADY BUILT AND
+  VALIDATED, 2026-08-14** - not something to build, the narrower
+  maintainer-suggested path from discussion #21961 ("we can obviously
+  implement the same scheduling for cross-request KV reuse at server
+  level") turns out to already be shipped in mainline: `server_prompt_cache`
+  (`tools/server/server-task.h`/`.cpp`), enabled by default via
+  `--cache-ram` (default 8192 MiB). When a slot's content is evicted, its
+  full KV state gets saved to this RAM-resident pool; on a new request,
+  `server_prompt_cache::load()` searches the pool by longest-common-prefix
+  match (same LCP logic as the live-slot `--slot-prompt-similarity`
+  selection, also already on by default) and restores a match into
+  *whichever* slot the new request lands on - genuinely cross-slot, not
+  just "the same slot got lucky."
+
+  **Verified empirically, not just read in source**: first test (Gemma-4,
+  the sandbox's only model) showed the restore firing correctly in the
+  trace log (`found better prompt with f_keep=0.866`, 187/216 tokens
+  matched) but then getting silently discarded - a *separate* per-slot
+  "context checkpoint" mechanism ran its own validation against the
+  physical slot's *unrelated* prior checkpoint history, found no match,
+  and erased the just-restored state, forcing near-full reprocessing
+  anyway (log message names the cause directly: "forcing full prompt
+  re-processing due to lack of cache data (likely due to SWA or
+  hybrid/recurrent memory..." - traced to PR #13194, SWA support,
+  an acknowledged upstream limitation, not a bug introduced here).
+  Confirmed `gemma4.cpp` uses SWA. **Confirmed `glm4.cpp`/`glm4-moe.cpp`/
+  `glm-dsa.cpp` (GLM-5.2's family) do not** - grepped directly, zero
+  matches for `swa_type`/`n_swa`. Re-ran the identical test on a non-SWA
+  model already on disk (Qwen2.5-0.5B) to isolate the mechanism from this
+  Gemma-4-specific limitation: **real, dramatic reuse** - a second request
+  sharing a 206-token prefix with an evicted, different-slot request
+  reprocessed only 14 new tokens (`cache_n=192`), 27.0ms -> 5.9ms. This is
+  the mechanism working exactly as designed once the SWA-specific
+  discard path doesn't trigger.
+
+  **Conclusion for the H200/GLM-5.2 deployment**: this backlog item is
+  effectively done already, not a build target - GLM-5.2 isn't SWA, so
+  the SWA-specific limitation that crippled the Gemma-4 test shouldn't
+  apply there. Worth re-confirming once on the real model/hardware (same
+  methodology: force a different-slot restore, check `cache_n` in the
+  response `timings` and the `-lv 4` trace log for "found better prompt"
+  immediately followed by *no* "erased invalidated context checkpoint"
+  line), but there's no code to write for the core mechanism - it already
+  exists, is on by default, and the one real failure mode found doesn't
+  apply to the target architecture. Narrower than full PagedAttention as
+  the maintainers wanted (discussion #21961); underlying paged-KV
+  experiment elsewhere showed a 26->247 concurrent-sequence capacity jump
+  at equal VRAM on an A10G, a different (block-pool) approach not needed
+  here given this simpler mechanism already covers the actual ask.
 - MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
   MIN_BATCH). **Started, 2026-08-14** - see "MTP verify-batch size x
   concurrency" under Open questions above for the full writeup. Half
