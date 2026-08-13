@@ -182,6 +182,33 @@ our own numbers once Gemma-4-26B-A4B is downloaded:
   when the same drafter ran on CPU (`-devd none`) instead. Relevant for our
   "expert-cache first, DSpark after" sequencing decision.
 
+## 5. Live skew detection driving adaptive strategy (our own idea, not from Colibri)
+
+Checked: Colibri does not do this anywhere (`tier.h`, `route_trace.h`,
+`resource_plan.py` all grepped for gini/entropy/skew/concentration - none
+found). It only reacts to raw heat counts, which implicitly reflects skew
+but never quantifies or acts on it. So this is a novel design, synthesized
+from what we've found, not an extraction from Colibri's source.
+
+The idea: leloch's earlier (pre-rework) design had a "baseline-sampled
+bail-out" - measured the cache against the pure-CPU path and disabled
+itself if not winning - removed in the final rework for maintenance burden
+(commit a01eb2646). The RFC thread independently confirmed *why* a static
+signal like that matters: dynamic caching only beats static layer-pinning
+on skewed routing (GLM-5.2, Qwen) and can lose to it on uniform routing
+(DeepSeek's aux-loss-free routing). A live skew measurement (e.g. a
+running Gini coefficient or top-K-share over the per-expert hit-count
+window, computed at negligible cost since we're already counting hits)
+could drive that decision continuously instead of a one-shot bail-out:
+lean into aggressive admission when concentration is high, fall back
+toward simpler/static-like behavior (or warn and suggest `-ot` instead)
+when it's not. Also matches SharkWipf's observation that skew may be
+partly *workload*-dependent (per conversation thread), not purely a fixed
+model property, which a one-shot startup measurement can't capture but a
+live one could.
+
+Not scoped or estimated yet - flagging as a real candidate, not a plan.
+
 ## Already checked, no action needed
 
 **NaN-safe router argmax** (`route_trace.h`'s `rt_router_pick`): if router
