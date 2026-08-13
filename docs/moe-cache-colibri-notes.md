@@ -1295,8 +1295,51 @@ against exactly this failure mode.
   all** - that turned out to be a separate GPU-kernel-dispatch limit in
   `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to this
   MAX_BATCH/MIN_BATCH question.
-- Suffix Decode (PR #26283, model-free spec decoding). No number found.
-  Additive to MTP, best case is repetitive agentic/tool-call output.
+- ~~Suffix Decode (PR #26283, model-free spec decoding)~~ **BUILT AND
+  MEASURED, 2026-08-14.** Merged `github.com/ggml-org/llama.cpp` pull/26283
+  directly (`git fetch origin pull/26283/head`, clean merge onto
+  `moe-cache-port`, only 9 files touched - the actual feature, no
+  unrelated churn). One compile fix needed: `ngram_suffix`'s
+  `need_embd() override` didn't override anything - our branch's
+  `common_speculative_impl` base already dropped that virtual (MTP's own
+  splitting decision goes through `task->need_embd()` now, a different
+  mechanism) - removed the dead override, not a functional change.
+  Mechanism: an online suffix tree built from the prompt + previously-
+  accepted tokens (no second model, no extra compute cost beyond tree
+  maintenance); draft tokens come from matching the current context
+  against previously-seen subsequences. `--spec-type ngram-suffix`,
+  comma-combinable with MTP (`--spec-type draft-mtp,ngram-suffix`).
+
+  **Measured** (ncmoe=15, 2 samples averaged, same methodology as
+  everything else this session), repetitive vs diverse prompts:
+
+  | config | repetitive tok/s | diverse tok/s | rep accept% | div accept% |
+  |---|---:|---:|---:|---:|
+  | baseline | 50.88 | 51.47 | - | - |
+  | MTP alone | 73.53 | 59.89 | 90.4% | 66.4% |
+  | suffix alone | 62.10 | 51.29 | 64.4% | 34.0% |
+  | **MTP + suffix combined** | 72.88 | **64.82** | 77.5% | 71.1% |
+
+  Suffix-alone matches its design intent exactly: real win on repetitive
+  text (+22.1%), flat on diverse text (+0.35%, noise) - nothing to catch
+  in genuinely non-repeating text. The nuance: **combined is *not*
+  strictly additive everywhere.** On repetitive text, combined (72.88) is
+  marginally *worse* than MTP-alone (73.53, -0.9%) - MTP alone is already
+  near its own acceptance ceiling there (90.4%), so a second drafter
+  competing for the same easy tokens adds coordination overhead without
+  new upside. But on **diverse text, combined beats MTP-alone by +8.2%**
+  (64.82 vs 59.89) - suffix-decode picks up extra accepted tokens (common
+  words/short phrases) that MTP alone misses, a genuine additive effect,
+  just showing up on the *opposite* prompt type from what "best case is
+  repetitive output" would suggest. Content-verified coherent via
+  `/v1/chat/completions` on the combined config (63% acceptance on a real
+  diverse prompt, real `reasoning_content`, not degenerate repetition -
+  same discipline as every other number in this doc).
+
+  **Recommendation**: enable `ngram-suffix` alongside MTP by default for
+  this deployment - the diverse-text case is the common one for an
+  agentic API workload, and the repetitive-text downside is small (-0.9%)
+  next to the diverse-text upside (+8.2%).
 - ~~The still-open concurrency-cliff root cause~~ **RESOLVED, 2026-08-14**
   - see "ROOT-CAUSED" under the concurrency-cliff investigation section
   above. Not llama-server's slot scheduling after all: a GPU-kernel
