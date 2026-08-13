@@ -1,3 +1,56 @@
+# Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
+
+## Already built, awaiting validation
+- moe-cache core port (leloch's design). Load-bearing feature. RFC: 1.7-2.1x
+  decode on skewed routing (Qwen-A3B). GLM-5.2 confirmed skewed (SharkWipf:
+  30-50% measured).
+- mmap host-pinning fix (ours). One-time load-speed win only, not decode.
+
+## Near-term - targets the GLM-5.2/H200 deployment directly
+- Native MTP speculative decoding (merged, PR #25980, needs enabling/testing).
+  Comparable DSpark data on Gemma-4: 1.0-1.76x, task-dependent. Likely
+  highest-value low-effort win - no external checkpoint needed.
+- FR-Spec draft-vocab trimming for GLM's MTP (pattern proven for Qwen,
+  issue #25187, needs ~30-line port to glm-dsa.cpp). ~75% draft LM-head
+  compute cut, lossless. Small slice of total, but cheap once ported.
+- LFRU eviction + hysteresis + decay, replacing our ported plain LRU
+  (Colibri's tier.h). No hard number yet - needs A/B. Motivated by
+  GLM-5.2's confirmed skew.
+
+## Medium-term - multi-user serving (5-10 agentic users)
+- Server-level cross-request prefix/KV reuse (narrower than full
+  PagedAttention - maintainer-endorsed path, discussion #21961). No
+  throughput number yet; underlying paged-KV experiment showed 26->247
+  concurrent-sequence capacity jump at equal VRAM on an A10G.
+- MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
+  MIN_BATCH). Tuning fix, not a feature. Unquantified until tested at
+  real concurrency.
+- Suffix Decode (PR #26283, model-free spec decoding). No number found.
+  Additive to MTP, best case is repetitive agentic/tool-call output.
+
+## Longer-term / exploratory - not yet scoped as real builds
+- Persistent cross-session usage history (Colibri-style) - avoids
+  cold-restart penalty, no number.
+- Live skew-detection driving adaptive strategy (our own synthesis) -
+  protects against static-beats-dynamic-on-uniform-routing failure case,
+  unscoped.
+- Live per-expert heatmap UI - debugging/demo value, not performance.
+- Static pre-flight capacity/hit-rate planner - planning tool, not
+  performance.
+
+## Explicitly decided against
+Full PagedAttention (maintainers want the narrower path), multi-LoRA
+serving (not our use case), multi-node serving (single H200), SGLang's
+expert-parallelism/DeepEP (multi-GPU only).
+
+## Honest calibration on the combined number
+RFC-thread testers got low-to-mid-20s tok/s with moe-cache alone on WORSE
+hardware (2x3090 + repaired 8-channel DDR4) running the HARDER case
+(DeepSeek's uniform routing). Our setup stacks three favorable factors on
+top - GLM-5.2's confirmed skew, H200's far higher HBM bandwidth, native
+MTP layered on - which is why 40+ tok/s reads as realistic, not optimistic.
+Target, not a guarantee, until actually measured.
+
 # Other software worth knowing about (not deep-dived into source yet)
 
 ## KTransformers (kvcache-ai/ktransformers) - validates our approach independently
