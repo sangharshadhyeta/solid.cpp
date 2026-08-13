@@ -13,6 +13,7 @@
 #include <cstring>
 #include <future>
 #include <regex>
+#include <unordered_map>
 
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
@@ -1440,6 +1441,32 @@ bool llama_model_loader::load_all_data(
     // 64MB works well for NVMe drives
     const size_t buffer_size = alignment != 1 ? 64 * 1024 * 1024 + 2 * alignment : 1 * 1024 * 1024;
 
+    // Below the mmap threshold, cudaHostRegister/cudaHostUnregister overhead (pagetable and DMA
+    // mapping work) isn't worth it for the handful of tiny tensors (norms, biases) that hit it.
+    constexpr size_t host_buffer_pin_threshold = 64 * 1024;
+
+    using register_host_buffer_fn_t   = bool (*)(void *, size_t);
+    using unregister_host_buffer_fn_t = void (*)(void *);
+    std::unordered_map<ggml_backend_buffer_t, std::pair<register_host_buffer_fn_t, unregister_host_buffer_fn_t>> host_register_fns_cache;
+    const auto get_host_register_fns = [&](ggml_backend_buffer_t buf) -> std::pair<register_host_buffer_fn_t, unregister_host_buffer_fn_t> {
+        auto it = host_register_fns_cache.find(buf);
+        if (it != host_register_fns_cache.end()) {
+            return it->second;
+        }
+        std::pair<register_host_buffer_fn_t, unregister_host_buffer_fn_t> fns{ nullptr, nullptr };
+        if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf))) {
+            if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev)) {
+                fns.first  = (register_host_buffer_fn_t)   ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+                fns.second = (unregister_host_buffer_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+                if (!fns.first || !fns.second) {
+                    fns = { nullptr, nullptr };
+                }
+            }
+        }
+        host_register_fns_cache.emplace(buf, fns);
+        return fns;
+    };
+
     std::vector<ggml_backend_buffer_t> host_buffers;
     std::vector<ggml_backend_event_t> events;
     std::vector<void *> host_ptrs;
@@ -1566,7 +1593,19 @@ bool llama_model_loader::load_all_data(
                 mmap_used.first  = std::min(mmap_used.first,  weight->offs);
                 mmap_used.second = std::max(mmap_used.second, weight->offs + n_size);
             } else {
+                // data points into the mmap'd file, which is not pinned. cudaMemcpyAsync (and
+                // equivalents on other backends) can't DMA from pageable memory, so it silently
+                // falls back to a synchronous copy staged through the driver's own pinned bounce
+                // buffer. Registering just this tensor's byte range as pinned host memory lets the
+                // copy DMA directly instead, then we unregister immediately since the range came
+                // from a read-only, page-cached file mapping we don't own past this call.
+                auto host_register_fns = get_host_register_fns(cur->buffer);
+                bool pinned = host_register_fns.first && n_size >= host_buffer_pin_threshold
+                    && host_register_fns.first(data, n_size);
                 ggml_backend_tensor_set(cur, data, 0, n_size);
+                if (pinned) {
+                    host_register_fns.second(data);
+                }
             }
         } else {
             const auto & file = files.at(weight->idx);
