@@ -2002,6 +2002,84 @@ void common_moe_calibrate(common_params & params) {
 // instead of just the memory-safe floor. Falls back to the live binary
 // search if there's no cache entry, or if conditions changed enough that
 // the cached placement no longer fits.
+// MUL_MAT_ID (MoE expert routing) silently drops off the fast MMVQ kernel
+// onto a slower general-batch path above a per-(GPU-arch, quant-type)
+// batch-size threshold - confirmed empirically this session as a real,
+// severe throughput cliff (>2x slower per token, RTX 3060 + Gemma-4-26B-A4B:
+// ~12.6 tok/s/sequence at concurrency=8, ~6.0 at concurrency=9, the exact
+// boundary of MMVQ_MAX_BATCH_SIZE=8 in ggml/src/ggml-cuda/mmvq.cu), not a
+// gentle diminishing return - and for NVIDIA cc>=Ada Lovelace (which
+// includes H200/Hopper) the threshold is a flat 8 regardless of quant type.
+// This is a GPU-kernel-dispatch limit, not a placement/VRAM question, so
+// unlike the rest of Layer 1 it can't be fixed by choosing a different
+// -ncmoe - the only real lever is the operator's own --parallel choice, so
+// this only ever warns, never silently changes anything.
+//
+// The real threshold depends on the model's actual expert-tensor quant
+// type, which isn't cheaply available before a full model load. Instead of
+// guessing one type, this queries every quant type MoE GGUFs commonly ship
+// with and reports the minimum across them - a true conservative lower
+// bound (the real answer for whatever type this model actually uses can
+// only be >= this), so the warning can under-fire slightly early but can
+// never miss a real risk by assuming a too-generous type.
+static int common_moe_min_mmvq_max_batch(void) {
+    static const ggml_type candidate_types[] = {
+        GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
+        GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4,
+    };
+
+    int (*get_max_batch)(int) = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count() && !get_max_batch; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev)) {
+            get_max_batch = (int (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_mmid_mmvq_max_batch");
+        }
+    }
+    if (!get_max_batch) {
+        return -1; // not a CUDA device, or backend doesn't expose this - no warning, nothing known
+    }
+
+    int min_batch = INT_MAX;
+    for (ggml_type t : candidate_types) {
+        min_batch = std::min(min_batch, get_max_batch((int) t));
+    }
+    return min_batch;
+}
+
+static void common_warn_concurrency_cliff(const common_params & params) {
+    // MTP/speculative verification batches (n_max+1) candidate positions per
+    // sequence into a single MUL_MAT_ID call, not just 1 - the same
+    // multiplier moe-cache's own max_batch hint accounts for
+    // (llama-context.cpp's set_max_batch_hint). Ignoring this would
+    // under-warn: even --parallel 1 can hit the real cliff once MTP's own
+    // verify-width alone exceeds the threshold, so the multiplier has to be
+    // applied before deciding whether there's anything to check at all, not
+    // gated behind an n_parallel>1 fast path.
+    const int verify_width    = params.speculative.has_dft() ? (params.speculative.draft.n_max + 1) : 1;
+    const int effective_batch = params.n_parallel * verify_width;
+    if (effective_batch <= 1) {
+        return;
+    }
+    const int max_batch = common_moe_min_mmvq_max_batch();
+    if (max_batch > 0 && effective_batch > max_batch) {
+        LOG_WRN("%s: --parallel %d%s = effective concurrent batch %d exceeds this GPU's MoE "
+                "routing fast-path batch limit (<=%d for at least one common quant type) - "
+                "concurrent decode above that limit hits a real GPU-kernel-dispatch throughput "
+                "cliff (measured >2x slower per token above the boundary, not a gentle decline). "
+                "This is not a moe-cache/placement issue and -ncmoe can't fix it; consider "
+                "keeping the effective batch (--parallel%s) at or below %d, or accept the "
+                "throughput drop above it.\n",
+                __func__, params.n_parallel,
+                verify_width > 1 ? string_format(" x MTP verify-width %d", verify_width).c_str() : "",
+                effective_batch, max_batch,
+                verify_width > 1 ? " x MTP verify-width" : "",
+                max_batch);
+    }
+}
+
 static bool common_maybe_autoplace_moe_cpu(
         const char * path_model, common_params & params,
         llama_model_params & mparams, const llama_context_params & cparams) {
@@ -2079,6 +2157,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     common_maybe_autoplace_moe_cpu(params.model.path.c_str(), params, mparams, cparams);
+
+    // Runs after autoplace, not before: the calibration-cache lookup inside
+    // it can override params.speculative.draft.n_max to the real calibrated
+    // value, and this needs to see that final value, not the pre-lookup
+    // default - otherwise an MTP setup with a cached n_max would be checked
+    // against the wrong (understated) effective batch size.
+    common_warn_concurrency_cliff(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
