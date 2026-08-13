@@ -980,6 +980,68 @@ against exactly this failure mode.
   GLM-5.2's own MTP layer per public sources) - directly applicable to
   the real deployment target once that hardware is available, **using
   `/v1/chat/completions` for any validation there, not `/completion`**.
+  **SECOND BUG FOUND, 2026-08-14, not yet fixed**: the golden-section
+  search's own `n_max` trace table (see "Corrected, validated results"
+  above) shows `n_max=2` scored 56.06 tok/s - *higher* than the declared
+  winner `n_max=9`'s 54.55 tok/s. Golden-section search assumes a
+  unimodal (single-peak) objective; the measured curve isn't one (it dips
+  at n=7 then rises again through n=8-10), and per-config noise is
+  already documented elsewhere in this doc as up to 65% run-to-run - so
+  the search silently converged on a local peak near where it started
+  bisecting and never revisited n=2. `common_golden_section_search_max`
+  in `common/common.cpp` needs either a full small-range grid scan with
+  repeats for `spec-draft-n-max` specifically (the range is small, ~1-32,
+  so the cost is affordable), or a validation pass that spot-checks the
+  golden-section pick against a few scattered probe points before
+  accepting it. Tracked as the next thing to fix, ahead of any further
+  throughput-number reporting - every "caveat"-tagged number in this doc
+  needs re-derivation through the fixed search before being trusted as a
+  real optimum, not just a real (but possibly non-optimal) measurement.
+- **LFRU eviction (SLRU + heat + decay hybrid, ours)** - replaces plain
+  LRU as the CUDA-side eviction policy. Four designs A/B'd on an identical
+  mixed hot/cold workload (RTX 3060, Gemma-4-26B-A4B, `-ncmoe 15
+  --moe-cache auto`, 604 slots) before landing on the shipped one:
+    - plain LRU (baseline): **63.8%** hit rate
+    - SLRU v1, two segments (probation/protected_), *uncapped* protected_:
+      **60.2-60.3%** - a real regression. Root cause: protected_ grew to
+      598-600/604 slots unbounded, starving probation to 4-6 slots -  new
+      admissions had nowhere to prove themselves before eviction pressure
+      hit them.
+    - Heat-only, single list + per-slot heat counter (Colibri's
+      `tier_decay()` halving) + bounded 8-candidate eviction window with
+      25%-plus-4 hysteresis (Colibri's `tier_pick_lfru` margin), no
+      segments at all: **64.6%** - recovered past plain LRU with just the
+      heat signal and no segmentation.
+    - Capped SLRU, same two segments as v1 but protected_ hard-capped at
+      50% of the pool with FIFO (oldest-first) demotion at the cap:
+      **65.0%** - the structural fix for v1's regression, and on its own
+      the best single mechanism measured.
+    - Two "let heat/decay decide the cap instead of a fixed percentage"
+      variants were tried and **both regressed back to v1's failure
+      mode**: an absolute per-slot heat floor for decay-driven demotion
+      (61.4%, protected_ still 596-598/604) and a floor relative to
+      protected_'s own mean heat (61.3%, still 599/604). Root cause in
+      both: decay only fires on *fill* (admission) events, but within one
+      busy request thousands of *hits* land on the same resident working
+      set between fills - heat balloons for nearly the whole pool before
+      decay gets a chance to run, and a demoted slot is usually re-hit and
+      re-promoted on the very next token before the next decay checkpoint.
+      Heat/decay alone doesn't have a fast enough signal to regulate
+      *population size* at this timescale; that needs a hard structural
+      bound.
+    - **Shipped design**: capped SLRU (the structural fix that measured
+      best) + heat as the *tiebreaker* - both for eviction-candidate choice
+      within whichever segment is being drained, and for which protected_
+      slot pays the demotion cost when a promotion needs to make room -
+      instead of heat/decay replacing the cap outright. **65.0%**,
+      statistically tied with capped-SLRU-alone on this workload (too
+      small/short to discriminate further); kept as the shipped design
+      because it's strictly safer (same proven structural bound, heat only
+      ever changes *which* candidate within an already-safe pool gets
+      picked, never *whether* the pool stays bounded) and should matter
+      more under a larger, more diverse, longer-running workload than this
+      16-request A/B can exercise. All four intermediate implementations
+      backed up during development, not kept in the tree.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
 - FR-Spec draft-vocab trimming for GLM's MTP (pattern proven for Qwen,
@@ -1018,6 +1080,16 @@ against exactly this failure mode.
 - Layer 2 extension: concurrency-target-aware calibration (calibrate for
   "N concurrent users" specifically, not just solo decode speed) - real
   extension of the now-built Layer 2, not yet attempted.
+- Verify whether Colibri actually avoids the full prefill pass before the
+  first token on large contexts, and if so how (prefix/KV caching?
+  chunked prefill?) - raised by the user, not yet investigated against
+  Colibri's actual source. Transformer attention architecturally requires
+  processing the whole prompt before the first output token regardless of
+  engine, so if Colibri's first-token latency doesn't show this, it's
+  using a real technique worth identifying, not skipping something
+  fundamental - both plausible candidate techniques (automatic prefix
+  caching, chunked prefill) are already separately tracked in the vLLM
+  feature-parity backlog below, unconnected to this specific claim.
 
 ## Explicitly decided against
 Full PagedAttention (maintainers want the narrower path), multi-LoRA
@@ -1421,21 +1493,21 @@ Status: research notes only, nothing implemented yet. Each needs its own A/B
 against the ported moe-cache before merging — Colibri's own README is explicit
 that even their validated techniques are "measurable policies, not promises."
 
-## 1. LFRU eviction + hysteresis + decay (runtime, dynamic)
+## 1. LFRU eviction + hysteresis + decay (runtime, dynamic) — DONE, see results below
 
-File: `c/tier.h` (~60 lines).
+File: `c/tier.h` (~60 lines) was the original Colibri reference.
 
-Our ported `ggml/src/ggml-cuda/moe-cache.cu` uses plain LRU (doubly-linked list,
-evict from `lru_head` — see `moe_cache_lru_remove`/`moe_cache_lru_push_back`,
-around line 452-660). Colibri instead scores each candidate with
-`(heat << 8) | recency`, so frequency is primary and recency only breaks ties
-(`tier_pick_lfru`), and gates every eviction behind a 25%-plus-4 hysteresis
-margin so two similarly-hot experts can't ping-pong. `tier_decay()` halves heat
-counters periodically so the hot set can still adapt to a workload change.
-
-Motivation: matches the RFC's own measured routing skew (top 10% of experts
-get ~80% of hits) better than plain recency. Worth A/B'ing against our LRU on
-real hit-rate/decode-speed numbers before considering it.
+**Built and A/B'd, 2026-08-14 — see "LFRU eviction: A/B results" under
+"Already built, VALIDATED with real measurement" below for the full story,
+including two designs that measured worse and were reverted rather than kept
+on the strength of a plausible-sounding rationale.** Final shipped design:
+`ggml/src/ggml-cuda/moe-cache.cu` now uses a two-segment probation/protected_
+structure (probation drains first, protected_ capped at 50% of pool with
+heat-based demotion choice at the cap) plus a per-slot heat counter with
+periodic decay, used as the eviction/demotion tiebreaker within each segment
+(bounded 8-candidate window, 25%-plus-4 hysteresis - Colibri's own margin,
+confirmed to matter here too). Measured 65.0% hit rate on a mixed hot/cold
+workload vs. plain LRU's 63.8%.
 
 ## 2. Persistent cross-session usage history (semi-dynamic — persists across runs)
 
