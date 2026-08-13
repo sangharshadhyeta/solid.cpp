@@ -1,3 +1,64 @@
+# vLLM features worth tracking (DSpark, Suffix Decode)
+
+Separate from the Colibri notes below - these are already being actively
+ported into `ggml-org/llama.cpp` by the community, not just candidate ideas.
+
+## DSpark (already partially in our checkout)
+
+Block-wise speculative decoding: a small draft model proposes several
+tokens per step via a "Markov head" instead of one at a time, with
+per-token confidence dynamically scheduling how many drafted tokens to
+verify. Originally DeepSeek-V4's technique, in vLLM via
+vllm-project/vllm#47093 and the vllm-project/speculators checkpoint format.
+
+- Core support: PR #25173 (merged 2026-07-28, well before our checkout at
+  1f368f354) - `src/models/dflash.cpp` and related files already present.
+- Newer checkpoint format: PR #26275 "dspark: support speculators-format
+  checkpoints" (open, NOT in our checkout - confirmed via grep, no
+  "speculators" handling anywhere in conversion/*.py or src/). Needed if we
+  want to load checkpoints using the newer vLLM speculators format
+  (`sample_from_anchor`, pruned draft vocab + d2t remapping table).
+
+**Directly relevant to us**: PR #26275's own verification benchmark uses
+[`makora-ai/gemma4-26b-a4b-dspark`](https://huggingface.co/makora-ai/gemma4-26b-a4b-dspark)
+- a public DSpark draft checkpoint whose `speculators_config.verifier`
+explicitly targets `google/gemma-4-26B-A4B-it` / `Gemma4ForConditionalGeneration`,
+the exact base model our unsloth GGUF is quantized from. Confirmed compatible
+on the target side. The draft's own internal transformer body is a small
+5-layer **qwen3**-architecture head (not Gemma), block_size=7,
+confidence_head_with_markov=true, markov_rank=256 - matches the "small
+Markov head" description found via web search earlier. Checkpoint is raw
+`safetensors`, needs GGUF conversion; likely routes through
+`conversion/qwen.py`'s existing dspark-handling (that file already
+references dspark/dflash) since the draft body is qwen3-shaped, though this
+isn't confirmed without porting #26275 and trying it.
+
+Reported speedup (task-dependent, from the PR's own numbers): coding 1.76x,
+QA/rag ~1.06-1.26x, writing ~1.00x (no gain), acceptance rate 0.24-0.58
+depending on category.
+
+**Path to actually testing this**: port PR #26275 (same kind of work as the
+moe-cache port, smaller diff), download the makora-ai checkpoint, convert to
+GGUF, run against our Gemma-4-26B-A4B target. Not started - this is what
+"expert-cache first, DSpark after" (our earlier sequencing decision) points
+to next once moe-cache is validated.
+
+## Suffix Decode (open PR, not in our checkout)
+
+PR #26283, open. Model-free speculative decoding - vLLM's
+[SuffixDecoding](https://suffix-decoding.github.io/): builds an online
+suffix tree from the current request's own generated tokens, best when the
+matched suffix is long (repetitive output - code edits, structured output,
+agentic tool-call loops). No draft model needed at all, so it composes with
+literally anything, including DSpark or moe-cache, without the
+device-placement complications DSpark has. vLLM's version optionally keeps
+a global cross-request corpus (up to 10k past requests); llama.cpp's port
+so far only builds the per-request tree, no global corpus yet.
+
+Worth trying once we have a real agentic/repetitive workload to test against
+- our own tool-call-heavy sessions in this very project would be a
+reasonable proxy.
+
 # Ideas from JustVugg/colibri worth evaluating for moe-cache
 
 Source: https://github.com/JustVugg/colibri (Apache-2.0, C engine + React web UI,
