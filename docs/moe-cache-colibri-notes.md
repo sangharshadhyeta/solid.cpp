@@ -465,20 +465,77 @@ definitively ruled out - a genuinely decode-scoped version of overlapped
 prefetch (much smaller per-step tensors, higher call frequency) is a
 different, untested mechanism.
 
-## Conclusion: not root-caused yet, points outside moe-cache
+## ROOT-CAUSED, 2026-08-14: `MMVQ_MAX_BATCH_SIZE` in ggml-cuda, not moe-cache or llama-server
 
-Five candidate explanations checked now (moe-cache MAX_BATCH gate - real
-bug, not this bug; cache-capacity thrashing - ruled out via stats;
-CPU thread-pool saturation - ruled out, made it worse; endpoint-bias
-artifact - ruled out, cliff reproduces through the corrected endpoint;
-prefill-oriented copy-prefetch - no effect, likely never engaged for this
-decode-shaped workload). None of moe-cache's own instrumentation shows
-anything unhealthy through the cliff in any of these runs. The next real
-step, not yet attempted, is reading `tools/server/server.cpp`'s own slot
-scheduling / continuous-batching logic directly rather than testing more
-moe-cache-adjacent hypotheses from outside it - the bottleneck is
-increasingly likely to be there, not anywhere this investigation has
-looked so far.
+Five candidate explanations were checked first and none of them it
+(moe-cache MAX_BATCH gate - real bug, not this bug; cache-capacity
+thrashing - ruled out via stats; CPU thread-pool saturation - ruled out,
+made it worse; endpoint-bias artifact - ruled out, cliff reproduces
+through the corrected endpoint; prefill-oriented copy-prefetch - no
+effect, likely never engaged for this decode-shaped workload). Rather
+than keep testing moe-cache-adjacent hypotheses from outside, captured
+full per-request timing distributions at concurrency=8 vs 10 instead of
+just the aggregate number: wall-time spread across concurrent requests
+stayed ~1.00x at *every* level tested (all requests in a batch finish
+within 0.05-0.07s of each other) - **no starvation or fairness issue at
+all**. Instead, every request's own per-token decode rate collapses
+uniformly: ~12.6-14 tok/s/sequence through concurrency=8, ~6.0
+tok/s/sequence at concurrency=9 (confirmed the exact boundary with a
+dedicated 7/8/9/10 sweep). A pure batch-size-triggered compute cliff, not
+a scheduling bug - which pointed straight at the GPU kernel dispatch
+layer, not `tools/server/server.cpp`.
+
+Found it in `ggml/src/ggml-cuda/mmvq.cu`: `ggml_cuda_mul_mat_id` (the
+MoE expert-routing dispatcher) only uses the fast `MMVQ` kernel - built
+for small batches - when batch size is at or below a per-(GPU-arch,
+quant-type) threshold; above it, dispatch falls through to the general
+`MMQ`/`MMF` kernels, tuned for large batches and sitting in an
+efficiency valley for medium ones (matches the partial recovery seen at
+concurrency=16 in the original sweep - closer to those kernels' own
+better-utilized batch size, not fully recovered). On this RTX 3060
+(compute capability 8.6, the "turing_plus" bucket in
+`get_mmvq_mmid_max_batch_turing_plus`), the per-quant-type table has
+explicit tuned values for several types but not for whatever quant our
+model's expert tensors actually use (Q4_K or Q8_0, both absent from that
+table) - so it silently falls to the generic default, `MMVQ_MAX_BATCH_SIZE
+= 8`, which is exactly the measured boundary.
+
+**Deployment-critical**: for NVIDIA compute capability >= Ada Lovelace
+(includes Hopper/H200) the dispatch code skips the per-type table
+entirely and always uses the flat default of 8:
+```cpp
+if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
+    return MMVQ_MAX_BATCH_SIZE;  // = 8, unconditionally
+}
+```
+The same cliff is likely to hit the real GLM-5.2/H200 deployment at
+concurrency 9-10, squarely inside the "5-10 users" target range,
+independent of every moe-cache/Layer1/Layer2/LFRU optimization built
+this session - this is a different, lower-level dispatch decision none
+of that work touches.
+
+**Fix shipped: warn, don't silently guess.** Not something `-ncmoe` or
+any placement/VRAM lever can fix (it's a GPU-kernel-dispatch limit, not
+a memory-fit question), so Layer 1 (`common_warn_concurrency_cliff` in
+`common/common.cpp`) now warns at startup instead of changing anything.
+`get_mmvq_mmid_max_batch()` is exposed outside `ggml-cuda` via the
+existing proc-address mechanism (same pattern as the host-buffer
+registration calls, scoped to device 0 for now - the CUDA backend's
+internal device indexing doesn't map 1:1 onto the global
+`ggml_backend_dev_get()` index space, worth revisiting for multi-GPU
+tensor-split later). Since the model's actual expert-tensor quant type
+isn't cheaply known before a full load, the warning queries every common
+MoE quant type and reports the minimum across them - a genuine
+conservative lower bound, so it can fire a bit early but never miss a
+real risk. **Also accounts for MTP**: speculative verification batches
+`(n_max+1)` candidate positions per sequence into a single `MUL_MAT_ID`
+call, the same multiplier moe-cache's own `max_batch` hint already uses
+- so effective batch = `n_parallel * verify_width`, not just
+`n_parallel`. Confirmed: `--parallel 1` with `spec-draft-n-max=9` (verify
+width 10) correctly fires the warning on its own, where a naive
+`n_parallel`-only check would have stayed silent. Runs after the
+calibration-cache lookup so it sees the real (possibly cached) `n_max`,
+not the pre-lookup default.
 
 | config | concurrency=8 | concurrency=10 | concurrency=12 |
 |---|---:|---:|---:|
@@ -1177,17 +1234,23 @@ against exactly this failure mode.
   concurrent-sequence capacity jump at equal VRAM on an A10G.
 - MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
   MIN_BATCH). Tuning fix, not a feature. Unquantified until tested at
-  real concurrency. Note: may be entangled with the still-unresolved
-  concurrency-cliff root cause (llama-server's own slot scheduling,
-  suspected but not confirmed) - worth investigating together, not
-  assuming they're independent.
+  real concurrency. **Not entangled with the concurrency-cliff root cause
+  after all** - that turned out to be a GPU-kernel-dispatch limit in
+  `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to
+  llama-server's MAX_BATCH/MIN_BATCH batch-gate tuning. Can be scoped
+  independently now.
 - Suffix Decode (PR #26283, model-free spec decoding). No number found.
   Additive to MTP, best case is repetitive agentic/tool-call output.
-- The still-open concurrency-cliff root cause itself (aggregate throughput
-  collapses at concurrency=10 on the RTX 3060 sandbox, three hypotheses
-  ruled out, points at llama-server's slot scheduling - not moe-cache).
-  Not yet in any build-list bucket because it's a diagnosis gap, not a
-  scoped feature - needs investigation before it can be scoped as a build.
+- ~~The still-open concurrency-cliff root cause~~ **RESOLVED, 2026-08-14**
+  - see "ROOT-CAUSED" under the concurrency-cliff investigation section
+  above. Not llama-server's slot scheduling after all: a GPU-kernel
+  dispatch threshold in `ggml-cuda/mmvq.cu` (`MMVQ_MAX_BATCH_SIZE=8`
+  default), confirmed to the exact token via a dedicated 7/8/9/10
+  concurrency sweep. Directly relevant to the H200/GLM-5.2 target - for
+  NVIDIA cc>=Ada Lovelace (Hopper included) this threshold is a flat 8
+  unconditionally. Fix shipped as a startup warning
+  (`common_warn_concurrency_cliff`), not a silent workaround - it's a
+  GPU-kernel limit, not something `-ncmoe`/placement can fix.
 
 ## Longer-term / exploratory - not yet scoped as real builds
 - Persistent cross-session usage history (Colibri-style) - avoids
