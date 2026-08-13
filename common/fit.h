@@ -34,6 +34,14 @@ void common_fit_print(
 
 void common_memory_breakdown_print(const llama_context * ctx);
 
+// print a recommended --moe-cache budget plus the GGML_CUDA_MOE_CACHE_*
+// env vars needed for it to actually engage, given a model + hardware.
+// No-op (prints a short note and returns) if the model isn't a MoE model.
+void common_fit_print_moe_cache(
+                         const char * path_model,
+                 llama_model_params * mparams,
+               llama_context_params * cparams);
+
 struct common_device_memory_data {
     int64_t total;
     int64_t free;

@@ -2897,6 +2897,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_ESTIMATE"));
     add_opt(common_arg(
+        { "-fitmc", "--fit-moe-cache" }, "[on|off]",
+        string_format("print a recommended --moe-cache / batch / reserve config for this model+hardware ('on' or 'off', default: '%s')", params.fit_params_moe_cache ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (is_truthy(value)) {
+                params.fit_params_moe_cache = true;
+            } else if (is_falsey(value)) {
+                params.fit_params_moe_cache = false;
+            } else {
+                throw std::runtime_error(
+                    string_format("error: unknown value for --fit-moe-cache: '%s'\n", value.c_str()));
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_FIT_PARAMS}).set_env("LLAMA_ARG_FIT_MOE_CACHE"));
+    add_opt(common_arg(
         { "-fitt", "--fit-target" }, "MiB0,MiB1,MiB2,...",
         string_format("target margin per device for --fit, comma-separated list of values, "
             "single value is broadcast across all devices, default: %zu", params.fit_params_target[0]/(1024*1024)),
