@@ -1775,19 +1775,39 @@ void common_moe_calibrate(common_params & params) {
     auto next_port = [&]() { return port_counter++; };
     const uint32_t ctx = cparams.n_ctx > 0 ? cparams.n_ctx : 4096;
 
-    // One retry before treating a failure as real: a single subprocess run
-    // is one noisy sample (same lesson as the n_max=3 run-to-run variance
-    // found earlier in this session - see docs), and a spurious failure
-    // shouldn't truncate a search.
-    auto bench_with_retry = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
+    // Two independent samples per candidate, averaged - a single subprocess
+    // run is one noisy sample, and this isn't a theoretical concern: a
+    // documented n_max=3 run-to-run swing of 65% (42.06 vs 69.21 tok/s)
+    // elsewhere in this history, and a real thread-tuning decision that
+    // shipped on a single n_threads=12 sample of 48.71 tok/s when the true
+    // 3-repeat mean was 61.82 - an outlier large enough to flip a closer
+    // decision, confirmed by re-measuring after the fact. Each sample gets
+    // its own one-retry-on-failure (a launch failure is a different problem
+    // than ordinary timing noise); a sample that still fails after its
+    // retry is dropped from the average rather than failing the whole
+    // candidate, so one bad launch doesn't cost two good measurements.
+    constexpr int n_samples_per_candidate = 2;
+    auto bench_one_sample = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
         if (tps < 0) {
-            LOG_WRN("%s:   candidate failed once, retrying ...\n", __func__);
+            LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
         }
         return tps;
+    };
+    auto bench_with_retry = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
+        double sum = 0.0;
+        int n_ok = 0;
+        for (int i = 0; i < n_samples_per_candidate; i++) {
+            const double tps = bench_one_sample(n_cpu_moe, n_max, mtp_path, n_threads);
+            if (tps > 0) {
+                sum += tps;
+                n_ok++;
+            }
+        }
+        return n_ok > 0 ? sum / n_ok : -1.0;
     };
 
     // Search range: from the safe floor up to a bound past which more
