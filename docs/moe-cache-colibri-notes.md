@@ -1,6 +1,7 @@
 # vLLM features beyond DSpark/Suffix Decode - priority order
 
-Not yet scoped, just recorded with a rough priority (nearest-term first):
+Not yet scoped, just recorded with a rough priority (nearest-term first).
+Status verified by reading the actual PRs/discussions/issues, not assumed.
 
 ## 1. Automatic prefix caching (next up after DSpark/Suffix Decode)
 
@@ -12,10 +13,33 @@ already page-like, sharing them across requests by content hash falls out
 almost for free. llama.cpp's prompt caching is per-slot/per-session today,
 not a global hash-addressed cache shared across arbitrary concurrent
 requests. Relevant for llama-server multi-session workloads (agentic/tool
-systems hammering the same system prompt across sessions). Prerequisite:
-some form of block-based KV layout - ties back to the still-open PR #18747
-("KV cache size limiting and block tracking infrastructure") rather than
-being a clean standalone drop-in.
+systems hammering the same system prompt across sessions).
+
+**Real status, verified by reading the threads (2026-08-13):**
+- Two prior PagedAttention attempts: #17579 (closed, zero comments, no
+  adoption) and #22569 (open draft, dormant since 2026-05, real numbers -
+  on an A10G at equal KV budget, unified KV OOMs at 26 concurrent
+  sequences, paged mode handles 247).
+- The actual design discussion is #21961 ("Paged KV cache and scheduler:
+  Phase 1"), still genuinely live - last comment 2026-08-11, two days
+  before writing this. No maintainer verdict landed yet, not rejected,
+  just unresolved.
+- **The real maintainer pushback isn't against the outcome, it's against
+  the implementation strategy.** ngxson (maintainer): "paged attn is only
+  beneficial when the incoming requests have the same prompt prefix...
+  we can obviously implement the same scheduling for cross-request KV
+  reuse at server level" - i.e. get prefix-sharing without adopting
+  vLLM's whole fixed-block-pool KV architecture. am17an (maintainer)
+  separately noted most llama.cpp users don't run enough parallel
+  requests for the >25-concurrency win to matter to them specifically.
+  Even the original design discussion #21961 already deferred CoW/prefix
+  caching itself to an unscoped "Phase 2" - it was never actually in
+  scope for the PR that stalled.
+- **Implication for us**: don't port PagedAttention wholesale. The
+  narrower, maintainer-suggested path - server-level cross-request KV
+  block reuse without a full block-pool rewrite - is the one with an
+  actual chance of landing, and is a smaller, more scoped project than
+  what either stalled PR attempted.
 
 ## 2. Chunked prefill + continuous batching (later - look at together)
 
@@ -24,9 +48,18 @@ other requests' decode steps, so one huge prompt doesn't stall everyone
 else's tokens; only makes sense on top of continuous batching (a new batch
 formed every iteration rather than waiting for the whole in-flight batch to
 finish). Both are multi-tenant serving mechanisms - relevant to llama-server
-specifically, not the CLI/single-user path. Grouping these two together
-since chunked prefill doesn't stand alone without the batching model under
-it.
+specifically, not the CLI/single-user path.
+
+**Real status, verified (2026-08-13):**
+- Continuous batching is **already shipped** in llama-server, not a gap -
+  PR #6358's title ("Allow continuous batching to be disabled") implies
+  it's on by default. llama.cpp already has this one; what it lacks is
+  vLLM's more sophisticated paged/chunked version layered on top.
+- Chunked prefill's tracked PR (#10718) is **stale, not just unmerged** -
+  created Dec 2024 as a single-day draft/example, zero updates since. Very
+  different situation from the paged-KV discussion, which is still active
+  this week. If we want this, we're likely starting closer to scratch than
+  picking up existing momentum.
 
 ## 3. Multi-LoRA serving (after that)
 
@@ -36,19 +69,41 @@ doesn't match today, but even vLLM's own ecosystem is still fighting an
 inherent conflict here as of 2026: prefix caching and multi-LoRA serving
 actively fight each other, since KV cache can't be shared across requests
 using different adapters - active research problem upstream, not a solved
-pattern to copy. Lower priority partly because of that immaturity, partly
-because "serve many fine-tunes off one deployment" isn't a typical
-llama.cpp use case.
+pattern to copy.
+
+**Real status, verified (2026-08-13):** llama.cpp is hitting the identical
+collision right now, live and unfixed - open issue #26207 (filed
+2026-07-28, unlabeled/untriaged): with per-request LoRA selection and
+`cache_prompt: true`, the server reuses KV computed under adapter A for a
+request selecting adapter B whenever the prompt prefix matches - silent
+output contamination, nothing logged. The only workaround
+(`cache_prompt: false`) means paying full prompt re-processing every
+request, i.e. disabling the very feature (prefix caching) that would make
+multi-LoRA serving fast. This isn't a "vLLM has it, we don't" gap - it's
+the same open problem in both codebases, which changes the framing: fixing
+this bug in llama.cpp *is* progress on the shared unsolved problem, not
+catch-up on a solved one.
 
 ## 4. True distributed / multi-node serving (very end)
 
 Tensor + pipeline + data + expert parallelism combined across a GPU
 cluster - vLLM's actual mission territory (cloud-scale multi-tenant
 serving, what most RL training loops and inference-as-a-service providers
-build on). llama.cpp has `rpc-server` for distributed inference already but
-far less mature. Lowest priority: this is vLLM's core differentiator
-*because* it's solving a different problem than llama.cpp's portability
-mission, not a gap llama.cpp is trying to close.
+build on).
+
+**Real status, verified (2026-08-13):** llama.cpp's `rpc-server` is real
+and used, not vaporware, but the open issues paint a rough picture:
+crashes on multi-node CUDA RPC (#26583, GLM-5.2), no error recovery - one
+worker's RPC failure aborts the entire process rather than returning an
+error (#25938, with a fix in flight at #26724), and model loading that
+serializes read+hash+dispatch on a single host core so a 535GB load takes
+~15 minutes with the NIC and 95 other cores idle (#25890). This is real,
+shipping infrastructure that people are actively hitting real bugs in -
+not a mature, hardened distributed-serving stack the way vLLM's is.
+Lowest priority for the same reason as before: this is vLLM's core
+differentiator because it solves cloud-scale serving, a different mission
+than llama.cpp's portability focus - but if we ever did touch this, fixing
+the existing rough edges would matter more than adding new capability.
 
 # vLLM features worth tracking (DSpark, Suffix Decode)
 
