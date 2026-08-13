@@ -128,6 +128,60 @@ generalizes. Encouragingly, a separate data point in the same thread
 (Tropfchen, Gemma4-26A4-APEX, cold 18 tok/s -> warm 30 tok/s) suggests Gemma
 4's routing does have exploitable skew, unlike DeepSeek's.
 
+## GLM-5.2 specifically: skew appears real (independent field data)
+
+From the same RFC #24528 thread, user SharkWipf (RTX 6000 + Threadripper,
+independent of leloch/noonghunna): measured 30-50% decode speedup on GLM 5.2
+from a hot-cache approach, and directly observed the shape: "the top ~1000
+most frequently hit experts per conversation thread seem to be the most
+important ones... after that it seems to fall off rapidly." noonghunna
+initially suspected this could be the same under-warmed-pool artifact that
+tripped their own early DeepSeek measurement, but after cross-checking
+conceded "your falloff is probably real" for the GLM-5.2 case specifically
+(with the residual caveat that nobody fully ruled out a VRAM-ceiling
+explanation over a routing-saturation one). Net: GLM-5.2's routing looks
+skewed like Qwen's, not uniform like DeepSeek's aux-loss-free routing -
+consistent with Gemma-4-A4B's own cold/warm gap noted above. Reasonable
+prior going into our own test: expect a real win, not a capacity-ratio-only
+one, but confirm by looking at the hit-rate-vs-pool-size *shape*, not just
+the final speedup number.
+
+## Benchmarking traps to avoid (learned the hard way by others, same thread)
+
+Several testers burned real runs on these; worth checking off before trusting
+our own numbers once Gemma-4-26B-A4B is downloaded:
+
+- **`--moe-cache` defaults to `auto`, which is ON.** Omitting the flag is
+  NOT a control arm - it measures cache-vs-cache. The zero arm needs
+  `--moe-cache off` (or `0`) explicit.
+- **The requested budget isn't the granted budget.** VRAM-capped silently;
+  read the actual `[moe-cache] ... pool[0]: ... slots=N total=M MiB` log
+  line, not the flag you passed.
+- **Never set `GGML_OP_OFFLOAD_MIN_BATCH` low on a cache-enabled config.**
+  It offloads expert `MUL_MAT_ID` to GPU directly, so no CPU-resident expert
+  op remains for the cache to intercept - the cache silently never
+  allocates at all. One tester measured a 4.2x *loss* (22.34 -> 5.31 tok/s)
+  from this exact mistake. Leave it at the default (32).
+- **A batch-size gap exists between the cache's max batch (default 8,
+  `GGML_CUDA_MOE_CACHE_MAX_BATCH`) and the offload threshold (default 32,
+  `GGML_OP_OFFLOAD_MIN_BATCH`).** Batches of 9-31 are served by neither
+  mechanism. Matters for `--parallel N` or larger speculative-decode drafts.
+- **Tune admission (`GGML_CUDA_MOE_CACHE_ADMIT_AFTER`) by wall-clock time,
+  not hit rate.** A bigger pool with a *higher* hit rate measured ~11%
+  slower for one tester - hit rate is a diagnostic, not the objective.
+- **Prefill is essentially untouched by the cache itself** (within 0.3-0.6%
+  in a clean single-variable test) - large reported prefill regressions
+  elsewhere turned out to be `-ub` size tradeoffs (smaller ubatch frees
+  compute-buffer VRAM for the pool, at a measured -12.5% prefill / +10%
+  decode tradeoff) or mmap/disk-streaming effects conflated with the cache.
+- **Composes well with an external speculative-decode drafter, but only if
+  the drafter is CPU-resident.** One tester measured 24.4 tok/s (cache
+  alone) + 33.6 tok/s (GPU-resident DSpark drafter alone) failing to
+  compose at all when combined on GPU (cache sees ~0 hits - a device/session
+  binding bug under the shared-draft-device reordering), but 46.8-48.2 tok/s
+  when the same drafter ran on CPU (`-devd none`) instead. Relevant for our
+  "expert-cache first, DSpark after" sequencing decision.
+
 ## Already checked, no action needed
 
 **NaN-safe router argmax** (`route_trace.h`'s `rt_router_pick`): if router
