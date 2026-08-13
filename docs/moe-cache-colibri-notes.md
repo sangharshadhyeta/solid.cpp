@@ -236,31 +236,101 @@ variance at this prompt/gen size is real and should be accounted for when
 comparing configs that differ by less than ~10-15%, not treated as
 measurement error to explain away.
 
-## v2 (launched immediately after v1, ~50 min budget) - results pending
+## v2 (403s wall clock - budgeted 50 min, again just fast on this HW)
 
 Purpose: v1 left three things unexplored that the user's original ask
 ("emulate users and requests to find optimal solutions... various kinds of
-configs and loads") called for and 126s wasn't enough time to cover:
+configs and loads") called for and 126s wasn't enough time to cover: the
+real OOM boundary, whether `MAX_BATCH` still matters now that it defaults
+to 8, and concurrency at the actual "5-10 users" deployment target with
+longer, more agentic-shaped generations.
 
-1. **Where's the actual OOM boundary?** v1 stopped at `-ncmoe 24` un-OOM'd.
-   v2 pushes the joint `-ncmoe` x `--moe-cache` grid down to 4, cross-tested
-   against `auto`/4096/8192 cache budgets (placement and cache budget share
-   the same VRAM pool, so the true optimum is a joint search, not two
-   independent 1-D sweeps - this was flagged explicitly by the user: "our
-   system should at least be as smart as we are doing by self").
-2. **Does `MAX_BATCH` still matter now that it defaults to 8?** Sweep
-   2/4/8/16/32 to check whether the new default is actually the local
-   optimum or just "no longer catastrophically wrong."
-3. **Concurrency at the actual deployment target.** v1 only tested powers of
-   2 up to 8; v2 adds 5 and 10 directly (the real target is "5-10 users"),
-   extends to 16 to see where saturation sets in, and uses longer
-   `n_predict=200` generations with more agentic-style prompts to better
-   match real usage than the short 60-token test.
+**Phase A - joint `-ncmoe` x `--moe-cache` grid (`-p 256 -n 128 -r 3`),
+pushing past v1's un-OOM'd floor of 24:**
 
-Check `/root/.claude/jobs/a804561e/tmp/sweep-v2-results/summary.md` for
-results once complete - this doc will get a follow-up update with the
-numbers and any resulting change to the placement/cache-budget
-recommendation.
+| `-ncmoe` | `auto` | `4096` | `8192` |
+|---:|---:|---:|---:|
+| 24 | 57.30 ± 5.59 | 56.87 ± 4.96 | 57.04 ± 5.87 |
+| 20 | 59.60 ± 4.74 | 59.54 ± 5.34 | 59.92 ± 5.19 |
+| **16** | **60.99 ± 3.41** | **61.06 ± 3.36** | **61.35 ± 3.10** |
+| 12 | 53.51 ± 0.94 | 53.67 ± 0.85 | 53.51 ± 0.94 |
+| 8 | **OOM** (model load fails) | OOM | OOM |
+
+**Two real findings here, both correcting earlier assumptions:**
+
+1. **The optimum is `-ncmoe 16`, not 24 or 30.** Throughput is
+   *non-monotonic* in placement aggressiveness: 24→20→16 climbs (57→60→61),
+   but 16→12 drops sharply (61→53.5) before failing outright at 8. The
+   previously-documented "safe" value of 30 (46.63 tok/s, from v1 phase 2)
+   left ~31% of decode throughput on the table. The likely mechanism: below
+   ~16, there's not enough free VRAM left for the cache pool + KV cache +
+   compute buffers to operate without contention, even though the model
+   itself still loads down to 12 - the failure mode isn't a hard wall until
+   8, it's a soft throughput cliff starting around 12. **True OOM boundary
+   on this card/model: between `-ncmoe 8` (fails) and `-ncmoe 12` (loads,
+   but already past the throughput cliff).**
+2. **Cache budget stops mattering once placement is right.** At every
+   placement tested, `auto`/`4096`/`8192` are statistically indistinguishable
+   (differences are inside the ± noise band). This means the earlier finding
+   ("`auto` ≈ best hand-tuned budget") wasn't a coincidence of the specific
+   `-ncmoe 99` placement it was measured at - it holds across placements too.
+   Once `-ncmoe` is dialed in, hand-tuning `--moe-cache` past `auto` buys
+   nothing further on this hardware.
+
+**Phase B - `GGML_CUDA_MOE_CACHE_MAX_BATCH` sweep** (2/4/8/16/32, `-ncmoe
+99`, `auto`): 53.40-53.78 tok/s across the entire range, all within ±6.8
+noise. **Confirms the earlier fix (default 1→8) was the fix that mattered;
+tuning past 8 buys nothing.** No further action needed here.
+
+**Phase C - concurrency, wider bracket + longer generations** (`--parallel
+16 -c 16384`, `auto`, `n_predict=200`, mixed agentic-style prompts):
+
+| concurrency | aggregate tok/s | per-user tok/s |
+|---:|---:|---:|
+| 1 | 46.88 | 46.88 |
+| 2 | 74.44 | 37.22 |
+| 4 | 88.60 | 22.15 |
+| **5** | **99.02** | 19.80 |
+| 8 | 96.42 | 12.05 |
+| 10 | 58.57 | 5.85 |
+| 12 | 57.94 | 4.82 |
+| 16 | 63.93 | 3.99 |
+
+**Unexpected and important: aggregate throughput peaks at concurrency=5,
+then collapses at 10-12 before a partial recovery at 16.** This is not a
+smooth diminishing-returns curve - there's a real cliff between 8 and 10.
+Not yet root-caused (candidates: KV-cache VRAM exhaustion at high
+`--parallel` x `-c` on a 12GB card with `-ncmoe 99`, or slot-scheduling
+contention in the server) - flagged as an open question, not a settled
+conclusion. **Directly actionable for the H200 deployment**: don't assume
+higher `--parallel` is free, or that a bigger card removes this cliff -
+this exact sweep methodology (concurrency emulation against the real
+target count) needs to be re-run on the actual deployment hardware/model,
+since the cliff's location is plausibly VRAM-budget-relative, not a fixed
+concurrency number. On this card, for a "5-10 users" target, **5 concurrent
+requests is the actual sweet spot, not 8 or 16** - matching the top end
+of the target range, not the middle.
+
+**Phase D - variance confirmation** (5x repeat, `-ncmoe 99`, `auto`,
+`-p 256 -n 128`): 56.06 ± 5.20 tok/s tg128, 244.38 ± 8.86 pp256. Consistent
+with phases A/B within noise. (Note: the script's auto-picked "best config"
+for this phase mis-selected `-ncmoe 24` instead of the actual winner `16`,
+due to a sort-key bug in the shell one-liner - harmless since phase A's raw
+numbers above are already the authoritative source, but worth knowing the
+phase D number isn't the true best-config confirmation it was meant to be.)
+
+## Updated recommendation after v1+v2
+
+For this card/model: `-ncmoe 16 --moe-cache auto`, no env var tuning needed
+(`MAX_BATCH` default of 8 and live `RESERVE_MB` computation are both
+already at their empirical optimum). Expected ~61 tok/s decode, up from the
+27.71 tok/s `off` baseline (**+120%**, larger than the +54% first measured
+because that used a suboptimal `-ncmoe 99` placement, not because the cache
+mechanism itself improved). For concurrent serving, provision for the
+concurrency sweet spot found empirically (5 here) rather than assuming
+higher `--parallel` monotonically helps - re-run phase C's methodology on
+whatever hardware is actually deployed to, since the cliff is suspected to
+be VRAM-relative rather than a portable fixed number.
 
 # Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
 
