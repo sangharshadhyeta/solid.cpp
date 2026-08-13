@@ -1,3 +1,62 @@
+# Other software worth knowing about (not deep-dived into source yet)
+
+## KTransformers (kvcache-ai/ktransformers) - validates our approach independently
+
+Published research (SOSP 2026, top-tier systems conference), 19.2k stars,
+Apache-2.0, active (pushed 2026-08-08). Now integrated as a backend into
+SGLang for CPU/GPU hybrid MoE inference. Core strategy confirmed from their
+own README: "Heterogeneous expert placement (hot experts on GPU, cold
+experts on CPU)" - the same fundamental approach as leloch's moe-cache we
+already ported, independently arrived at and peer-reviewed. Useful as
+validation that the design direction is sound, not just a hobbyist idea.
+
+Differentiators worth understanding better if we go deeper:
+- AMX/AVX-optimized CPU kernels (Intel AMX-Int8/AMX-BF16 specific -
+  depends on the office HPC's actual CPU supporting AMX; needs checking,
+  not assumed)
+- NUMA-aware memory management (relevant if the H200 node is multi-socket)
+- **Native multi-concurrency support built in from the start** (per their
+  "Apr 2, 2025: Support Multi-concurrency" changelog entry) - directly
+  relevant to our 5-10 concurrent user requirement, which is currently an
+  open question for our moe-cache port (see MTP x concurrency question
+  above), not a solved design there.
+
+Reported: >220 tok/s total throughput on trillion-parameter MoE models in
+their hybrid setup (hardware config not verified from this pass - would
+need to check if comparable to our 1x H200 + 512GB target before treating
+as a benchmark to match).
+
+Not yet: read their actual source for the concurrency/scheduling
+mechanism, compared their eviction/placement policy in detail against
+leloch's, or checked AMX availability on the target HPC's CPU.
+
+## ik_llama.cpp (ikawrakow/ikawrakow_llama.cpp) - sibling fork, same problem space
+
+llama.cpp fork specifically focused on CPU/GPU hybrid MoE offload
+performance. Already has MTP decoding support merged for GLM-4.x MoE,
+Qwen 3.5/3.6, Gemma 4, and GLM 5 - i.e. both of our target models already
+have MTP support in this fork, same as we just verified for mainline
+GLM-5.2. Uses a concrete, specific GPU-offload threshold formula: prompt
+processing offloads to GPU above `32 * total_experts / active_experts`
+tokens - a different, more MoE-shape-aware heuristic than the flat
+default-32 `GGML_OP_OFFLOAD_MIN_BATCH` threshold we've been discussing for
+mainline. Worth comparing once we're tuning batch-size gates for our own
+deployment - this formula scales with the model's actual expert:active
+ratio rather than being a flat constant.
+
+Not yet: read their actual moe-cache-equivalent implementation, if one
+exists, or diffed their offload heuristic against leloch's approach in
+detail.
+
+## Ollama / LM Studio - confirmed downstream, not independent sources
+
+Both wrap llama.cpp rather than implementing independent MoE-offload
+architectures. Ollama's MoE handling is transparently llama.cpp
+underneath; their own recent additions are MLX (Apple Silicon) engine
+support alongside llama.cpp, not a competing scheduling/placement design.
+Checked directly (2026-08-13) rather than assumed - nothing to extract
+here for this specific concern.
+
 # Open questions, tracked but not yet resolved
 
 ## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate
