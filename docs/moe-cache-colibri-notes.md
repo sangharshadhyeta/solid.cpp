@@ -585,6 +585,22 @@ our own numbers once Gemma-4-26B-A4B is downloaded:
 - **`--moe-cache` defaults to `auto`, which is ON.** Omitting the flag is
   NOT a control arm - it measures cache-vs-cache. The zero arm needs
   `--moe-cache off` (or `0`) explicit.
+- **CORRECTED 2026-08-13, confirmed from our own test + reading the actual
+  source: `auto`/`on` mode NEVER engages on a single-GPU system, full
+  stop, regardless of free VRAM.** `moe-cache.cu` line ~1365-66:
+  `automatic && budget_devices < 2` unconditionally sets the session
+  dormant. This contradicts noonghunna's RFC-thread claim ("no
+  device-count check, just a 1GiB minimum-slab floor") - that must have
+  applied to an earlier revision; the final rework we ported has a real,
+  hard single-GPU gate. **Reproduced directly**: ran identical prompts on
+  our RTX 3060 with `--moe-cache off` vs `--moe-cache auto`
+  (`-ngl 99 -ncmoe 99`, same prompt, same n_predict) - got 27.0 tok/s
+  both times, zero difference, no pool/log lines emitted either run.
+  **Explicit numeric budgets bypass this gate** (`--moe-cache <MiB>`) -
+  this is the only way to engage the cache on a single GPU. **Directly
+  affects the real deployment too, not just this sandbox test - the H200
+  target is also a single GPU.** Must always use an explicit budget
+  there, never `auto`.
 - **The requested budget isn't the granted budget.** VRAM-capped silently;
   read the actual `[moe-cache] ... pool[0]: ... slots=N total=M MiB` log
   line, not the flag you passed.
