@@ -415,7 +415,70 @@ threadpool now saturates all cores and starves the server's own
 request-handling/sampling/JSON threads. Ruled out as the cause - more
 threads didn't fix it and moved the wrong direction.
 
+## Hypothesis 4 (2026-08-14): endpoint-bias artifact - RULED OUT, cliff is real
+
+The three hypotheses above were tested 2026-08-13, before the endpoint-bias
+bug (raw `/completion` bypassing the chat template, see the endpoint-bias
+investigation section) was found. Worth checking whether the cliff itself
+was ever real, or partly a measurement artifact of the same bug. Re-ran the
+Phase C sweep through the corrected `/v1/chat/completions` endpoint with 16
+distinct real prompts (not repeated), `-ncmoe 99 --moe-cache auto -c 16384
+--parallel 16`, aggregate tok/s = total generated tokens / wall-clock for
+all N concurrent requests to complete:
+
+| concurrency | 1 | 2 | 4 | 5 | 8 | 10 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| agg tok/s | 42.18 | 69.49 | 81.53 | 85.94 | **92.12** | 54.38 | 58.52 | 64.54 |
+
+Same shape as the original (peak around 5-8, hard collapse at 10, -41% vs
+the original's -39%, partial recovery by 16). **The cliff is confirmed
+real, not an endpoint-bias artifact.**
+
+## Hypothesis 5 (2026-08-14): copy/PCIe contention under concurrency - inconclusive, mechanism likely never engaged
+
+Motivated directly by the expert-prefetch port done this session (from
+github.com/thecodacus/llama.cpp, fable5/prefetch-experts branch - unrelated
+to the JustVugg/colibri material elsewhere in this doc): if GPU-idle-during-
+copy compounds under concurrent load (more simultaneous sequences needing
+CPU-resident expert weights fetched over the same PCIe bus), that could
+plausibly explain a cliff once total in-flight copy volume crosses a
+hardware limit. Re-ran
+the same corrected sweep with `GGML_CUDA_REGISTER_HOST=1
+GGML_SCHED_PREFETCH_EXPERTS=1` (the prefetch-experts port, measured
++36.0% prefill throughput on this same hardware) active:
+
+| concurrency | 1 | 2 | 4 | 5 | 8 | 10 | 12 | 16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| agg tok/s (patched) | 42.56 | 69.57 | 80.04 | 88.90 | 91.99 | 53.24 | 58.42 | 63.87 |
+
+**Zero measurable difference at any concurrency level, cliff identical in
+shape and magnitude.** Not a clean "ruled out" though: the prefetch
+mechanism only engages above a batch-size threshold
+(`ids->ne[0]*ids->ne[1] >= 2*n_expert` in `ggml_backend_sched_compute_splits`)
+tuned for large-batch *prefill*, not single-token-per-sequence *decode* -
+at concurrency=16 with Gemma-4's top-k, the per-step routing-id count is
+plausibly still well under that threshold, meaning the patch likely never
+activated during this decode-dominated workload at all. So this result
+shows the prefill-oriented prefetch fix doesn't touch the decode-time
+concurrency cliff, not that copy/PCIe contention during decode is
+definitively ruled out - a genuinely decode-scoped version of overlapped
+prefetch (much smaller per-step tensors, higher call frequency) is a
+different, untested mechanism.
+
 ## Conclusion: not root-caused yet, points outside moe-cache
+
+Five candidate explanations checked now (moe-cache MAX_BATCH gate - real
+bug, not this bug; cache-capacity thrashing - ruled out via stats;
+CPU thread-pool saturation - ruled out, made it worse; endpoint-bias
+artifact - ruled out, cliff reproduces through the corrected endpoint;
+prefill-oriented copy-prefetch - no effect, likely never engaged for this
+decode-shaped workload). None of moe-cache's own instrumentation shows
+anything unhealthy through the cliff in any of these runs. The next real
+step, not yet attempted, is reading `tools/server/server.cpp`'s own slot
+scheduling / continuous-batching logic directly rather than testing more
+moe-cache-adjacent hypotheses from outside it - the bottleneck is
+increasingly likely to be there, not anywhere this investigation has
+looked so far.
 
 | config | concurrency=8 | concurrency=10 | concurrency=12 |
 |---|---:|---:|---:|
