@@ -520,11 +520,18 @@ a memory-fit question), so Layer 1 (`common_warn_concurrency_cliff` in
 `common/common.cpp`) now warns at startup instead of changing anything.
 `get_mmvq_mmid_max_batch()` is exposed outside `ggml-cuda` via the
 existing proc-address mechanism (same pattern as the host-buffer
-registration calls, scoped to device 0 for now - the CUDA backend's
-internal device indexing doesn't map 1:1 onto the global
-`ggml_backend_dev_get()` index space, worth revisiting for multi-GPU
-tensor-split later). Since the model's actual expert-tensor quant type
-isn't cheaply known before a full load, the warning queries every common
+registration calls). **Multi-GPU/tensor-split correct**: initially
+shipped scoped to device 0 only (the CUDA backend's internal device
+indexing doesn't map 1:1 onto the global `ggml_backend_dev_get()` index
+space), then fixed the same session - the exposed function now takes the
+caller's own `ggml_backend_dev_t` directly and recovers the real
+per-backend device index from `dev->context`, and the common.cpp side
+checks every GPU device (not just the first), since on a tensor-split
+setup the full concurrent batch hits whichever device is computing the
+current layer - the cliff can happen on any of them, so the safe ceiling
+is the minimum across every device. Since the model's actual
+expert-tensor quant type isn't cheaply known before a full load, the
+warning queries every common
 MoE quant type and reports the minimum across them - a genuine
 conservative lower bound, so it can fire a bit early but never miss a
 real risk. **Also accounts for MTP**: speculative verification batches
