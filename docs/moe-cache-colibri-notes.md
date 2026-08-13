@@ -1363,9 +1363,30 @@ against exactly this failure mode.
   protects against static-beats-dynamic-on-uniform-routing failure case,
   unscoped.
 - Live per-expert heatmap UI - debugging/demo value, not performance.
-- Layer 2 extension: concurrency-target-aware calibration (calibrate for
-  "N concurrent users" specifically, not just solo decode speed) - real
-  extension of the now-built Layer 2, not yet attempted.
+- ~~Layer 2 extension: concurrency-target-aware calibration~~ **BUILT AND
+  VALIDATED, 2026-08-14.** `--moe-calibrate` now benchmarks every
+  candidate (ncmoe, threads, spec-draft-n-max) with real concurrent
+  requests and scores by aggregate throughput whenever `--parallel N > 1`
+  is passed alongside it, instead of always using solo decode speed -
+  directly motivated by this session's own findings that the MMVQ and
+  bulk-offload GPU-kernel-dispatch cliffs only appear above certain
+  concurrent batch sizes, invisible to a solo benchmark entirely.
+  Deliberately reuses `--parallel` itself as the concurrency target
+  rather than a separate flag, since the calibration cache key already
+  includes `n_parallel` - a separate flag risked drifting out of sync
+  with the deploy-time `--parallel` and silently missing the cache.
+  Found and fixed a real bug along the way: the benchmark's request
+  builder wrapped JSON bodies in shell single quotes, and one of the
+  probe prompts ("Explain Newton's second law...") had an apostrophe
+  that broke the quoting outright - added proper escaping
+  (`common_shell_quote`) rather than just avoiding the word. **Verified
+  end-to-end**, not just compiled: calibrated at `--parallel 8` found
+  ncmoe=15 at 76.11 aggregate tok/s, closely matching this session's
+  independent concurrency-sweep measurement at the same concurrency
+  (78.12 tok/s, within normal noise) - real cross-validation, not a
+  unit-level check. Confirmed the cache correctly isolates by
+  concurrency: a `--parallel 1` launch afterward missed the
+  concurrency=8 entry and fell back to Layer 1's live safe floor.
 - ~~Verify whether Colibri actually avoids the full prefill pass before the
   first token~~ **RESOLVED, 2026-08-14, checked against actual source**
   (`c/kv_prefix.h` in JustVugg/colibri, cloned and read directly). It
