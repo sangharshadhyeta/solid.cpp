@@ -1284,16 +1284,21 @@ against exactly this failure mode.
   experiment elsewhere showed a 26->247 concurrent-sequence capacity jump
   at equal VRAM on an A10G, a different (block-pool) approach not needed
   here given this simpler mechanism already covers the actual ask.
-- MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
-  MIN_BATCH). **Started, 2026-08-14** - see "MTP verify-batch size x
-  concurrency" under Open questions above for the full writeup. Half
-  done: moe-cache's own `MAX_BATCH` gate is now MTP-aware (was silently
-  ignoring MTP's verify-width multiplier entirely, fixed and verified).
-  Still open: whether a real throughput dip remains in the 9-31 range now
-  that the gate is correctly sized - needs its own empirical sweep, not
-  done yet. **Not entangled with the concurrency-cliff root cause after
-  all** - that turned out to be a separate GPU-kernel-dispatch limit in
-  `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to this
+- ~~MTP batch-gate tuning (close the 9-31 dead zone between MAX_BATCH/
+  MIN_BATCH)~~ **RESOLVED, 2026-08-14** - see "MTP verify-batch size x
+  concurrency" under Open questions above for the full writeup. moe-cache's
+  own `MAX_BATCH` gate is now MTP-aware (was silently ignoring MTP's
+  verify-width multiplier entirely, fixed and verified). The empirical
+  9-31 sweep found no dead zone in that range itself (smooth climb, 51.2
+  -> 77.5 tok/s) - but did find a real, separate, sharp cliff exactly at
+  concurrency=32 (77.5 -> 41.2, -46.8%), matching `GGML_OP_OFFLOAD_MIN_BATCH`'s
+  default threshold precisely, confirmed independent of moe-cache
+  (reproduced with moe-cache both genuinely active and accidentally
+  starved of VRAM). Not root-caused to kernel level like the MMVQ cliff
+  was, but comfortably outside the 5-10 concurrent user deployment target,
+  so not a blocker. **Not entangled with the concurrency-cliff root cause
+  after all** - that turned out to be a separate GPU-kernel-dispatch limit
+  in `ggml-cuda` (`MMVQ_MAX_BATCH_SIZE`, see below), unrelated to this
   MAX_BATCH/MIN_BATCH question.
 - ~~Suffix Decode (PR #26283, model-free spec decoding)~~ **BUILT AND
   MEASURED, 2026-08-14.** Merged `github.com/ggml-org/llama.cpp` pull/26283
@@ -1527,7 +1532,7 @@ here for this specific concern.
 
 # Open questions, tracked but not yet resolved
 
-## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate - PARTIALLY RESOLVED 2026-08-14
+## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate - RESOLVED 2026-08-14
 
 Native MTP (GLM-5.2's NextN head, PR #25980) is architecturally safer than
 the external-drafter case the RFC thread found broken - MTP runs in the
@@ -1555,17 +1560,41 @@ default 32) - turned out to be two separable questions, not one:
    to the no-MTP case) to `max-batch=32` (correct); `--parallel 16` +
    n_max=3 went from 16 to 64. Non-MTP configs unaffected.
 2. **Does a real throughput dip still exist in the 9-31 range even with
-   the gate now correctly sized?** Not yet measured - `GGML_OP_OFFLOAD_MIN_BATCH`
-   (default 32, upstream, unrelated to moe-cache) is still a flat
-   constant, so for configs where the now-correctly-computed effective
-   batch lands between the (now live, possibly-higher) `MAX_BATCH` and
-   32, a gap could still exist. Also note this is a *third*, independent
-   mechanism from the MMVQ dispatch cliff found and fixed earlier the
-   same session (`MMVQ_MAX_BATCH_SIZE`) - that one decides which GPU
-   *kernel* handles an op once it's already running on GPU; this one
-   decides whether a CPU-resident op gets bulk-offloaded to GPU at all.
-   Needs its own empirical batch-size sweep (9-31 range) before treating
-   the gap as closed or still open - not done yet.
+   the gate now correctly sized? Measured directly, and the answer is
+   nuanced: no dead zone in 9-31 itself, but a real, separate, sharp
+   cliff exactly at 32.** Ran a dedicated concurrency sweep (`-ncmoe 99
+   --moe-cache auto -c 12288 --parallel 40`, real concurrent requests,
+   confirmed moe-cache genuinely engaged via its own log lines - `max-batch=40`,
+   real pool allocation, live hit-rate tracking, not a silent no-op):
+
+   | concurrency | 4 | 8 | 9 | 12 | 16 | 20 | 24 | 28 | 31 | **32** | 40 |
+   |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+   | agg tok/s | 67.9 | 78.1 | 51.2 | 58.0 | 63.8 | 67.2 | 72.0 | 75.7 | 77.5 | **41.2** | 47.2 |
+
+   Throughput climbs smoothly and monotonically from 9 through 31 (51.2 ->
+   77.5) - the already-known-and-fixed MMVQ cliff shows up once at the
+   8->9 boundary as expected, but there's no *further* dip anywhere in
+   9-31 itself. Then a sharp, distinct cliff hits exactly at 32 (77.5 ->
+   41.2, -46.8%), with partial recovery by 40 (47.2) - the same rise-then-
+   cliff-then-partial-recovery shape as the MMVQ cliff, just at a
+   different boundary. **Confirmed this is real and not a moe-cache
+   artifact**: first run accidentally used `-c 32768` (too large a
+   context for `--parallel 40` on this 12GB card, leaving no VRAM for
+   moe-cache's own pool - confirmed via zero `[moe-cache]` log lines the
+   entire run) and still showed the identical cliff shape/magnitude at 32
+   (76.4 -> 41.6); the corrected re-run with moe-cache genuinely active
+   reproduced it almost exactly (77.5 -> 41.2). The boundary lines up
+   precisely with `GGML_OP_OFFLOAD_MIN_BATCH`'s default (32) - crossing
+   into bulk-GPU-offload territory for CPU-resident ops appears to cause a
+   real regression here, not the expected improvement, plausibly a
+   PCIe/transfer-volume bottleneck from many expert tensors being shipped
+   to GPU simultaneously for one step (untested hypothesis, not
+   confirmed) - not yet root-caused to the same depth as the MMVQ cliff,
+   but the empirical shape is solid and reproducible. **Practical
+   takeaway for the H200/GLM-5.2 deployment** (5-10 concurrent users):
+   comfortably clear of both cliffs (8 and 32) at that target, so neither
+   needs fixing before deployment - flagged here in case concurrency ever
+   scales toward 32 in the future.
 
 # Real deployment target (drives all priority calls above and below)
 
