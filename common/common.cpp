@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <list>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -1284,6 +1285,110 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+static bool common_device_memory_data_fits(const common_device_memory_data_vec & data) {
+    for (const auto & d : data) {
+        if (d.total <= 0) {
+            continue; // not a real device (host aggregate, or a device with unknown budget)
+        }
+        const int64_t needed = (int64_t) d.model + (int64_t) d.context + (int64_t) d.compute;
+        if (needed > d.free) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Runs as a fallback *after* the general --fit system has already had its
+// chance (whether --fit is on or off): --fit's only levers are -c and -ngl,
+// so as soon as a user pins both explicitly (a completely ordinary thing to
+// do - e.g. -ngl 99 -c 16384) it has nothing left to try and gives up,
+// while common_init_result() discards that failure status and attempts the
+// real load anyway. This fills the specific gap --fit doesn't cover: partial
+// MoE-expert CPU offload while leaving -ngl/-c exactly as the user set them.
+// Only steps in when nothing has already decided placement (-ncmoe, -ot,
+// -cmoe, or --fit itself already writing real overrides all leave this
+// alone) and the config as given would actually fail to fit - this predicts
+// the failure via the same no-alloc probe --fit-moe-cache uses, instead of
+// catching the crash after a real allocation fails (CUDA allocator state
+// after a real failed cudaMalloc isn't something to rely on being cleanly
+// retriable). No-op (and no added startup cost beyond one no-alloc probe)
+// whenever the config already fits.
+static bool common_maybe_autoplace_moe_cpu(
+        const char * path_model, common_params & params,
+        llama_model_params & mparams, const llama_context_params & cparams) {
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (o.pattern != nullptr) {
+            return false;
+        }
+    }
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+    common_device_memory_data_vec data;
+    try {
+        data = common_get_device_memory_data(path_model, &mparams, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+                GGML_LOG_LEVEL_ERROR);
+    } catch (const std::exception &) {
+        return false; // let the real load surface whatever error this is
+    }
+
+    if (common_device_memory_data_fits(data)) {
+        return false; // fits as given - zero behavior change
+    }
+    if (hp_n_expert == 0) {
+        return false; // not a MoE model, this lever doesn't apply
+    }
+
+    LOG_WRN("%s: model does not fit in available device memory as configured; "
+            "probing live for a safe MoE CPU-offload placement (pass -ncmoe explicitly to override) ...\n", __func__);
+
+    static std::list<std::string> pattern_storage; // keep C strings alive past this function
+    auto build_overrides = [&](uint32_t n) {
+        std::vector<llama_model_tensor_buft_override> ov;
+        for (uint32_t i = 0; i < n; i++) {
+            pattern_storage.push_back(llm_ffn_exps_block_regex((int) i));
+            ov.push_back({pattern_storage.back().c_str(), ggml_backend_cpu_buffer_type()});
+        }
+        ov.push_back({nullptr, nullptr});
+        return ov;
+    };
+    auto fits_with_n = [&](uint32_t n) {
+        std::vector<llama_model_tensor_buft_override> trial = build_overrides(n);
+        llama_model_params mparams_trial = mparams;
+        mparams_trial.tensor_buft_overrides = trial.data();
+        try {
+            common_device_memory_data_vec trial_data = common_get_device_memory_data(
+                    path_model, &mparams_trial, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
+            return common_device_memory_data_fits(trial_data);
+        } catch (const std::exception &) {
+            return false;
+        }
+    };
+
+    // fit is monotonic in n (more CPU offload never needs more device
+    // memory), so binary search finds the minimal working n in O(log ngl)
+    // no-alloc probes instead of up to ngl of them.
+    if (!fits_with_n(hp_ngl)) {
+        LOG_WRN("%s: could not find any MoE CPU-offload placement that fits in available device memory; "
+                "proceeding with the original configuration, load will likely fail\n", __func__);
+        return false;
+    }
+    uint32_t lo = 1, hi = hp_ngl;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (fits_with_n(mid)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+
+    params.tensor_buft_overrides = build_overrides(lo);
+    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    LOG_WRN("%s: auto-placed the MoE experts of the first %u layers on CPU to fit in available VRAM\n", __func__, lo);
+    return true;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
@@ -1299,6 +1404,8 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
+
+    common_maybe_autoplace_moe_cpu(params.model.path.c_str(), params, mparams, cparams);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {

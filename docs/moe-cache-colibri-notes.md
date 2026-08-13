@@ -457,27 +457,64 @@ scratch/reserve costs don't scale with the setting, so there was no
 tradeoff to balance - raising them was a free win). Planned fix, agreed
 scope for this session:
 
-**Layer 1 (this session, in progress)**: compute a *safe* `-ncmoe`
-analytically, live, on every launch, only when the user hasn't explicitly
-passed `-ncmoe` - using the same expert-size-scanning + free-VRAM math
-`--fit-moe-cache` already computes (real per-tensor sizes from the no-alloc
-probe, real free VRAM, real KV-cache size for the requested `-c`/
-`--parallel`), used as a predictive gate *before* the real allocation
-happens - not a catch-after-crash retry. We hit exactly the crash this
-guards against mid-session (`-ncmoe 16 -c 16384 --parallel 16` on this
-card: `cudaMalloc failed: out of memory` on the KV cache, because dropping
-`-ncmoe` from 99 to 16 moves several GB of experts onto the GPU that KV
-cache no longer has room for) - confirming the interaction is real, not
-hypothetical, and that predicting it ahead of the allocation (cheap, just
-arithmetic on numbers already computed) is preferable to a retry loop
-(CUDA allocator state after a real failed `cudaMalloc` is not something to
-rely on being cleanly retriable).
+**Layer 1 (built and validated this session)**: `common_maybe_autoplace_moe_cpu()`
+in `common/common.cpp`, called from `common_init_result::common_init_result()`
+right after the existing `--fit` system has had its chance and right before
+the real model load. Only steps in when nothing has already decided
+placement (`-ncmoe`/`-ot`/`-cmoe`, or `--fit` itself, leave real patterns in
+`params.tensor_buft_overrides` - checked directly, any real pattern anywhere
+in that vector means skip) and the exact config as given would fail to fit -
+predicted via the same no-alloc probe `--fit-moe-cache`/`common_fit_params`
+already use (`common_get_device_memory_data`), used as a gate *before* the
+real allocation happens, not a catch-after-crash retry. When it doesn't fit
+and the model has MoE tensors, binary-searches the minimal CPU-offloaded
+layer count that does fit (O(log n_layer) no-alloc probes, not O(n_layer) -
+monotonic in placement aggressiveness so binary search is valid), then
+writes the winning overrides into both `params.tensor_buft_overrides` (for
+consistency/future reuse) and the `mparams` about to be used for the real
+load.
+
+**Why this needed to run after `--fit`, not skip when `--fit` is on (as
+first implemented)**: `--fit` runs by default for `llama-server`. Initial
+version bailed out whenever `params.fit_params` was true, assuming the
+general system already covered this. It doesn't - `--fit`'s only levers are
+`-c` and `-ngl` (whole-model layer count), and it aborts as soon as *either*
+is user-pinned, with no MoE-specific fallback at all. Confirmed directly:
+launching with `-ngl 99 -c 16384 --parallel 16` and no `-ncmoe` (both
+explicitly pinned, nothing unusual) produced
+`common_fit_params: failed to fit params to free device memory: n_gpu_layers
+already set by user to 99, abort` - and `common_init_result` **silently
+discards that failure status** and attempts the real load anyway, which
+then hard-crashed exactly as our very first mid-session OOM did (`-ncmoe 16
+-c 16384 --parallel 16`: `cudaMalloc failed: out of memory` on the KV cache,
+because moving experts onto the GPU left no room for it). Moved Layer 1 to
+run as an explicit fallback after `--fit`, operating on `--fit`'s own
+(possibly still-failing) `mparams`/`cparams` rather than rebuilding fresh
+ones - this is the gap `--fit` doesn't cover, not a duplicate of it.
+
+**Validated end-to-end, four real scenarios, real hardware:**
+
+| scenario | model | config | result |
+|---|---|---|---|
+| previously-crashing OOM | Gemma-4-26B-A4B (15.77 GiB) | `-ngl 99 -c 16384 --parallel 16`, no `-ncmoe` | auto-placed first 19 layers to CPU (6 binary-search probes), server started, served real completions at 37.2 tok/s |
+| same model, smaller context | same | `-ngl 99 -c 2048 --parallel 1`, no `-ncmoe` | auto-placed first **12** layers (correctly less aggressive - smaller KV cache footprint leaves more room for experts on GPU; confirms this is live per-config, not a cached/fixed answer) |
+| explicit override respected | same | `-ngl 99 -ncmoe 30 -c 16384 --parallel 16` | zero auto-placement log output, user's exact value used untouched |
+| dense model, already fits | Qwen2.5-0.5B-Instruct | `-ngl 99 -c 16384 --parallel 16`, no `-ncmoe` | zero auto-placement log output (fits as given - `--fit` itself found no reduction needed); concurrent load test (1/4/8/16 requests) all succeeded, clean scaling 326→1656 agg tok/s, no cliff |
+
+Case 2 is the important one for the "live, not one-shot" property asked
+for earlier: the same model, same hardware, produces a *different* correct
+answer (12 vs. 19 layers) purely because the context/concurrency config
+changed - there's no cached/stale value involved, every launch computes
+fresh.
 
 **Layer 2 (deferred, scoped but not built)**: the throughput-optimal
 refinement on top of Layer 1's safe floor - a short empirical calibration
 (2-3 candidate placements, few seconds) run once per (GPU, model, context
 config) combination and cached, instead of re-measured on every restart.
-Explicitly deferred this session in favor of shipping Layer 1 first.
+Also now includes `n_threads`/`n_threads_batch` as a swept dimension (see
+the concurrency-cliff investigation above - no safe-analytic-floor exists
+for that lever, only a real curve to measure). Explicitly deferred this
+session in favor of shipping and validating Layer 1 first.
 
 **Third item for Layer 2, not Layer 1**: `n_threads`/`n_threads_batch`.
 Unlike `-ncmoe`, this has no safe-analytic-floor property to give it a
