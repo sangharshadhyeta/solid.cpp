@@ -673,6 +673,12 @@ expert tensor sizes (metadata only, fast), discover VRAM/RAM, project a hit
 rate for our `--moe-cache` budget before the user runs anything. Complements
 the runtime cache rather than replacing it.
 
+**Full scoping done, see `docs/moe-cache-planner-scope.md`** - where it
+lives (extends `tools/fit-params/fit-params.cpp`, not a new binary), what
+new code is needed (an expert-size scanner, resurrected+widened from code
+that briefly existed in our own git history), output format, explicit v1
+scope boundaries, and a testing plan. Not yet implemented.
+
 **Elevated priority after 2026-08-13 validation - this is no longer just a
 nice-to-have.** The RTX 3060 test above needed real debugging (temporary
 source-level diagnostics) to discover that `--moe-cache auto`/`on` silently
