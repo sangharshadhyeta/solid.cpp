@@ -2064,16 +2064,24 @@ static int common_moe_min_mmvq_max_batch(void) {
     return found_any ? min_batch : -1;
 }
 
+// MTP/speculative verification batches (n_max+1) candidate positions per
+// sequence into a single MUL_MAT_ID call, not just 1. Shared by both the
+// MMVQ-cliff warning below and the moe-cache max_batch fix right after it -
+// moe-cache's own hint (llama-context.cpp's set_max_batch_hint) does NOT
+// apply this multiplier, it passes n_seq_max alone (checked directly in
+// the source, not assumed) - a real, separate gap this session found while
+// investigating the MMVQ cliff, fixed by common_moe_apply_mtp_aware_max_batch_hint
+// below rather than touching llama_context's public API surface.
+static int common_moe_verify_width(const common_params & params) {
+    return params.speculative.has_dft() ? (params.speculative.draft.n_max + 1) : 1;
+}
+
 static void common_warn_concurrency_cliff(const common_params & params) {
-    // MTP/speculative verification batches (n_max+1) candidate positions per
-    // sequence into a single MUL_MAT_ID call, not just 1 - the same
-    // multiplier moe-cache's own max_batch hint accounts for
-    // (llama-context.cpp's set_max_batch_hint). Ignoring this would
-    // under-warn: even --parallel 1 can hit the real cliff once MTP's own
-    // verify-width alone exceeds the threshold, so the multiplier has to be
-    // applied before deciding whether there's anything to check at all, not
-    // gated behind an n_parallel>1 fast path.
-    const int verify_width    = params.speculative.has_dft() ? (params.speculative.draft.n_max + 1) : 1;
+    // Ignoring the MTP multiplier here would under-warn: even --parallel 1
+    // can hit the real cliff once MTP's own verify-width alone exceeds the
+    // threshold, so it has to be applied before deciding whether there's
+    // anything to check at all, not gated behind an n_parallel>1 fast path.
+    const int verify_width    = common_moe_verify_width(params);
     const int effective_batch = params.n_parallel * verify_width;
     if (effective_batch <= 1) {
         return;
@@ -2093,6 +2101,44 @@ static void common_warn_concurrency_cliff(const common_params & params) {
                 verify_width > 1 ? " x MTP verify-width" : "",
                 max_batch);
     }
+}
+
+// moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults
+// from a live hint set by llama_context (real n_seq_max, floored at 8,
+// ceilinged at 64 - see moe-cache.cu's MOE_CACHE_MAX_BATCH_CEILING) - but
+// that hint is n_seq_max alone, with no MTP verify-width multiplier applied
+// (checked directly at the call site, llama-context.cpp's reserve()).
+// Under MTP, the real per-step batch moe-cache actually sees is
+// n_seq_max * verify_width, so without this fix the cache gate stays sized
+// for the no-MTP case and silently stops helping (falls back to
+// uncached CPU compute, not a crash) for any MTP-active deployment whose
+// effective batch exceeds whatever n_seq_max alone would have set.
+//
+// Fixed without touching llama_context's public API: this file already
+// knows params.speculative.draft.n_max (the context layer doesn't), so it
+// sets GGML_CUDA_MOE_CACHE_MAX_BATCH explicitly when MTP is active,
+// reusing the existing "explicit env var always wins over the hint"
+// precedence in moe_cache_read_config() rather than adding a new one.
+// Never overrides an operator-set value - only steps in for the specific
+// case the live hint under-serves.
+static void common_moe_apply_mtp_aware_max_batch_hint(const common_params & params) {
+    if (getenv("GGML_CUDA_MOE_CACHE_MAX_BATCH")) {
+        return; // explicit operator choice - never override it
+    }
+    const int verify_width = common_moe_verify_width(params);
+    if (verify_width <= 1) {
+        return; // no MTP - the plain n_seq_max hint already covers this correctly
+    }
+    // MOE_CACHE_MAX_BATCH_CEILING in moe-cache.cu - duplicated here since
+    // that constant is internal to the CUDA backend, not exposed publicly;
+    // both need to move together if the real ceiling ever changes.
+    constexpr int moe_cache_max_batch_ceiling = 64;
+    const int effective = std::max(1, std::min(moe_cache_max_batch_ceiling, params.n_parallel * verify_width));
+    setenv("GGML_CUDA_MOE_CACHE_MAX_BATCH", std::to_string(effective).c_str(), 1);
+    LOG_INF("%s: MTP active (spec-draft-n-max=%d) - set GGML_CUDA_MOE_CACHE_MAX_BATCH=%d "
+            "(n_parallel=%d x verify-width=%d) so moe-cache's own admission gate matches the "
+            "real effective batch size, not just n_seq_max alone\n",
+            __func__, params.speculative.draft.n_max, effective, params.n_parallel, verify_width);
 }
 
 static bool common_maybe_autoplace_moe_cpu(
@@ -2173,12 +2219,14 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     common_maybe_autoplace_moe_cpu(params.model.path.c_str(), params, mparams, cparams);
 
-    // Runs after autoplace, not before: the calibration-cache lookup inside
-    // it can override params.speculative.draft.n_max to the real calibrated
-    // value, and this needs to see that final value, not the pre-lookup
-    // default - otherwise an MTP setup with a cached n_max would be checked
-    // against the wrong (understated) effective batch size.
+    // Both run after autoplace, not before: the calibration-cache lookup
+    // inside it can override params.speculative.draft.n_max to the real
+    // calibrated value, and both of these need to see that final value, not
+    // the pre-lookup default - otherwise an MTP setup with a cached n_max
+    // would be checked/sized against the wrong (understated) effective
+    // batch size.
     common_warn_concurrency_cliff(params);
+    common_moe_apply_mtp_aware_max_batch_hint(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
