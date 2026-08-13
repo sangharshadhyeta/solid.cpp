@@ -4,7 +4,6 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
-#include "ggml-backend-moe-cache.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -21,10 +20,15 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <csignal>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <iterator>
 #include <list>
+#include <map>
 #include <regex>
+#include <sys/wait.h>
 
 #define JSON_ASSERT GGML_ASSERT
 #include <nlohmann/json.hpp>
@@ -1356,7 +1360,13 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
     try {
         data = common_get_device_memory_data(path_model, &mparams_base, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
                 GGML_LOG_LEVEL_ERROR);
-    } catch (const std::exception &) {
+    } catch (const std::exception & e) {
+        // Deliberately logged, not swallowed: an empty result here reads
+        // identically to "not is_moe" to every caller, which previously
+        // misreported a real probe crash (invalid n_seq_max, OOM, etc.) as
+        // "model has no MoE experts" - found by hitting exactly that with
+        // --moe-calibrate + --model-draft together.
+        LOG_ERR("%s: no-alloc probe failed: %s\n", __func__, e.what());
         return result;
     }
     result.n_layer = hp_ngl;
@@ -1391,6 +1401,7 @@ struct common_moe_calibration_entry {
     int         n_cpu_moe       = 0;
     int         n_threads       = -1;
     int         n_threads_batch = -1;
+    int         spec_n_max      = -1; // -1 = no MTP calibration recorded
     double      tok_per_sec     = 0.0;
     std::string calibrated_at;
 };
@@ -1445,6 +1456,7 @@ static bool common_moe_calibration_lookup(
         out.n_cpu_moe       = e.value("n_cpu_moe", 0);
         out.n_threads       = e.value("n_threads", -1);
         out.n_threads_batch = e.value("n_threads_batch", -1);
+        out.spec_n_max      = e.value("spec_n_max", -1);
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.calibrated_at   = e.value("calibrated_at", std::string());
         return true;
@@ -1472,6 +1484,7 @@ static void common_moe_calibration_save(
         {"n_cpu_moe",       entry.n_cpu_moe},
         {"n_threads",       entry.n_threads},
         {"n_threads_batch", entry.n_threads_batch},
+        {"spec_n_max",      entry.spec_n_max},
         {"tok_per_sec",     entry.tok_per_sec},
         {"calibrated_at",   entry.calibrated_at},
     };
@@ -1480,92 +1493,235 @@ static void common_moe_calibration_save(
     out << j.dump(2);
 }
 
-static llama_token common_moe_greedy_sample(llama_context * ctx, int idx) {
-    const float * logits = llama_get_logits_ith(ctx, idx);
-    const llama_model * model = llama_get_model(ctx);
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-    int32_t best = 0;
-    float best_val = logits[0];
-    for (int32_t i = 1; i < n_vocab; i++) {
-        if (logits[i] > best_val) {
-            best_val = logits[i];
-            best = i;
+// Golden-section search over integers in [lo, hi] for the argmax of a
+// unimodal (single-peak) function - the shape our own -ncmoe and
+// spec-draft-n-max sweeps actually showed empirically (a real interior
+// peak, not monotonic), not a guess. O(log(hi-lo)) evaluations instead of
+// O(hi-lo) for a full grid - matters because each evaluation here is a
+// real model load, not a cheap probe. Memoizes every point actually
+// measured (golden-section revisits nearby points) and returns it via
+// `trace` for logging/debugging.
+template <typename F>
+static int common_golden_section_search_max(
+        int lo, int hi, F && measure, std::map<int, double> & trace) {
+    if (lo >= hi) {
+        if (trace.find(lo) == trace.end()) {
+            trace[lo] = measure(lo);
+        }
+        return lo;
+    }
+    auto measured = [&](int x) -> double {
+        auto it = trace.find(x);
+        if (it != trace.end()) {
+            return it->second;
+        }
+        const double v = measure(x);
+        trace[x] = v;
+        return v;
+    };
+
+    const double gr = 0.6180339887498949; // 1/phi
+    int x1 = lo + (int) std::lround((1.0 - gr) * (hi - lo));
+    int x2 = lo + (int) std::lround(gr * (hi - lo));
+    x1 = std::max(lo, std::min(hi, x1));
+    x2 = std::max(lo, std::min(hi, x2));
+    double f1 = measured(x1);
+    double f2 = measured(x2);
+
+    while (hi - lo > 2) {
+        if (f1 < f2) {
+            lo = x1;
+            x1 = x2; f1 = f2;
+            x2 = std::max(lo, std::min(hi, lo + (int) std::lround(gr * (hi - lo))));
+            if (x2 == x1) {
+                break;
+            }
+            f2 = measured(x2);
+        } else {
+            hi = x2;
+            x2 = x1; f2 = f1;
+            x1 = std::max(lo, std::min(hi, lo + (int) std::lround((1.0 - gr) * (hi - lo))));
+            if (x1 == x2) {
+                break;
+            }
+            f1 = measured(x1);
+        }
+    }
+    // small remaining range - just check every point directly, cheap now
+    int best = lo;
+    double best_val = measured(lo);
+    for (int x = lo + 1; x <= hi; x++) {
+        const double v = measured(x);
+        if (v > best_val) {
+            best_val = v;
+            best = x;
         }
     }
     return best;
 }
 
-// Real load + short real decode, timed - unlike the no-alloc fit probes
-// above, this measures actual throughput (memory-fit says nothing about
-// speed, as our own -ncmoe sweep proved: ncmoe=12 fit but was a cliff,
-// ncmoe=16 was 12%+ faster). Returns decode tok/s, or -1.0 on failure.
-// Deliberately simple (greedy decode, no sampler subsystem) since output
-// quality is irrelevant to a speed probe - only realistic token diversity
-// (for representative MoE routing/cache behavior) matters, which greedy
-// decoding on a real prompt still exercises.
-static double common_moe_bench_candidate(
-        const char * path_model, const llama_model_params & mparams_base, const llama_context_params & cparams_base,
-        uint32_t n_cpu_moe, int n_threads, int n_threads_batch, int n_predict) {
-    llama_model_params mparams = mparams_base;
-    std::vector<llama_model_tensor_buft_override> overrides = common_moe_build_cpu_overrides(n_cpu_moe);
-    if (n_cpu_moe > 0) {
-        mparams.tensor_buft_overrides = overrides.data();
+// Spawns a real llama-server subprocess with the given placement/n_max/
+// thread count, waits for it to become healthy, sends real chat-completion
+// requests (averaged over a couple of representative prompts), and returns
+// measured decode tok/s (already net-of-rejection when MTP is active - see
+// the MTP section of docs/moe-cache-colibri-notes.md: predicted_per_second
+// is tokens_predicted/elapsed, and tokens_predicted only counts tokens that
+// survived speculative verification, so rejected draft attempts are
+// already excluded from the numerator while their wasted compute is
+// captured in the denominator).
+//
+// This is the *only* benchmark path in this file - an earlier in-process
+// version (direct llama_decode() calls, bypassing the HTTP server) existed
+// for the non-MTP -ncmoe search, on the theory that avoiding a real
+// draft/verify reimplementation for MTP was the main correctness risk.
+// That was true but incomplete: the in-process version also fed the model
+// a raw, un-chat-templated prompt, and this model family (instruction/
+// reasoning-tuned) produces degenerate, highly-repetitive output on
+// unformatted prompts *independent of MTP, moe-cache, or placement* -
+// confirmed directly by testing (see docs). Degenerate repetitive text is
+// trivially predictable, which would have silently inflated every
+// measurement taken with it: MTP acceptance rate (repeating the same token
+// is an easy guess for the draft), and MoE-cache hit rate (repetitive text
+// routes to a narrow, unrealistic set of experts). Spawning the real
+// server and using /v1/chat/completions (which applies the GGUF's own
+// chat template server-side, exactly like a real client would) avoids
+// both the draft/verify-reimplementation risk and the prompt-formatting
+// risk in one path, at the cost of a real subprocess per candidate.
+static double common_moe_bench_candidate_server(
+        const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
+        uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict) {
+    std::string mtp_args;
+    if (!mtp_path.empty()) {
+        char buf[2048];
+        snprintf(buf, sizeof(buf), "--model-draft '%s' --spec-type draft-mtp --spec-draft-n-max %d ",
+                mtp_path.c_str(), n_max);
+        mtp_args = buf;
     }
-
-    llama_context_params cparams = cparams_base;
-    cparams.n_threads       = n_threads;
-    cparams.n_threads_batch = n_threads_batch;
-
-    llama_model * model = llama_model_load_from_file(path_model, mparams);
-    if (!model) {
+    std::string threads_args;
+    if (n_threads > 0) {
+        char buf[128];
+        snprintf(buf, sizeof(buf), "-t %d -tb %d ", n_threads, n_threads);
+        threads_args = buf;
+    }
+    char cmd[4096];
+    // --temp/--top-p/--top-k match this model family's documented MTP
+    // sampling recommendation (Unsloth's llama.cpp MTP guide) - found to
+    // matter for output correctness, not just MTP: benchmarking with
+    // mismatched sampling produced degenerate, highly-repetitive
+    // generations that (being trivially predictable) artificially inflate
+    // both MoE-cache hit rate and MTP acceptance rate, biasing every
+    // throughput number measured this way. Real, representative numbers
+    // require realistic, non-degenerate generation.
+    snprintf(cmd, sizeof(cmd),
+        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache auto -c %u %s%s"
+        "--temp 1.0 --top-p 0.95 --top-k 64 "
+        "--port %d --no-webui > /dev/null 2>&1 & echo $!",
+        self_exe.c_str(), path_model.c_str(), n_cpu_moe, n_ctx,
+        mtp_args.c_str(), threads_args.c_str(), port);
+    FILE * pf = popen(cmd, "r");
+    if (!pf) {
         return -1.0;
     }
-    llama_context * ctx = llama_init_from_model(model, cparams);
-    if (!ctx) {
-        llama_model_free(model);
+    char pidbuf[32] = {0};
+    const bool got_pid = fgets(pidbuf, sizeof(pidbuf), pf) != nullptr;
+    pclose(pf);
+    if (!got_pid) {
+        return -1.0;
+    }
+    const pid_t pid = (pid_t) atol(pidbuf);
+    if (pid <= 0) {
         return -1.0;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
-    std::vector<llama_token> prompt = common_tokenize(vocab,
-            "The quick brown fox jumps over the lazy dog. In a distant galaxy, explorers charted "
-            "new worlds while engineers debugged the navigation system late into the night. ", true);
+    auto cleanup = [&]() {
+        kill(pid, SIGKILL);
+        int status = 0;
+        waitpid(pid, &status, 0);
+    };
 
-    llama_batch batch = llama_batch_init(std::max<int>(512, (int) prompt.size() + 1), 0, 1);
-    common_batch_clear(batch);
-    for (size_t i = 0; i < prompt.size(); i++) {
-        common_batch_add(batch, prompt[i], (llama_pos) i, {0}, i + 1 == prompt.size());
-    }
-    double tok_per_sec = -1.0;
-    if (llama_decode(ctx, batch) == 0) {
-        llama_token tok = common_moe_greedy_sample(ctx, batch.n_tokens - 1);
-        llama_pos n_past = (llama_pos) prompt.size();
-
-        const int64_t t0 = ggml_time_us();
-        int n_generated = 0;
-        bool ok = true;
-        for (int i = 0; i < n_predict; i++) {
-            common_batch_clear(batch);
-            common_batch_add(batch, tok, n_past, {0}, true);
-            if (llama_decode(ctx, batch) != 0) {
-                ok = false;
+    char health_cmd[256];
+    snprintf(health_cmd, sizeof(health_cmd),
+        "curl -s -o /dev/null -w '%%{http_code}' http://127.0.0.1:%d/health 2>/dev/null", port);
+    bool ready = false;
+    for (int i = 0; i < 30; i++) {
+        FILE * hp = popen(health_cmd, "r");
+        if (hp) {
+            char code[8] = {0};
+            const bool got = fgets(code, sizeof(code), hp) != nullptr;
+            pclose(hp);
+            if (got && strncmp(code, "200", 3) == 0) {
+                ready = true;
                 break;
             }
-            n_past++;
-            n_generated++;
-            tok = common_moe_greedy_sample(ctx, 0);
         }
-        const int64_t t1 = ggml_time_us();
-        if (ok && n_generated > 0) {
-            tok_per_sec = n_generated / ((t1 - t0) * 1e-6);
+        struct timespec ts{2, 0};
+        nanosleep(&ts, nullptr);
+    }
+    if (!ready) {
+        cleanup();
+        return -1.0;
+    }
+
+    // /v1/chat/completions, not /completion: the raw completion endpoint
+    // bypasses the model's chat template entirely, and this model family
+    // (instruction/reasoning-tuned) produces degenerate output on
+    // unformatted raw prompts independent of MTP/moe-cache/placement -
+    // confirmed directly by testing (see docs). The chat endpoint applies
+    // the GGUF's own template server-side, matching how any real client
+    // would actually talk to this server.
+    static const char * const probe_prompts[] = {
+        "Explain how photosynthesis works in three sentences, then describe the role of chlorophyll.",
+        "Write a Python function that implements binary search, then explain its time complexity.",
+    };
+    double sum_tps = 0.0;
+    int n_ok = 0;
+    for (const char * prompt : probe_prompts) {
+        nlohmann::json req = {
+            {"messages", nlohmann::json::array({
+                {{"role", "user"}, {"content", prompt}}
+            })},
+            {"max_tokens", n_predict},
+        };
+        const std::string req_body = req.dump();
+        char req_cmd[4096];
+        snprintf(req_cmd, sizeof(req_cmd),
+            "curl -s http://127.0.0.1:%d/v1/chat/completions -H 'Content-Type: application/json' --data-binary %s",
+            port, ("'" + req_body + "'").c_str());
+        FILE * rp = popen(req_cmd, "r");
+        if (!rp) {
+            continue;
+        }
+        std::string body;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof(buf), rp)) > 0) {
+            body.append(buf, n);
+        }
+        pclose(rp);
+        try {
+            auto j = nlohmann::json::parse(body);
+            if (j.contains("timings") && j["timings"].contains("predicted_per_second")) {
+                sum_tps += j["timings"]["predicted_per_second"].get<double>();
+                n_ok++;
+            }
+        } catch (const std::exception &) {
+            // this one prompt failed to parse - continue to the next, only
+            // fail the whole candidate if every prompt fails (checked below)
         }
     }
 
-    llama_batch_free(batch);
-    llama_free(ctx);
-    llama_model_free(model);
-    return tok_per_sec;
+    cleanup();
+    return n_ok > 0 ? sum_tps / n_ok : -1.0;
+}
+
+static std::string common_self_exe_path() {
+    char buf[4096];
+    const ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+    if (n <= 0) {
+        return "";
+    }
+    buf[n] = '\0';
+    return std::string(buf);
 }
 
 // --moe-calibrate: empirically finds the throughput-optimal -ncmoe and
@@ -1573,6 +1729,11 @@ static double common_moe_bench_candidate(
 // of real short benchmarks, caches the result, then the caller exits
 // (matches the existing --fit-moe-cache preview-before-you-commit pattern
 // rather than mixing calibration into the same run as real serving).
+// -ncmoe is searched via golden-section search (interior-peak-aware, not a
+// fixed grid). When a draft/MTP model is configured, spec-draft-n-max is
+// also searched the same way, within an envelope found first by doubling
+// until cache health collapses (see the n_max=8 finding in the docs - a
+// real, measured collapse, not a guess at where the envelope ends).
 // Deliberately scoped to single-sequence decode speed for this first
 // version - concurrent-load calibration is a further extension, not
 // attempted here (see docs/moe-cache-colibri-notes.md).
@@ -1595,36 +1756,123 @@ void common_moe_calibrate(common_params & params) {
         return;
     }
 
-    std::vector<uint32_t> candidates_n = { safe_n };
-    const uint32_t step = std::max<uint32_t>(1, probe.n_layer / 15);
-    for (uint32_t k = 1; k <= 4; k++) {
-        const uint32_t n = safe_n + k * step;
-        if (n <= probe.n_layer) {
-            candidates_n.push_back(n);
-        }
-    }
-
     const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
     const int n_predict = 64;
 
-    LOG_INF("%s: benchmarking %zu placement candidate(s) at n_threads=%d (real load + %d-token decode each) ...\n",
-            __func__, candidates_n.size(), n_threads_default, n_predict);
-
-    uint32_t best_n = safe_n;
-    double   best_tps = -1.0;
-    for (uint32_t n : candidates_n) {
-        const double tps = common_moe_bench_candidate(
-                path_model, mparams, cparams, n, n_threads_default, n_threads_default, n_predict);
-        LOG_INF("%s:   ncmoe=%u -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
-        if (tps > best_tps) {
-            best_tps = tps;
-            best_n   = n;
-        }
+    const std::string self_exe = common_self_exe_path();
+    if (self_exe.empty()) {
+        LOG_ERR("%s: could not resolve /proc/self/exe - --moe-calibrate needs this to spawn benchmark "
+                "subprocesses (real llama-server instances, so benchmarks go through the same chat-template "
+                "and sampling path a real client would use, not a raw/unformatted prompt)\n", __func__);
+        return;
     }
+    // A fresh port per subprocess, not one reused across the whole run:
+    // SIGKILLing a candidate's server doesn't guarantee the OS releases its
+    // listening socket before the next candidate tries to bind the same
+    // port (TIME_WAIT) - reusing one port caused a real intermittent
+    // "failed" candidate when this was tested.
+    int port_counter = 18900 + (int) (getpid() % 500);
+    auto next_port = [&]() { return port_counter++; };
+    const uint32_t ctx = cparams.n_ctx > 0 ? cparams.n_ctx : 4096;
+
+    // One retry before treating a failure as real: a single subprocess run
+    // is one noisy sample (same lesson as the n_max=3 run-to-run variance
+    // found earlier in this session - see docs), and a spurious failure
+    // shouldn't truncate a search.
+    auto bench_with_retry = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
+        double tps = common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
+        if (tps < 0) {
+            LOG_WRN("%s:   candidate failed once, retrying ...\n", __func__);
+            tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
+        }
+        return tps;
+    };
+
+    // Search range: from the safe floor up to a bound past which more
+    // conservative placement essentially never helps (our own sweep never
+    // found the peak more than ~15% of n_layer above the floor) - wide
+    // enough to contain the peak, narrow enough that golden-section search
+    // stays cheap.
+    const uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
+
+    LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d (real llama-server subprocess, "
+            "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default);
+
+    std::map<int, double> ncmoe_trace;
+    auto measure_ncmoe = [&](int n) -> double {
+        const double tps = bench_with_retry((uint32_t) n, 0, "", n_threads_default);
+        LOG_INF("%s:   ncmoe=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        return tps; // failed candidates measure as -1, golden-section still works (just avoids them)
+    };
+    const uint32_t best_n = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
+    double best_tps = ncmoe_trace.at((int) best_n);
     if (best_tps < 0) {
         LOG_ERR("%s: every placement candidate failed to benchmark; not writing a cache entry\n", __func__);
         return;
     }
+
+    int best_n_max = -1;
+    if (params.speculative.has_dft()) {
+        {
+            // Find the envelope: double n_max until throughput drops below
+            // half the n_max=1 baseline (the real n_max=8 collapse we
+            // measured went from ~80% cache health to ~14-21% - a >2x
+            // throughput cliff, not a gentle decline, so "less than half"
+            // is a safe, real signal for "past the edge" rather than
+            // ordinary run-to-run noise).
+            LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
+            std::map<int, double> nmax_trace;
+            double baseline = -1.0;
+            int last_good = 1;
+            for (int n = 1; n <= 32; n *= 2) {
+                const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
+                nmax_trace[n] = tps;
+                LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                if (n == 1) {
+                    baseline = tps;
+                }
+                if (tps < 0 || (baseline > 0 && tps < baseline * 0.5)) {
+                    break;
+                }
+                last_good = n;
+            }
+            const int nmax_hi = std::max(1, last_good);
+
+            if (baseline > 0) {
+                LOG_INF("%s: golden-section search for spec-draft-n-max in [1, %d] at ncmoe=%u ...\n",
+                        __func__, nmax_hi, best_n);
+                auto measure_nmax = [&](int n) -> double {
+                    auto it = nmax_trace.find(n);
+                    if (it != nmax_trace.end()) {
+                        return it->second;
+                    }
+                    const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
+                    LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                    return tps;
+                };
+                best_n_max = common_golden_section_search_max(1, nmax_hi, measure_nmax, nmax_trace);
+                LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
+                // The n_max search's own winning number (MTP active) is the
+                // real answer for this deployment, not the earlier ncmoe-only
+                // number (MTP off) - carry it forward so the final report and
+                // cache entry don't undersell what was actually found.
+                if (nmax_trace.at(best_n_max) > best_tps) {
+                    best_tps = nmax_trace.at(best_n_max);
+                }
+            } else {
+                LOG_WRN("%s: spec-draft-n-max=1 itself failed to benchmark - skipping n_max calibration\n", __func__);
+            }
+        }
+    }
+
+    // Now uses the same correct subprocess/chat-template path as ncmoe and
+    // n_max above, so - unlike before this fix - it's safe to also tune
+    // threads under MTP when MTP was calibrated: same real generation
+    // conditions, numbers are directly comparable to best_tps above.
+    const std::string mtp_path_for_threads = best_n_max > 0 ? params.speculative.draft.mparams.path : std::string();
+    const int n_max_for_threads = best_n_max > 0 ? best_n_max : 0;
 
     const int n_threads_physical = common_cpu_get_num_physical_cores();
     const int n_threads_logical  = (int) std::thread::hardware_concurrency();
@@ -1639,12 +1887,13 @@ void common_moe_calibrate(common_params & params) {
     int    best_threads = n_threads_default;
     double best_threads_tps = best_tps;
     if (thread_candidates.size() > 1) {
-        LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u ...\n", __func__, thread_candidates.size(), best_n);
+        LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u%s ...\n", __func__, thread_candidates.size(), best_n,
+                best_n_max > 0 ? string_format(", spec-draft-n-max=%d", best_n_max).c_str() : "");
         for (int nt : thread_candidates) {
             if (nt == n_threads_default) {
                 continue; // already measured above as best_tps
             }
-            const double tps = common_moe_bench_candidate(path_model, mparams, cparams, best_n, nt, nt, n_predict);
+            const double tps = bench_with_retry(best_n, n_max_for_threads, mtp_path_for_threads, nt);
             LOG_INF("%s:   n_threads=%d -> %s\n", __func__, nt, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
             if (tps > best_threads_tps) {
                 best_threads_tps = tps;
@@ -1661,13 +1910,21 @@ void common_moe_calibrate(common_params & params) {
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
     entry.n_threads_batch = best_threads;
+    entry.spec_n_max      = best_n_max;
     entry.tok_per_sec     = best_threads_tps;
     entry.calibrated_at   = timebuf;
     common_moe_calibration_save(path_model, params, entry);
 
-    LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, measured %.2f tok/s. "
-            "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
-            __func__, entry.n_cpu_moe, entry.n_threads, entry.tok_per_sec, common_moe_calibration_cache_path().c_str());
+    if (best_n_max > 0) {
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, spec-draft-n-max=%d, measured %.2f tok/s. "
+                "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
+                __func__, entry.n_cpu_moe, entry.n_threads, entry.spec_n_max, entry.tok_per_sec,
+                common_moe_calibration_cache_path().c_str());
+    } else {
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, measured %.2f tok/s. "
+                "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
+                __func__, entry.n_cpu_moe, entry.n_threads, entry.tok_per_sec, common_moe_calibration_cache_path().c_str());
+    }
 }
 
 // Runs as a fallback *after* the general --fit system has already had its
@@ -1715,9 +1972,19 @@ static bool common_maybe_autoplace_moe_cpu(
             if (cached.n_threads_batch > 0) {
                 params.cpuparams_batch.n_threads = cached.n_threads_batch;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d, measured %.2f tok/s on %s) "
+            // Only apply the calibrated n_max if the user is already running
+            // with a draft model configured and didn't pin n_max themselves
+            // - this never turns MTP on for someone who didn't ask for it,
+            // it only tunes n_max for someone who already did.
+            if (cached.spec_n_max > 0 && params.speculative.has_dft() &&
+                params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
+                params.speculative.draft.n_max = cached.spec_n_max;
+            }
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s, measured %.2f tok/s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
-                    __func__, cached.n_cpu_moe, cached.n_threads, cached.tok_per_sec, cached.calibrated_at.c_str());
+                    __func__, cached.n_cpu_moe, cached.n_threads,
+                    cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
+                    cached.tok_per_sec, cached.calibrated_at.c_str());
             return true;
         }
         LOG_WRN("%s: cached calibration no longer fits current conditions - recalibrating placement live\n", __func__);
@@ -1746,19 +2013,6 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
-
-    // MTP/speculative verify batches submit up to n_max+1 candidate positions
-    // per step, a real, separately measured cause of moe-cache silently
-    // going cold when that exceeds max_batch (n_seq_max alone, set later by
-    // llama-context.cpp per-context, doesn't know about this). Set before
-    // any model load so it's in place before the main model's moe-cache
-    // session reads its config. set_max_batch_hint only ever raises the
-    // hint (never lowers it), so call order relative to llama-context.cpp's
-    // own per-context call doesn't matter.
-    if (ggml_moe_cache.set_max_batch_hint && params.speculative.has_dft()) {
-        const int64_t worst_case = (int64_t) cparams.n_seq_max * (params.speculative.draft.n_max + 1);
-        ggml_moe_cache.set_max_batch_hint((int) std::min<int64_t>(worst_case, INT32_MAX));
-    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
