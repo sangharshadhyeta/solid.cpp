@@ -2022,31 +2022,46 @@ void common_moe_calibrate(common_params & params) {
 // bound (the real answer for whatever type this model actually uses can
 // only be >= this), so the warning can under-fire slightly early but can
 // never miss a real risk by assuming a too-generous type.
+//
+// Checks every GPU device, not just the first: on a tensor-split multi-GPU
+// setup, layers (and therefore MUL_MAT_ID calls) are spread across devices,
+// so the full concurrent batch hits whichever device is computing the
+// current layer - the cliff can happen on any of them, and the safe ceiling
+// for the whole deployment is the minimum across every device, not just
+// device 0's. Each device gets its own ggml_backend_dev_t passed straight
+// through to the backend's own proc-address function, which recovers that
+// backend's real internal device index from it - this file never assumes
+// global device index i lines up with the backend's own numbering.
 static int common_moe_min_mmvq_max_batch(void) {
     static const ggml_type candidate_types[] = {
         GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K,
         GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q8_0, GGML_TYPE_IQ4_XS, GGML_TYPE_MXFP4,
     };
 
-    int (*get_max_batch)(int) = nullptr;
-    for (size_t i = 0; i < ggml_backend_dev_count() && !get_max_batch; i++) {
+    int min_batch = INT_MAX;
+    bool found_any = false;
+
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
             continue;
         }
-        if (ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev)) {
-            get_max_batch = (int (*)(int)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_get_mmid_mmvq_max_batch");
+        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+        if (!reg) {
+            continue;
+        }
+        auto get_max_batch = (int (*)(int, ggml_backend_dev_t)) ggml_backend_reg_get_proc_address(
+                reg, "ggml_backend_get_mmid_mmvq_max_batch");
+        if (!get_max_batch) {
+            continue; // this device's backend doesn't expose this (not CUDA) - nothing known for it
+        }
+        found_any = true;
+        for (ggml_type t : candidate_types) {
+            min_batch = std::min(min_batch, get_max_batch((int) t, dev));
         }
     }
-    if (!get_max_batch) {
-        return -1; // not a CUDA device, or backend doesn't expose this - no warning, nothing known
-    }
 
-    int min_batch = INT_MAX;
-    for (ggml_type t : candidate_types) {
-        min_batch = std::min(min_batch, get_max_batch((int) t));
-    }
-    return min_batch;
+    return found_any ? min_batch : -1;
 }
 
 static void common_warn_concurrency_cliff(const common_params & params) {
