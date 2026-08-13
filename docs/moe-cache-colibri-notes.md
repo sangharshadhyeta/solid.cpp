@@ -511,21 +511,74 @@ fresh.
 refinement on top of Layer 1's safe floor - a short empirical calibration
 (2-3 candidate placements, few seconds) run once per (GPU, model, context
 config) combination and cached, instead of re-measured on every restart.
-Also now includes `n_threads`/`n_threads_batch` as a swept dimension (see
-the concurrency-cliff investigation above - no safe-analytic-floor exists
-for that lever, only a real curve to measure). Explicitly deferred this
-session in favor of shipping and validating Layer 1 first.
+Also includes `n_threads`/`n_threads_batch` as a swept dimension - no
+safe-analytic-floor exists for that lever (our own test proved the
+"obviously safe" direction, more threads, actually made concurrent
+throughput *worse* - see the root-cause investigation above), only a real
+curve to measure.
 
-**Third item for Layer 2, not Layer 1**: `n_threads`/`n_threads_batch`.
-Unlike `-ncmoe`, this has no safe-analytic-floor property to give it a
-Layer 1 - our own test proved the "obviously safe" direction (more threads
-= more parallelism) actually made concurrent throughput *worse* (see the
-root-cause investigation above), so there's nothing to compute ahead of
-time, only a real curve to measure. Belongs in the same empirical
-calibration pass as placement, swept as its own dimension (the sweep
-script should test `-t` values, not just `-ncmoe` × `--moe-cache`, exactly
-per the standing ask that every check like this becomes part of the
-repeatable script rather than a one-off manual investigation).
+**Layer 2 (built and validated this session): `--moe-calibrate`.** A new
+`llama-server` flag. `common_moe_calibrate()` in `common/common.cpp`: finds
+Layer 1's safe floor via `common_moe_find_safe_layers()` (refactored out of
+Layer 1's own logic so both share it), then benchmarks real candidates
+*above* that floor (`safe_n + k*step` for k=1..4, `step = max(1, n_layer/15)`)
+via `common_moe_bench_candidate()` - a genuinely real load + real short
+greedy-decode loop (deliberately no sampler subsystem, since output quality
+is irrelevant to a speed probe and greedy decoding on a real prompt still
+exercises representative MoE routing/cache behavior), timed with
+`ggml_time_us()`. Picks the best by measured tok/s, then does the same for
+a couple of thread-count candidates (default/physical/logical) at the
+winning placement. Writes the result to
+`fs_get_cache_directory()/moe-calibration.json` (nlohmann::json, already
+vendored) keyed by GPU signature (name + **total** VRAM per device -
+deliberately not free VRAM, which fluctuates with background load and would
+make the key spuriously miss) + model path + model file size + `-c`/
+`--parallel`/`-ngl`. Calibrate-then-exit, matching the existing
+`--fit-moe-cache` preview-before-you-commit pattern rather than mixing
+calibration into the same run as real serving.
+
+**Cache lookup wired into Layer 1's fallback** (`common_maybe_autoplace_moe_cpu`):
+before falling back to the binary search, checks the cache; if an entry
+exists, runs **one** verification probe (not the full search) to confirm
+it still fits under current conditions, then applies it directly (placement
++ thread counts) - fast path. If conditions changed enough that the cached
+placement no longer fits, logs that plainly and falls back to the live
+binary search rather than silently using a stale answer.
+
+**Validated on real hardware** (RTX 3060, Gemma-4-26B-A4B, `-ngl 99 -c
+16384 --parallel 16`, the exact previously-crashing config):
+
+| `-ncmoe` candidate | measured decode tok/s |
+|---:|---:|
+| 19 (Layer 1's safe floor) | 35.35 |
+| 21 | 47.65 |
+| **23 (winner)** | **49.33** |
+| 25 | 46.63 |
+| 27 | 45.59 |
+| thread candidate 12 (vs. default 6) | 42.88 (worse - default 6 wins) |
+
+**Layer 1's safe floor (19) was the *worst* of every candidate tested -
+Layer 2 found a placement 40% faster** (49.33 vs. 35.35 tok/s), directly
+confirming the earlier finding that memory-fit and throughput-optimal are
+different questions, not approximately the same thing. Cache file written
+correctly (`{"CUDA0:11900;|<path>|<size>|c16384|p16|ngl99": {"n_cpu_moe":
+23, "n_threads": 6, "n_threads_batch": 6, "tok_per_sec": 49.33, ...}}`).
+Relaunching the exact same config **without** `--moe-calibrate` produced
+`common_maybe_autoplace_moe_cpu: using calibrated MoE placement from cache
+(ncmoe=23, n_threads=6, measured 49.33 tok/s on ...)`, started successfully,
+and served a real completion at 45.68 tok/s (close to the calibrated
+number; the small gap is normal first-request cache warm-up, consistent
+with everything else observed about warm-up in this doc).
+
+**Known limitations of this first version**: single-sequence decode speed
+only (concurrent-load calibration - e.g. calibrating for a specific
+concurrency target, not just solo throughput - is a real further extension,
+not attempted here); each candidate costs a full real model load, so total
+calibration time scales with model size and shard count (fine as a one-time
+opt-in step for a long-lived server, would need reconsidering for very
+large models like GLM-5.2 where a single load may itself take minutes -
+worth timing on the actual H200 box before assuming the current candidate
+count/step size is still reasonable there).
 
 # Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
 
