@@ -1,9 +1,58 @@
+# VALIDATED 2026-08-13: moe-cache works, real 54% speedup measured on RTX 3060
+
+First real end-to-end test on the downloaded Gemma-4-26B-A4B model. Took real
+debugging to get there - two undocumented defaults silently blocked
+engagement on a VRAM-constrained card, found only by adding temporary
+diagnostic prints to the actual source (reverted after, see git history for
+the fix commit if these ever get upstreamed):
+
+1. **`GGML_CUDA_MOE_CACHE_MAX_BATCH` defaults to 1, not 8** (8 is the max
+   *allowed* value, not the default - our own earlier notes had this wrong,
+   corrected now). Default 1 means the cache rejects every call except exact
+   single-token batches - even a 2-token prefill gets silently rejected, no
+   error, no log. Confirmed empirically: baseline and "cache on" runs were
+   bit-identical in speed until this was set to 8 explicitly.
+2. **`GGML_CUDA_MOE_CACHE_RESERVE_MB` defaults to 3072 (3GB)**, sized for
+   GPUs with real headroom (RTX 3090 24GB, A100, H100 - the RFC thread's
+   test rigs). On our 12GB RTX 3060, `-ngl 99` for a 26B/262144-vocab model
+   leaves only ~3.05GB free after loading - the 3GB reserve ate nearly all
+   of it (47MB left, against a ~136MB minimum pool requirement). Lowered to
+   256MB to unblock. **This will matter for the H200 deployment too** if
+   VRAM headroom after loading GLM-5.2's dense weights + KV cache for 5-10
+   slots is proportionally tight - worth checking early there, not assuming
+   3GB reserve is fine just because the card is bigger.
+
+**Clean A/B result** (same prompt, same n_predict=100, `-ngl 99 -ncmoe 99`):
+
+| config | decode tok/s | hit rate |
+|---|---:|---|
+| `--moe-cache off` (baseline) | 27.0 | - |
+| `--moe-cache 2048` + tuned MAX_BATCH=8, RESERVE_MB=256 | **41.6** | **62.1%** (32421/52200) |
+
+**+54% decode speedup, real and measured**, not projected. Hit rate climbed
+from 44.2% on a shorter 20-token run to 62.1% on this 100-token run - cache
+warm-up matters, consistent with the RFC thread's own "under-warmed pool
+reads as saturated" warning. This is now hard evidence for what was
+previously projection based on other people's hardware/models - directly
+validates the core premise (Gemma-4-A4B's routing skew is real and
+exploitable) and confirms the port itself works correctly end-to-end
+(loads, runs, generates coherent output, no crashes, real speedup).
+
+**Action for the GLM-5.2/H200 deployment**: don't assume defaults work.
+Explicitly set `--moe-cache <budget>` (never `auto`/`on` alone - see the
+single-GPU dormancy finding above), `GGML_CUDA_MOE_CACHE_MAX_BATCH=8`, and
+size `GGML_CUDA_MOE_CACHE_RESERVE_MB` based on actual free VRAM after model
+load, not the 3GB default. Verify eligibility empirically (real pool[]/hits=
+log lines with `-v`), don't just assume config was accepted.
+
 # Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
 
-## Already built, awaiting validation
-- moe-cache core port (leloch's design). Load-bearing feature. RFC: 1.7-2.1x
-  decode on skewed routing (Qwen-A3B). GLM-5.2 confirmed skewed (SharkWipf:
-  30-50% measured).
+## Already built, VALIDATED with real measurement
+- moe-cache core port (leloch's design). Load-bearing feature. **Measured
+  +54% decode speedup (27.0 -> 41.6 tok/s), 62.1% hit rate on our RTX 3060 +
+  Gemma-4-26B-A4B** - see validation section above. RFC: 1.7-2.1x decode on
+  skewed routing (Qwen-A3B), consistent with our own result. GLM-5.2
+  confirmed skewed (SharkWipf: 30-50% measured).
 - mmap host-pinning fix (ours). One-time load-speed win only, not decode.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
