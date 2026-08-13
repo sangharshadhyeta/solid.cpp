@@ -124,9 +124,17 @@ struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
     size_t budget_mb = 0;
-    size_t reserve_mb = 3072;
+    // 0 = not explicitly set by the user; moe_cache_prepare_budget() computes
+    // a live default from actual free VRAM at that point instead of trusting
+    // a fixed constant that can't be right across both a 12GB card and a
+    // 141GB one. GGML_CUDA_MOE_CACHE_RESERVE_MB still overrides this exactly
+    // as before when explicitly set.
+    size_t reserve_mb = 0;
     size_t min_expert_bytes = 1u << 20;
-    int max_batch = 1;
+    // 8 is also the max allowed value (see the (1,8) clamp on the env var
+    // below) - the cache should engage on ordinary prefill/decode batches by
+    // default, not just exact single-token calls.
+    int max_batch = 8;
     int inserts_per_plan = 8;
     int admit_after = 2;
     int readmit_after = 8;
@@ -803,7 +811,21 @@ static bool moe_cache_prepare_budget(
         return false;
     }
 
-    const size_t reserve = session.config.reserve_mb << 20;
+    // Live default when GGML_CUDA_MOE_CACHE_RESERVE_MB wasn't explicitly set:
+    // 5% of *actual* free VRAM at this exact moment, clamped to [128, 1024]
+    // MiB. A fixed constant can't be right across both a 12GB card (where a
+    // 3GB reserve left ~47MB available after loading a 26B model - measured
+    // directly, see docs/moe-cache-colibri-notes.md) and a 141GB one (where
+    // 3GB is negligible). Computed here, not at config-parse time, because
+    // cudaMemGetInfo above is the actual live resource query - this reflects
+    // what's free right now, not a stale snapshot from an earlier planning
+    // step on a shared multi-tenant machine where availability can shift.
+    size_t reserve_mb = session.config.reserve_mb;
+    if (reserve_mb == 0) {
+        const size_t free_mb = free_memory >> 20;
+        reserve_mb = std::min<size_t>(1024, std::max<size_t>(128, free_mb / 20));
+    }
+    const size_t reserve = reserve_mb << 20;
     size_t available = free_memory > reserve ? free_memory - reserve : 0;
     if (session.config.budget_mb > 0) {
         available = std::min(available, session.config.budget_mb << 20);
@@ -811,8 +833,8 @@ static bool moe_cache_prepare_budget(
     device.budget_limit = available;
 
     if (available == 0) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve\n",
-                device.physical, session.config.reserve_mb);
+        MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve (%zu MiB free)\n",
+                device.physical, reserve_mb, free_memory >> 20);
         return false;
     }
     return true;
@@ -908,11 +930,25 @@ static bool moe_cache_allocate_pool(
     }
 
     if (!session.announced) {
-        MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=%zu MiB min-expert=%zu KiB admit=%d/%d\n",
-                session.config.automatic ? "auto" : "on",
-                session.config.budget_mb ? "fixed" : "free-minus-reserve",
-                session.config.reserve_mb, session.config.min_expert_bytes >> 10,
-                session.config.admit_after, session.config.readmit_after);
+        // reserve_mb==0 means "not explicitly set" - the real value used is
+        // computed live per-device from actual free VRAM at that moment (see
+        // moe_cache_prepare_budget) and logged there via the "no cache
+        // budget after N MiB reserve" message on failure, or implied by
+        // pool[]'s total size on success. Printing 0 here would misleadingly
+        // read as "no reserve" rather than "computed live, see per-device".
+        if (session.config.reserve_mb > 0) {
+            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=%zu MiB (explicit) min-expert=%zu KiB admit=%d/%d\n",
+                    session.config.automatic ? "auto" : "on",
+                    session.config.budget_mb ? "fixed" : "free-minus-reserve",
+                    session.config.reserve_mb, session.config.min_expert_bytes >> 10,
+                    session.config.admit_after, session.config.readmit_after);
+        } else {
+            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=live-per-device(5%% free, 128-1024 MiB) min-expert=%zu KiB admit=%d/%d\n",
+                    session.config.automatic ? "auto" : "on",
+                    session.config.budget_mb ? "fixed" : "free-minus-reserve",
+                    session.config.min_expert_bytes >> 10,
+                    session.config.admit_after, session.config.readmit_after);
+        }
         session.announced = true;
     }
     MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
@@ -1088,8 +1124,17 @@ static void * moe_cache_session_create(void * const * backends, int n_backends) 
             session->devices.emplace_back(new moe_cache_device(physical));
         }
 
-        if (session->devices.empty() ||
-            (session->config.automatic && session->devices.size() < 2)) {
+        // A single eligible device is enough for automatic mode: the live
+        // reserve computed in moe_cache_prepare_budget() from actual free
+        // VRAM at that moment already accounts for headroom safety on a
+        // single card, so there's no longer a reason to require a second
+        // device just to try. Previously required devices.size() >= 2 for
+        // `automatic`, which meant --moe-cache auto/on silently never
+        // engaged on any single-GPU system regardless of free VRAM -
+        // measured directly on an RTX 3060 (see
+        // docs/moe-cache-colibri-notes.md) and directly relevant to any
+        // single-GPU deployment (e.g. one H200).
+        if (session->devices.empty()) {
             return nullptr;
         }
 
@@ -1362,8 +1407,10 @@ static void * moe_cache_begin(
                 eligible_devices++;
             }
         }
-        if (budget_devices == 0 ||
-            (session->config.automatic && budget_devices < 2)) {
+        // A single device with a real budget/eligible pool is enough - see
+        // the matching note above on why `automatic` no longer requires 2+
+        // devices.
+        if (budget_devices == 0) {
             session->dormant.store(true);
             lock.unlock();
             for (const auto & device_ptr : session->devices) {
@@ -1371,7 +1418,7 @@ static void * moe_cache_begin(
             }
             return nullptr;
         }
-        if (session->config.automatic && eligible_devices < 2) {
+        if (eligible_devices == 0) {
             return nullptr;
         }
 
