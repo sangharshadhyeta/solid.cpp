@@ -673,6 +673,36 @@ expert tensor sizes (metadata only, fast), discover VRAM/RAM, project a hit
 rate for our `--moe-cache` budget before the user runs anything. Complements
 the runtime cache rather than replacing it.
 
+**Elevated priority after 2026-08-13 validation - this is no longer just a
+nice-to-have.** The RTX 3060 test above needed real debugging (temporary
+source-level diagnostics) to discover that `--moe-cache auto`/`on` silently
+never engages on a single GPU, `MAX_BATCH` defaults to 1 not 8, and the
+default 3GB `RESERVE_MB` can eat nearly all free VRAM on a smaller card -
+none of which produced an error, just silent zero-benefit. A pre-flight
+planner should compute and print (or directly emit) the correct values for
+all three, so nobody else has to repeat that debugging marathon:
+- GPU count -> forces explicit numeric `--moe-cache <budget>`, refuses to
+  suggest `auto`/`on` when count is 1
+- always overrides `MAX_BATCH` to 8 (default is simply wrong for real use,
+  barely needs "computing")
+- actual free VRAM after estimated model load (dense weights + KV cache
+  for N concurrent slots) minus a safety margin, sized against the
+  model's real per-expert byte size (from GGUF metadata) so the
+  resulting budget clears the ~64x-expert-size minimum pool requirement
+
+**This is static, not dynamic - confirmed 2026-08-13.** GPU count, free
+VRAM after load, and per-expert tensor size are fixed facts about the
+hardware+model pairing, knowable before the process starts generating and
+unchanging for the life of the run. A one-time pre-flight calculation
+(exactly this candidate) is the right mechanism - no live monitoring or
+running server needed. This is different from candidate #5 below (live
+skew detection): routing *concentration* can genuinely vary by workload/
+session while the server keeps running (SharkWipf measured skew "per
+conversation thread"), which a one-time static calculation can't capture.
+Don't conflate the two - static sizing (this section) and dynamic skew
+adaptation (candidate #5) are separate mechanisms solving separate
+problems, both worth having, not substitutes for each other.
+
 ## Reality check on Colibri's own numbers
 
 Independent review (wavect.io, GLM-5.2 on consumer hardware) tempers the
