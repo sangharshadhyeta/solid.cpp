@@ -1,3 +1,33 @@
+# Open questions, tracked but not yet resolved
+
+## MTP verify-batch size x concurrency, interacting with moe-cache's batch gate
+
+Native MTP (GLM-5.2's NextN head, PR #25980) is architecturally safer than
+the external-drafter case the RFC thread found broken - MTP runs in the
+same trunk graph, same device/session as the main model, so the "GPU
+drafter causes the cache to see zero hits" failure mode (a device/session
+binding conflict under shared-draft-device reordering) likely doesn't
+apply here.
+
+But a different, untested risk exists specific to our deployment: the RFC
+thread found a "dead batch-size zone" - requests sized 9-31 are served by
+neither the cache (gated by `GGML_CUDA_MOE_CACHE_MAX_BATCH`, default 8)
+nor the bulk-offload path (gated by `GGML_OP_OFFLOAD_MIN_BATCH`, default
+32). MTP verify batches are small individually (block_size ~7 in the
+Gemma DSpark reference example), but with 5-10 concurrent `--parallel`
+slots each potentially drafting-and-verifying at once, the *effective*
+batch size the scheduler sees could land in that gap. Nobody in the RFC
+thread tested MTP at real multi-user concurrency, only single-stream.
+
+Not resolvable from the Gemma-4/RTX-3060 sandbox test - we won't be
+running 5-10 concurrent `--parallel` slots there. Needs explicit testing
+once we have access to hardware that can actually run that concurrency
+(the real H200 deployment, or a scaled-down concurrency test earlier if
+possible). If it turns out to be a real gap, the fix is likely widening
+`MAX_BATCH` and/or lowering `MIN_BATCH` so there's no dead zone for the
+batch sizes this deployment actually produces - not a redesign, just a
+tuning gap to close once measured.
+
 # Real deployment target (drives all priority calls above and below)
 
 Office HPC: 1x H200 (141GB HBM3e), 512GB system RAM, GLM-5.2 (744B, Q4_K_M,
