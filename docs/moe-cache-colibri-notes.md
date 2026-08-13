@@ -85,6 +85,21 @@ expert tensor sizes (metadata only, fast), discover VRAM/RAM, project a hit
 rate for our `--moe-cache` budget before the user runs anything. Complements
 the runtime cache rather than replacing it.
 
+## Reality check on Colibri's own numbers
+
+Independent review (wavect.io, GLM-5.2 on consumer hardware) tempers the
+README's framing considerably: cold inference on a 24GB-RAM laptop is
+0.05-0.1 tok/s (one token every 10-20s) with a 3-4% expert hit rate; the
+5.8-6.8 tok/s "success" case needed six RTX 5090s and 251GB RAM with all
+experts VRAM-resident (60%+ hit rate) — not actually consumer hardware.
+Also: single-generation only (no concurrent requests/batching), no
+multimodal input. Doesn't diminish the individual techniques above (each is
+small, self-contained, independently verifiable in the source) but the
+engine's own headline claims are rosier than its real-world numbers -
+calibrate expectations accordingly, especially for candidate #4's hit-rate
+projections, which assume a use case with a large enough cache budget to
+actually work.
+
 ## Already checked, no action needed
 
 **NaN-safe router argmax** (`route_trace.h`'s `rt_router_pick`): if router
