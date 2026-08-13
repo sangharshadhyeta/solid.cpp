@@ -1402,6 +1402,7 @@ struct common_moe_calibration_entry {
     int         n_threads       = -1;
     int         n_threads_batch = -1;
     int         spec_n_max      = -1; // -1 = no MTP calibration recorded
+    int         concurrency     = 1;  // > 1: tok_per_sec is aggregate throughput at this many concurrent requests, not solo
     double      tok_per_sec     = 0.0;
     std::string calibrated_at;
 };
@@ -1457,6 +1458,7 @@ static bool common_moe_calibration_lookup(
         out.n_threads       = e.value("n_threads", -1);
         out.n_threads_batch = e.value("n_threads_batch", -1);
         out.spec_n_max      = e.value("spec_n_max", -1);
+        out.concurrency     = e.value("concurrency", 1);
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.calibrated_at   = e.value("calibrated_at", std::string());
         return true;
@@ -1485,6 +1487,7 @@ static void common_moe_calibration_save(
         {"n_threads",       entry.n_threads},
         {"n_threads_batch", entry.n_threads_batch},
         {"spec_n_max",      entry.spec_n_max},
+        {"concurrency",     entry.concurrency},
         {"tok_per_sec",     entry.tok_per_sec},
         {"calibrated_at",   entry.calibrated_at},
     };
@@ -1587,9 +1590,67 @@ static int common_golden_section_search_max(
 // chat template server-side, exactly like a real client would) avoids
 // both the draft/verify-reimplementation risk and the prompt-formatting
 // risk in one path, at the cost of a real subprocess per candidate.
+// Wraps a string in single quotes for safe use as one shell argument,
+// escaping any embedded single quotes via the standard '\'' trick (close
+// the quote, emit an escaped literal quote, reopen). Without this, a
+// prompt containing an apostrophe (e.g. "Newton's second law" - a real
+// prompt in this file's own probe pool, found the hard way when it broke
+// the concurrency-benchmark path with a shell syntax error) corrupts the
+// surrounding --data-binary '...' argument and the request silently
+// becomes a shell parse error instead of an HTTP call.
+static std::string common_shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+// Fetches one /v1/chat/completions response and returns (predicted_n, predicted_ms),
+// or (-1, 0) on any failure - used by both the solo and concurrent benchmark paths below.
+static std::pair<double, double> common_moe_bench_one_request(int port, const char * prompt, int n_predict) {
+    nlohmann::json req = {
+        {"messages", nlohmann::json::array({
+            {{"role", "user"}, {"content", prompt}}
+        })},
+        {"max_tokens", n_predict},
+    };
+    const std::string req_body = req.dump();
+    char req_cmd[4096];
+    snprintf(req_cmd, sizeof(req_cmd),
+        "curl -s http://127.0.0.1:%d/v1/chat/completions -H 'Content-Type: application/json' --data-binary %s",
+        port, common_shell_quote(req_body).c_str());
+    FILE * rp = popen(req_cmd, "r");
+    if (!rp) {
+        return {-1.0, 0.0};
+    }
+    std::string body;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), rp)) > 0) {
+        body.append(buf, n);
+    }
+    pclose(rp);
+    try {
+        auto j = nlohmann::json::parse(body);
+        if (j.contains("timings") && j["timings"].contains("predicted_n")) {
+            return {j["timings"]["predicted_n"].get<double>(), j["timings"]["predicted_ms"].get<double>()};
+        }
+    } catch (const std::exception &) {
+        // falls through to the failure return below
+    }
+    return {-1.0, 0.0};
+}
+
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
-        uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict) {
+        uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
+        int n_concurrency = 1) {
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -1603,6 +1664,20 @@ static double common_moe_bench_candidate_server(
         snprintf(buf, sizeof(buf), "-t %d -tb %d ", n_threads, n_threads);
         threads_args = buf;
     }
+    // At concurrency > 1, --parallel must match so the candidate server can
+    // actually hold n_concurrency slots, and -c needs enough headroom for
+    // all of them at once (n_predict + a real prompt, per slot) - reusing
+    // the caller's n_ctx here would starve most slots down to a handful of
+    // tokens each and force truncation/failure well before this is a real
+    // concurrent-throughput measurement.
+    std::string parallel_args;
+    uint32_t ctx_for_launch = n_ctx;
+    if (n_concurrency > 1) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "--parallel %d ", n_concurrency);
+        parallel_args = buf;
+        ctx_for_launch = std::max<uint32_t>(n_ctx, (uint32_t) n_concurrency * 384);
+    }
     char cmd[4096];
     // --temp/--top-p/--top-k match this model family's documented MTP
     // sampling recommendation (Unsloth's llama.cpp MTP guide) - found to
@@ -1613,11 +1688,11 @@ static double common_moe_bench_candidate_server(
     // throughput number measured this way. Real, representative numbers
     // require realistic, non-degenerate generation.
     snprintf(cmd, sizeof(cmd),
-        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache auto -c %u %s%s"
+        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache auto -c %u %s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
-        self_exe.c_str(), path_model.c_str(), n_cpu_moe, n_ctx,
-        mtp_args.c_str(), threads_args.c_str(), port);
+        self_exe.c_str(), path_model.c_str(), n_cpu_moe, ctx_for_launch,
+        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
         return -1.0;
@@ -1672,46 +1747,75 @@ static double common_moe_bench_candidate_server(
     static const char * const probe_prompts[] = {
         "Explain how photosynthesis works in three sentences, then describe the role of chlorophyll.",
         "Write a Python function that implements binary search, then explain its time complexity.",
+        "Summarize the plot of a mystery novel in two sentences, then suggest a twist ending.",
+        "Describe the water cycle briefly, then explain how it relates to weather patterns.",
+        "Explain Newton's second law of motion, then give a real-world example.",
+        "Describe how a car engine works in simple terms, then list its main components.",
+        "What are the main causes of inflation, and how do central banks respond?",
+        "Explain how vaccines work, then describe herd immunity.",
     };
-    double sum_tps = 0.0;
-    int n_ok = 0;
-    for (const char * prompt : probe_prompts) {
-        nlohmann::json req = {
-            {"messages", nlohmann::json::array({
-                {{"role", "user"}, {"content", prompt}}
-            })},
-            {"max_tokens", n_predict},
-        };
-        const std::string req_body = req.dump();
-        char req_cmd[4096];
-        snprintf(req_cmd, sizeof(req_cmd),
-            "curl -s http://127.0.0.1:%d/v1/chat/completions -H 'Content-Type: application/json' --data-binary %s",
-            port, ("'" + req_body + "'").c_str());
-        FILE * rp = popen(req_cmd, "r");
-        if (!rp) {
-            continue;
-        }
-        std::string body;
-        char buf[4096];
-        size_t n;
-        while ((n = fread(buf, 1, sizeof(buf), rp)) > 0) {
-            body.append(buf, n);
-        }
-        pclose(rp);
-        try {
-            auto j = nlohmann::json::parse(body);
-            if (j.contains("timings") && j["timings"].contains("predicted_per_second")) {
-                sum_tps += j["timings"]["predicted_per_second"].get<double>();
+    static constexpr int n_probe_prompts = sizeof(probe_prompts) / sizeof(probe_prompts[0]);
+
+    double result_tps = -1.0;
+    if (n_concurrency <= 1) {
+        // Solo path: average per-request predicted_per_second across a
+        // couple of sequential probes - unchanged from before concurrency
+        // support was added, so existing solo calibration behavior is
+        // bit-for-bit identical.
+        double sum_tps = 0.0;
+        int n_ok = 0;
+        for (int i = 0; i < 2; i++) {
+            const auto [predicted_n, predicted_ms] = common_moe_bench_one_request(port, probe_prompts[i], n_predict);
+            if (predicted_n > 0 && predicted_ms > 0) {
+                sum_tps += predicted_n / (predicted_ms / 1000.0);
                 n_ok++;
             }
-        } catch (const std::exception &) {
-            // this one prompt failed to parse - continue to the next, only
-            // fail the whole candidate if every prompt fails (checked below)
         }
+        result_tps = n_ok > 0 ? sum_tps / n_ok : -1.0;
+    } else {
+        // Concurrent path: fire n_concurrency real requests at once (cycling
+        // through the prompt pool so it's not the same prompt N times, which
+        // would bias moe-cache/MTP toward an unrealistically easy repeated
+        // pattern - see the endpoint-bias lesson elsewhere in this file),
+        // measure wall-clock for all of them to complete, and report
+        // aggregate tok/s = total generated tokens / wall time. This is the
+        // actual quantity a concurrent deployment cares about, not the
+        // average of what each individual request would have gotten alone.
+        std::vector<double> predicted_n_per_req(n_concurrency, -1.0);
+        std::vector<std::thread> threads;
+        threads.reserve(n_concurrency);
+        const auto t_start = std::chrono::steady_clock::now();
+        for (int i = 0; i < n_concurrency; i++) {
+            const char * prompt = probe_prompts[i % n_probe_prompts];
+            threads.emplace_back([&predicted_n_per_req, i, port, prompt, n_predict]() {
+                const auto [predicted_n, predicted_ms] = common_moe_bench_one_request(port, prompt, n_predict);
+                predicted_n_per_req[i] = predicted_n;
+                (void) predicted_ms; // wall-clock comes from the outer timer, not per-request timing
+            });
+        }
+        for (auto & t : threads) {
+            t.join();
+        }
+        const auto t_end = std::chrono::steady_clock::now();
+        const double wall_s = std::chrono::duration<double>(t_end - t_start).count();
+
+        double total_tokens = 0.0;
+        int n_ok = 0;
+        for (double predicted_n : predicted_n_per_req) {
+            if (predicted_n > 0) {
+                total_tokens += predicted_n;
+                n_ok++;
+            }
+        }
+        // Require every concurrent request to have succeeded - a partial
+        // failure under real concurrency is itself a signal this candidate
+        // can't actually sustain the target concurrency, not just noise to
+        // average past.
+        result_tps = (n_ok == n_concurrency && wall_s > 0) ? total_tokens / wall_s : -1.0;
     }
 
     cleanup();
-    return n_ok > 0 ? sum_tps / n_ok : -1.0;
+    return result_tps;
 }
 
 static std::string common_self_exe_path() {
@@ -1734,13 +1838,27 @@ static std::string common_self_exe_path() {
 // also searched the same way, within an envelope found first by doubling
 // until cache health collapses (see the n_max=8 finding in the docs - a
 // real, measured collapse, not a guess at where the envelope ends).
-// Deliberately scoped to single-sequence decode speed for this first
-// version - concurrent-load calibration is a further extension, not
-// attempted here (see docs/moe-cache-colibri-notes.md).
+//
+// Concurrency-aware: if params.n_parallel > 1, every candidate is
+// benchmarked with that many real concurrent requests (aggregate
+// throughput), not solo decode speed - the optimal placement/threads/n_max
+// can differ meaningfully at real concurrency (confirmed this session: the
+// MMVQ and bulk-offload GPU-kernel-dispatch cliffs both only appear above
+// certain concurrent batch sizes, invisible to a solo benchmark entirely).
+// cparams.n_seq_max already equals params.n_parallel via
+// common_context_params_to_llama, so the safe-floor probe below already
+// accounts for the larger KV-cache footprint N concurrent slots need - no
+// separate concurrency-specific probe required. Deliberately reuses
+// --parallel itself as the concurrency target (not a separate flag): the
+// calibration cache key already includes n_parallel, so calibrating and
+// deploying with the same --parallel value is what makes the cache
+// lookup find this entry later - a separate flag that could drift out of
+// sync with --parallel would be a real footgun here.
 void common_moe_calibrate(common_params & params) {
     const char * path_model = params.model.path.c_str();
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+    const int concurrency = std::max(1, (int) params.n_parallel);
 
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
     common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
@@ -1789,11 +1907,11 @@ void common_moe_calibrate(common_params & params) {
     constexpr int n_samples_per_candidate = 2;
     auto bench_one_sample = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
         double tps = common_moe_bench_candidate_server(
-                self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
+                self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency);
         if (tps < 0) {
             LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict);
+                    self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency);
         }
         return tps;
     };
@@ -1817,8 +1935,9 @@ void common_moe_calibrate(common_params & params) {
     // stays cheap.
     const uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
 
-    LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d (real llama-server subprocess, "
-            "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default);
+    LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
+            "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
+            concurrency > 1 ? string_format(", concurrency=%d (aggregate throughput)", concurrency).c_str() : "");
 
     std::map<int, double> ncmoe_trace;
     auto measure_ncmoe = [&](int n) -> double {
@@ -1964,19 +2083,24 @@ void common_moe_calibrate(common_params & params) {
     entry.n_threads       = best_threads;
     entry.n_threads_batch = best_threads;
     entry.spec_n_max      = best_n_max;
+    entry.concurrency     = concurrency;
     entry.tok_per_sec     = best_threads_tps;
     entry.calibrated_at   = timebuf;
     common_moe_calibration_save(path_model, params, entry);
 
+    const char * tps_label = concurrency > 1 ? "aggregate tok/s" : "tok/s";
     if (best_n_max > 0) {
-        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, spec-draft-n-max=%d, measured %.2f tok/s. "
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, spec-draft-n-max=%d%s, measured %.2f %s. "
                 "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
-                __func__, entry.n_cpu_moe, entry.n_threads, entry.spec_n_max, entry.tok_per_sec,
-                common_moe_calibration_cache_path().c_str());
+                __func__, entry.n_cpu_moe, entry.n_threads, entry.spec_n_max,
+                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "",
+                entry.tok_per_sec, tps_label, common_moe_calibration_cache_path().c_str());
     } else {
-        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, measured %.2f tok/s. "
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d%s, measured %.2f %s. "
                 "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
-                __func__, entry.n_cpu_moe, entry.n_threads, entry.tok_per_sec, common_moe_calibration_cache_path().c_str());
+                __func__, entry.n_cpu_moe, entry.n_threads,
+                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "",
+                entry.tok_per_sec, tps_label, common_moe_calibration_cache_path().c_str());
     }
 }
 
@@ -2172,11 +2296,12 @@ static bool common_maybe_autoplace_moe_cpu(
                 params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
                 params.speculative.draft.n_max = cached.spec_n_max;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s, measured %.2f tok/s on %s) "
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
                     cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
-                    cached.tok_per_sec, cached.calibrated_at.c_str());
+                    cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
+                    cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;
         }
         LOG_WRN("%s: cached calibration no longer fits current conditions - recalibrating placement live\n", __func__);
