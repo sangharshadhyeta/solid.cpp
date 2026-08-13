@@ -69,13 +69,35 @@ struct moe_cache_key_hash {
     }
 };
 
+// LFRU eviction, hybrid design: two O(1) doubly-linked lists (probation/
+// protected_, the SLRU structure) PLUS a per-slot heat counter with
+// periodic decay (the heat-based design). Measured separately first
+// (A/B'd on the same mixed hot/cold workload, RTX 3060 + Gemma-4-26B-A4B,
+// -ncmoe 15): plain LRU 63.8%, capped-SLRU-alone 65.0%, heat-alone 64.6%,
+// uncapped-SLRU-v1 (the original broken attempt) 60.2-60.3%. Segments
+// answer "has this ever proven itself hot" (binary, sticky); heat answers
+// "how hot, and how recently" (graded, decaying) - they're complementary,
+// not redundant: segments alone can't tell two protected slots apart when
+// deciding who to demote at the cap (previously just "oldest", ignoring
+// how often either was actually re-hit); heat alone has no admission
+// control, so a burst of one-off cold admissions can still churn through
+// slots that would otherwise deserve segment-level protection. This
+// combines them: promotion to protected_ and eviction/demotion candidate
+// selection are both segment-scoped (drain probation before protected_,
+// same as capped-SLRU) but *within* whichever segment is being drawn
+// from, the choice among a bounded recency window is by heat, not just
+// recency order (see moe_cache_colder_enough below).
+enum class moe_cache_segment : uint8_t { probation, protected_ };
+
 struct moe_cache_slot {
     moe_cache_key key;
     uint64_t generation = 0;
     int prev = -1;
     int next = -1;
     int readers = 0;
+    uint32_t heat = 0;
     moe_cache_slot_state state = moe_cache_slot_state::free;
+    moe_cache_segment segment = moe_cache_segment::probation;
 };
 
 struct moe_cache_pool {
@@ -87,8 +109,12 @@ struct moe_cache_pool {
     std::vector<moe_cache_slot> slots;
     std::vector<int> free_slots;
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
-    int lru_head = -1;
+    int lru_head = -1;       // probation segment (new/one-off admissions)
     int lru_tail = -1;
+    int protected_head = -1; // protected segment (proven hot: re-requested at least once while resident)
+    int protected_tail = -1;
+    int protected_count = 0; // capped at n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100 - see moe_cache_promote_to_protected
+    long long fills_since_decay = 0;
 };
 
 struct moe_cache_shape {
@@ -485,32 +511,146 @@ static bool moe_cache_type_supported(ggml_type type) {
     }
 }
 
-static void moe_cache_lru_remove(moe_cache_pool & pool, int index) {
+// Generic doubly-linked-list primitives, parameterized by which segment's
+// head/tail to operate on - shared by both the probation and protected
+// lists below, since a slot is only ever in one of the two at a time and
+// its prev/next fields are safe to reuse for whichever list currently owns
+// it.
+static void moe_cache_list_remove(int & head, int & tail, moe_cache_pool & pool, int index) {
     moe_cache_slot & slot = pool.slots[index];
     if (slot.prev >= 0) {
         pool.slots[slot.prev].next = slot.next;
     } else {
-        pool.lru_head = slot.next;
+        head = slot.next;
     }
     if (slot.next >= 0) {
         pool.slots[slot.next].prev = slot.prev;
     } else {
-        pool.lru_tail = slot.prev;
+        tail = slot.prev;
     }
     slot.prev = -1;
     slot.next = -1;
 }
 
-static void moe_cache_lru_push_back(moe_cache_pool & pool, int index) {
+static void moe_cache_list_push_back(int & head, int & tail, moe_cache_pool & pool, int index) {
     moe_cache_slot & slot = pool.slots[index];
-    slot.prev = pool.lru_tail;
+    slot.prev = tail;
     slot.next = -1;
-    if (pool.lru_tail >= 0) {
-        pool.slots[pool.lru_tail].next = index;
+    if (tail >= 0) {
+        pool.slots[tail].next = index;
     } else {
-        pool.lru_head = index;
+        head = index;
     }
-    pool.lru_tail = index;
+    tail = index;
+}
+
+// Removes a slot from whichever segment it currently occupies (reads
+// slot.segment to know which list's head/tail to update).
+static void moe_cache_segment_remove(moe_cache_pool & pool, int index) {
+    moe_cache_slot & slot = pool.slots[index];
+    if (slot.segment == moe_cache_segment::probation) {
+        moe_cache_list_remove(pool.lru_head, pool.lru_tail, pool, index);
+    } else {
+        moe_cache_list_remove(pool.protected_head, pool.protected_tail, pool, index);
+        pool.protected_count--;
+    }
+}
+
+// Pushes a slot onto the tail of the given segment's list, updating
+// slot.segment to match. New admissions always go to `probation` (a slot
+// has to prove itself hot via a real post-admission hit before it earns
+// `protected_` status - see the struct comment above moe_cache_segment).
+// Callers wanting the cap+demotion enforced should go through
+// moe_cache_promote_to_protected() below instead of pushing to
+// protected_ directly.
+static void moe_cache_segment_push_back(moe_cache_pool & pool, int index, moe_cache_segment seg) {
+    moe_cache_slot & slot = pool.slots[index];
+    slot.segment = seg;
+    if (seg == moe_cache_segment::probation) {
+        moe_cache_list_push_back(pool.lru_head, pool.lru_tail, pool, index);
+    } else {
+        moe_cache_list_push_back(pool.protected_head, pool.protected_tail, pool, index);
+        pool.protected_count++;
+    }
+}
+
+// Heat gained per hit and the ceiling it saturates at (avoids overflow
+// concerns entirely - 20 bits is far more resolution than the hysteresis
+// margin below ever needs).
+static constexpr uint32_t MOE_CACHE_HEAT_MAX = 1u << 20;
+static constexpr uint32_t MOE_CACHE_HEAT_STEP = 4;
+
+// How many fills between heat-decay sweeps, and how many of the
+// coldest-recency slots the eviction scan below considers - both cheap,
+// bounded costs (decay is O(pool size) but runs rarely; the eviction scan
+// is O(window), not O(pool size), on every eviction).
+static constexpr long long MOE_CACHE_HEAT_DECAY_EVERY = 512;
+static constexpr int MOE_CACHE_EVICT_WINDOW = 8;
+
+// Two things were tried and measured here before landing on this one:
+// letting decay alone regulate protected_'s population, with no fixed
+// cap, either via an absolute per-slot heat floor (61.4% hit rate,
+// protected_ still hit 596-598/604) or a floor relative to protected_'s
+// own mean heat (61.3%, 599/604) - both collapsed back to essentially the
+// same runaway as the original uncapped-SLRU bug (60.2-60.3%). Root
+// cause in both: decay only fires on *fill* events (new admissions), but
+// within one busy request thousands of *hits* land on the same resident
+// working set between fills - heat (and the mean along with it) balloons
+// for nearly the whole pool before decay ever gets a chance to run, and
+// even when a slot does get demoted, it's usually re-hit and re-promoted
+// on the very next token before the next decay. Heat/decay alone doesn't
+// have a fast enough signal to regulate *population size* at this
+// timescale - that needs a hard structural bound. So: keep the fixed
+// MOE_CACHE_PROTECTED_CAP_PCT cap (measured 65.0% alone, still the best
+// single mechanism found), and let heat do the job it's actually good at
+// - choosing *which* slot pays the demotion cost when the cap is hit
+// (coldest in a bounded recency window, not just oldest) - see
+// moe_cache_promote_to_protected below.
+static void moe_cache_pool_decay(moe_cache_pool & pool) {
+    for (moe_cache_slot & slot : pool.slots) {
+        slot.heat >>= 1;
+    }
+}
+
+// Colibri's "25%-plus-4" hysteresis: candidate `b` only replaces the
+// current best eviction pick `a` if b's heat is *meaningfully* colder,
+// not just marginally - prevents two similarly-hot slots from flip-
+// flopping as the eviction choice from one insertion to the next purely
+// from noise.
+static bool moe_cache_colder_enough(uint32_t a_heat, uint32_t b_heat) {
+    return (uint64_t) b_heat + b_heat / 4 + 4 <= a_heat;
+}
+
+// protected_ is capped at half the pool - the structural fix for the
+// v1 SLRU regression (uncapped: 60.2-60.3% hit rate, protected_ grew to
+// 598-600/604, starving probation). When promotion needs to make room,
+// the slot that pays for it is chosen by heat, not recency: scan a
+// bounded window from protected_head (the segment's own oldest-recency
+// end) and demote whichever of those is coldest, with hysteresis so a
+// marginal difference doesn't flip-flop the choice run to run. Plain
+// oldest-first demotion (capped-SLRU, no heat tiebreak) already measured
+// well (65.0%) - this only changes *which* of the stale-recency
+// candidates gets picked when several are in contention.
+static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
+
+static void moe_cache_promote_to_protected(moe_cache_pool & pool, int index) {
+    moe_cache_segment_remove(pool, index);
+    const int cap = std::max(1, pool.n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100);
+    if (pool.protected_count >= cap && pool.protected_head >= 0) {
+        int demote = pool.protected_head;
+        uint32_t demote_heat = pool.slots[demote].heat;
+        int candidate = pool.slots[demote].next;
+        for (int seen = 1; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next, seen++) {
+            const uint32_t heat = pool.slots[candidate].heat;
+            if (moe_cache_colder_enough(demote_heat, heat)) {
+                demote = candidate;
+                demote_heat = heat;
+            }
+        }
+        moe_cache_segment_remove(pool, demote);
+        moe_cache_segment_push_back(pool, demote, moe_cache_segment::probation);
+    }
+    moe_cache_segment_push_back(pool, index, moe_cache_segment::protected_);
 }
 
 static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
@@ -524,13 +664,15 @@ static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
 static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_free) {
     moe_cache_slot & slot = pool.slots[index];
     if (slot.state == moe_cache_slot_state::valid) {
-        moe_cache_lru_remove(pool, index);
+        moe_cache_segment_remove(pool, index);
     }
     moe_cache_map_erase(pool, index);
     slot.key = {};
     slot.generation++;
     slot.readers = 0;
+    slot.heat = 0; // heat belongs to the content that was resident, not the physical slot
     slot.state = moe_cache_slot_state::free;
+    slot.segment = moe_cache_segment::probation;
     slot.prev = -1;
     slot.next = -1;
     if (add_to_free) {
@@ -769,9 +911,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     slot.generation == job.generation && slot.key == job.key) {
                     if (error == cudaSuccess) {
                         slot.state = moe_cache_slot_state::valid;
-                        moe_cache_lru_push_back(*pool, job.slot);
+                        // Fresh admission - starts in probation regardless
+                        // of how many pre-admission misses it took to get
+                        // here (that's a different signal from "reused
+                        // while resident", which is what earns protected_
+                        // status - see moe_cache_segment_push_back).
+                        moe_cache_segment_push_back(*pool, job.slot, moe_cache_segment::probation);
                         device->demand_count.erase(job.key);
                         device->fills++;
+                        if (++pool->fills_since_decay >= MOE_CACHE_HEAT_DECAY_EVERY) {
+                            moe_cache_pool_decay(*pool);
+                            pool->fills_since_decay = 0;
+                        }
                     } else {
                         moe_cache_slot_reset(*pool, job.slot, true);
                         device->fill_failures++;
@@ -1092,16 +1243,29 @@ static int moe_cache_discover_pool(
 static void moe_cache_log_stats(moe_cache_device & device) {
     size_t used = 0;
     size_t slots = 0;
+    size_t protected_used = 0;
+    unsigned long long heat_sum = 0;
+    size_t heat_n = 0;
     for (const auto & pool_ptr : device.pools) {
         const moe_cache_pool & pool = *pool_ptr;
         slots += pool.n_slots;
         used += pool.n_slots - pool.free_slots.size();
+        for (int i = pool.protected_head; i >= 0; i = pool.slots[i].next) {
+            protected_used++;
+            heat_sum += pool.slots[i].heat;
+            heat_n++;
+        }
+        for (int i = pool.lru_head; i >= 0; i = pool.slots[i].next) {
+            heat_sum += pool.slots[i].heat;
+            heat_n++;
+        }
     }
+    const double avg_heat = heat_n ? (double) heat_sum / (double) heat_n : 0.0;
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu (protected=%zu avg_heat=%.1f) enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
-            used, slots, device.inserts, device.fills, device.fill_failures,
+            used, slots, protected_used, avg_heat, device.inserts, device.fills, device.fill_failures,
             device.evictions, device.insert_skips,
             device.admission_skips, device.queue.size(), device.queued_bytes >> 20,
             device.dispatch_failures, device.collect_failures);
@@ -1680,8 +1844,14 @@ static int moe_cache_plan(
             moe_cache_slot & slot = pool.slots[found->second];
             if (slot.state == moe_cache_slot_state::valid) {
                 slot.readers++;
-                moe_cache_lru_remove(pool, found->second);
-                moe_cache_lru_push_back(pool, found->second);
+                slot.heat = std::min(MOE_CACHE_HEAT_MAX, slot.heat + MOE_CACHE_HEAT_STEP);
+                // Any real hit, from either segment, promotes to (or
+                // refreshes within) protected_ - a resident slot being
+                // requested again is exactly the "genuinely hot, not just
+                // a one-off admission" signal that earns real protection
+                // from eviction churn. Heat then decides how long that
+                // protection actually lasts, at the next decay sweep.
+                moe_cache_promote_to_protected(pool, found->second);
                 node->pins[node->n_pins++] = {found->second};
                 slot_indices[index] = found->second;
                 device.hits++;
@@ -1723,9 +1893,36 @@ static int moe_cache_plan(
             slot_index = pool.free_slots.back();
             pool.free_slots.pop_back();
         } else {
-            int candidate = pool.lru_head;
-            while (candidate >= 0 && pool.slots[candidate].readers > 0) {
-                candidate = pool.slots[candidate].next;
+            // Drain probation first - only touch protected_ (proven-hot
+            // slots, reused at least once while resident) once probation
+            // has genuinely nothing left to sacrifice. This is the segment
+            // half of the LFRU protection: a burst of one-off cold
+            // admissions can fully cycle through probation without ever
+            // touching something with a real repeated-access history.
+            // Within whichever segment is being drawn from, though, the
+            // pick among a bounded recency window is by heat (coldest
+            // wins, with hysteresis) rather than plain oldest-first - the
+            // heat half of the hybrid.
+            auto pick_coldest_unpinned = [&](int head) -> int {
+                int best = -1;
+                uint32_t best_heat = 0;
+                int candidate = head;
+                for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
+                    if (pool.slots[candidate].readers > 0) {
+                        continue;
+                    }
+                    seen++;
+                    const uint32_t heat = pool.slots[candidate].heat;
+                    if (best < 0 || moe_cache_colder_enough(best_heat, heat)) {
+                        best = candidate;
+                        best_heat = heat;
+                    }
+                }
+                return best;
+            };
+            int candidate = pick_coldest_unpinned(pool.lru_head);
+            if (candidate < 0) {
+                candidate = pick_coldest_unpinned(pool.protected_head);
             }
             if (candidate < 0) {
                 device.insert_skips++;
