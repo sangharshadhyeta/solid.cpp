@@ -1,3 +1,49 @@
+# Real deployment target (drives all priority calls above and below)
+
+Office HPC: 1x H200 (141GB HBM3e), 512GB system RAM, GLM-5.2 (744B, Q4_K_M,
+unsloth quant), 5-10 users - but usage is API/agentic (many requests per
+user, not just interactive chat), not simple back-and-forth chat. Target:
+40+ tok/s decode.
+
+**Why unsloth specifically**: their dynamic-quant approach is what's
+needed to hit the 40 tok/s sweet spot at Q4_K_M quality - same reasoning
+that put us on the Gemma-4-26B-A4B unsloth GGUF for the sandbox test.
+
+**Capacity math** (rough, Q4_K_M ~0.59 bytes/param average): ~439GB total
+GGUF, ~10GB dense/attention (always VRAM-resident), ~429GB routed experts.
+512GB RAM holds the entire expert mass resident - no disk-tier streaming
+needed at all, unlike Colibri's harder cases. Leaves ~131GB of H200 VRAM
+for the moe-cache hot-expert-set, KV cache across 5-10 concurrent slots,
+and compute buffers once dense weights are subtracted - workable but needs
+deliberate sizing once we're testing on the real hardware.
+
+**Why this reprioritizes things above generic advice:**
+- GLM-5.2's confirmed routing skew (SharkWipf: top ~1000 experts dominate,
+  30-50% measured speedup) means moe-cache is a strong fit, not a maybe -
+  validated for the real target, not just our Gemma-4 sandbox stand-in.
+- GLM-5.2's native NextN/MTP speculative decoding is merged in-tree (PR
+  #25980) - uses the model's own trained draft head, no external
+  checkpoint needed. Likely the single highest-value, lowest-effort win
+  for this deployment specifically (verify the downloaded GGUF wasn't
+  converted with `--no-mtp` stripping the head).
+- 5-10 nominal users but agentic/API-heavy traffic pushes effective
+  request volume and repetition patterns well past "5-10 people typing in
+  a chat box." Prefix caching (agents resending stable system
+  prompts/tool schemas every turn) and Suffix Decode (repetitive
+  code-edit/tool-call output) both become more directly relevant here
+  than they'd be for plain chat - matches the RFC thread's own finding
+  that agentic coding workloads are prefill-heavy by construction.
+- A single H200 (not multi-GPU) means the RFC thread's multi-device
+  pool-distribution findings (sticky layer/device routing, uneven pool
+  sizing across cards) don't apply - simpler single-device sizing problem.
+- Sanity check against real numbers: RFC-thread testers got low-to-mid-20s
+  tok/s decode with moe-cache on 2x RTX 3090 + repaired 8-channel DDR4
+  (~100GB/s) running DeepSeek-V4-Flash 284B - the *harder* case (uniform
+  routing). GLM-5.2's skew plus an H200's far higher HBM bandwidth plus
+  512GB of presumably fast server RAM all point toward 40+ tok/s being a
+  realistic target, not optimistic - more so once MTP speculative decoding
+  stacks on top.
+
 # vLLM features beyond DSpark/Suffix Decode - priority order
 
 Not yet scoped, just recorded with a rough priority (nearest-term first).
