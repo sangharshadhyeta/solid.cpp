@@ -2742,7 +2742,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "empirically calibrate -ncmoe placement and thread count for this GPU+model+context "
         "combination (a handful of real short benchmarks, tens of seconds to a few minutes), "
         "cache the result under the llama.cpp cache directory, then exit - run this once per "
-        "hardware/model/context combo, then launch normally to pick up the cached values",
+        "hardware/model/context combo, then launch normally to pick up the cached values. "
+        "If --parallel N > 1, calibrates for N concurrent requests (real concurrent "
+        "benchmarks, aggregate throughput) instead of solo decode speed - the optimal "
+        "-ncmoe/thread-count/spec-draft-n-max can differ meaningfully at real concurrency, "
+        "so pass the same --parallel value you intend to actually deploy with",
         [](common_params & params) {
             params.moe_calibrate = true;
         }
