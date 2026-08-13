@@ -278,10 +278,20 @@ static constexpr int MOE_CACHE_MAX_BATCH_CEILING = 64;
 // exactly as before when explicitly set - this only changes the default.
 static std::atomic<int> g_max_batch_hint{0};
 
+// Raises the hint to at least this value - never lowers it. Multiple
+// callers contribute independent lower bounds on the real max batch size
+// (llama-context.cpp's own n_seq_max-driven call happens per-context, and
+// common.cpp separately accounts for speculative-decoding's n_max before
+// that - see the call site there for why n_max matters: MTP verify batches
+// submit up to n_max+1 candidate positions per step, a real, separately
+// measured cause of the cache silently going cold at high n_max). Order
+// between callers must not matter, hence max-not-overwrite.
 static void moe_cache_set_max_batch_hint(int n_seq_max) {
-    g_max_batch_hint.store(
-            std::max(0, std::min(n_seq_max, MOE_CACHE_MAX_BATCH_CEILING)),
-            std::memory_order_relaxed);
+    const int clamped = std::max(0, std::min(n_seq_max, MOE_CACHE_MAX_BATCH_CEILING));
+    int current = g_max_batch_hint.load(std::memory_order_relaxed);
+    while (clamped > current &&
+           !g_max_batch_hint.compare_exchange_weak(current, clamped, std::memory_order_relaxed)) {
+    }
 }
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;

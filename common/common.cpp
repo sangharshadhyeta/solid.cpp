@@ -4,6 +4,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "ggml-backend-moe-cache.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1745,6 +1746,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // MTP/speculative verify batches submit up to n_max+1 candidate positions
+    // per step, a real, separately measured cause of moe-cache silently
+    // going cold when that exceeds max_batch (n_seq_max alone, set later by
+    // llama-context.cpp per-context, doesn't know about this). Set before
+    // any model load so it's in place before the main model's moe-cache
+    // session reads its config. set_max_batch_hint only ever raises the
+    // hint (never lowers it), so call order relative to llama-context.cpp's
+    // own per-context call doesn't matter.
+    if (ggml_moe_cache.set_max_batch_hint && params.speculative.has_dft()) {
+        const int64_t worst_case = (int64_t) cparams.n_seq_max * (params.speculative.draft.n_max + 1);
+        ggml_moe_cache.set_max_batch_hint((int) std::min<int64_t>(worst_case, INT32_MAX));
+    }
 
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
