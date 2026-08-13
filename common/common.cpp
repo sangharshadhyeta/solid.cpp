@@ -1806,8 +1806,26 @@ void common_moe_calibrate(common_params & params) {
         LOG_INF("%s:   ncmoe=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
         return tps; // failed candidates measure as -1, golden-section still works (just avoids them)
     };
-    const uint32_t best_n = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
+    uint32_t best_n = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
     double best_tps = ncmoe_trace.at((int) best_n);
+    // Golden-section search assumes a unimodal objective and only ever
+    // bisects toward whichever side of its *current* probe pair scores
+    // higher - it never revisits a point once the search has narrowed
+    // away from it, even if that point is sitting right there in the
+    // trace map already measured. Confirmed to matter in practice for
+    // the spec-draft-n-max search below (see docs/moe-cache-colibri-notes.md,
+    // "SECOND BUG FOUND": n_max=2 scored higher than the declared winner
+    // n_max=9, silently ignored because the search had already bisected
+    // past it). This costs zero extra subprocess spawns - ncmoe_trace
+    // already holds every point actually measured - so always trust the
+    // best of what was truly measured over what golden-section converged
+    // to, not just for n_max but here too as a general safety net.
+    for (const auto & kv : ncmoe_trace) {
+        if (kv.second > best_tps) {
+            best_tps = kv.second;
+            best_n = (uint32_t) kv.first;
+        }
+    }
     if (best_tps < 0) {
         LOG_ERR("%s: every placement candidate failed to benchmark; not writing a cache entry\n", __func__);
         return;
@@ -1853,6 +1871,21 @@ void common_moe_calibrate(common_params & params) {
                     return tps;
                 };
                 best_n_max = common_golden_section_search_max(1, nmax_hi, measure_nmax, nmax_trace);
+                // Validate against the full trace, not just what
+                // golden-section converged to - see the comment on the
+                // identical check after the ncmoe search above. This is
+                // the fix for a confirmed real bug: the envelope-doubling
+                // phase above already measures n=1,2,4,8,... before
+                // golden-section ever runs, but golden-section's own
+                // bisection can (and, measured once, did: n_max=2 scored
+                // 56.06 tok/s vs the bisection's own pick of n_max=9 at
+                // 54.55) narrow away from those low values without ever
+                // reconsidering them.
+                for (const auto & kv : nmax_trace) {
+                    if (kv.second > nmax_trace.at(best_n_max)) {
+                        best_n_max = kv.first;
+                    }
+                }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
                 // The n_max search's own winning number (MTP active) is the
                 // real answer for this deployment, not the earlier ncmoe-only
