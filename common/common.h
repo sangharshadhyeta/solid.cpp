@@ -468,6 +468,7 @@ struct common_params {
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     bool    fit_params_moe_cache = false; // print a recommended --moe-cache / batch / reserve config
+    bool    moe_calibrate      = false; // empirically calibrate -ncmoe / n_threads for this GPU+model+context combo, cache the result, then exit
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
@@ -1100,6 +1101,12 @@ inline std::string llm_ffn_exps_block_regex(int idx) {
 inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
     return { LLM_FFN_EXPS_REGEX, ggml_backend_cpu_buffer_type() };
 }
+
+// Empirically calibrates -ncmoe placement and thread count for the exact
+// GPU+model+context combination in params (real short benchmarks), caches
+// the result under fs_get_cache_directory(), then returns - does not start
+// a server or load a long-lived context. See --moe-calibrate in arg.cpp.
+void common_moe_calibrate(common_params & params);
 
 //
 // training utils

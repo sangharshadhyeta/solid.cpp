@@ -109,6 +109,11 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    if (params.moe_calibrate) {
+        common_moe_calibrate(params);
+        return 0;
+    }
+
     return llama_server(params, argc, argv);
 }
 

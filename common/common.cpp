@@ -24,6 +24,9 @@
 #include <iterator>
 #include <list>
 #include <regex>
+
+#define JSON_ASSERT GGML_ASSERT
+#include <nlohmann/json.hpp>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1298,6 +1301,374 @@ static bool common_device_memory_data_fits(const common_device_memory_data_vec &
     return true;
 }
 
+// Shared by Layer 1 (use the safe floor as-is) and Layer 2/--moe-calibrate
+// (use the safe floor as the starting point for empirical throughput
+// candidates above it). Keeps its own C-string storage alive for the
+// lifetime of the process, same as the override lists it hands back.
+static std::vector<llama_model_tensor_buft_override> common_moe_build_cpu_overrides(uint32_t n) {
+    static std::list<std::string> pattern_storage;
+    std::vector<llama_model_tensor_buft_override> ov;
+    for (uint32_t i = 0; i < n; i++) {
+        pattern_storage.push_back(llm_ffn_exps_block_regex((int) i));
+        ov.push_back({pattern_storage.back().c_str(), ggml_backend_cpu_buffer_type()});
+    }
+    ov.push_back({nullptr, nullptr});
+    return ov;
+}
+
+static bool common_moe_fits_with_n(
+        const char * path_model, const llama_model_params & mparams_base,
+        const llama_context_params & cparams, uint32_t n,
+        std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert) {
+    std::vector<llama_model_tensor_buft_override> trial = common_moe_build_cpu_overrides(n);
+    llama_model_params mparams_trial = mparams_base;
+    mparams_trial.tensor_buft_overrides = trial.data();
+    try {
+        common_device_memory_data_vec trial_data = common_get_device_memory_data(
+                path_model, &mparams_trial, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
+        return common_device_memory_data_fits(trial_data);
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+struct common_moe_fit_probe_result {
+    bool     is_moe        = false;
+    bool     already_fits  = false;
+    bool     found_safe_n  = false;
+    uint32_t safe_n        = 0;
+    uint32_t n_layer       = 0;
+};
+
+// Binary-searches the minimal MoE CPU-offload layer count N such that the
+// model fits in available device memory - fit is monotonic in N (more
+// offload never needs more memory), so this is O(log n_layer) no-alloc
+// probes, not O(n_layer). A live, per-launch computation: the answer
+// depends on -c/--parallel/free VRAM at that moment, not a cached constant.
+static common_moe_fit_probe_result common_moe_find_safe_layers(
+        const char * path_model, const llama_model_params & mparams_base, const llama_context_params & cparams) {
+    common_moe_fit_probe_result result;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+    common_device_memory_data_vec data;
+    try {
+        data = common_get_device_memory_data(path_model, &mparams_base, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
+                GGML_LOG_LEVEL_ERROR);
+    } catch (const std::exception &) {
+        return result;
+    }
+    result.n_layer = hp_ngl;
+    result.is_moe  = hp_n_expert > 0;
+
+    if (common_device_memory_data_fits(data)) {
+        result.already_fits = true;
+        return result;
+    }
+    if (!result.is_moe) {
+        return result;
+    }
+    if (!common_moe_fits_with_n(path_model, mparams_base, cparams, hp_ngl, devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
+        return result; // nothing fits even with everything offloaded
+    }
+
+    uint32_t lo = 1, hi = hp_ngl;
+    while (lo < hi) {
+        const uint32_t mid = lo + (hi - lo) / 2;
+        if (common_moe_fits_with_n(path_model, mparams_base, cparams, mid, devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
+            hi = mid;
+        } else {
+            lo = mid + 1;
+        }
+    }
+    result.found_safe_n = true;
+    result.safe_n        = lo;
+    return result;
+}
+
+struct common_moe_calibration_entry {
+    int         n_cpu_moe       = 0;
+    int         n_threads       = -1;
+    int         n_threads_batch = -1;
+    double      tok_per_sec     = 0.0;
+    std::string calibrated_at;
+};
+
+// Key identifies "the same launch, calibrated before": GPU signature (name +
+// total VRAM per device - not free VRAM, which fluctuates and would make
+// the cache miss on unrelated background load), model file identity (path +
+// size, cheap proxy for content without hashing multi-GB files), and the
+// context shape that determines KV-cache footprint. Any change here (new
+// GPU, different model, different -c/--parallel/-ngl) is a real cache miss,
+// not staleness - a stale entry is caught separately by the fits-check in
+// the lookup path, not by this key.
+static std::string common_moe_calibration_key(const char * path_model, const common_params & params) {
+    std::string gpu_sig;
+    const size_t ndev = ggml_backend_dev_count();
+    for (size_t i = 0; i < ndev; i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t dfree = 0, dtotal = 0;
+        ggml_backend_dev_memory(dev, &dfree, &dtotal);
+        gpu_sig += string_format("%s:%zu;", ggml_backend_dev_name(dev), dtotal >> 20);
+    }
+    long long model_size = 0;
+    struct stat st;
+    if (stat(path_model, &st) == 0) {
+        model_size = (long long) st.st_size;
+    }
+    return string_format("%s|%s|%lld|c%u|p%u|ngl%d",
+            gpu_sig.c_str(), path_model, model_size, params.n_ctx, params.n_parallel, params.n_gpu_layers);
+}
+
+static std::string common_moe_calibration_cache_path() {
+    return fs_get_cache_directory() + "moe-calibration.json";
+}
+
+static bool common_moe_calibration_lookup(
+        const char * path_model, const common_params & params, common_moe_calibration_entry & out) {
+    std::ifstream f(common_moe_calibration_cache_path());
+    if (!f.good()) {
+        return false;
+    }
+    try {
+        nlohmann::json j;
+        f >> j;
+        const std::string key = common_moe_calibration_key(path_model, params);
+        if (!j.contains(key)) {
+            return false;
+        }
+        const auto & e = j.at(key);
+        out.n_cpu_moe       = e.value("n_cpu_moe", 0);
+        out.n_threads       = e.value("n_threads", -1);
+        out.n_threads_batch = e.value("n_threads_batch", -1);
+        out.tok_per_sec     = e.value("tok_per_sec", 0.0);
+        out.calibrated_at   = e.value("calibrated_at", std::string());
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+static void common_moe_calibration_save(
+        const char * path_model, const common_params & params, const common_moe_calibration_entry & entry) {
+    const std::string path = common_moe_calibration_cache_path();
+    nlohmann::json j = nlohmann::json::object();
+    {
+        std::ifstream f(path);
+        if (f.good()) {
+            try {
+                f >> j;
+            } catch (const std::exception &) {
+                j = nlohmann::json::object();
+            }
+        }
+    }
+    const std::string key = common_moe_calibration_key(path_model, params);
+    j[key] = {
+        {"n_cpu_moe",       entry.n_cpu_moe},
+        {"n_threads",       entry.n_threads},
+        {"n_threads_batch", entry.n_threads_batch},
+        {"tok_per_sec",     entry.tok_per_sec},
+        {"calibrated_at",   entry.calibrated_at},
+    };
+    fs_create_directory_with_parents(fs_get_cache_directory());
+    std::ofstream out(path);
+    out << j.dump(2);
+}
+
+static llama_token common_moe_greedy_sample(llama_context * ctx, int idx) {
+    const float * logits = llama_get_logits_ith(ctx, idx);
+    const llama_model * model = llama_get_model(ctx);
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    int32_t best = 0;
+    float best_val = logits[0];
+    for (int32_t i = 1; i < n_vocab; i++) {
+        if (logits[i] > best_val) {
+            best_val = logits[i];
+            best = i;
+        }
+    }
+    return best;
+}
+
+// Real load + short real decode, timed - unlike the no-alloc fit probes
+// above, this measures actual throughput (memory-fit says nothing about
+// speed, as our own -ncmoe sweep proved: ncmoe=12 fit but was a cliff,
+// ncmoe=16 was 12%+ faster). Returns decode tok/s, or -1.0 on failure.
+// Deliberately simple (greedy decode, no sampler subsystem) since output
+// quality is irrelevant to a speed probe - only realistic token diversity
+// (for representative MoE routing/cache behavior) matters, which greedy
+// decoding on a real prompt still exercises.
+static double common_moe_bench_candidate(
+        const char * path_model, const llama_model_params & mparams_base, const llama_context_params & cparams_base,
+        uint32_t n_cpu_moe, int n_threads, int n_threads_batch, int n_predict) {
+    llama_model_params mparams = mparams_base;
+    std::vector<llama_model_tensor_buft_override> overrides = common_moe_build_cpu_overrides(n_cpu_moe);
+    if (n_cpu_moe > 0) {
+        mparams.tensor_buft_overrides = overrides.data();
+    }
+
+    llama_context_params cparams = cparams_base;
+    cparams.n_threads       = n_threads;
+    cparams.n_threads_batch = n_threads_batch;
+
+    llama_model * model = llama_model_load_from_file(path_model, mparams);
+    if (!model) {
+        return -1.0;
+    }
+    llama_context * ctx = llama_init_from_model(model, cparams);
+    if (!ctx) {
+        llama_model_free(model);
+        return -1.0;
+    }
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+    std::vector<llama_token> prompt = common_tokenize(vocab,
+            "The quick brown fox jumps over the lazy dog. In a distant galaxy, explorers charted "
+            "new worlds while engineers debugged the navigation system late into the night. ", true);
+
+    llama_batch batch = llama_batch_init(std::max<int>(512, (int) prompt.size() + 1), 0, 1);
+    common_batch_clear(batch);
+    for (size_t i = 0; i < prompt.size(); i++) {
+        common_batch_add(batch, prompt[i], (llama_pos) i, {0}, i + 1 == prompt.size());
+    }
+    double tok_per_sec = -1.0;
+    if (llama_decode(ctx, batch) == 0) {
+        llama_token tok = common_moe_greedy_sample(ctx, batch.n_tokens - 1);
+        llama_pos n_past = (llama_pos) prompt.size();
+
+        const int64_t t0 = ggml_time_us();
+        int n_generated = 0;
+        bool ok = true;
+        for (int i = 0; i < n_predict; i++) {
+            common_batch_clear(batch);
+            common_batch_add(batch, tok, n_past, {0}, true);
+            if (llama_decode(ctx, batch) != 0) {
+                ok = false;
+                break;
+            }
+            n_past++;
+            n_generated++;
+            tok = common_moe_greedy_sample(ctx, 0);
+        }
+        const int64_t t1 = ggml_time_us();
+        if (ok && n_generated > 0) {
+            tok_per_sec = n_generated / ((t1 - t0) * 1e-6);
+        }
+    }
+
+    llama_batch_free(batch);
+    llama_free(ctx);
+    llama_model_free(model);
+    return tok_per_sec;
+}
+
+// --moe-calibrate: empirically finds the throughput-optimal -ncmoe and
+// thread count for this exact GPU+model+context combination via a handful
+// of real short benchmarks, caches the result, then the caller exits
+// (matches the existing --fit-moe-cache preview-before-you-commit pattern
+// rather than mixing calibration into the same run as real serving).
+// Deliberately scoped to single-sequence decode speed for this first
+// version - concurrent-load calibration is a further extension, not
+// attempted here (see docs/moe-cache-colibri-notes.md).
+void common_moe_calibrate(common_params & params) {
+    const char * path_model = params.model.path.c_str();
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+
+    LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
+    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
+    if (!probe.is_moe) {
+        LOG_WRN("%s: model has no MoE experts - nothing for --moe-calibrate to do\n", __func__);
+        return;
+    }
+
+    const uint32_t safe_n = probe.already_fits ? 0 : probe.safe_n;
+    if (!probe.already_fits && !probe.found_safe_n) {
+        LOG_ERR("%s: config does not fit in available device memory even with all MoE experts on CPU; "
+                "reduce -c/--parallel or add VRAM before calibrating\n", __func__);
+        return;
+    }
+
+    std::vector<uint32_t> candidates_n = { safe_n };
+    const uint32_t step = std::max<uint32_t>(1, probe.n_layer / 15);
+    for (uint32_t k = 1; k <= 4; k++) {
+        const uint32_t n = safe_n + k * step;
+        if (n <= probe.n_layer) {
+            candidates_n.push_back(n);
+        }
+    }
+
+    const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
+    const int n_predict = 64;
+
+    LOG_INF("%s: benchmarking %zu placement candidate(s) at n_threads=%d (real load + %d-token decode each) ...\n",
+            __func__, candidates_n.size(), n_threads_default, n_predict);
+
+    uint32_t best_n = safe_n;
+    double   best_tps = -1.0;
+    for (uint32_t n : candidates_n) {
+        const double tps = common_moe_bench_candidate(
+                path_model, mparams, cparams, n, n_threads_default, n_threads_default, n_predict);
+        LOG_INF("%s:   ncmoe=%u -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        if (tps > best_tps) {
+            best_tps = tps;
+            best_n   = n;
+        }
+    }
+    if (best_tps < 0) {
+        LOG_ERR("%s: every placement candidate failed to benchmark; not writing a cache entry\n", __func__);
+        return;
+    }
+
+    const int n_threads_physical = common_cpu_get_num_physical_cores();
+    const int n_threads_logical  = (int) std::thread::hardware_concurrency();
+    std::vector<int> thread_candidates = { n_threads_default };
+    if (n_threads_physical > 0 && n_threads_physical != n_threads_default) {
+        thread_candidates.push_back(n_threads_physical);
+    }
+    if (n_threads_logical > 0 && n_threads_logical != n_threads_default && n_threads_logical != n_threads_physical) {
+        thread_candidates.push_back(n_threads_logical);
+    }
+
+    int    best_threads = n_threads_default;
+    double best_threads_tps = best_tps;
+    if (thread_candidates.size() > 1) {
+        LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u ...\n", __func__, thread_candidates.size(), best_n);
+        for (int nt : thread_candidates) {
+            if (nt == n_threads_default) {
+                continue; // already measured above as best_tps
+            }
+            const double tps = common_moe_bench_candidate(path_model, mparams, cparams, best_n, nt, nt, n_predict);
+            LOG_INF("%s:   n_threads=%d -> %s\n", __func__, nt, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            if (tps > best_threads_tps) {
+                best_threads_tps = tps;
+                best_threads     = nt;
+            }
+        }
+    }
+
+    time_t now = time(nullptr);
+    char timebuf[32];
+    strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+
+    common_moe_calibration_entry entry;
+    entry.n_cpu_moe       = (int) best_n;
+    entry.n_threads       = best_threads;
+    entry.n_threads_batch = best_threads;
+    entry.tok_per_sec     = best_threads_tps;
+    entry.calibrated_at   = timebuf;
+    common_moe_calibration_save(path_model, params, entry);
+
+    LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, measured %.2f tok/s. "
+            "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
+            __func__, entry.n_cpu_moe, entry.n_threads, entry.tok_per_sec, common_moe_calibration_cache_path().c_str());
+}
+
 // Runs as a fallback *after* the general --fit system has already had its
 // chance (whether --fit is on or off): --fit's only levers are -c and -ngl,
 // so as soon as a user pins both explicitly (a completely ordinary thing to
@@ -1313,6 +1684,13 @@ static bool common_device_memory_data_fits(const common_device_memory_data_vec &
 // after a real failed cudaMalloc isn't something to rely on being cleanly
 // retriable). No-op (and no added startup cost beyond one no-alloc probe)
 // whenever the config already fits.
+//
+// Checks the --moe-calibrate cache first (single verification probe, not
+// the full binary search) - if a prior calibration run still fits under
+// current conditions, its throughput-optimal answer is used directly
+// instead of just the memory-safe floor. Falls back to the live binary
+// search if there's no cache entry, or if conditions changed enough that
+// the cached placement no longer fits.
 static bool common_maybe_autoplace_moe_cpu(
         const char * path_model, common_params & params,
         llama_model_params & mparams, const llama_context_params & cparams) {
@@ -1322,70 +1700,44 @@ static bool common_maybe_autoplace_moe_cpu(
         }
     }
 
-    std::vector<ggml_backend_dev_t> devs;
-    uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
-    common_device_memory_data_vec data;
-    try {
-        data = common_get_device_memory_data(path_model, &mparams, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert,
-                GGML_LOG_LEVEL_ERROR);
-    } catch (const std::exception &) {
-        return false; // let the real load surface whatever error this is
-    }
-
-    if (common_device_memory_data_fits(data)) {
-        return false; // fits as given - zero behavior change
-    }
-    if (hp_n_expert == 0) {
-        return false; // not a MoE model, this lever doesn't apply
-    }
-
-    LOG_WRN("%s: model does not fit in available device memory as configured; "
-            "probing live for a safe MoE CPU-offload placement (pass -ncmoe explicitly to override) ...\n", __func__);
-
-    static std::list<std::string> pattern_storage; // keep C strings alive past this function
-    auto build_overrides = [&](uint32_t n) {
-        std::vector<llama_model_tensor_buft_override> ov;
-        for (uint32_t i = 0; i < n; i++) {
-            pattern_storage.push_back(llm_ffn_exps_block_regex((int) i));
-            ov.push_back({pattern_storage.back().c_str(), ggml_backend_cpu_buffer_type()});
+    common_moe_calibration_entry cached;
+    if (common_moe_calibration_lookup(path_model, params, cached)) {
+        std::vector<ggml_backend_dev_t> devs;
+        uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
+        if (common_moe_fits_with_n(path_model, mparams, cparams, (uint32_t) cached.n_cpu_moe,
+                                    devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
+            params.tensor_buft_overrides = common_moe_build_cpu_overrides((uint32_t) cached.n_cpu_moe);
+            mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+            if (cached.n_threads > 0) {
+                params.cpuparams.n_threads = cached.n_threads;
+            }
+            if (cached.n_threads_batch > 0) {
+                params.cpuparams_batch.n_threads = cached.n_threads_batch;
+            }
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d, measured %.2f tok/s on %s) "
+                    "- run --moe-calibrate again if hardware/model/context changed\n",
+                    __func__, cached.n_cpu_moe, cached.n_threads, cached.tok_per_sec, cached.calibrated_at.c_str());
+            return true;
         }
-        ov.push_back({nullptr, nullptr});
-        return ov;
-    };
-    auto fits_with_n = [&](uint32_t n) {
-        std::vector<llama_model_tensor_buft_override> trial = build_overrides(n);
-        llama_model_params mparams_trial = mparams;
-        mparams_trial.tensor_buft_overrides = trial.data();
-        try {
-            common_device_memory_data_vec trial_data = common_get_device_memory_data(
-                    path_model, &mparams_trial, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
-            return common_device_memory_data_fits(trial_data);
-        } catch (const std::exception &) {
-            return false;
-        }
-    };
+        LOG_WRN("%s: cached calibration no longer fits current conditions - recalibrating placement live\n", __func__);
+    }
 
-    // fit is monotonic in n (more CPU offload never needs more device
-    // memory), so binary search finds the minimal working n in O(log ngl)
-    // no-alloc probes instead of up to ngl of them.
-    if (!fits_with_n(hp_ngl)) {
+    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
+    if (probe.already_fits || !probe.is_moe) {
+        return false;
+    }
+    if (!probe.found_safe_n) {
         LOG_WRN("%s: could not find any MoE CPU-offload placement that fits in available device memory; "
                 "proceeding with the original configuration, load will likely fail\n", __func__);
         return false;
     }
-    uint32_t lo = 1, hi = hp_ngl;
-    while (lo < hi) {
-        const uint32_t mid = lo + (hi - lo) / 2;
-        if (fits_with_n(mid)) {
-            hi = mid;
-        } else {
-            lo = mid + 1;
-        }
-    }
 
-    params.tensor_buft_overrides = build_overrides(lo);
+    LOG_WRN("%s: model does not fit in available device memory as configured; "
+            "auto-placed the MoE experts of the first %u layers on CPU to fit "
+            "(pass -ncmoe explicitly to override, or run --moe-calibrate once for a throughput-optimal placement)\n",
+            __func__, probe.safe_n);
+    params.tensor_buft_overrides = common_moe_build_cpu_overrides(probe.safe_n);
     mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
-    LOG_WRN("%s: auto-placed the MoE experts of the first %u layers on CPU to fit in available VRAM\n", __func__, lo);
     return true;
 }
 

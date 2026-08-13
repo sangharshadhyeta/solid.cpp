@@ -2738,6 +2738,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
     add_opt(common_arg(
+        {"--moe-calibrate"},
+        "empirically calibrate -ncmoe placement and thread count for this GPU+model+context "
+        "combination (a handful of real short benchmarks, tens of seconds to a few minutes), "
+        "cache the result under the llama.cpp cache directory, then exit - run this once per "
+        "hardware/model/context combo, then launch normally to pick up the cached values",
+        [](common_params & params) {
+            params.moe_calibrate = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--moe-cache"}, "MODE",
         "adaptively cache the hottest CPU-resident MoE experts in spare VRAM "
         "(default: auto; auto = preserve weight repacking; on = automatic budget without weight repacking; "
