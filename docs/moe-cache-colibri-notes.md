@@ -54,8 +54,13 @@ deliberate sizing once we're testing on the real hardware.
 - GLM-5.2's native NextN/MTP speculative decoding is merged in-tree (PR
   #25980) - uses the model's own trained draft head, no external
   checkpoint needed. Likely the single highest-value, lowest-effort win
-  for this deployment specifically (verify the downloaded GGUF wasn't
-  converted with `--no-mtp` stripping the head).
+  for this deployment specifically. **Verified 2026-08-13**: fetched the
+  header of `unsloth/GLM-5.2-GGUF` (UD-Q4_K_M, shard 1/11) directly and
+  confirmed `glm-dsa.nextn_predict_layers = 1` in the GGUF metadata - the
+  MTP layer was not stripped, it's present in the file we'd actually
+  deploy. Also from the same header: `glm-dsa.block_count = 79`,
+  `glm-dsa.expert_count = 256`, `glm-dsa.leading_dense_block_count = 3`
+  (first 3 blocks dense, MoE starts after).
 - 5-10 nominal users but agentic/API-heavy traffic pushes effective
   request volume and repetition patterns well past "5-10 people typing in
   a chat box." Prefix caching (agents resending stable system
