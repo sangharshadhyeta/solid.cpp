@@ -5463,6 +5463,25 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// Exposes get_mmvq_mmid_max_batch() (mmvq.cu) outside this backend, so
+// live-tuning code (e.g. common_maybe_autoplace_moe_cpu) can warn when
+// --parallel exceeds the batch size above which MUL_MAT_ID (MoE expert
+// routing) silently drops off the fast MMVQ kernel onto a slower general
+// path for this GPU+quant-type combination - a real, hardware-level
+// throughput cliff, not a placement/VRAM problem the rest of Layer 1
+// already knows how to reason about. Scoped to device 0: the CUDA
+// backend's internal device numbering doesn't map 1:1 onto the global
+// ggml_backend_dev_get() index space used by callers outside this file,
+// and single-GPU is the deployment case this warning targets first -
+// worth revisiting for tensor-split multi-GPU setups later.
+static int ggml_backend_cuda_get_mmvq_mmid_max_batch(int type) {
+    const auto & info = ggml_cuda_info();
+    if (info.device_count <= 0) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+    return get_mmvq_mmid_max_batch((ggml_type) type, info.devices[0].cc);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5482,6 +5501,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_get_mmid_mmvq_max_batch") == 0) {
+        return (void *)ggml_backend_cuda_get_mmvq_mmid_max_batch;
     }
     return nullptr;
 }
