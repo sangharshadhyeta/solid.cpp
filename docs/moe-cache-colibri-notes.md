@@ -1,3 +1,55 @@
+# vLLM features beyond DSpark/Suffix Decode - priority order
+
+Not yet scoped, just recorded with a rough priority (nearest-term first):
+
+## 1. Automatic prefix caching (next up after DSpark/Suffix Decode)
+
+vLLM hashes KV-cache in 16-token blocks and reuses them across *different*
+requests sharing a prefix (system prompt, few-shot preamble, multi-turn
+history) - not just within one conversation. A natural extension of
+PagedAttention's block-based, reference-counted KV layout: since blocks are
+already page-like, sharing them across requests by content hash falls out
+almost for free. llama.cpp's prompt caching is per-slot/per-session today,
+not a global hash-addressed cache shared across arbitrary concurrent
+requests. Relevant for llama-server multi-session workloads (agentic/tool
+systems hammering the same system prompt across sessions). Prerequisite:
+some form of block-based KV layout - ties back to the still-open PR #18747
+("KV cache size limiting and block tracking infrastructure") rather than
+being a clean standalone drop-in.
+
+## 2. Chunked prefill + continuous batching (later - look at together)
+
+Chunked prefill splits a long prompt's prefill into chunks interleaved with
+other requests' decode steps, so one huge prompt doesn't stall everyone
+else's tokens; only makes sense on top of continuous batching (a new batch
+formed every iteration rather than waiting for the whole in-flight batch to
+finish). Both are multi-tenant serving mechanisms - relevant to llama-server
+specifically, not the CLI/single-user path. Grouping these two together
+since chunked prefill doesn't stand alone without the batching model under
+it.
+
+## 3. Multi-LoRA serving (after that)
+
+Serving many different LoRA adapters against one base model simultaneously,
+swapping per-request cheaply (S-LoRA-style). Real capability llama.cpp
+doesn't match today, but even vLLM's own ecosystem is still fighting an
+inherent conflict here as of 2026: prefix caching and multi-LoRA serving
+actively fight each other, since KV cache can't be shared across requests
+using different adapters - active research problem upstream, not a solved
+pattern to copy. Lower priority partly because of that immaturity, partly
+because "serve many fine-tunes off one deployment" isn't a typical
+llama.cpp use case.
+
+## 4. True distributed / multi-node serving (very end)
+
+Tensor + pipeline + data + expert parallelism combined across a GPU
+cluster - vLLM's actual mission territory (cloud-scale multi-tenant
+serving, what most RL training loops and inference-as-a-service providers
+build on). llama.cpp has `rpc-server` for distributed inference already but
+far less mature. Lowest priority: this is vLLM's core differentiator
+*because* it's solving a different problem than llama.cpp's portability
+mission, not a gap llama.cpp is trying to close.
+
 # vLLM features worth tracking (DSpark, Suffix Decode)
 
 Separate from the Colibri notes below - these are already being actively
