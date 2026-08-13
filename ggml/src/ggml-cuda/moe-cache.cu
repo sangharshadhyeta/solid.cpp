@@ -18,7 +18,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include "quantize.cuh"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
-#include "../ggml-backend-moe-cache.h"
+#include "ggml-backend-moe-cache.h"
 
 #include <algorithm>
 #include <atomic>
@@ -131,9 +131,13 @@ struct moe_cache_config {
     // as before when explicitly set.
     size_t reserve_mb = 0;
     size_t min_expert_bytes = 1u << 20;
-    // 8 is also the max allowed value (see the (1,8) clamp on the env var
-    // below) - the cache should engage on ordinary prefill/decode batches by
-    // default, not just exact single-token calls.
+    // Default is derived live from g_max_batch_hint (the real n_seq_max of
+    // the context, set before session_create() runs) - see
+    // moe_cache_read_config(). Floor of 8 so ordinary prefill/decode batches
+    // engage the cache even with no hint given; ceiling of
+    // MOE_CACHE_MAX_BATCH_CEILING (64) because that's a real buffer-size
+    // limit, not a conservative guess. GGML_CUDA_MOE_CACHE_MAX_BATCH
+    // overrides this exactly as before when explicitly set.
     int max_batch = 8;
     int inserts_per_plan = 8;
     int admit_after = 2;
@@ -260,6 +264,25 @@ struct moe_cache_node {
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
+
+// Structural ceiling shared by the scratch buffers below (moe_cache_scratch_requirements'
+// max_rows) and the CPU-side stack arrays (ggml-cpu.c's MOE_CACHE_MAX_TOPK) - both are
+// already sized for this many rows regardless of max_batch, so this is a real capacity
+// limit, not a conservative guess.
+static constexpr int MOE_CACHE_MAX_BATCH_CEILING = 64;
+
+// Live hint for max_batch's default, set by the caller (llama_context, via the
+// set_max_batch_hint vtable entry) to the real max concurrent sequence count
+// (n_seq_max) before session_create() runs. 0 = no hint given, use the
+// hardware-agnostic floor. GGML_CUDA_MOE_CACHE_MAX_BATCH still overrides this
+// exactly as before when explicitly set - this only changes the default.
+static std::atomic<int> g_max_batch_hint{0};
+
+static void moe_cache_set_max_batch_hint(int n_seq_max) {
+    g_max_batch_hint.store(
+            std::max(0, std::min(n_seq_max, MOE_CACHE_MAX_BATCH_CEILING)),
+            std::memory_order_relaxed);
+}
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
@@ -325,8 +348,13 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB", 1, 1024 * 1024, value)) {
         config.min_expert_bytes = (size_t)value << 10;
     }
-    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, 8, value)) {
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, MOE_CACHE_MAX_BATCH_CEILING, value)) {
         config.max_batch = (int)value;
+    } else {
+        const int hint = g_max_batch_hint.load(std::memory_order_relaxed);
+        if (hint > 0) {
+            config.max_batch = std::max(8, hint);
+        }
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_INSERTS", 1, 1024, value)) {
         config.inserts_per_plan = (int)value;
@@ -937,17 +965,19 @@ static bool moe_cache_allocate_pool(
         // pool[]'s total size on success. Printing 0 here would misleadingly
         // read as "no reserve" rather than "computed live, see per-device".
         if (session.config.reserve_mb > 0) {
-            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=%zu MiB (explicit) min-expert=%zu KiB admit=%d/%d\n",
+            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=%zu MiB (explicit) min-expert=%zu KiB admit=%d/%d max-batch=%d\n",
                     session.config.automatic ? "auto" : "on",
                     session.config.budget_mb ? "fixed" : "free-minus-reserve",
                     session.config.reserve_mb, session.config.min_expert_bytes >> 10,
-                    session.config.admit_after, session.config.readmit_after);
+                    session.config.admit_after, session.config.readmit_after,
+                    session.config.max_batch);
         } else {
-            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=live-per-device(5%% free, 128-1024 MiB) min-expert=%zu KiB admit=%d/%d\n",
+            MOE_CACHE_LOG("[moe-cache] enabled: mode=%s budget=%s reserve=live-per-device(5%% free, 128-1024 MiB) min-expert=%zu KiB admit=%d/%d max-batch=%d\n",
                     session.config.automatic ? "auto" : "on",
                     session.config.budget_mb ? "fixed" : "free-minus-reserve",
                     session.config.min_expert_bytes >> 10,
-                    session.config.admit_after, session.config.readmit_after);
+                    session.config.admit_after, session.config.readmit_after,
+                    session.config.max_batch);
         }
         session.announced = true;
     }
@@ -2160,6 +2190,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
+    ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
 }
 
 #endif

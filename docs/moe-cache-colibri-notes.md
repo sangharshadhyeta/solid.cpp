@@ -332,6 +332,164 @@ higher `--parallel` monotonically helps - re-run phase C's methodology on
 whatever hardware is actually deployed to, since the cliff is suspected to
 be VRAM-relative rather than a portable fixed number.
 
+# Concurrency-cliff root-cause investigation, 2026-08-13 (same day, follow-up)
+
+Dug into *why* the concurrency cliff (peak ~99 tok/s at concurrency=5,
+collapse to ~57 tok/s at concurrency=10-12) happens specifically between 8
+and 10. Three hypotheses, each tested with a real controlled change and
+re-measurement, not just theorized:
+
+## Hypothesis 1: `GGML_CUDA_MOE_CACHE_MAX_BATCH` gate - CONFIRMED a real bug, but not this bug
+
+Traced the code path: `moe_cache_begin()` in `moe-cache.cu` rejects (falls
+back to full CPU compute, no GPU cache acceleration at all for that call)
+any batch where `n_tokens > config.max_batch`. `n_tokens` here is
+`ids->ne[1]`, the actual token count in the current ubatch - during
+concurrent decode with `--parallel N`, this scales with how many sequences
+are decoding a token in the same step, up to `N`. The env var clamp was
+hardcoded to `[1, 8]` - not just defaulting to 8, *incapable* of being set
+higher - while the default was also 8. With `--parallel 16`, any decode
+step batching more than 8 concurrent tokens together silently loses GPU
+cache acceleration entirely for that step.
+
+**Verified this ceiling is artificial, not structural**: the GPU scratch
+buffers (`moe_cache_scratch_requirements`'s `constexpr max_rows = 64`) and
+the CPU-side stack arrays (`ggml-cpu.c`'s `MOE_CACHE_MAX_TOPK = 64`) are
+already sized for up to 64 rows regardless of `max_batch` - raising the
+ceiling costs nothing structurally. (64 itself is *also* just a
+human-picked constant, not derived from anything live - the difference
+from the old 8 is only that 64 is wired into fixed-size memory layouts, so
+raising it further would need an actual code change, not a config tweak.
+Worth being honest about that distinction rather than treating 64 as
+principled.)
+
+**Fixed**: `max_batch`'s default is now derived live from the real
+`n_seq_max` of the context (`llama_context` calls a new
+`ggml_moe_cache.set_max_batch_hint()` vtable entry with `cparams.n_seq_max`
+before `ggml_backend_sched_new()`, i.e. before the moe-cache session reads
+its config), floored at 8 (preserves current single/few-user behavior and
+ordinary prefill batching), ceilinged at the real 64 structural limit. The
+env var override range was widened from `[1,8]` to `[1,64]` to match.
+Verified end-to-end: with `--parallel 16`, the `[moe-cache] enabled` log
+line now reads `max-batch=16` where it previously silently used 8 no
+matter what `--parallel` was set to (this required moving
+`ggml-backend-moe-cache.h` from `ggml/src/` to `ggml/include/` since
+`llama-context.cpp` needed to call the new vtable entry and the private
+`ggml/src` include path doesn't propagate to `libllama`).
+
+**Re-tested the concurrency sweep with the fix active** (confirmed
+`max-batch=16` in the log): the cliff was still there, nearly identical in
+shape (concurrency=10 landed at 57.4 tok/s vs. 58.6 before the fix). *The
+fix is real and worth keeping - `MAX_BATCH=8` was a genuine silent
+cache-disabling bug for any concurrent deployment - but it was not the
+cause of this specific cliff.*
+
+## Hypothesis 2: cache-capacity thrashing under diverse concurrent workloads - RULED OUT
+
+Enabled `GGML_CUDA_MOE_CACHE_STATS=100` for periodic hit-rate logging and
+watched it through the concurrency=10 run. Hit rate held rock steady at
+~82% (424680/517480 through 630399/766400 across the run, drifting only
+±0.4%), pool fully utilized (2851/2851 slots) with healthy, steady eviction
+churn, **zero** `dispatch-fail` or `collect-fail` throughout. The cache
+mechanism itself performs identically before, during, and after the cliff
+- ruling out thrashing/eviction-storm explanations entirely.
+
+## Hypothesis 3: CPU thread-pool saturation for the miss-row (~18%) CPU fallback - RULED OUT
+
+`n_threads` defaulted to 6 on this box's 6 physical / 12 logical
+(hyperthreaded) cores (`common_cpu_get_num_math()` uses physical core
+count). Reasoned this was a plausible bottleneck: cache misses still need
+CPU computation regardless of GPU cache health, and more concurrent
+sequences mean more total miss-row work funneling through a fixed 6-thread
+pool - a classic queueing cliff as utilization crosses saturation. Note
+this default is *not* an unmotivated guess like the old `max_batch=8` -
+physical-core-only is a legitimate heuristic to avoid SMT contention within
+one tight single-stream compute loop. But it's a heuristic tuned for one
+stream monopolizing the CPU, not tested against many independent
+concurrent streams, so it was worth checking.
+
+Re-ran the identical concurrency test with `-t 12 -tb 12` (all logical
+cores). Result: **not better, slightly worse** (concurrency=8: 80.1 vs 87.4
+tok/s; concurrency=10: 47.8 vs 57.4 tok/s), plausibly because the compute
+threadpool now saturates all cores and starves the server's own
+request-handling/sampling/JSON threads. Ruled out as the cause - more
+threads didn't fix it and moved the wrong direction.
+
+## Conclusion: not root-caused yet, points outside moe-cache
+
+| config | concurrency=8 | concurrency=10 | concurrency=12 |
+|---|---:|---:|---:|
+| `max_batch=8` (original bug) | 96.4 | 58.6 | 57.9 |
+| `max_batch=16` (fixed) | 87.4 | 57.4 | 57.7 |
+| `max_batch=16`, `-t 12` | 80.1 | 47.8 | 58.9 |
+
+The cliff's shape (rise to a peak around 5-8, hard drop at 10, plateau
+57-59 through 12) is essentially identical across all three configurations
+- strong evidence the bottleneck is **not** in moe-cache at all (its own
+health metrics stayed clean throughout every run), but in something
+structural to `llama-server`'s own slot scheduling / continuous-batching
+logic. That's a different investigation from the moe-cache port itself and
+wasn't pursued further this session - flagged here as a genuine open
+question, not swept under a wrong explanation. **Action for the H200
+deployment**: re-run this same three-hypothesis-style controlled
+investigation there rather than assuming any of these three (all ruled out
+here) explain a cliff if one appears - the real cause is still unknown and
+may be config- or version-specific to `llama-server`'s scheduler, not
+something moe-cache-specific work will fix.
+
+# Live self-tuning design, 2026-08-13 - what's done vs. what's next
+
+Prompted by direct pushback during the sweep-result review: computing
+defaults once from a snapshot isn't the same as being genuinely
+self-correcting, and env-var gotchas someone has to know about isn't
+"smart," it's just documentation debt. Two things now compute live at
+*every* process start (not cached, not a one-time calibration artifact):
+
+1. **`reserve_mb`** (fixed earlier session) - live 5%-of-free-VRAM at
+   session creation, clamped 128-1024 MiB.
+2. **`max_batch`** (fixed above) - live from `n_seq_max` at every launch.
+
+**What's still static and shouldn't be**: `-ncmoe` placement. Our own
+sweep proved memory-fit and throughput-optimal are different things
+(`ncmoe=12` loads fine, `ncmoe=16` is 12%+ faster) - a real OOM-vs-throughput
+tradeoff exists here that doesn't exist for the two levers above (their
+scratch/reserve costs don't scale with the setting, so there was no
+tradeoff to balance - raising them was a free win). Planned fix, agreed
+scope for this session:
+
+**Layer 1 (this session, in progress)**: compute a *safe* `-ncmoe`
+analytically, live, on every launch, only when the user hasn't explicitly
+passed `-ncmoe` - using the same expert-size-scanning + free-VRAM math
+`--fit-moe-cache` already computes (real per-tensor sizes from the no-alloc
+probe, real free VRAM, real KV-cache size for the requested `-c`/
+`--parallel`), used as a predictive gate *before* the real allocation
+happens - not a catch-after-crash retry. We hit exactly the crash this
+guards against mid-session (`-ncmoe 16 -c 16384 --parallel 16` on this
+card: `cudaMalloc failed: out of memory` on the KV cache, because dropping
+`-ncmoe` from 99 to 16 moves several GB of experts onto the GPU that KV
+cache no longer has room for) - confirming the interaction is real, not
+hypothetical, and that predicting it ahead of the allocation (cheap, just
+arithmetic on numbers already computed) is preferable to a retry loop
+(CUDA allocator state after a real failed `cudaMalloc` is not something to
+rely on being cleanly retriable).
+
+**Layer 2 (deferred, scoped but not built)**: the throughput-optimal
+refinement on top of Layer 1's safe floor - a short empirical calibration
+(2-3 candidate placements, few seconds) run once per (GPU, model, context
+config) combination and cached, instead of re-measured on every restart.
+Explicitly deferred this session in favor of shipping Layer 1 first.
+
+**Third item for Layer 2, not Layer 1**: `n_threads`/`n_threads_batch`.
+Unlike `-ncmoe`, this has no safe-analytic-floor property to give it a
+Layer 1 - our own test proved the "obviously safe" direction (more threads
+= more parallelism) actually made concurrent throughput *worse* (see the
+root-cause investigation above), so there's nothing to compute ahead of
+time, only a real curve to measure. Belongs in the same empirical
+calibration pass as placement, swept as its own dimension (the sweep
+script should test `-t` values, not just `-ncmoe` × `--moe-cache`, exactly
+per the standing ask that every check like this becomes part of the
+repeatable script rather than a one-off manual investigation).
+
 # Build list summary (consolidated 2026-08-13) - see sections below for detail/sourcing
 
 ## Already built, VALIDATED with real measurement

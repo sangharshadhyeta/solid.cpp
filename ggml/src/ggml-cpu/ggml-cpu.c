@@ -54,7 +54,7 @@
 #    include "spacemit/ime.h"
 #endif
 
-#include "../ggml-backend-moe-cache.h"
+#include "ggml-backend-moe-cache.h"
 
 // Note: once we move threading into a separate C++ file
 // will use std::hardware_destructive_interference_size instead of hardcoding it here
