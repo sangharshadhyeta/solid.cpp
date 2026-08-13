@@ -609,11 +609,39 @@ point), same two prompts both times:
 | binary search + complexity | 56.91 tok/s | 75.57 tok/s | **1.33x** |
 
 Real, consistent **~1.33-1.35x** decode speedup, in line with (conservative
-end of) Unsloth's claimed 1.4-2.2x range for `--spec-draft-n-max 2` -
-higher `n_max` values (up to 6) are worth sweeping but not tried yet.
+end of) Unsloth's claimed 1.4-2.2x range for `--spec-draft-n-max 2`.
 moe-cache showed no dispatch/collect failures under MTP's verify-batch
 load in this short test - doesn't fully resolve the open question below,
 just no red flag in this specific run.
+
+## `--spec-draft-n-max` sweep - the "2" was never actually tested, it's just Unsloth's suggested starting point
+
+Same principle already applied to `-ncmoe`/`n_threads` in Layer 2: don't
+trust a suggested default, measure it. Swept n_max in {1,2,3,4,5,6,8},
+same two prompts, one full server restart per candidate (real load each
+time, not a no-alloc probe):
+
+| n_max | avg tok/s (2 prompts) |
+|---:|---:|
+| 1 | 60.11 |
+| 2 (Unsloth's suggested default) | 70.75 |
+| 3 | 55.64 |
+| 4 | 71.94 |
+| **5** | **74.72** |
+| 6 | 67.12 |
+| 8 | 36.80 |
+
+**n_max=5 beat the default of 2 by ~5.6%.** Shape matches theory - too low
+leaves speedup on the table (fewer chances to skip a full forward pass),
+too high wastes compute on tokens whose acceptance probability compounds
+downward with each additional draft position, collapsing hard by n_max=8.
+**Caveat, stated honestly**: only 2 samples per candidate, real run-to-run
+noise present (n_max=3's two runs differ by 65%, 42.06 vs 69.21) - the
+*pattern* (peak in the middle, collapse at the high end) is trustworthy,
+the exact winner between 2/4/5 is not fully settled without more repeats.
+This is exactly the kind of dimension `--moe-calibrate` should sweep
+automatically once MTP is in scope for Layer 2 - not done yet, tracked
+below.
 
 ## Download reliability note (unrelated to MTP itself, but real and costly)
 
