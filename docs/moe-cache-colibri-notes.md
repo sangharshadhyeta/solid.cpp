@@ -1467,6 +1467,58 @@ against exactly this failure mode.
   they were measured at different `--parallel` settings across the
   session's own timeline and because of this same prompt-dependence.
 
+  **Real bug found running everything together, 2026-08-14: FR-Spec
+  trim is currently incompatible with `--spec-type
+  draft-mtp,ngram-suffix` (MTP + suffix-decode combined).** Requested
+  directly: test all of this session's work together, not FR-Spec in
+  isolation. Built the combined config - `-ncmoe 15 --parallel 4
+  --spec-type draft-mtp,ngram-suffix --spec-draft-n-max 3
+  --spec-vocab-map <sidecar> --kv-unified --cache-idle-slots` - and hit
+  a severe regression: 29.8-30.2 tok/s with only 10.7% draft
+  acceptance, versus 66.3-68.6 tok/s at 70-74% acceptance for the exact
+  same config minus `--spec-vocab-map`. Isolated properly rather than
+  guessing: removing `--kv-unified` alone reproduced the identical
+  broken numbers (30.24 tok/s, 10.7%), ruling it out; removing
+  `--spec-vocab-map` alone (keeping `--kv-unified`) fully restored
+  healthy numbers (65.6-68.0 tok/s, 70-74% acceptance). **FR-Spec is
+  the cause, specifically when combined with suffix-decode** - FR-Spec
+  alone with MTP was at parity (measured above), suffix-decode alone
+  with MTP was healthy (measured earlier this session), but the three
+  together break badly.
+
+  Working theory, not yet root-caused at the code level: suffix-decode
+  proposes candidates by n-gram matching against real context tokens,
+  completely independent of FR-Spec's 645-token trim - those candidates
+  are very often outside the trimmed set. If the combined-drafter
+  verification path uses MTP's (now -inf-outside-trimmed-set) logits to
+  help score or rank candidates from *either* drafter rather than only
+  MTP's own, a suffix-decode candidate landing outside the trim would
+  read as -inf and get suppressed regardless of how good a match it
+  actually was - which would produce exactly this shape of damage (most
+  candidates from either source getting rejected, not just MTP's
+  trimmed-out ones). Not confirmed by reading the verification code
+  yet; flagging as the leading hypothesis, not a diagnosis.
+
+  **Action taken: do not enable both together.** FR-Spec trim
+  (`--spec-vocab-map`) should not be used alongside `--spec-type
+  draft-mtp,ngram-suffix` until this is root-caused and fixed - each is
+  fine alone, MTP+suffix is the recommended production combination from
+  earlier in this document, and FR-Spec is not worth keeping active at
+  the cost of breaking that. This is not yet enforced in code (no
+  warning or guard added), only documented here - a real follow-up if
+  FR-Spec is pursued further.
+
+  **The real, clean "net outcome of this session's work" number**, all
+  compatible pieces together (moe-cache placement + MTP + suffix-decode
+  + `--kv-unified`/`--cache-idle-slots`, FR-Spec excluded per the
+  finding above), solo decode, `--parallel 4`, same photosynthesis
+  prompt: **65.6-68.0 tok/s (mean 66.8), 70-74% draft acceptance** -
+  genuinely ahead of the 55.5-55.7 tok/s MTP-alone number at the same
+  config, and the real reference point for "what does combining
+  everything actually get us" rather than adding percentages from
+  differently-configured measurements taken at different points in the
+  session.
+
   Toggling is clean either way: `--spec-vocab-map` unset (the default)
   is a verified no-op - `frspec_d2t_ids` stays empty, `load_arch_tensors`
   and the graph-building gather/scatter code both no-op, full untrimmed
