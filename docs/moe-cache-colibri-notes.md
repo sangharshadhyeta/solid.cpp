@@ -2556,6 +2556,61 @@ per-(layer,expert) tier+heat state, packed the same way, plus a small canvas
 component in `tools/ui`, would be a scoped debugging/demo view — much smaller
 than adopting Colibri's engine.
 
+**Built, 2026-08-14.** Fetched Colibri's actual `resource_plan.py` and
+`Brain.tsx` (raw GitHub content, JustVugg/colibri, Apache-2.0) as reference,
+then ported the logic rather than the code - the underlying systems are too
+different for literal reuse (Python+HF-safetensors+env-vars vs
+C++/CUDA+GGUF+CLI-flags, React vs Svelte 5).
+
+CUDA side (`ggml/src/ggml-cuda/moe-cache.cu`): added purely additive
+bookkeeping to `moe_cache_session` - a `host_base -> layer` map and the
+widest `n_expert` seen. The layer number reuses `moe_cache_layer_number()`,
+the same battle-tested name parser the existing device-routing logic already
+depends on (`blk.N.ffn_*_exps` -> N) - not a new heuristic, and populated at
+the exact point (`moe_cache_begin()`) where that parse already happens for
+routing, so it's one extra map insert on an existing code path, not a new
+one. Neither new field is read by any routing/eviction decision, so this
+carries none of that logic's correctness risk - confirmed by keeping the
+change to pure insertion, no conditionals depending on the new state.
+`moe_cache_get_expert_map()` snapshots the live grid under the same session
+mutex the hot dispatch path already takes, one byte per cell (tier<<6|heat),
+exposed through a new `get_expert_map` slot on the existing
+`ggml_moe_cache_api` table (same NULL-safe pattern as `get_stats`) and a
+`common_moe_cache_get_expert_map()` wrapper that does a two-call
+probe-then-fetch so the caller never has to guess a grid size.
+
+Server side: new `GET /experts` endpoint, same hex-packed wire format as
+Colibri's (map + a hits bitset for the flash-on-fire animation) - the hit
+bitset isn't tracked in the CUDA cache itself, computed in the endpoint
+handler instead by diffing each poll's bytes against the previous one, to
+keep the CUDA-side change purely additive/read-only rather than adding more
+mutable state there.
+
+UI side (`tools/ui`): Svelte 5 port of `Brain.tsx` - Canvas 2D grid, tier
+colour + heat brightness + pulse-decay flash on hit, hover tooltip. Dropped
+the expert-affinity atlas overlay (a separate, much bigger measured-topic-
+clustering system this fork doesn't have) and full i18n wiring for a first
+cut.
+
+**Validated, not just built**: `svelte-check` 0 errors across the whole
+project (6288 files), production build succeeds, and confirmed live against
+the actual running server - grid shape (15 layers x 128 experts) matches
+`-ncmoe 15` x Gemma-4-26B-A4B's real expert count exactly, and after a real
+generation request, 64/1920 cells populated with a sane tier split (32
+protected, 32 probation) and the hit bitset exactly matching the
+newly-cached cells, confirmed by direct byte-level inspection of the
+endpoint's response, not just "the page loaded."
+
+**Commit note**: the backend (CUDA + server endpoint) and the new,
+self-contained UI files (the Brain component, its service, the route page)
+are committed. The sidebar-nav wiring and shared route/type/service-barrel
+edits are applied locally and working, but not yet committed - they touch
+files that sit inside a large, unrelated, already in-progress `tools/ui`
+constants reorganization found sitting uncommitted in the working tree (not
+a pure rename: real content moved between files, e.g. `MCP_RECONNECT`'s own
+shape changed) that isn't safe to bundle in sight-unseen. See the Brain-view
+commit message for the exact file list still pending.
+
 ## 4. Static pre-flight resource planner — NOT dynamic, no running server needed
 
 File: `c/resource_plan.py`, `build_plan()`.
