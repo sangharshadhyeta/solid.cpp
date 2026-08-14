@@ -194,8 +194,15 @@ std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
 // trimmed-vocab size as `cur`'s first dimension (I32, not I64, so the
 // same tensor doubles as the index argument to ggml_get_rows() when
 // gathering the trimmed weight rows - ggml_get_rows() requires I32).
+// `out_template` must already be F32 [1, n_vocab_full, n_outputs] and
+// -inf-filled (see llm_graph_input_frspec_d2t::out_template below) -
+// this never fills it itself, so it's safe to call every step against
+// the same persistent template without repaying that fill each time:
+// d2t names the same fixed set of positions on every call for a given
+// model instance, so every position outside that set is written by no
+// call, ever, and can safely stay whatever out_template already had.
 ggml_tensor * llm_frspec_scatter_to_full_vocab(
-        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab_full);
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, ggml_tensor * out_template);
 
 // Internal-only read side of the pending-vocab-map hint - see
 // llama_frspec_set_pending_vocab_map() in llama.h for the public setter
@@ -207,25 +214,30 @@ std::string llm_frspec_take_pending_vocab_map();
 
 // Graph input for FR-Spec vocab trimming. Shared so each architecture's
 // own graph-building code only needs a few lines (create this, use
-// output_w in build_lora_mm instead of the full weight, scatter back)
-// rather than reimplementing the input-tensor lifecycle - see
-// gemma4-assistant.cpp for the one current user. Two different
+// output_w in build_lora_mm instead of the full weight, scatter back via
+// out_template) rather than reimplementing the input-tensor lifecycle -
+// see gemma4-assistant.cpp for the one current user. Three different
 // lifetimes bundled into one input:
 //   - d2t (the index tensor): constant for the model's whole lifetime,
 //     cheap to rewrite, rewritten on every set_input() call regardless.
-//   - output_w (the pre-gathered trimmed weight): also constant for the
+//   - output_w (the pre-gathered trimmed weight) and out_template (the
+//     -inf-filled full-vocab scatter target): both also constant for the
 //     model's whole lifetime, but genuinely expensive to recompute (a
-//     real row-gather over up to a few thousand embedding-width rows) -
+//     real row-gather, and a full-vocab-width fill, respectively) -
 //     populated exactly once, on the first set_input() call, then left
-//     alone. Gathering it via a live ggml_get_rows() graph op instead
-//     (the original design) re-ran that gather as a real GPU kernel on
-//     every single decode step - can_reuse()=true only skips rebuilding
-//     the graph's CPU-side topology, it does not skip executing each
-//     node's kernel once the graph runs, so a "constant" op sitting in
-//     the graph is silently paid for on every step. output_w sidesteps
-//     that entirely by never appearing as a graph node in the first
-//     place - it's a plain input, like d2t itself.
-// can_reuse() always returns true for both: neither ever changes in a
+//     alone. Doing either as a live graph op every step instead (the
+//     original design for both) re-ran real GPU kernels on every single
+//     decode step - can_reuse()=true only skips rebuilding the graph's
+//     CPU-side topology, it does not skip executing each node's kernel
+//     once the graph runs, so "constant" ops sitting in the graph are
+//     silently paid for on every step regardless. Both sidestep that by
+//     never appearing as graph nodes in the first place - they're plain
+//     inputs, like d2t itself. out_template stays correct without ever
+//     being re-filled because d2t names the exact same fixed positions
+//     on every scatter call for a given model instance - every position
+//     outside that set is written by no call, ever, so it can safely
+//     keep whatever the one-time fill gave it.
+// can_reuse() always returns true for all three: none ever changes in a
 // way that should defeat graph/CUDA-graph reuse across decode steps the
 // way a genuinely per-token-varying input would.
 class llm_graph_input_frspec_d2t : public llm_graph_input_i {
@@ -237,14 +249,16 @@ public:
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * d2t      = nullptr; // I32 [n_trimmed_vocab]
-    ggml_tensor * output_w = nullptr; // same type as full_weight, [n_embd, n_trimmed_vocab]
+    ggml_tensor * d2t          = nullptr; // I32 [n_trimmed_vocab]
+    ggml_tensor * output_w     = nullptr; // same type as full_weight, [n_embd, n_trimmed_vocab]
+    ggml_tensor * out_template = nullptr; // F32 [1, n_vocab_full, n_outputs], -inf outside the trimmed set
 
     const std::vector<int64_t> & ids;
     const ggml_tensor * full_weight; // source for output_w's one-time gather; never itself modified
 
 private:
-    bool output_w_populated = false;
+    bool output_w_populated     = false;
+    bool out_template_populated = false;
 };
 
 //

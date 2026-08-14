@@ -440,11 +440,16 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         LLAMA_LOG_WARN("%s: FR-Spec vocab trim configured but model.output_s is set "
                 "(quantized output scale) - trim is not supported here, using full vocab\n", __func__);
     } else if (!gmodel.frspec_d2t_ids.empty()) {
+        const int64_t n_vocab_full = (int64_t) model.vocab.n_tokens();
+        const int64_t n_outputs    = cur->ne[1];
+
         auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids, model.output);
         inp->d2t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) gmodel.frspec_d2t_ids.size());
         ggml_set_input(inp->d2t);
         inp->output_w = ggml_new_tensor_2d(ctx0, model.output->type, model.output->ne[0], (int64_t) gmodel.frspec_d2t_ids.size());
         ggml_set_input(inp->output_w);
+        inp->out_template = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs);
+        ggml_set_input(inp->out_template);
         inp_d2t = inp.get();
         output_w = inp->output_w;
         res->add_input(std::move(inp));
@@ -459,7 +464,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
     }
 
     if (inp_d2t) {
-        cur = llm_frspec_scatter_to_full_vocab(ctx0, cur, inp_d2t->d2t, (int64_t) model.vocab.n_tokens());
+        cur = llm_frspec_scatter_to_full_vocab(ctx0, cur, inp_d2t->d2t, inp_d2t->out_template);
     }
 
     cb(cur, "result_output", -1);

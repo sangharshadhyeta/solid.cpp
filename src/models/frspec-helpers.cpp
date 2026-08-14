@@ -70,15 +70,17 @@ std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
 }
 
 ggml_tensor * llm_frspec_scatter_to_full_vocab(
-        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab_full) {
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, ggml_tensor * out_template) {
     const int64_t n_draft_vocab = cur->ne[0];
     const int64_t n_outputs     = cur->ne[1];
+    const int64_t n_vocab_full  = out_template->ne[1];
 
     GGML_ASSERT(d2t->type == GGML_TYPE_I32);
     GGML_ASSERT(d2t->ne[0] == n_draft_vocab);
+    GGML_ASSERT(out_template->type == GGML_TYPE_F32);
+    GGML_ASSERT(out_template->ne[2] == n_outputs);
 
-    ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
-    cur = ggml_set_rows(ctx0, logits,
+    cur = ggml_set_rows(ctx0, out_template,
             ggml_reshape_3d(ctx0, cur, 1,             n_draft_vocab, n_outputs),
             ggml_reshape_3d(ctx0, d2t, n_draft_vocab, 1,             1));
     return ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
@@ -108,6 +110,18 @@ void llm_graph_input_frspec_d2t::set_input(const llama_ubatch * /*ubatch*/) {
         std::vector<uint8_t> gathered = llm_frspec_gather_vocab_rows_from_backend(full_weight, ids);
         ggml_backend_tensor_set(output_w, gathered.data(), 0, gathered.size());
         output_w_populated = true;
+    }
+
+    // out_template: the -inf-filled full-vocab scatter target. Same
+    // "genuinely expensive, populate once" reasoning as output_w - a
+    // full-vocab-width fill is a real kernel's worth of work, not
+    // something to redo every step for a value that never changes at
+    // any position this input's own scatter ever touches.
+    if (out_template && !out_template_populated) {
+        const int64_t n = ggml_nelements(out_template);
+        std::vector<float> neg_inf((size_t) n, -INFINITY);
+        ggml_backend_tensor_set(out_template, neg_inf.data(), 0, (size_t) n * sizeof(float));
+        out_template_populated = true;
     }
 }
 
