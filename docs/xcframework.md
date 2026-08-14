@@ -29,3 +29,8 @@ let package = Package(
 
 The above example is using an intermediate build `b5046` of the library. This can be modified
 to use a different version by changing the URL and checksum.
+
+**Note for this fork:** the URL above points at an upstream `ggml-org/llama.cpp` prebuilt release, which
+does not include this fork's changes (MoE expert-cache, Brain/Atlas view, expert-prefetch, etc). This fork
+does not currently publish its own prebuilt XCFrameworks - to get an XCFramework with this fork's changes,
+build it from source instead (see the CMake build docs and target the relevant Apple platform).

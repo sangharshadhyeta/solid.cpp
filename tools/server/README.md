@@ -300,7 +300,8 @@ For boolean options like `--mmap` or `--kv-offload`, the environment variable is
 - `LLAMA_ARG_MMAP=false` means disabled, other accepted values are: `0`, `off`, `disabled`
 - If `LLAMA_ARG_NO_MMAP` is present (no matter the value), it means disabling mmap
 
-Example usage of docker compose with environment variables:
+Example usage of docker compose with environment variables (build your own image from `.devops/*.Dockerfile`
+to get this fork's changes - `ghcr.io/ggml-org/llama.cpp` is upstream-only):
 
 ```yml
 services:
@@ -379,6 +380,10 @@ The above command will start a server that by default listens on `127.0.0.1:8080
 You can consume the endpoints with Postman or NodeJS with axios library. You can visit the web front end at the same url.
 
 ### Docker
+
+> Note for this fork: the `ghcr.io/ggml-org/llama.cpp` images below are upstream-only prebuilt images and do
+> not include this fork's changes. To run this fork in Docker, build locally from `.devops/*.Dockerfile`
+> instead - see [docs/docker.md](../../docs/docker.md#building-docker-locally).
 
 ```bash
 docker run -p 8080:8080 -v /path/to/models:/models ghcr.io/ggml-org/llama.cpp:server -m models/7B/ggml-model.gguf -c 512 --host 0.0.0.0 --port 8080
