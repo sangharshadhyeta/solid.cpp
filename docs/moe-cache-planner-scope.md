@@ -1,11 +1,18 @@
 # Scope: MoE-cache pre-flight planner
 
-Status: scoping only, nothing implemented yet. Written 2026-08-13, follows
-directly from the RTX 3060 validation (see moe-cache-colibri-notes.md) where
-two undocumented defaults silently blocked the cache and had to be found by
-adding temporary diagnostics to the source. This tool exists to compute the
-correct values ahead of time instead of repeating that debugging marathon on
-the H200 deployment.
+Status: **implemented** (`--fit-params-moe-cache`, `common_fit_print_moe_cache()`
+in `common/fit.cpp`) - this doc's "scoping only" status line went stale after
+the fact; items 1-4 below (expert-size scanner with the widened fused-tensor
+name check, GPU-count mode decision, budget/reserve sizing, MAX_BATCH
+recommendation) are real, working code, confirmed by reading it directly
+2026-08-14, not a stub. Item 5 (naive hit-rate floor) and the CPU-offload-
+vs-partial-placement preference heuristic (adapted from leloch's removed
+`common_moe_cache_prefers_cpu_moe()`) are implemented too. Written
+2026-08-13, follows directly from the RTX 3060 validation (see
+moe-cache-colibri-notes.md) where two undocumented defaults silently blocked
+the cache and had to be found by adding temporary diagnostics to the source.
+This tool exists to compute the correct values ahead of time instead of
+repeating that debugging marathon on the H200 deployment.
 
 ## Where it lives - extend, don't create a new binary
 
