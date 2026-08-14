@@ -2763,3 +2763,95 @@ index / file offset — silent corruption, not a crash. Checked our
 `ggml/src/ggml-cuda/topk-moe.cu:136-146` — already sanitizes NaN to
 `-FLT_MAX` before the iterative argmax, with a comment referencing
 https://github.com/ggml-org/llama.cpp/issues/19659. Nothing to port.
+
+## Design: CUDA MMVQ many-expert density gate (scoped, NOT implemented, 2026-08-14)
+
+Investigated as a "moe.cpp" throughput-triage candidate, prompted by
+upstream issue [ggml-org/llama.cpp#25356](https://github.com/ggml-org/llama.cpp/issues/25356)
+(Vulkan backend: batched-decode throughput cliff at n_tokens=9 on
+many-expert MoE, fixed 8-token thresholds in MMV dispatch). That issue is
+Vulkan-only and its own thread found NVIDIA-via-Vulkan *regresses* with a
+naive fix (-6% to -35%) - not directly portable. But the same architectural
+blind spot exists in our real deployment backend, CUDA, independently
+implemented and unexamined until now.
+
+**The gap.** `ggml/src/ggml-cuda/mmvq.cu`'s `get_mmvq_mmid_max_batch(type, cc)`
+picks the max token-batch for which the fast MMVQ (mat-vec) kernel is used
+for `MUL_MAT_ID` (MoE routed matmul), via a hand-tuned per-architecture,
+per-quant-type table (Pascal/Turing+/GCN/CDNA/RDNA1-4, referencing PR
+#20905) capped at `MMVQ_MAX_BATCH_SIZE = 8`. The table takes `(type, cc)`
+only - no `n_expert` or `n_experts_used` parameter anywhere in its
+signature or body. This is exactly the blind spot #25356 identified for
+Vulkan: the threshold was tuned against some canonical MoE shape (few
+experts, e.g. Mixtral-class), and never accounts for how the real
+computational cost driver - average rows landing on the *same* expert,
+`n_tokens * n_experts_used / n_expert` - shrinks as `n_expert` grows, so a
+many-expert model should tolerate a much higher raw token count before the
+tiled/MMQ path actually wins.
+
+**This is not hypothetical for us.** Our own sandbox model, checked
+directly via GGUF metadata: `gemma4.expert_count = 128`,
+`gemma4.expert_used_count = 8`. That's squarely in the "many-expert"
+class the Vulkan issue's testers used (128- and 512-expert models). Our
+own `common_warn_concurrency_cliff` (`common/common.cpp`, built earlier
+this session investigating this exact CUDA-side cliff under MTP) already
+detects and warns about it - on this hardware/quant combination it fires
+at effective batch > ~5, well below where a density-aware gate would say
+it's actually safe. Applying the community-validated formula
+(`n_tokens * n_experts_used <= C * n_expert`, `C = 2`, cross-validated by
+three independent testers on the Vulkan side) to our model's real numbers:
+`n_tokens * 8 <= 2 * 128 = 256`, i.e. safe up to **n_tokens = 32** - the
+literal hardware ceiling (one warp per token at `32 * 32 = 1024`
+threads/block), a 4x wider window than the current flat cutoff of 8.
+
+**Why this isn't a quick threshold edit.** `ggml_cuda_mul_mat_vec_q()`
+(`mmvq.cu:1173`) has a hard `GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE)`
+- not a soft per-arch/type threshold, an absolute ceiling on the whole
+function's contract. `MMVQ_MAX_BATCH_SIZE` is threaded through buffer
+sizing, warp-count calculation (`calc_nwarps`), and - critically - the
+kernel's own `__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()
+* warp_size, 1)` (`mmvq.cu:708`), which is a *compile-time* register/
+occupancy budget for the whole compiled kernel, not a per-call runtime
+check. Simply raising the table's values would change that budget
+globally, for every call site including the existing, already-tuned small
+-batch case - real risk of a silent regression there (the same failure
+mode the Vulkan thread hit on NVIDIA, just via a different mechanism:
+register pressure instead of tile-padding GFLOP/s crossover).
+
+**Proposed design (safe: never touches the existing compiled kernel).**
+1. Add a second, non-default template parameter to `mul_mat_vec_q_moe`
+   carrying the launch-bounds ceiling explicitly (default =
+   `get_mmvq_mmid_max_batch_for_device<type>()`, so the *existing*
+   call site's instantiation is byte-for-byte unchanged - same object
+   code, same register budget, zero regression risk by construction).
+2. Instantiate a second, explicit variant at the hardware ceiling (32),
+   compiled as a genuinely separate kernel - isolates all new risk to
+   code paths that only run in the new regime.
+3. Add a new host launcher (parallel to `mul_mat_vec_q_moe_launch`) and a
+   new top-level entry point alongside `ggml_cuda_mul_mat_vec_q()` (its
+   hard `ne12 <= MMVQ_MAX_BATCH_SIZE` assert means the wide path needs its
+   own entry, not a relaxed version of the existing one, so the existing
+   function's contract - and every other caller relying on it - stays
+   intact).
+4. Wire the density gate into `ggml_cuda_mul_mat_id`/
+   `ggml_cuda_mul_mat_id_needs_sync` (`ggml-cuda.cu:1889-1957`): after the
+   existing narrow-kernel check fails, before falling to MMQ, try the wide
+   path when `ne2 <= 32 && ne2 * n_expert_used <= 2 * n_expert` (n_expert =
+   `src0->ne[2]`, n_expert_used = `ids->ne[0]`).
+5. Validate on this sandbox (Gemma-4-26B-A4B, 128/8 experts, real
+   many-expert case): correctness first (byte-identical greedy output at
+   batch sizes spanning both the untouched narrow path and the new wide
+   path), then throughput (wide-MMVQ vs. current MMQ/cuBLAS fallback,
+   which is what it's actually competing against in the 9-32 token range,
+   not the narrow kernel) across the batch sizes that currently fall back.
+   Also explicitly re-benchmark the *unchanged* narrow path (batch <= 8)
+   to confirm the new template parameter really did leave it untouched,
+   not just assume it from the design.
+
+**Effort estimate**: real CUDA kernel engineering, not a config change -
+new kernel instantiation, new launcher, new dispatch wiring, correctness
++ performance validation across quant types actually in use. Scoped here
+so the investigation doesn't need to be redone, but deliberately not
+started without a dedicated pass - the blast radius (MUL_MAT_ID feeds
+every MoE FFN forward pass) means a subtle bug here is a correctness risk
+across the whole model, not a contained feature.
