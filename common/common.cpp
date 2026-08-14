@@ -1,5 +1,6 @@
 #include "ggml.h"
 #include "gguf.h"
+#include "ggml-backend-moe-cache.h"
 
 #include "build-info.h"
 #include "common.h"
@@ -2270,6 +2271,31 @@ static void common_warn_p_min_disabled(const common_params & params) {
             "output (see ggml-org/llama.cpp#25908). Consider setting --spec-draft-p-min explicitly "
             "(e.g. 0.5-0.75) now that n_max is above its default of 3.\n",
             __func__, params.speculative.draft.n_max, params.speculative.draft.n_max);
+}
+
+bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out_rows, int & out_cols) {
+    out_rows = 0;
+    out_cols = 0;
+    if (!ggml_moe_cache.get_expert_map) {
+        return false; // no CUDA backend registered, or built without it
+    }
+    // First call with a zero-capacity probe to learn the real shape (the
+    // provider reports rows/cols even on a "buffer too small" 0 return),
+    // then size the real buffer and fetch for real - avoids guessing a
+    // grid size up front for a model we haven't measured yet.
+    int rows = 0, cols = 0;
+    ggml_moe_cache.get_expert_map(nullptr, 0, &rows, &cols);
+    if (rows <= 0 || cols <= 0) {
+        return false; // nothing cached yet
+    }
+    out_bytes.assign((size_t) rows * (size_t) cols, 0);
+    if (!ggml_moe_cache.get_expert_map(out_bytes.data(), (int) out_bytes.size(), &rows, &cols)) {
+        out_bytes.clear();
+        return false;
+    }
+    out_rows = rows;
+    out_cols = cols;
+    return true;
 }
 
 // moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults

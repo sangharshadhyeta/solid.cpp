@@ -4468,6 +4468,67 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // "Brain" view (tools/ui) - live per-(layer,expert) moe-cache tier/heat
+    // state, wire format ported from Colibri (see
+    // docs/moe-cache-colibri-notes.md): a hex string, one byte per cell
+    // (top 2 bits tier, bottom 6 bits heat), plus a hex-packed hit bitset
+    // for the flash-on-fire animation and a seq counter the client uses to
+    // know when the bitset actually changed. The hit bitset isn't tracked
+    // in the CUDA cache itself (kept that change purely additive/read-only,
+    // see moe-cache.cu) - computed here instead by diffing this poll's
+    // bytes against the previous one. Static locals are fine for this: a
+    // debug/demo view, not correctness-critical, and every poller sharing
+    // one "last known state" is the same trade-off the CUDA-side snapshot
+    // itself already makes for concurrent readers.
+    this->get_experts = [this](const server_http_req &) {
+        auto res = create_response();
+
+        static std::vector<uint8_t> prev_bytes;
+        static uint64_t seq = 0;
+
+        std::vector<uint8_t> bytes;
+        int rows = 0, cols = 0;
+        if (!common_moe_cache_get_expert_map(bytes, rows, cols)) {
+            res->ok({{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"seq", seq}});
+            return res;
+        }
+
+        const size_t n = bytes.size();
+        std::string map_hex;
+        map_hex.reserve(n * 2);
+        static const char hex_digits[] = "0123456789abcdef";
+        for (uint8_t b : bytes) {
+            map_hex.push_back(hex_digits[b >> 4]);
+            map_hex.push_back(hex_digits[b & 0xf]);
+        }
+
+        std::vector<uint8_t> hit_bits((n + 7) / 8, 0);
+        bool any_hit = false;
+        if (prev_bytes.size() == n) {
+            for (size_t i = 0; i < n; i++) {
+                const uint8_t tier = bytes[i] >> 6;
+                if (tier > 0 && bytes[i] != prev_bytes[i]) {
+                    hit_bits[i >> 3] |= (uint8_t)(1u << (i & 7));
+                    any_hit = true;
+                }
+            }
+        }
+        if (any_hit) {
+            seq++;
+        }
+        prev_bytes = bytes;
+
+        std::string hits_hex;
+        hits_hex.reserve(hit_bits.size() * 2);
+        for (uint8_t b : hit_bits) {
+            hits_hex.push_back(hex_digits[b >> 4]);
+            hits_hex.push_back(hex_digits[b & 0xf]);
+        }
+
+        res->ok({{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"seq", seq}});
+        return res;
+    };
+
     this->get_metrics = [this](const server_http_req & req) {
         auto res = create_response();
         if (!params.endpoint_metrics) {

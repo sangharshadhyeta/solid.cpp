@@ -64,6 +64,16 @@ struct ggml_moe_cache_api {
     // session has recorded anything yet. NULL-safe like the other optional
     // entries here.
     void (*get_stats)(long long * out_hits, long long * out_misses);
+
+    // Snapshot the live per-(layer,expert) cache state for a debugging/demo
+    // UI view (the "Brain" page). One byte per (layer,expert) cell packed
+    // as (tier << 6) | heat - see moe_cache_get_expert_map()'s own comment
+    // in moe-cache.cu for the exact encoding. out_rows/out_cols are always
+    // written (0 on failure). Returns 1 on success, 0 if no session has
+    // cached anything yet or out_bytes is too small for the real grid (in
+    // which case out_rows/out_cols still report the real shape so the
+    // caller can retry with a bigger buffer). NULL-safe like get_stats.
+    int (*get_expert_map)(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;
