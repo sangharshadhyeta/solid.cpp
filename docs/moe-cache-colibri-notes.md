@@ -1439,6 +1439,34 @@ against exactly this failure mode.
   arrived at by refusing to accept "there's probably just some overhead
   somewhere" as a final answer.
 
+  **"Net outcome" test at the real calibrated config, not `--parallel
+  1`.** All FR-Spec numbers above were measured at `--parallel 1`,
+  chosen for simplicity during correctness testing - not the config the
+  session's own 64.92 tok/s MTP headline number was calibrated at
+  (`--parallel 4`, per the calibration cache key
+  `...c4096|p4|ngl99`). Re-ran trimmed vs. untrimmed at that real
+  config, `/v1/chat/completions` (the "solid"-tier endpoint used
+  throughout this doc, not the raw `/completion` endpoint the earlier
+  FR-Spec numbers used), 5 samples each: untrimmed 55.12-55.98 tok/s
+  (mean 55.66); trimmed 55.21-55.71 tok/s (mean 55.50). Tighter spread
+  than any earlier FR-Spec measurement, and genuinely flat - not even
+  the parity-with-a-slight-edge seen at `--parallel 1`, just a clean
+  wash either way. Consistent with the fix being real and complete: no
+  regression at any config tested, and no dramatic win either.
+
+  Two things this run surfaces that are worth separating from FR-Spec
+  itself: (1) at the *identical* calibrated config, this photosynthesis
+  prompt gives ~55.7 tok/s solo, not 64.92 - a ~14% gap, from prompt
+  content alone (MTP's draft-acceptance rate is prompt-dependent; the
+  64.92 figure came from whatever probe prompts `--moe-calibrate` used,
+  not this one). The 64.92 headline number is real but prompt-specific,
+  not a universal constant for "this config" - a caution against
+  treating any single throughput number in this document as portable
+  across different real traffic. (2) None of this session's percentage
+  gains compound the way stacking them on paper suggests, both because
+  they were measured at different `--parallel` settings across the
+  session's own timeline and because of this same prompt-dependence.
+
   Toggling is clean either way: `--spec-vocab-map` unset (the default)
   is a verified no-op - `frspec_d2t_ids` stays empty, `load_arch_tensors`
   and the graph-building gather/scatter code both no-op, full untrimmed
