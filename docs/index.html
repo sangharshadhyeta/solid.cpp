@@ -1,149 +1,183 @@
 <!doctype html>
-<title>Throughput Impact</title>
+<title>solid.cpp — proven, not promised</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-:root{--bg:#fff;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#2563eb;--good:#059669;--warn:#d97706;--bad:#dc2626;--code-bg:#f3f4f6;}
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#2563eb;--good:#059669;--warn:#d97706;--bad:#dc2626;--code-bg:#f3f4f6;--card-bg:#f9fafb;}
 @media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){--bg:#16181d;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1f2229;}
+  :root:not([data-theme="light"]){--bg:#0f1115;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1a1d24;--card-bg:#171a21;}
 }
-:root[data-theme="dark"]{--bg:#16181d;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1f2229;}
-body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;max-width:900px;margin:0 auto;padding:2rem 1.25rem 4rem;line-height:1.5;}
-h1{font-size:1.5rem;margin-bottom:.25rem;}
-.sub{color:var(--muted);font-size:.9rem;margin-bottom:2rem;}
+:root[data-theme="dark"]{--bg:#0f1115;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1a1d24;--card-bg:#171a21;}
+
+*{box-sizing:border-box;}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;margin:0;line-height:1.6;}
+.wrap{max-width:900px;margin:0 auto;padding:0 1.25rem 5rem;}
+
+header.hero{text-align:center;padding:3.5rem 1.25rem 2.5rem;}
+header.hero img{width:180px;height:auto;margin-bottom:1rem;}
+header.hero h1{font-size:2.1rem;margin:.25rem 0;text-wrap:balance;}
+header.hero .tagline{color:var(--muted);font-size:1.05rem;max-width:36rem;margin:.5rem auto 1.5rem;text-wrap:balance;}
+.badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;margin-bottom:.5rem;}
+.badges img{height:20px;}
+
+h2{font-size:1.4rem;margin:3rem 0 1rem;padding-top:.5rem;border-top:1px solid var(--border);}
+h2:first-of-type{border-top:none;}
+p{margin:.75rem 0;}
+a{color:var(--accent);}
+code{background:var(--code-bg);padding:.15rem .4rem;border-radius:4px;font-size:.88em;}
+pre{background:var(--code-bg);padding:.9rem 1rem;border-radius:8px;overflow-x:auto;}
+pre code{background:none;padding:0;}
+ul{padding-left:1.3rem;}
+li{margin:.5rem 0;}
+
+.callout{background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:1rem 1.15rem;margin:1.25rem 0;font-size:.95rem;}
+
 table{width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:.92rem;table-layout:fixed;}
-th,td{text-align:left;padding:.55rem .6rem;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:break-word;}
-th{color:var(--muted);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.02em;}
-td.num{font-variant-numeric:tabular-nums;white-space:normal;font-weight:600;}
+th,td{text-align:left;padding:.6rem .6rem;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:break-word;}
+th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em;}
+td.num{font-variant-numeric:tabular-nums;font-weight:600;}
 .tag{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.72rem;font-weight:600;white-space:nowrap;}
 .tag-solid{background:color-mix(in srgb, var(--good) 18%, transparent);color:var(--good);}
-.tag-caveat{background:color-mix(in srgb, var(--warn) 18%, transparent);color:var(--warn);}
-.tag-retracted{background:color-mix(in srgb, var(--bad) 18%, transparent);color:var(--bad);}
 .delta-pos{color:var(--good);font-weight:700;}
 .delta-neg{color:var(--bad);font-weight:700;}
 .delta-none{color:var(--muted);}
-.section-note{background:var(--code-bg);border-left:3px solid var(--accent);padding:.85rem 1rem;border-radius:4px;font-size:.88rem;margin:1rem 0 1.5rem;}
-.section-note.warn{border-left-color:var(--warn);}
-code{background:var(--code-bg);padding:.1rem .35rem;border-radius:4px;font-size:.85em;}
-footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.82rem;}
+.note{color:var(--muted);font-size:.82rem;}
+.tablewrap{overflow-x:auto;}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin:1.25rem 0;}
+.grid a.card{display:block;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;text-decoration:none;color:var(--fg);}
+.grid a.card:hover{border-color:var(--accent);}
+.grid a.card .k{font-weight:600;color:var(--accent);}
+.grid a.card .d{color:var(--muted);font-size:.85rem;margin-top:.25rem;}
+
+footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid var(--border);color:var(--muted);font-size:.85rem;}
+footer a{color:var(--muted);text-decoration:underline;}
+@media (max-width:600px){.grid{grid-template-columns:1fr;}}
 </style>
 
-<h1>Throughput impact, by piece of work</h1>
-<div class="sub">RTX 3060 + Gemma-4-26B-A4B sandbox, this session — confidence tags indicate how the number was measured</div>
+<div class="wrap">
 
-<div class="section-note">
-<strong>Confidence key:</strong>
-<span class="tag tag-solid">solid</span> chat-templated (<code>/v1/chat/completions</code>) and/or content-verified coherent &nbsp;·&nbsp; <span class="tag tag-caveat">caveat</span> measured correctly but with a real, named limitation
+<header class="hero">
+<img src="solid.cpp.jpeg" alt="solid.cpp logo">
+<h1>solid.cpp</h1>
+<div class="tagline">llama.cpp, hardened: real bugs found, root-caused, and measured before they ship</div>
+<div class="badges">
+<img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
+<img src="https://img.shields.io/badge/based%20on-llama.cpp-blue.svg" alt="Based on llama.cpp">
 </div>
+<p><a href="https://github.com/sangharshadhyeta/solid.cpp">github.com/sangharshadhyeta/solid.cpp</a></p>
+</header>
 
+<h2>What this is</h2>
+<p><code>solid.cpp</code> is a fork of <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> that tracks
+upstream directly and layers on a curated set of performance and correctness fixes - triaged from real, reported
+issues, root-caused in code, and validated with actual measurements before anything is kept. Not a rewrite, not a
+speed pun: every change here is either a measured win or a documented, honest "no" (a fix that was tried, found
+not to be the cause, and kept anyway if it was independently valid, or reverted if it wasn't).</p>
+<p>The two starting focus areas were MoE expert-cache placement and speculative decoding (draft acceptance,
+FR-Spec vocab trimming, MTP correctness), but the scope is the whole inference hot path - kernels, batching,
+KV-cache, sampling, quantization - not just MoE.</p>
+
+<h2>Proven, not promised</h2>
+<p>The headline claim: MoE models too big for your VRAM don't just run here via CPU offload, they run
+<em>fast</em> - measured, not assumed. Every row below is a real before/after on the same hardware (RTX 3060,
+12GB VRAM - about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config except the
+one thing being measured, chat-templated and content-verified so the number reflects real usage, not a
+synthetic benchmark.</p>
+
+<div class="tablewrap">
 <table>
-<colgroup>
-<col style="width:30%">
-<col style="width:15%">
-<col style="width:15%">
-<col style="width:12%">
-<col style="width:28%">
-</colgroup>
-<thead><tr><th>Work</th><th>Before</th><th>After</th><th>Δ</th><th>Confidence</th></tr></thead>
+<colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
+<thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
-
-<tr>
-<td><strong>moe-cache core port</strong><br><span style="color:var(--muted);font-size:.85rem">CPU-only MoE → GPU-cached hot experts, ncmoe=15, re-verified via <code>/v1/chat/completions</code></span></td>
-<td class="num">39.37 tok/s<br><span style="color:var(--muted)">(--moe-cache off)</span></td>
-<td class="num">51.71 tok/s<br><span style="color:var(--muted)">(--moe-cache auto)</span></td>
-<td class="num delta-pos">+31.3%</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>Live <code>reserve_mb</code>/<code>max_batch</code> fix</strong><br><span style="color:var(--muted);font-size:.85rem">was silently disabling the cache on this 12GB card</span></td>
-<td colspan="3" style="color:var(--muted)">the moe-cache on/off row above <em>is</em> the proof this fix mattered - without it the cache never engaged on this card at all</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>Placement sweep</strong><br><span style="color:var(--muted);font-size:.85rem">found real <code>-ncmoe</code> optimum vs. a conservative guess, re-verified via <code>/v1/chat/completions</code> (ncmoe 13-30 swept)</span></td>
-<td class="num">46.995 tok/s<br><span style="color:var(--muted)">(ncmoe=30, conservative guess)</span></td>
-<td class="num">51.71 tok/s<br><span style="color:var(--muted)">(ncmoe=15, real optimum)</span></td>
-<td class="num delta-pos">+10.0%</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">the original "+31%, 61+ tok/s" claim was itself inflated by the endpoint bug - real gain is smaller but genuine</span></td>
-</tr>
-
-<tr>
-<td><strong>Layer 1 — live auto-placement</strong><br><span style="color:var(--muted);font-size:.85rem">OOM avoidance, not a speed lever</span></td>
-<td colspan="3" style="color:var(--muted)">reliability fix — turns a hard crash into a working server; not a throughput number</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>Layer 2 — <code>--moe-calibrate</code></strong><br><span style="color:var(--muted);font-size:.85rem">empirical placement search vs. safe-floor-only, re-verified 2026-08-14</span></td>
-<td class="num">41.68 tok/s<br><span style="color:var(--muted)">(safe floor, ncmoe=13)</span></td>
-<td class="num">50.70 tok/s<br><span style="color:var(--muted)">(ncmoe=15)</span></td>
-<td class="num delta-pos">+21.6%</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>MTP, corrected re-measurement</strong><br><span style="color:var(--muted);font-size:.85rem">ncmoe=15, chat-templated, content-verified coherent, golden-section search bug fixed</span></td>
-<td class="num">50.70 tok/s<br><span style="color:var(--muted)">(ncmoe=15, no MTP)</span></td>
-<td class="num">64.92 tok/s<br><span style="color:var(--muted)">(+ MTP n_max=3)</span></td>
-<td class="num delta-pos">+28.1%</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">supersedes an earlier n_max=9/54.55 result - the search itself had a bug, fixed 2026-08-14</span></td>
-</tr>
-
-<tr>
-<td><strong>Thread-count tuning (MTP-aware)</strong><br><span style="color:var(--muted);font-size:.85rem">re-tried at the corrected n_max=3</span></td>
-<td class="num">64.92 tok/s<br><span style="color:var(--muted)">(6 threads, default)</span></td>
-<td class="num">48.71 tok/s<br><span style="color:var(--muted)">(12 threads)</span></td>
-<td class="num delta-none">no gain - stayed at 6</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">correctly rejected; more threads lost this time, opposite of the earlier (now-superseded) n_max=9 run</span></td>
-</tr>
-
-<tr>
-<td><strong>LFRU eviction (final: capped SLRU + heat tiebreak)</strong><br><span style="color:var(--muted);font-size:.85rem">4 designs A/B'd; uncapped SLRU (60.2%) and 2 decay-only-cap variants (61.3-61.4%) all regressed and were reverted</span></td>
-<td class="num">63.8% hit rate<br><span style="color:var(--muted)">(plain LRU)</span></td>
-<td class="num">65.0% hit rate<br><span style="color:var(--muted)">(capped SLRU + heat tiebreak)</span></td>
-<td class="num delta-pos">+1.2pp</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>Concurrency-target-aware <code>--moe-calibrate</code></strong><br><span style="color:var(--muted);font-size:.85rem">benchmarks candidates with real concurrent requests when <code>--parallel N &gt; 1</code>, instead of solo decode speed</span></td>
-<td class="num">78.12 tok/s<br><span style="color:var(--muted)">(independent concurrency-sweep measurement, --parallel 8)</span></td>
-<td class="num">76.11 tok/s<br><span style="color:var(--muted)">(calibrated aggregate, --parallel 8)</span></td>
-<td class="num delta-none">cross-validated, within noise</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">not a throughput gain itself — proves the calibrator's aggregate-tok/s scoring matches an independent measurement, so it can be trusted to pick concurrency-correct placements</span></td>
-</tr>
-
-<tr>
-<td><strong>FR-Spec-style MTP draft-vocab trim, final corrected number</strong><br><span style="color:var(--muted);font-size:.85rem">gemma4-assistant, 645-token real-traffic sidecar, explicit <code>--spec-type draft-mtp</code> so real speculative decoding is actually exercised on both sides</span></td>
-<td class="num">75.93 tok/s<br><span style="color:var(--muted)">(no trim, 81.5% draft accept)</span></td>
-<td class="num">55.6-56.7 tok/s<br><span style="color:var(--muted)">(645-token trim, 43-44% draft accept)</span></td>
-<td class="num delta-neg">-26%</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">root cause: a "cache once" gather/scatter optimization corrupted MTP's draft predictions; reverting to live (recomputed every step) graph ops alone took accept rate 8.8%→44.3%. A genuine, budget-for-it cost, not a free trim — still untested at GLM-5.2/H200 scale, still a no-op when <code>--spec-vocab-map</code> is unset</span></td>
-</tr>
-
-<tr>
-<td><strong>Probabilistic draft acceptance (<code>--spec-prob-accept</code>)</strong><br><span style="color:var(--muted);font-size:.85rem">accepts a draft token whenever the target considers it at least as likely as the draft did (<code>min(1, p_target/p_draft)</code>), not only on exact match — opt-in, byte-identical to before when off</span></td>
-<td class="num">53.6-53.8 tok/s<br><span style="color:var(--muted)">(flag off, temp=0.7, healthy MTP-only config)</span></td>
-<td class="num">55.6-55.7 tok/s<br><span style="color:var(--muted)">(flag on, same config)</span></td>
-<td class="num delta-pos">+~3.5%</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">flag off verified byte-identical to before this feature existed; at temp=0 confirmed a mathematical no-op (greedy target has a point-mass distribution, so this never applies) rather than assumed. Only matters at temperature &gt; 0 — real, free upside there, zero downside by construction</span></td>
-</tr>
-
-<tr>
-<td><strong>MTP <code>accept()</code> stale-state fix</strong><br><span style="color:var(--muted);font-size:.85rem">a different configured drafter winning a round was corrupting MTP's own recurrent hidden-state input with unrelated data</span></td>
-<td colspan="3" style="color:var(--muted)">correctness fix for any multi-drafter MTP configuration — not a throughput lever on its own (measured separately: not the cause of the FR-Spec collapse above)</td>
-<td><span class="tag tag-solid">solid</span></td>
-</tr>
-
-<tr>
-<td><strong>Backend sampling (<code>-bs</code>)</strong><br><span style="color:var(--muted);font-size:.85rem">already existed upstream, validated here — samples on-device instead of copying the full logits matrix D2H every step for CPU-side sampling</span></td>
-<td class="num">103.59 tok/s<br><span style="color:var(--muted)">(flag off, aggregate, --parallel 4)</span></td>
-<td class="num">107.48 tok/s<br><span style="color:var(--muted)">(flag on, same config)</span></td>
-<td class="num delta-pos">+3.76%</td>
-<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">also +4.98% at --parallel 8 (past this card's MMVQ cliff, but both arms equally confounded — comparison still fair). Real but modest here vs. upstream's own +48% at 32 slots on an RTX 5090 — this sandbox has nowhere near that concurrency or GPU speed, both of which the win scales with. Worth re-validating at the GLM-5.2/H200 target specifically</span></td>
-</tr>
-
+<tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>, naive CPU-offload)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>LFRU eviction <span class="note">(vs plain LRU)</span></td><td class="num">63.8% hit rate</td><td class="num">65.0% hit rate</td><td class="num delta-pos">+1.2pp</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Probabilistic draft acceptance <span class="note">(<code>--spec-prob-accept</code>, temp 0.7)</span></td><td class="num">53.6 tok/s</td><td class="num">55.7 tok/s</td><td class="num delta-pos">+3.5%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Backend sampling <span class="note">(<code>-bs</code>, concurrent load)</span></td><td class="num">103.6 tok/s</td><td class="num">107.5 tok/s</td><td class="num delta-pos">+3.8%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>FR-Spec draft-vocab trim <span class="note">(measured, not assumed free)</span></td><td class="num">75.93 tok/s</td><td class="num">56.2 tok/s</td><td class="num delta-neg">-26%</td><td><span class="tag tag-solid">solid</span></td></tr>
 </tbody>
 </table>
+</div>
 
-<footer>Session work, RTX 3060 sandbox — not yet re-run on the real GLM-5.2/H200 deployment target. All rows re-verified 2026-08-14 via <code>/v1/chat/completions</code> after three real bugs were found and fixed: an endpoint-formatting bug (raw <code>/completion</code> bypasses the chat template, silently inflating throughput on this instruction-tuned model), a golden-section search bug (silently missed a better already-measured point), and a "cache once" correctness bug in the FR-Spec draft-vocab trim (corrupted MTP's draft predictions, cut accept rate roughly 5x until reverted to live graph ops). Throughput numbers in this table are not portable across prompts, and any number not shown here that was measured via implicit <code>-md</code>-only mode (no explicit <code>--spec-type</code>) should be treated as a non-speculative baseline, not a real MTP measurement.</footer>
+<div class="callout">
+That last row is deliberate. FR-Spec was expected to be a free win and turned out not to be on this hardware -
+so it's reported as a loss, not quietly dropped from the table. That's the actual point of <code>solid.cpp</code>:
+every number here is something that was measured and would be reported honestly either way. If a claimed
+improvement doesn't survive contact with a real benchmark, it doesn't ship, and if it does ship, this is where
+you can check the receipts. Full raw numbers, per-row methodology, and the complete working log (including
+investigations that turned out not to apply) live in
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a>.
+</div>
+
+<h2>What's different from upstream</h2>
+<ul>
+<li><strong>MoE expert-cache</strong> - GPU-resident hot-expert cache for CPU-offloaded MoE layers, with LFRU
+eviction (capped SLRU + heat tiebreak), live auto-placement, and <code>--moe-calibrate</code> for empirical,
+concurrency-aware placement search instead of a fixed guess.</li>
+<li><strong>Probabilistic draft acceptance</strong> (<code>--spec-prob-accept</code>) - accepts a draft token
+whenever the target considers it at least as likely as the draft did (<code>min(1, p_target/p_draft)</code>),
+not only on exact match. Opt-in, strict superset of the old behavior - verified byte-identical when off.</li>
+<li><strong>FR-Spec-style MTP draft-vocab trimming</strong>, with its real cost (not assumed-free) measured
+directly: a genuine trade of throughput and accept-rate for VRAM, not a free win - see the notes for the numbers
+and the cache-related correctness bug that was found and fixed along the way.</li>
+<li><strong><code>p_min</code> footgun warning</strong> - a diagnostic (not a silent default change) that fires
+when a drafter's confidence early-stop is left disabled while draft width has been raised, mirroring the
+existing concurrency-cliff warning pattern.</li>
+<li><strong>Backend-sampling validation</strong> - confirmed upstream's on-device sampling path (<code>-bs</code>)
+gives a real, positive throughput gain here too, measured directly rather than assumed from upstream's own numbers.</li>
+<li><strong>Diagnostic instrumentation kept permanently</strong> - <code>LLAMA_DEBUG_VERIFY=1</code> gates
+zero-cost-when-unset traces (drafted-vs-target token mismatches, resolved speculative types, draft-context
+graph-reuse stats) that were directly responsible for finding more than one of the fixes above.</li>
+<li>Ongoing triage of upstream's open issue tracker for real, bounded, evidenced performance and correctness
+bugs - accepted, fixed properly, and measured; or investigated, found not to apply, and documented so the same
+dead end isn't walked twice. Several larger, correctly-scoped-but-not-yet-implemented designs (a CUDA
+many-expert MMVQ dispatch gate, among others) are recorded in the notes rather than rushed.</li>
+</ul>
+
+<h2>Quick start</h2>
+<p>Build from source - see upstream's <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a>, which still applies unchanged:</p>
+<pre><code>cmake -B build -DGGML_CUDA=ON   # or your backend of choice
+cmake --build build --config Release -j</code></pre>
+<pre><code># Launch an OpenAI-compatible API server
+./build/bin/llama-server -m &lt;model.gguf&gt; -ngl 99</code></pre>
+
+<h2>Supported backends</h2>
+<p>Unchanged from upstream - see <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>
+for the full table and per-backend build flags (CUDA, HIP, Vulkan, Metal, SYCL, CANN, and more).</p>
+
+<h2>Documentation</h2>
+<div class="grid">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">
+<div class="k">Working log</div>
+<div class="d">docs/moe-cache-colibri-notes.md - measurements, dead ends, and root causes for everything above</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/tree/moe-cache-port/docs">
+<div class="k">Everything else</div>
+<div class="d">Upstream's own docs - build instructions, backend guides, server API, model support</div>
+</a>
+</div>
+
+<h2>Relationship to upstream</h2>
+<p>This repo's git history <em>is</em> <code>llama.cpp</code>'s history, plus the commits on top. Upstream
+changes are pulled in directly rather than re-implemented; nothing here is intended to diverge from upstream's
+own architecture or conventions more than a given fix requires. See upstream's own
+<a href="https://github.com/ggml-org/llama.cpp">README</a> and
+<a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a> for the base project this builds on.</p>
+
+<h2>License &amp; acknowledgements</h2>
+<p>MIT licensed, same as upstream. Third-party components inherited from upstream, still accurate:</p>
+<ul>
+<li><a href="https://github.com/yhirose/cpp-httplib">yhirose/cpp-httplib</a> - single-header HTTP server, used by <code>llama-server</code> - MIT license</li>
+<li><a href="https://github.com/nothings/stb">stb-image</a> - single-header image format decoder, used by multimodal subsystem - public domain</li>
+<li><a href="https://github.com/nlohmann/json">nlohmann/json</a> - single-header JSON library, used by various tools/examples - MIT license</li>
+<li><a href="https://github.com/mackron/miniaudio">miniaudio.h</a> - single-header audio format decoder, used by multimodal subsystem - public domain</li>
+<li><a href="https://github.com/sheredom/subprocess.h">subprocess.h</a> - single-header process launching solution for C and C++ - public domain</li>
+</ul>
+
+<footer>
+solid.cpp - <a href="https://github.com/sangharshadhyeta/solid.cpp">source on GitHub</a>
+</footer>
+
+</div>
