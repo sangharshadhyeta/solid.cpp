@@ -1735,6 +1735,196 @@ against exactly this failure mode.
   slot, exact-match only) - not a new technique to add, confirms the
   already-tracked item is the right thing to build if this is wanted.
 
+## FR-Spec + multi-drafter incompatibility, final investigation (2026-08-14, end of session)
+
+Explicit directive: find the real root cause, using any means, as the
+last piece of this session's work. Summary of the full push below - a
+real independent bug was found and fixed along the way, but the
+headline bug's root cause was not conclusively pinned down despite
+substantial effort. Reporting the state honestly rather than claiming
+a fix that isn't verified.
+
+**New findings this pass:**
+- **Not suffix-decode-specific at all.** Bisected across three
+  completely different second drafter types - `ngram-suffix`,
+  `ngram-simple`, and `ngram-cache` configured with no cache files (as
+  inert as a second drafter can be: never produces a draft, ever,
+  since it has nothing to match against). All three reproduce the
+  identical regression (~30 tok/s, ~9-11% accept) when combined with
+  MTP + FR-Spec. This rules out anything in any specific second
+  drafter's own `draft()`/`accept()` logic - confirmed by reading all
+  three implementations directly, all self-contained (`ngram-suffix`
+  and `ngram-simple`'s own `accept()` are literally `// noop`).
+- **The internal drafter priority order is hardcoded, not CLI-order-controlled**
+  (`common_speculative_init()`, `common/speculative.cpp`): ngram-family
+  types are always tried before draft-based types (MTP), regardless of
+  the order given to `--spec-type`. This means ngram-suffix's
+  `draft()` actually runs *every single round* (not rarely, as first
+  assumed from an incomplete trace read) - it just usually produces
+  nothing usable (its own `n_min` gate) and falls through to MTP. This
+  correction doesn't change the diagnosis but corrects a wrong mental
+  model from earlier in the investigation.
+- **A real, independent bug found and fixed**: `common_speculative_impl_draft_mtp::accept()`
+  ignored its `is_other` parameter entirely and unconditionally
+  overwrote its own `pending_h` (the recurrent hidden-state input MTP
+  feeds into its own next prediction) using `verify_h`/`n_accepted` -
+  data that's only meaningful when MTP itself was the drafter actually
+  verified that round. When a *different* configured drafter wins a
+  round instead, `is_other=true` and that same code still ran,
+  corrupting `pending_h` with a stale, unrelated hidden state. Fixed
+  by skipping the update when `is_other=true` (leaving `pending_h`
+  untouched is strictly safer than overwriting it with definitely-wrong
+  data). Found via new instrumentation added this session
+  (`LLAMA_DEBUG_VERIFY=1` env var, `common/sampling.cpp`, prints the
+  drafted-vs-target token text on every mismatch) which surfaced a
+  genuine repeating/lagging pattern in rejected drafts, consistent with
+  a stale recurrent-state input.
+- **The fix does not resolve the regression** - re-measured at 31.7-31.9
+  tok/s, 10.7-11.0% accept, statistically identical to before the fix.
+  In hindsight this is logically expected, not surprising: `is_other=true`
+  only ever fires on the ~5% of rounds where a different drafter wins;
+  the observed ~90% rejection rate is present even across the ~95% of
+  rounds where MTP drafts uninterrupted, with no other impl involved at
+  all that round. A bug scoped to the rare cross-drafter rounds cannot
+  explain damage present in the common, uninterrupted-MTP rounds - this
+  should have been checked analytically before spending a test cycle
+  confirming it empirically. The fix is being kept regardless: it's a
+  real, independently-valid correctness bug (any multi-drafter MTP
+  configuration has it, with or without FR-Spec), just not the
+  explanation for this one.
+
+**Where this leaves the investigation:** the bug requires exactly
+(MTP active) + (any second `--spec-type` configured, regardless of what
+it does) + (FR-Spec trim active) - all three, confirmed via direct
+bisection on both of the first two dimensions. What's been eliminated
+with real evidence, across this and the prior investigation pass:
+`p_min` confidence gating, probability-based verification (both by
+reading the actual code and by direct A/B test with `--spec-prob-accept`
+showing zero effect), any specific second-drafter's own logic (three
+different types tested including a maximally inert one), output-buffer
+sizing driven by the other type's larger default `n_max`/`size_m`
+(tested directly by forcing `--spec-ngram-suffix-n-max 3` to match
+MTP's own value - no change), CLI argument order (proven irrelevant,
+priority is hardcoded), and now `pending_h` corruption via `is_other`
+(real bug, fixed, confirmed not the cause via direct re-test). What
+remains unexplained: some structural difference between "MTP is the
+only configured drafter" and "MTP is one of several configured
+drafters" that affects MTP's own prediction quality on effectively
+every round, not just rounds where another drafter actually
+participates - and that specifically requires FR-Spec's vocab
+restriction to become severe (this same multi-drafter structural fact,
+without FR-Spec, measured healthy earlier this session: 66-69 tok/s,
+70%+ accept). No further hypothesis was identified with strong enough
+supporting evidence to test as a probable fix within this session.
+
+**Recommendation unchanged**: don't combine `--spec-vocab-map` with a
+multi-type `--spec-type` configuration. Each half works well
+independently and is recommended on its own merits.
+
+## SUPERSEDES THE ABOVE: root cause found, real fix committed (2026-08-14, later same day)
+
+The section above ended honestly inconclusive. Pushed further per
+explicit instruction to keep going and check llama.cpp's own
+issues/PRs for prior art: issue #23184 ("Pipeline speculative decoding
+strategies draft-mtp -> ngram-mod") confirms independent-draft-streams
+is a known architectural limitation, not a reported accuracy
+regression; issue #23154, a closed/stale CUDA OOM report combining
+`ngram-mod,draft-mtp`, gave a useful but not directly applicable clue.
+That search didn't find the bug directly, but re-examining the test
+methodology did.
+
+**The methodology bug**: every "healthy MTP-only baseline" number in
+this document (including the 66-69 tok/s / 70%+ accept figures cited
+just above as the healthy comparison point) that was produced by
+launching with `-md <path>` and *no explicit `--spec-type`* was never
+actually running speculative decoding at all.
+`params.speculative.types` defaults to a single-element `{NONE}`
+vector; the HF-sidecar auto-detection in `arg.cpp` only populates it
+for `-hfd`-style HF-repo auto-discovery, not a plain local `-md` path.
+With `types == {NONE}`, `common_speculative_init()`'s impl list is
+empty and it returns `nullptr`; `server_slot::can_speculate()` is
+`!!spec`, so speculative decoding silently never engaged - the draft
+model loaded into VRAM and then was never called. Confirmed directly
+with two new debug prints gated on `LLAMA_DEBUG_VERIFY=1`
+(`[DEBUG-TYPES]` in `tools/server/server-context.cpp`, now permanent):
+`resolved speculative.types = none` / `spec = (nil) (can_speculate
+would be FALSE)`.
+
+**Re-ran with explicit `--spec-type draft-mtp`, the only way to get a
+real apples-to-apples number:**
+- MTP alone, no FR-Spec: **75.93 tok/s, 81.5% accept.**
+- MTP alone, with FR-Spec (`--spec-vocab-map`) active, same prompt/config:
+  **30.53 tok/s, 8.8% accept.** A real, severe regression - not the
+  fabricated "parity" claimed earlier in this document under implicit
+  mode, and not resolved by the `is_other` fix above.
+- Bisected exactly as before, but now against a real baseline:
+  identical collapse reproduces with **`--spec-type draft-mtp` alone,
+  no second drafter type configured at all.** This eliminates
+  "multi-drafter interaction" as the mechanism outright - the whole
+  suffix-decode/ngram angle investigated above and in the section
+  before it was chasing a variable that was never actually the cause.
+
+**The real root cause**: this session's own earlier "cache once"
+optimization for FR-Spec's weight gather (`output_w`) and scatter
+template (`out_template`) - populated a single time via `set_input()`
+on the assumption their shape/content never change - has a genuine,
+silent correctness bug. Direct A/B test, reverting
+`gemma4-assistant.cpp`'s graph-building code to the original live
+(recomputed every forward pass) `ggml_get_rows`/`ggml_fill`+`ggml_set_rows`
+pattern, same model/config/prompt: accept rate 8.8% -> 44.3%, tok/s
+30.5 -> 55.6-56.7. Correctness (byte-identical greedy output) held
+throughout, both cached and live - this was never a wrong-answer bug,
+only a "confidently wrong draft, so the target rejects it constantly"
+bug. The exact GGML-level mechanism (something about the cached
+input's `can_reuse() == true` no longer being a safe signal once the
+tensor's *populated content*, not just its shape, needs to track the
+live graph) was not traced to the instruction level, but the fix is
+unambiguous and repeatedly confirmed.
+
+**Fix committed**: `gemma4-assistant.cpp`, `gemma4.cpp`, `models.h`,
+`frspec-helpers.cpp` reverted to the live/uncached pattern; the
+`output_w`/`out_template` caching fields and the now-unused
+`llm_frspec_gather_vocab_rows_from_backend` helper removed entirely
+rather than left as dead, tempting code (commit `fc0818502`). Final,
+validated numbers for FR-Spec + MTP, `--spec-type draft-mtp`, fix
+applied: **55.6-56.7 tok/s, 43-44% accept**, vs 75.93 tok/s / 81.5%
+without FR-Spec - a genuine ~26% throughput cost and a real
+accept-rate cost, not the free trim originally hoped for. Still a
+plausible trade in a real VRAM-constrained deployment (that's the
+whole point of trimming the vocab), just not a free one - budget for
+it rather than assuming parity.
+
+**What this retroactively means for the rest of this investigation**:
+there was never a real "FR-Spec + multi-drafter" bug - that framing
+was a byproduct of comparing a broken cached-FR-Spec run against a
+baseline (implicit `-md` mode) that wasn't running speculative
+decoding at all, so of course adding a second drafter type "made it
+worse" - the baseline had nowhere to go but down once real speculation
+was actually switched on for either side. The `is_other` fix in MTP's
+`accept()` is still real and still kept (any actual multi-drafter MTP
+config has that bug), it was just never this bug's cause.
+
+**Standing caveat for the rest of this document**: any throughput or
+accept-rate number elsewhere in this file that was produced by
+launching with `-md <path>` and no explicit `--spec-type` should be
+treated as a **non-speculative baseline**, not a valid MTP
+measurement, until re-verified with `--spec-type` set explicitly and
+(ideally) `LLAMA_DEBUG_VERIFY=1` confirming `spec` is non-null. This
+document was not fully re-audited line by line for this after the
+discovery; numbers that explicitly show `--spec-type` on the command
+line (e.g. the MTP+suffix-decode "net outcome" figures above, which do
+show it) were real speculative-decoding runs and are not affected by
+this specific bug, but should still be treated as unverified against
+the now-fixed FR-Spec code path until re-measured.
+
+**Recommendation, corrected**: `--spec-vocab-map` is safe to combine
+with a multi-type `--spec-type` configuration now that the actual root
+cause (the cache-once bug, not a multi-drafter interaction) is fixed.
+Budget for FR-Spec's real cost (~26% throughput, ~38pp accept-rate
+drop on this sandbox/prompt) rather than assuming it, and re-measure
+before relying on it for the GLM-5.2/H200 target, where vocab size and
+trim ratio both differ substantially from this sandbox.
+
 ## Probabilistic draft acceptance (`--spec-prob-accept`) - BUILT AND VALIDATED, 2026-08-14
 
 Motivated by the FR-Spec+suffix-decode investigation above: llama.cpp's
@@ -1789,24 +1979,24 @@ target's own sample" behavior the old code always used. Implementation:
   suffix-decode): **53.6-53.8 tok/s (off) -> 55.6-55.7 tok/s (on), a
   real, consistent ~3.5% improvement** - the mechanism genuinely works
   and helps in the case it's designed for.
-- Flag on at `temperature=0` and `0.7`, the broken FR-Spec+suffix-decode
-  config from the investigation above: **no measurable change either
-  way** (~30 tok/s, ~10% accept, same as flag-off). This is a real,
-  useful negative result: it rules out "borderline draft tokens losing
-  narrow coin-flips" as the mechanism behind that bug - MTP's trimmed-
-  vocab candidates in that specific failure mode are apparently getting
-  genuinely low target-probability, not just missing an exact-match
-  technicality, so a smarter acceptance test doesn't recover them. The
-  FR-Spec+suffix-decode incompatibility remains open and undiagnosed at
-  the root-cause level; this doesn't close it, but it does eliminate one
-  candidate explanation with real evidence instead of leaving it as an
-  untested guess.
+- Flag on at `temperature=0` and `0.7`, the FR-Spec config that was
+  believed broken at the time (cache-once bug still present, and
+  measured under implicit `-md` mode besides): **no measurable change
+  either way.** At the time this was read as ruling out "borderline
+  draft tokens losing narrow coin-flips" as the bug's mechanism. With
+  the benefit of the later finding (see "SUPERSEDES THE ABOVE" above),
+  this negative result still stands on its own terms - probabilistic
+  acceptance genuinely doesn't move a *correctness* bug like the
+  cache-once one, since the drafted tokens themselves were being
+  computed wrong, not just narrowly rejected - but it should no longer
+  be read as evidence about FR-Spec+suffix-decode specifically, since
+  that framing itself didn't survive the later investigation.
 
 Recommendation: safe to enable generally (`--spec-prob-accept`) for any
 non-greedy (temperature > 0) deployment using MTP - real upside, zero
-downside by construction. Does not help or hurt the FR-Spec+suffix-decode
-combination either way; that guidance (don't combine them) stands
-unchanged.
+downside by construction. Independent of the now-fixed FR-Spec
+cache-once bug; combine freely with FR-Spec once re-measured against
+the fixed code path.
 
 ## Explicitly decided against
 Multi-LoRA serving (not our use case), multi-node serving (single H200),
