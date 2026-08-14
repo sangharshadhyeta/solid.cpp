@@ -459,6 +459,76 @@ static void common_params_fit_impl(
     uint32_t hp_nct = 0; // hparams.n_ctx_train
     uint32_t hp_nex = 0; // hparams.n_expert
 
+    // step 0: an explicitly-requested context size can be so large that even the *measurement* pass
+    // below (which creates a real llama_context to simulate allocations) hard-aborts the whole process
+    // on CUDA OOM before any of the reduction logic further down gets a chance to run - ggml aborts hard
+    // on CUDA errors, which no try/catch can intercept, so this has to be prevented rather than caught.
+    // The n_ctx==0 (auto) path is already safe because unset context resolves to the model's own trained
+    // context internally before anything is allocated. A large *explicit* request has no such protection,
+    // and - confirmed by testing - even "the model's own trained context" is not a safe stand-in ceiling
+    // by itself (a 256K-trained model can still exceed a 12GB card just to *measure* that size), and a
+    // single two-point extrapolation from tiny probes turned out to be too crude too (the true cost-per-
+    // token isn't uniform all the way from a few thousand tokens up to hundreds of thousands, so a rate
+    // measured near the bottom under- or overshoots badly near the top). Search by doubling instead: each
+    // step is only ever 2x the size of the last one that was *actually measured* to fit, so the risk of
+    // any single probe overshooting stays bounded, and the final number is a real, checked measurement,
+    // not a guess extrapolated from a distant sample. Scoped to the common single-device (or host-only)
+    // case, where the free-memory budget is unambiguous; multi-device setups fall back to the one size
+    // that's unconditionally safe everywhere.
+    const uint32_t requested_n_ctx = cparams->n_ctx;
+    bool ctx_clamped_by_fit = false;
+    if (requested_n_ctx > 4 * n_ctx_min) {
+        llama_context_params cparams_probe = *cparams;
+        cparams_probe.n_ctx = n_ctx_min;
+
+        std::vector<ggml_backend_dev_t> probe_devs;
+        uint32_t probe_hp_ngl = 0, probe_hp_nct = 0, probe_hp_nex = 0;
+        try {
+            const dmds_t dmds_first = common_get_device_memory_data_impl(
+                path_model, mparams, &cparams_probe, probe_devs, probe_hp_ngl, probe_hp_nct, probe_hp_nex, log_level);
+
+            if (probe_devs.size() > 1) {
+                LOG_WRN("%s: requested context of %" PRIu32 " is large and multiple devices are in use - "
+                        "probing at the minimum context size of %" PRIu32 " first instead of risking a hard "
+                        "crash on the raw request\n", __func__, requested_n_ctx, n_ctx_min);
+                cparams->n_ctx = n_ctx_min;
+                ctx_clamped_by_fit = true;
+            } else if (probe_hp_nct > 0 && (int64_t) dmds_first[0].mb.total() + (int64_t) margins_s[0] > (int64_t) dmds_first[0].free) {
+                // does not even fit at the minimum context size - nothing more this step can do,
+                // step 1 below will report the same shortfall through the normal (safe, small-ctx) path
+            } else {
+                const uint32_t ceiling = std::min(requested_n_ctx, probe_hp_nct);
+                uint32_t safe_n_ctx = n_ctx_min;
+                uint32_t next_probe = std::min(2 * n_ctx_min, ceiling);
+                while (true) {
+                    llama_context_params cparams_step = *cparams;
+                    cparams_step.n_ctx = next_probe;
+                    const dmds_t dmds_step = common_get_device_memory_data_impl(
+                        path_model, mparams, &cparams_step, probe_devs, probe_hp_ngl, probe_hp_nct, probe_hp_nex, log_level);
+                    const bool fits = (int64_t) dmds_step[0].mb.total() + (int64_t) margins_s[0] <= (int64_t) dmds_step[0].free;
+                    if (!fits) {
+                        break;
+                    }
+                    safe_n_ctx = next_probe;
+                    if (safe_n_ctx >= ceiling) {
+                        break;
+                    }
+                    next_probe = std::min(2 * safe_n_ctx, ceiling);
+                }
+                if (safe_n_ctx < requested_n_ctx) {
+                    LOG_WRN("%s: requested context of %" PRIu32 " does not fit (model's trained context is %"
+                            PRIu32 ") - probed and confirmed %" PRIu32 " fits instead of risking a hard crash "
+                            "on the raw request\n", __func__, requested_n_ctx, probe_hp_nct, safe_n_ctx);
+                    cparams->n_ctx = safe_n_ctx;
+                    ctx_clamped_by_fit = true;
+                }
+            }
+        } catch (const std::runtime_error &) {
+            // even the small safe probes failed for some unrelated reason (e.g. bad model path) -
+            // let the normal step 1 measurement below surface that error the usual way
+        }
+    }
+
     // step 1: get data for default parameters and check whether any changes are necessary in the first place
 
     LOG_TRC("%s: getting device memory data for initial parameters:\n", __func__);
@@ -574,6 +644,25 @@ static void common_params_fit_impl(
                 LOG_TRC(
                     "%s: cannot meet free memory targets on all devices, need to use %" PRId64 " MiB less in total\n",
                     __func__, -global_surplus/MiB);
+            }
+            if (ctx_clamped_by_fit) {
+                // step 0 already searched for and validated the largest context that fits, with the
+                // same margin required here - reaching this point despite that means the real
+                // measurement below came out slightly different from the last probe (e.g. driver-level
+                // allocator variance right at the boundary step 0 deliberately searched right up to).
+                // The interpolation math below assumes dmds_full was measured at hp_nct, which is no
+                // longer true once step 0 has clamped things, so reusing it here would produce a bogus
+                // (likely far too large) result rather than a merely-suboptimal one - fall back to the
+                // one size every other path in this function already trusts unconditionally instead.
+                LOG_WRN("%s: context size of %" PRIu32 " (found safe by step 0) did not leave the required "
+                        "margin on remeasurement - falling back to the minimum context size of %" PRIu32 "\n",
+                        __func__, cparams->n_ctx, n_ctx_min);
+                cparams->n_ctx = n_ctx_min;
+                if (nd <= 1) {
+                    return;
+                }
+                // nd > 1: fall through to step 3 below, same as the n_ctx==0 path does after reducing
+                // context - layer placement across devices still needs to run using this context size.
             }
             if (cparams->n_ctx == 0) {
                 if (hp_nct > n_ctx_min) {
