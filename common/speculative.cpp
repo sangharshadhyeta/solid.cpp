@@ -1143,7 +1143,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             const int32_t n = (int32_t) dp.n_past;
 
-            const int32_t n_draft = params.n_max;
+            // Respect the caller's remaining per-sequence context budget the
+            // same way draft-simple already does (see its own dp.n_max check
+            // above) - hardens against the class of bug reported upstream in
+            // ggml-org/llama.cpp#26478 (KV cache position crash at the
+            // context boundary), where a block gets built and decoded at the
+            // full configured width regardless of how much context is
+            // actually left. Preventive, not a confirmed fix for a
+            // reproduced crash here: tried directly (A/B rebuild, both with
+            // and without this line, targeted prompts sized to leave a small
+            // partial-block budget at the danger boundary) and could not
+            // trigger the crash in our fork's current state even without
+            // this change - some other layer already prevents it here for
+            // reasons not fully traced. Kept anyway since it's strictly
+            // safer (can only reduce draft width, never increase it) and
+            // mirrors an already-proven pattern at effectively zero cost.
+            // See docs/moe-cache-colibri-notes.md for the full investigation.
+            const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
 
             const int32_t n_block_tokens = n_draft + (is_dspark ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
