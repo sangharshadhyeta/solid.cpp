@@ -1667,8 +1667,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        // is_other=true means a *different* implementation's draft was the one
+        // actually verified this round - n_accepted counts tokens from that
+        // draft, not ours, so it has no valid meaning as an index into our own
+        // verify_h (hidden states saved from our own last draft() call, which
+        // may be several rounds stale by now if another impl has been winning).
+        // Indexing into it with someone else's n_accepted previously corrupted
+        // pending_h with an unrelated hidden state, which this model then fed
+        // straight back into its own next prediction - producing confidently
+        // wrong, often repeating/lagging drafts. Simplest correct fix: leave
+        // pending_h untouched here: it's not being handed a real update to
+        // apply, so an incorrect one is strictly worse than none.
+        if (is_other) {
             return;
         }
 

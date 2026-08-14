@@ -163,28 +163,6 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 // fail model load over it.
 std::vector<int64_t> llm_frspec_load_d2t_sidecar(const std::string & path);
 
-// Gathers just the rows named by d2t_ids out of a full-vocab weight
-// tensor (n_embd * n_vocab_full elements of full_weight->type, row-major
-// by vocab position - i.e. tok_embd/output.weight's usual layout),
-// producing a new, smaller buffer for just the trimmed vocab, in
-// d2t_ids' order. Reads through ggml_backend_tensor_get(), so it works
-// whether full_weight actually lives in CPU or GPU memory. Row-granularity
-// gather is safe for block-quantized types (Q8_0 etc.) as long as n_embd
-// is a whole number of quant blocks, which it always is for real
-// vocab/embedding dimensions - never splits a quant block across a row
-// boundary.
-//
-// Called exactly once per model load (from set_input(), the first time
-// it runs - see llm_graph_input_frspec_d2t below), not from inside the
-// compute graph: gathering via a live ggml_get_rows() graph op instead
-// re-ran the gather as a real GPU kernel on every single forward pass -
-// a real, reproducible decode-speed regression, measured on the sandbox
-// (see docs/moe-cache-colibri-notes.md) - since ordinary ggml graph-node
-// reuse only skips CPU-side graph *construction*, not re-executing each
-// node's kernel once the graph runs.
-std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
-        const ggml_tensor * full_weight, const std::vector<int64_t> & d2t_ids);
-
 // Scatters compressed (trimmed-vocab-sized) logits back into a
 // full-vocab-shaped tensor (positions outside the trimmed set filled
 // -inf), so downstream verify/sampling code never has to know the draft
@@ -194,15 +172,28 @@ std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
 // trimmed-vocab size as `cur`'s first dimension (I32, not I64, so the
 // same tensor doubles as the index argument to ggml_get_rows() when
 // gathering the trimmed weight rows - ggml_get_rows() requires I32).
-// `out_template` must already be F32 [1, n_vocab_full, n_outputs] and
-// -inf-filled (see llm_graph_input_frspec_d2t::out_template below) -
-// this never fills it itself, so it's safe to call every step against
-// the same persistent template without repaying that fill each time:
-// d2t names the same fixed set of positions on every call for a given
-// model instance, so every position outside that set is written by no
-// call, ever, and can safely stay whatever out_template already had.
+//
+// Deliberately a live graph op, rebuilding its -inf template fresh every
+// call, not a cached/populate-once tensor: an earlier version of this
+// (and the weight gather feeding build_lora_mm) cached both under the
+// assumption their shape and content never change once loaded. That
+// assumption was wrong in a way that produced silently corrupted
+// predictions rather than a crash - measured directly: 8.8% draft
+// acceptance with the cached version on this sandbox's real MTP
+// decoding, 44.3% with this live version, same model, same trim, same
+// prompt (see docs/moe-cache-colibri-notes.md for the full
+// investigation). Root cause not fully isolated - likely something
+// about ggml graph-reuse eligibility not correctly accounting for a
+// cached input whose needed shape isn't actually as constant as
+// assumed - but the fix here is unambiguous and verified, not
+// theoretical. Costs a real, measured amount of throughput versus a
+// correctly-working cache (this session's earlier, invalid "parity"
+// benchmarks never actually exercised real speculative decoding to
+// catch this - see the docs writeup) - revisit caching only with a
+// verification methodology that guarantees real drafting is exercised,
+// not assumed.
 ggml_tensor * llm_frspec_scatter_to_full_vocab(
-        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, ggml_tensor * out_template);
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab_full);
 
 // Internal-only read side of the pending-vocab-map hint - see
 // llama_frspec_set_pending_vocab_map() in llama.h for the public setter
@@ -212,53 +203,30 @@ ggml_tensor * llm_frspec_scatter_to_full_vocab(
 // later, unrelated model load never accidentally inherits a stale value.
 std::string llm_frspec_take_pending_vocab_map();
 
-// Graph input for FR-Spec vocab trimming. Shared so each architecture's
-// own graph-building code only needs a few lines (create this, use
-// output_w in build_lora_mm instead of the full weight, scatter back via
-// out_template) rather than reimplementing the input-tensor lifecycle -
-// see gemma4-assistant.cpp for the one current user. Three different
-// lifetimes bundled into one input:
-//   - d2t (the index tensor): constant for the model's whole lifetime,
-//     cheap to rewrite, rewritten on every set_input() call regardless.
-//   - output_w (the pre-gathered trimmed weight) and out_template (the
-//     -inf-filled full-vocab scatter target): both also constant for the
-//     model's whole lifetime, but genuinely expensive to recompute (a
-//     real row-gather, and a full-vocab-width fill, respectively) -
-//     populated exactly once, on the first set_input() call, then left
-//     alone. Doing either as a live graph op every step instead (the
-//     original design for both) re-ran real GPU kernels on every single
-//     decode step - can_reuse()=true only skips rebuilding the graph's
-//     CPU-side topology, it does not skip executing each node's kernel
-//     once the graph runs, so "constant" ops sitting in the graph are
-//     silently paid for on every step regardless. Both sidestep that by
-//     never appearing as graph nodes in the first place - they're plain
-//     inputs, like d2t itself. out_template stays correct without ever
-//     being re-filled because d2t names the exact same fixed positions
-//     on every scatter call for a given model instance - every position
-//     outside that set is written by no call, ever, so it can safely
-//     keep whatever the one-time fill gave it.
-// can_reuse() always returns true for all three: none ever changes in a
-// way that should defeat graph/CUDA-graph reuse across decode steps the
-// way a genuinely per-token-varying input would.
+// Graph input for the d2t index tensor FR-Spec vocab trimming needs.
+// Shared so each architecture's own graph-building code only needs a
+// few lines (create this, ggml_get_rows the weight, build_lora_mm on
+// the result, scatter back) rather than reimplementing the input-tensor
+// lifecycle - see gemma4-assistant.cpp for the one current user. Unlike
+// ordinary per-ubatch inputs (attention masks, positions, ...), d2t
+// itself is genuinely constant for the model's whole lifetime once
+// loaded (just a fixed list of token ids, cheap to rewrite regardless),
+// so can_reuse() always returns true - this never defeats graph/CUDA-graph
+// reuse across decode steps the way a genuinely per-token-varying input
+// would. The weight gather and scatter template that use this d2t are
+// deliberately *not* cached the same way - see llm_frspec_scatter_to_full_vocab's
+// own comment for why that was tried and reverted.
 class llm_graph_input_frspec_d2t : public llm_graph_input_i {
 public:
-    llm_graph_input_frspec_d2t(const std::vector<int64_t> & ids, const ggml_tensor * full_weight) :
-        ids(ids), full_weight(full_weight) {}
+    llm_graph_input_frspec_d2t(const std::vector<int64_t> & ids) : ids(ids) {}
     virtual ~llm_graph_input_frspec_d2t() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * d2t          = nullptr; // I32 [n_trimmed_vocab]
-    ggml_tensor * output_w     = nullptr; // same type as full_weight, [n_embd, n_trimmed_vocab]
-    ggml_tensor * out_template = nullptr; // F32 [1, n_vocab_full, n_outputs], -inf outside the trimmed set
+    ggml_tensor * d2t = nullptr; // I32 [n_trimmed_vocab]
 
     const std::vector<int64_t> & ids;
-    const ggml_tensor * full_weight; // source for output_w's one-time gather; never itself modified
-
-private:
-    bool output_w_populated     = false;
-    bool out_template_populated = false;
 };
 
 //

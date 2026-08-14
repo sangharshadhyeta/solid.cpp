@@ -52,82 +52,38 @@ std::vector<int64_t> llm_frspec_load_d2t_sidecar(const std::string & path) {
     return d2t;
 }
 
-std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
-        const ggml_tensor * full_weight, const std::vector<int64_t> & d2t_ids) {
-    // Row-granularity gather: each row is full_weight->ne[0] elements.
-    // This is safe for block-quantized types as long as that's a whole
-    // number of the type's quant blocks (true for every real embedding
-    // dimension - block sizes are small powers of 2 like 32/256, embedding
-    // dims are large powers of 2/multiples thereof), so no row ever splits
-    // a quant block.
-    const size_t row_bytes = ggml_row_size(full_weight->type, full_weight->ne[0]);
-    std::vector<uint8_t> out(row_bytes * d2t_ids.size());
-    for (size_t i = 0; i < d2t_ids.size(); i++) {
-        const int64_t tok = d2t_ids[i];
-        ggml_backend_tensor_get(full_weight, out.data() + i * row_bytes, (size_t) tok * row_bytes, row_bytes);
-    }
-    return out;
-}
-
 ggml_tensor * llm_frspec_scatter_to_full_vocab(
-        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, ggml_tensor * out_template) {
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab_full) {
     const int64_t n_draft_vocab = cur->ne[0];
     const int64_t n_outputs     = cur->ne[1];
-    const int64_t n_vocab_full  = out_template->ne[1];
 
     GGML_ASSERT(d2t->type == GGML_TYPE_I32);
     GGML_ASSERT(d2t->ne[0] == n_draft_vocab);
-    GGML_ASSERT(out_template->type == GGML_TYPE_F32);
-    GGML_ASSERT(out_template->ne[2] == n_outputs);
 
-    cur = ggml_set_rows(ctx0, out_template,
+    ggml_tensor * logits = ggml_fill(ctx0, ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, n_vocab_full, n_outputs), -INFINITY);
+    cur = ggml_set_rows(ctx0, logits,
             ggml_reshape_3d(ctx0, cur, 1,             n_draft_vocab, n_outputs),
             ggml_reshape_3d(ctx0, d2t, n_draft_vocab, 1,             1));
     return ggml_reshape_2d(ctx0, cur, n_vocab_full, n_outputs);
 }
 
 void llm_graph_input_frspec_d2t::set_input(const llama_ubatch * /*ubatch*/) {
-    // d2t: constant for the model's whole lifetime - same data on every
-    // graph build, unlike ordinary per-ubatch inputs. Cheap enough (a few
-    // KB at most for any realistic trim size) that redoing this on every
-    // call rather than tracking an "already set" flag isn't worth the
-    // extra state.
+    // Constant for the model's whole lifetime - same data on every graph
+    // build, unlike ordinary per-ubatch inputs. Cheap enough (a few KB at
+    // most for any realistic trim size) that redoing this on every call
+    // rather than tracking an "already set" flag isn't worth the extra
+    // state.
     //
     // Stored/loaded as int64_t (ids, from the plain-text sidecar) but the
-    // tensor itself is I32 (ggml_get_rows() requires it, and d2t is also
-    // used directly as an index by build code elsewhere) - real vocab
+    // tensor itself is I32 (ggml_get_rows() requires it) - real vocab
     // sizes are always far under INT32_MAX, so this narrowing is exact.
     std::vector<int32_t> ids32(ids.begin(), ids.end());
     ggml_backend_tensor_set(d2t, ids32.data(), 0, ids32.size() * sizeof(int32_t));
-
-    // output_w: unlike d2t, genuinely expensive to redo (a real row
-    // gather, not a few KB of index copying) - populated exactly once.
-    // Safe to leave stale-if-ever-repopulated-differently because it
-    // never changes: full_weight is the original, never-modified
-    // checkpoint tensor, and ids is the same sidecar-derived list for
-    // this model instance's entire lifetime.
-    if (output_w && !output_w_populated) {
-        std::vector<uint8_t> gathered = llm_frspec_gather_vocab_rows_from_backend(full_weight, ids);
-        ggml_backend_tensor_set(output_w, gathered.data(), 0, gathered.size());
-        output_w_populated = true;
-    }
-
-    // out_template: the -inf-filled full-vocab scatter target. Same
-    // "genuinely expensive, populate once" reasoning as output_w - a
-    // full-vocab-width fill is a real kernel's worth of work, not
-    // something to redo every step for a value that never changes at
-    // any position this input's own scatter ever touches.
-    if (out_template && !out_template_populated) {
-        const int64_t n = ggml_nelements(out_template);
-        std::vector<float> neg_inf((size_t) n, -INFINITY);
-        ggml_backend_tensor_set(out_template, neg_inf.data(), 0, (size_t) n * sizeof(float));
-        out_template_populated = true;
-    }
 }
 
 bool llm_graph_input_frspec_d2t::can_reuse(const llm_graph_params & /*params*/) {
-    // Neither d2t nor output_w ever changes once loaded - always safe to
-    // reuse whatever graph this was last built into, regardless of
-    // ubatch shape or other graph params.
+    // d2t itself never changes once loaded - always safe to reuse
+    // whatever graph this was last built into, regardless of ubatch
+    // shape or other graph params.
     return true;
 }
