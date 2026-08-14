@@ -21,8 +21,35 @@ void llama_model_gemma4_assistant::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,   hparams.n_embd_head_v_swa);
 }
 
-void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader &) {
+void llama_model_gemma4_assistant::load_arch_tensors(llama_model_loader & ml) {
     LLAMA_LOAD_LOCALS;
+
+    // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md).
+    // This model instance's own output.weight below is always created and
+    // loaded at its real, full size, completely unchanged - the trim only
+    // ever affects which rows of it the graph-building code below chooses
+    // to matmul against, never the tensor/weights themselves. Silently a
+    // no-op (empty frspec_d2t_ids) whenever no hint was set.
+    {
+        const std::string vocab_map_path = llm_frspec_take_pending_vocab_map();
+        if (!vocab_map_path.empty()) {
+            frspec_d2t_ids = llm_frspec_load_d2t_sidecar(vocab_map_path);
+            if (!frspec_d2t_ids.empty()) {
+                // LLAMA_LOG_WARN, not _INFO: this codebase's default server
+                // verbosity maps GGML_LOG_LEVEL_INFO to trace-level (hidden
+                // unless -lv is cranked way up), so a plain _INFO call here
+                // would silently never appear in normal server logs. This
+                // status line is exactly the kind of one-time, load-time
+                // confirmation a deploying user needs to see by default.
+                LLAMA_LOG_WARN("%s: FR-Spec vocab trim active (%zu of %lld tokens, from %s)\n",
+                        __func__, frspec_d2t_ids.size(), (long long) n_vocab, vocab_map_path.c_str());
+            } else {
+                LLAMA_LOG_WARN("%s: FR-Spec vocab map %s configured but empty/unreadable - loading full vocab\n",
+                        __func__, vocab_map_path.c_str());
+            }
+        }
+    }
+    GGML_UNUSED(ml);
 
     if (n_embd_head_k != n_embd_head_v) {
         throw std::runtime_error("Gemma 4 assistant requires n_embd_head_k == n_embd_head_v");
@@ -190,7 +217,32 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     cb(cur, "result_norm", -1);
 
-    ggml_tensor * logits = build_lora_mm(model.output, cur);
+    // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md):
+    // when this instance was loaded with a sidecar vocab map, gather just
+    // the trimmed rows of the output weight and matmul against those
+    // instead of the full vocab - cuts the dominant draft-time cost
+    // losslessly, since the scattered-back logits below are -inf
+    // everywhere outside the trimmed set and the target always
+    // re-verifies over the real, full vocab regardless.
+    const auto & gmodel = static_cast<const llama_model_gemma4_assistant &>(model);
+
+    ggml_tensor * output_w = model.output;
+    llm_graph_input_frspec_d2t * inp_d2t = nullptr;
+    if (!gmodel.frspec_d2t_ids.empty()) {
+        auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids);
+        inp->d2t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) gmodel.frspec_d2t_ids.size());
+        ggml_set_input(inp->d2t);
+        inp_d2t = inp.get();
+        output_w = ggml_get_rows(ctx0, model.output, inp->d2t);
+        res->add_input(std::move(inp));
+    }
+
+    ggml_tensor * logits = build_lora_mm(output_w, cur);
+
+    if (inp_d2t) {
+        logits = llm_frspec_scatter_to_full_vocab(ctx0, logits, inp_d2t->d2t, (int64_t) model.vocab.n_tokens());
+    }
+
     cb(logits, "result_output", -1);
     res->t_logits = logits;
 

@@ -9,6 +9,8 @@ add_library(${TARGET} STATIC
     server-chat.h
     server-task.cpp
     server-task.h
+    server-token-freq.cpp
+    server-token-freq.h
     server-queue.cpp
     server-queue.h
     server-common.cpp

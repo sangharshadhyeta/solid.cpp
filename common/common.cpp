@@ -1687,9 +1687,14 @@ static double common_moe_bench_candidate_server(
     // both MoE-cache hit rate and MTP acceptance rate, biasing every
     // throughput number measured this way. Real, representative numbers
     // require realistic, non-degenerate generation.
+    // --no-token-freq-log: this candidate's probe traffic is a handful of
+    // fixed prompts repeated across many candidates, not representative of
+    // real deployment usage - would badly skew a histogram meant to guide
+    // FR-Spec vocab trimming toward this benchmark's own prompt pool
+    // instead of real traffic.
     snprintf(cmd, sizeof(cmd),
         "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache auto -c %u %s%s%s"
-        "--temp 1.0 --top-p 0.95 --top-k 64 "
+        "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
         self_exe.c_str(), path_model.c_str(), n_cpu_moe, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), port);

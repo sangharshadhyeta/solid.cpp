@@ -466,6 +466,19 @@ extern "C" {
     LLAMA_API struct llama_sampler_chain_params  llama_sampler_chain_default_params(void);
     LLAMA_API struct llama_model_quantize_params llama_model_quantize_default_params(void);
 
+    // FR-Spec-style MTP draft-vocab trim (see docs/moe-cache-colibri-notes.md
+    // in the llama.cpp source tree, "FR-Spec draft-vocab trimming"): hints
+    // that the *next* llama_model_load_from_file() call is loading a
+    // speculative draft that should have its output projection trimmed to
+    // the vocab subset named by the sidecar mapping file at `path` (see
+    // tools/frspec-vocab-trim). Consumed (cleared) by that load - call
+    // this immediately before loading the draft specifically, never
+    // before loading the target model. Pass NULL or an empty path to
+    // clear a pending hint without loading anything. Currently honored by
+    // gemma4-family models only; a no-op (silently ignored, not an error)
+    // for architectures that haven't wired this in yet.
+    LLAMA_API void llama_frspec_set_pending_vocab_map(const char * path);
+
     // Initialize the llama + ggml backend
     // If numa is true, use NUMA optimizations
     // Call once at the start of the program

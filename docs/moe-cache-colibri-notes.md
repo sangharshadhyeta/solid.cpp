@@ -1227,9 +1227,144 @@ against exactly this failure mode.
       backed up during development, not kept in the tree.
 
 ## Near-term - targets the GLM-5.2/H200 deployment directly
-- FR-Spec draft-vocab trimming for GLM's MTP (pattern proven for Qwen,
-  issue #25187, needs ~30-line port to glm-dsa.cpp). ~75% draft LM-head
-  compute cut, lossless. Small slice of total, but cheap once ported.
+- ~~FR-Spec draft-vocab trimming for GLM's MTP~~ **BUILT for gemma4
+  (sandbox), MEASURED, gemma4-only for now, 2026-08-14.** Not the
+  upstream EAGLE3/qwen35 design (a d2t tensor baked into a pre-trimmed
+  draft GGUF at conversion time - no producer tooling for that exists
+  anywhere upstream, not even for its original Qwen3.5 target). Instead,
+  Option B from this session's own design discussion: the original draft
+  checkpoint is never modified. Four pieces, all model-agnostic except
+  the last:
+  1. **Real-traffic token-frequency logging** (`tools/server/server-token-freq.{h,cpp}`,
+     `server_token_freq_logger`) - the server passively counts every
+     confirmed *generated* token (not prompt tokens) into a dense
+     per-vocab-id histogram, persisted as sparse JSON under
+     `fs_get_cache_directory()`, keyed by a hash of the model path,
+     accumulating across restarts. `--token-freq-log` (on by default).
+  2. **Sidecar regeneration tool** (`tools/frspec-vocab-trim/`,
+     `llama-frspec-vocab-trim`) - standalone, re-runnable any time (cron,
+     or by hand): reads the histogram, ranks by real frequency, writes
+     the top N token ids as a plain-text sidecar file (one id per line,
+     trimmed-vocab position = line index - the same d2t convention
+     EAGLE3/qwen35 use, just sourced externally instead of from a GGUF
+     tensor).
+  3. **Shared, architecture-agnostic ggml helpers**
+     (`src/models/models.h` + `src/models/frspec-helpers.cpp`):
+     `llm_frspec_load_d2t_sidecar`, `llm_frspec_gather_vocab_rows`,
+     `llm_frspec_scatter_to_full_vocab`, the pending-vocab-map hint
+     mechanism (`llama_frspec_set_pending_vocab_map` in `llama.h`, public
+     API - needed to cross the `common/` -> `src/models/` boundary since
+     Gemma-4's MTP draft has no in-file signal distinguishing it from the
+     trunk the way qwen35's `mtp_only` flag does), and
+     `llm_graph_input_frspec_d2t` (an `llm_graph_input_i`, matching
+     `granite-switch.cpp`'s `llm_graph_input_switch` template exactly -
+     the correct pattern for a load-time-populated, per-model-lifetime-constant
+     tensor, found only after an extended dead end trying to create a
+     GGUF-independent constant weight tensor directly via
+     `llama_model_loader` internals). A future GLM port only needs a
+     small amount of code calling into these already-tested helpers, not
+     a fresh reimplementation.
+  4. **Load-time gather/scatter wiring** - architecture-specific, ~40
+     lines. Named `--spec-vocab-map <path>` on the CLI
+     (`common_params_speculative_draft::frspec_vocab_map`).
+
+  **Real bug: wired into the wrong class initially.** Gemma-4's MTP
+  draft GGUF declares `general.architecture = gemma4-assistant`
+  (`LLM_ARCH_GEMMA4_ASSISTANT` -> `llama_model_gemma4_assistant`,
+  `src/models/gemma4-assistant.cpp`) - a genuinely separate architecture
+  from the `gemma4` trunk class the *target* checkpoint uses, not a mode
+  flag on the same class. The first pass wired the trim into
+  `gemma4.cpp` (`llama_model_gemma4`) end to end, compiled cleanly, and
+  only revealed the mismatch at live-load time (no "FR-Spec vocab trim
+  active" log line, traced via targeted debug instrumentation before
+  finding the real cause: `strings <gguf> | grep general.architecture`
+  showed `gemma4-assistant`, not `gemma4`). Ported the identical pattern
+  to `gemma4-assistant.cpp`; `gemma4.cpp`'s copy was left in place
+  (harmless no-op there in this deployment shape, and free insurance for
+  any future case where `gemma4` itself is loaded as a self-speculating
+  MTP draft).
+
+  **Three more real bugs found and fixed during build/verify, all
+  latent, none specific to this feature's logic:**
+  - **Token-frequency histogram was never flushed on normal shutdown.**
+    `destroy()` (which flushes) was only ever called on the
+    server's "sleeping" state transition, never from the actual
+    `SIGTERM`/`SIGINT` shutdown path (`clean_up()` in `server.cpp` calls
+    `ctx_server.terminate()`, which only unblocks the task queue - it
+    never touched the logger). Every restart silently lost every count
+    recorded since the last periodic 4096-token flush - for the
+    "restart to regenerate the sidecar" workflow this whole feature
+    depends on, that could be most or all of a session's real traffic,
+    every single time. Fixed with a new public
+    `server_context::flush_token_freq()`, called from `clean_up()`
+    before `terminate()`. Verified with a real kill -TERM: histogram
+    file was stale/empty before the fix, correctly populated after.
+  - **`llama-frspec-vocab-trim`'s `--model-draft` flag hashed the wrong
+    path.** The server keys the histogram by the *target* model's path
+    (`params_base.model.path`) - correct, since confirmed generated
+    tokens are always in the target's vocab space regardless of which
+    draft proposed the (possibly-rejected) candidates for them - but the
+    tool derived its lookup hash from whatever `--model-draft` path the
+    user passed. Every user following the tool's own documented usage
+    would reliably get "no histogram found" starting from nothing.
+    Renamed the flag to `--model` (target model path; `--model-draft` is
+    kept as an accepted alias for the old name, not removed outright).
+  - **`ggml_get_rows` requires I32 indices, not I64.** Initial design
+    copied EAGLE3/qwen35's convention of an I64 d2t tensor (needed for
+    their `ggml_set_rows`-only scatter-back use case). This trim also
+    needs a *gather* step first (EAGLE3/qwen35 never do, since their
+    trim is baked in at conversion time) - `ggml_get_rows` asserts
+    `b->type == GGML_TYPE_I32` and would have failed loudly the first
+    time a real trim was exercised. Switched the shared d2t tensor to
+    I32 throughout (still accepted by `ggml_set_rows`, which allows
+    either).
+
+  **Verified correct, not just compiled.** Live end-to-end test on the
+  sandbox (RTX 3060, gemma-4-26B-A4B, Q8_0 draft): confirmed the
+  activation log line fires with the real trim size
+  ("421 of 262144 tokens" from an initial small real-traffic sample);
+  identical output to the untrimmed baseline at temp=0
+  ("The capital of France is **Paris**.", byte-for-byte, same
+  `predicted_n`); coherent output on a "list primes" prompt; and one
+  prompt ("haiku about mountains") that degenerated into token
+  repetition identically *with and without* the trim, confirming that's
+  a pre-existing small-quant-model quality artifact, not something the
+  trim introduced. This matches the design's lossless guarantee: the
+  draft's candidates are restricted to the trimmed set, but the target
+  always re-verifies over the real, full vocab, so a wrong/rejected
+  draft proposal can only cost a fallback token, never wrong output.
+
+  **Honest speed finding: no net win measured in this sandbox, possibly
+  a small regression.** Repeated timing on a 200-token completion
+  (temp=0): untrimmed baseline ~61-63 tok/s; trimmed ~55-59 tok/s -
+  reproduced with two different sidecars, including one built directly
+  from 12 real repetitions of the *exact* benchmark prompt itself (645
+  tokens, 100% coverage of its own observed traffic - about as
+  favorable a real-traffic match as this technique could ever get).
+  Working theory, not yet confirmed at the kernel level: the trim is
+  applied via a live `ggml_get_rows` gather inside the compute graph on
+  *every* forward pass (not a persistent pre-gathered weight - deliberately
+  avoided per Option B, and blocked architecturally besides: no clean
+  way found in `llama_model_loader` to create a GGUF-independent
+  constant weight tensor, which is *why* this uses a live
+  `llm_graph_input_i` gather instead). At the very small per-step batch
+  sizes real MTP drafting uses (`--parallel 1`, `spec-draft-n-max=3`
+  here), the fixed launch/dispatch overhead of an extra GPU kernel per
+  step may be outweighing whatever the smaller LM-head matmul saves -
+  plausible on this GPU/draft-size/vocab combination, but genuinely
+  untested at GLM-5.2/H200 scale (a much larger draft, a different vocab
+  size, real concurrent multi-user batches rather than solo
+  `--parallel 1`). **Do not treat this as validating or invalidating the
+  technique for the real deployment target** - it's a real result on the
+  sandbox proxy only, in the direction opposite to what the technique
+  promises, and the honest next step before porting to GLM's
+  `glm-dsa.cpp` is re-measuring closer to the real target's scale, not
+  extrapolating either way from this number.
+
+  Toggling is clean either way: `--spec-vocab-map` unset (the default)
+  is a verified no-op - `frspec_d2t_ids` stays empty, `load_arch_tensors`
+  and the graph-building gather/scatter code both no-op, full untrimmed
+  vocab used exactly as before this feature existed.
 - LFRU eviction + hysteresis + decay, replacing our ported plain LRU
   (Colibri's tier.h). No hard number yet - needs A/B. Motivated by
   GLM-5.2's confirmed skew.
