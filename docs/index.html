@@ -1,0 +1,149 @@
+<!doctype html>
+<title>Throughput Impact</title>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#2563eb;--good:#059669;--warn:#d97706;--bad:#dc2626;--code-bg:#f3f4f6;}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){--bg:#16181d;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1f2229;}
+}
+:root[data-theme="dark"]{--bg:#16181d;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1f2229;}
+body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;max-width:900px;margin:0 auto;padding:2rem 1.25rem 4rem;line-height:1.5;}
+h1{font-size:1.5rem;margin-bottom:.25rem;}
+.sub{color:var(--muted);font-size:.9rem;margin-bottom:2rem;}
+table{width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:.92rem;table-layout:fixed;}
+th,td{text-align:left;padding:.55rem .6rem;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:break-word;}
+th{color:var(--muted);font-weight:600;font-size:.8rem;text-transform:uppercase;letter-spacing:.02em;}
+td.num{font-variant-numeric:tabular-nums;white-space:normal;font-weight:600;}
+.tag{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.72rem;font-weight:600;white-space:nowrap;}
+.tag-solid{background:color-mix(in srgb, var(--good) 18%, transparent);color:var(--good);}
+.tag-caveat{background:color-mix(in srgb, var(--warn) 18%, transparent);color:var(--warn);}
+.tag-retracted{background:color-mix(in srgb, var(--bad) 18%, transparent);color:var(--bad);}
+.delta-pos{color:var(--good);font-weight:700;}
+.delta-neg{color:var(--bad);font-weight:700;}
+.delta-none{color:var(--muted);}
+.section-note{background:var(--code-bg);border-left:3px solid var(--accent);padding:.85rem 1rem;border-radius:4px;font-size:.88rem;margin:1rem 0 1.5rem;}
+.section-note.warn{border-left-color:var(--warn);}
+code{background:var(--code-bg);padding:.1rem .35rem;border-radius:4px;font-size:.85em;}
+footer{margin-top:2.5rem;padding-top:1rem;border-top:1px solid var(--border);color:var(--muted);font-size:.82rem;}
+</style>
+
+<h1>Throughput impact, by piece of work</h1>
+<div class="sub">RTX 3060 + Gemma-4-26B-A4B sandbox, this session — confidence tags indicate how the number was measured</div>
+
+<div class="section-note">
+<strong>Confidence key:</strong>
+<span class="tag tag-solid">solid</span> chat-templated (<code>/v1/chat/completions</code>) and/or content-verified coherent &nbsp;·&nbsp; <span class="tag tag-caveat">caveat</span> measured correctly but with a real, named limitation
+</div>
+
+<table>
+<colgroup>
+<col style="width:30%">
+<col style="width:15%">
+<col style="width:15%">
+<col style="width:12%">
+<col style="width:28%">
+</colgroup>
+<thead><tr><th>Work</th><th>Before</th><th>After</th><th>Δ</th><th>Confidence</th></tr></thead>
+<tbody>
+
+<tr>
+<td><strong>moe-cache core port</strong><br><span style="color:var(--muted);font-size:.85rem">CPU-only MoE → GPU-cached hot experts, ncmoe=15, re-verified via <code>/v1/chat/completions</code></span></td>
+<td class="num">39.37 tok/s<br><span style="color:var(--muted)">(--moe-cache off)</span></td>
+<td class="num">51.71 tok/s<br><span style="color:var(--muted)">(--moe-cache auto)</span></td>
+<td class="num delta-pos">+31.3%</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>Live <code>reserve_mb</code>/<code>max_batch</code> fix</strong><br><span style="color:var(--muted);font-size:.85rem">was silently disabling the cache on this 12GB card</span></td>
+<td colspan="3" style="color:var(--muted)">the moe-cache on/off row above <em>is</em> the proof this fix mattered - without it the cache never engaged on this card at all</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>Placement sweep</strong><br><span style="color:var(--muted);font-size:.85rem">found real <code>-ncmoe</code> optimum vs. a conservative guess, re-verified via <code>/v1/chat/completions</code> (ncmoe 13-30 swept)</span></td>
+<td class="num">46.995 tok/s<br><span style="color:var(--muted)">(ncmoe=30, conservative guess)</span></td>
+<td class="num">51.71 tok/s<br><span style="color:var(--muted)">(ncmoe=15, real optimum)</span></td>
+<td class="num delta-pos">+10.0%</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">the original "+31%, 61+ tok/s" claim was itself inflated by the endpoint bug - real gain is smaller but genuine</span></td>
+</tr>
+
+<tr>
+<td><strong>Layer 1 — live auto-placement</strong><br><span style="color:var(--muted);font-size:.85rem">OOM avoidance, not a speed lever</span></td>
+<td colspan="3" style="color:var(--muted)">reliability fix — turns a hard crash into a working server; not a throughput number</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>Layer 2 — <code>--moe-calibrate</code></strong><br><span style="color:var(--muted);font-size:.85rem">empirical placement search vs. safe-floor-only, re-verified 2026-08-14</span></td>
+<td class="num">41.68 tok/s<br><span style="color:var(--muted)">(safe floor, ncmoe=13)</span></td>
+<td class="num">50.70 tok/s<br><span style="color:var(--muted)">(ncmoe=15)</span></td>
+<td class="num delta-pos">+21.6%</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>MTP, corrected re-measurement</strong><br><span style="color:var(--muted);font-size:.85rem">ncmoe=15, chat-templated, content-verified coherent, golden-section search bug fixed</span></td>
+<td class="num">50.70 tok/s<br><span style="color:var(--muted)">(ncmoe=15, no MTP)</span></td>
+<td class="num">64.92 tok/s<br><span style="color:var(--muted)">(+ MTP n_max=3)</span></td>
+<td class="num delta-pos">+28.1%</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">supersedes an earlier n_max=9/54.55 result - the search itself had a bug, fixed 2026-08-14</span></td>
+</tr>
+
+<tr>
+<td><strong>Thread-count tuning (MTP-aware)</strong><br><span style="color:var(--muted);font-size:.85rem">re-tried at the corrected n_max=3</span></td>
+<td class="num">64.92 tok/s<br><span style="color:var(--muted)">(6 threads, default)</span></td>
+<td class="num">48.71 tok/s<br><span style="color:var(--muted)">(12 threads)</span></td>
+<td class="num delta-none">no gain - stayed at 6</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">correctly rejected; more threads lost this time, opposite of the earlier (now-superseded) n_max=9 run</span></td>
+</tr>
+
+<tr>
+<td><strong>LFRU eviction (final: capped SLRU + heat tiebreak)</strong><br><span style="color:var(--muted);font-size:.85rem">4 designs A/B'd; uncapped SLRU (60.2%) and 2 decay-only-cap variants (61.3-61.4%) all regressed and were reverted</span></td>
+<td class="num">63.8% hit rate<br><span style="color:var(--muted)">(plain LRU)</span></td>
+<td class="num">65.0% hit rate<br><span style="color:var(--muted)">(capped SLRU + heat tiebreak)</span></td>
+<td class="num delta-pos">+1.2pp</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>Concurrency-target-aware <code>--moe-calibrate</code></strong><br><span style="color:var(--muted);font-size:.85rem">benchmarks candidates with real concurrent requests when <code>--parallel N &gt; 1</code>, instead of solo decode speed</span></td>
+<td class="num">78.12 tok/s<br><span style="color:var(--muted)">(independent concurrency-sweep measurement, --parallel 8)</span></td>
+<td class="num">76.11 tok/s<br><span style="color:var(--muted)">(calibrated aggregate, --parallel 8)</span></td>
+<td class="num delta-none">cross-validated, within noise</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">not a throughput gain itself — proves the calibrator's aggregate-tok/s scoring matches an independent measurement, so it can be trusted to pick concurrency-correct placements</span></td>
+</tr>
+
+<tr>
+<td><strong>FR-Spec-style MTP draft-vocab trim, final corrected number</strong><br><span style="color:var(--muted);font-size:.85rem">gemma4-assistant, 645-token real-traffic sidecar, explicit <code>--spec-type draft-mtp</code> so real speculative decoding is actually exercised on both sides</span></td>
+<td class="num">75.93 tok/s<br><span style="color:var(--muted)">(no trim, 81.5% draft accept)</span></td>
+<td class="num">55.6-56.7 tok/s<br><span style="color:var(--muted)">(645-token trim, 43-44% draft accept)</span></td>
+<td class="num delta-neg">-26%</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">root cause: a "cache once" gather/scatter optimization corrupted MTP's draft predictions; reverting to live (recomputed every step) graph ops alone took accept rate 8.8%→44.3%. A genuine, budget-for-it cost, not a free trim — still untested at GLM-5.2/H200 scale, still a no-op when <code>--spec-vocab-map</code> is unset</span></td>
+</tr>
+
+<tr>
+<td><strong>Probabilistic draft acceptance (<code>--spec-prob-accept</code>)</strong><br><span style="color:var(--muted);font-size:.85rem">accepts a draft token whenever the target considers it at least as likely as the draft did (<code>min(1, p_target/p_draft)</code>), not only on exact match — opt-in, byte-identical to before when off</span></td>
+<td class="num">53.6-53.8 tok/s<br><span style="color:var(--muted)">(flag off, temp=0.7, healthy MTP-only config)</span></td>
+<td class="num">55.6-55.7 tok/s<br><span style="color:var(--muted)">(flag on, same config)</span></td>
+<td class="num delta-pos">+~3.5%</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">flag off verified byte-identical to before this feature existed; at temp=0 confirmed a mathematical no-op (greedy target has a point-mass distribution, so this never applies) rather than assumed. Only matters at temperature &gt; 0 — real, free upside there, zero downside by construction</span></td>
+</tr>
+
+<tr>
+<td><strong>MTP <code>accept()</code> stale-state fix</strong><br><span style="color:var(--muted);font-size:.85rem">a different configured drafter winning a round was corrupting MTP's own recurrent hidden-state input with unrelated data</span></td>
+<td colspan="3" style="color:var(--muted)">correctness fix for any multi-drafter MTP configuration — not a throughput lever on its own (measured separately: not the cause of the FR-Spec collapse above)</td>
+<td><span class="tag tag-solid">solid</span></td>
+</tr>
+
+<tr>
+<td><strong>Backend sampling (<code>-bs</code>)</strong><br><span style="color:var(--muted);font-size:.85rem">already existed upstream, validated here — samples on-device instead of copying the full logits matrix D2H every step for CPU-side sampling</span></td>
+<td class="num">103.59 tok/s<br><span style="color:var(--muted)">(flag off, aggregate, --parallel 4)</span></td>
+<td class="num">107.48 tok/s<br><span style="color:var(--muted)">(flag on, same config)</span></td>
+<td class="num delta-pos">+3.76%</td>
+<td><span class="tag tag-solid">solid</span><br><span style="color:var(--muted);font-size:.78rem">also +4.98% at --parallel 8 (past this card's MMVQ cliff, but both arms equally confounded — comparison still fair). Real but modest here vs. upstream's own +48% at 32 slots on an RTX 5090 — this sandbox has nowhere near that concurrency or GPU speed, both of which the win scales with. Worth re-validating at the GLM-5.2/H200 target specifically</span></td>
+</tr>
+
+</tbody>
+</table>
+
+<footer>Session work, RTX 3060 sandbox — not yet re-run on the real GLM-5.2/H200 deployment target. All rows re-verified 2026-08-14 via <code>/v1/chat/completions</code> after three real bugs were found and fixed: an endpoint-formatting bug (raw <code>/completion</code> bypasses the chat template, silently inflating throughput on this instruction-tuned model), a golden-section search bug (silently missed a better already-measured point), and a "cache once" correctness bug in the FR-Spec draft-vocab trim (corrupted MTP's draft predictions, cut accept rate roughly 5x until reverted to live graph ops). Throughput numbers in this table are not portable across prompts, and any number not shown here that was measured via implicit <code>-md</code>-only mode (no explicit <code>--spec-type</code>) should be treated as a non-speculative baseline, not a real MTP measurement.</footer>

@@ -30,7 +30,10 @@ The headline claim: MoE models too big for your VRAM don't just run here via CPU
 *fast* - measured, not assumed. Every row below is a real before/after on the same hardware (RTX 3060,
 12GB VRAM - about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config
 except the one thing being measured, chat-templated and content-verified so the number reflects real
-usage, not a synthetic benchmark. Full methodology and raw numbers in
+usage, not a synthetic benchmark.
+
+**[See the live results page →](https://sangharshadhyeta.github.io/solid.cpp/)** for the full table
+with methodology notes per row. Full raw numbers and working log in
 [`docs/moe-cache-colibri-notes.md`](docs/moe-cache-colibri-notes.md).
 
 | What | Before | After | Change |
