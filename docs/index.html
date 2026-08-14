@@ -1,95 +1,297 @@
 <!doctype html>
 <title>solid.cpp — proven, not promised</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="description" content="llama.cpp, hardened: real bugs found, root-caused, and measured before they ship. Big MoE models on hardware people actually own, proven live with a real-time Brain/Atlas cache view.">
+<meta property="og:title" content="solid.cpp — proven, not promised">
+<meta property="og:description" content="llama.cpp, hardened: real bugs found, root-caused, and measured before they ship.">
+<meta property="og:image" content="https://sangharshadhyeta.github.io/solid.cpp/solid.cpp.jpeg">
+<meta property="og:type" content="website">
+<meta name="twitter:card" content="summary">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400..800&family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#fff;--fg:#1a1a1a;--muted:#6b7280;--border:#e5e7eb;--accent:#2563eb;--good:#059669;--warn:#d97706;--bad:#dc2626;--code-bg:#f3f4f6;--card-bg:#f9fafb;}
-@media (prefers-color-scheme: dark){
-  :root:not([data-theme="light"]){--bg:#0f1115;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1a1d24;--card-bg:#171a21;}
+html{scroll-behavior:smooth;}
+@media (prefers-reduced-motion: reduce){html{scroll-behavior:auto;}*{animation:none!important;transition:none!important;}}
+:root{
+  --bg:#08090b;
+  --bg-2:#0d0f13;
+  --card:#131519;
+  --card-2:#1a1d23;
+  --border:#24272e;
+  --border-soft:#1c1e24;
+  --fg:#edeef1;
+  --muted:#8b8f98;
+  --muted-2:#5c6068;
+  --hot:#4ed6a5;
+  --hot-dim:#2f7a5c;
+  --warm:#5a9bd8;
+  --bad:#f87171;
+  --code-bg:#0e1013;
+  --shine: linear-gradient(180deg, rgba(255,255,255,.09), rgba(255,255,255,0) 40%);
+  --font-display:'Bricolage Grotesque', 'Manrope', -apple-system, sans-serif;
+  --font-body:'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono:'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, monospace;
 }
-:root[data-theme="dark"]{--bg:#0f1115;--fg:#e5e7eb;--muted:#9ca3af;--border:#2d3139;--accent:#60a5fa;--good:#34d399;--warn:#fbbf24;--bad:#f87171;--code-bg:#1a1d24;--card-bg:#171a21;}
 
 *{box-sizing:border-box;}
-body{background:var(--bg);color:var(--fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif;margin:0;line-height:1.6;}
-.wrap{max-width:900px;margin:0 auto;padding:0 1.25rem 5rem;}
+html{background:var(--bg);}
+body{
+  background:var(--bg);
+  color:var(--fg);
+  font-family:var(--font-body);
+  margin:0;
+  line-height:1.65;
+  -webkit-font-smoothing:antialiased;
+}
+::selection{background:var(--hot);color:#06110d;}
 
-header.hero{text-align:center;padding:3.5rem 1.25rem 2.5rem;}
-header.hero img{width:180px;height:auto;margin-bottom:1rem;}
-header.hero h1{font-size:2.1rem;margin:.25rem 0;text-wrap:balance;}
-header.hero .tagline{color:var(--muted);font-size:1.05rem;max-width:36rem;margin:.5rem auto 1.5rem;text-wrap:balance;}
-.badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;margin-bottom:.5rem;}
-.badges img{height:20px;}
+.wrap{max-width:960px;margin:0 auto;padding:0 1.25rem 6rem;position:relative;}
 
-h2{font-size:1.4rem;margin:3rem 0 1rem;padding-top:.5rem;border-top:1px solid var(--border);}
-h2:first-of-type{border-top:none;}
-p{margin:.75rem 0;}
-a{color:var(--accent);}
-code{background:var(--code-bg);padding:.15rem .4rem;border-radius:4px;font-size:.88em;}
-pre{background:var(--code-bg);padding:.9rem 1rem;border-radius:8px;overflow-x:auto;}
-pre code{background:none;padding:0;}
-ul{padding-left:1.3rem;}
+/* ---------- ambient background artefacts ---------- */
+.bg-artefacts{position:fixed;inset:0;z-index:-1;overflow:hidden;pointer-events:none;}
+.bg-artefacts::before{
+  content:"";position:absolute;inset:0;
+  background-image:
+    radial-gradient(circle at 1px 1px, rgba(255,255,255,.05) 1px, transparent 0);
+  background-size:34px 34px;
+  mask-image:radial-gradient(ellipse 70% 55% at 50% 0%, #000 30%, transparent 75%);
+}
+.glow{position:absolute;border-radius:50%;filter:blur(90px);opacity:.20;}
+.glow.g1{width:520px;height:520px;top:-220px;left:50%;transform:translateX(-60%);background:var(--hot);}
+.glow.g2{width:420px;height:420px;top:120px;right:-140px;background:var(--warm);opacity:.14;}
+
+/* ---------- type ---------- */
+h1,h2,h3{font-family:var(--font-display);font-weight:700;text-wrap:balance;letter-spacing:-.01em;}
+p{margin:.8rem 0;color:var(--fg);}
+a{color:var(--hot);text-decoration:none;}
+a:hover{text-decoration:underline;}
+code{font-family:var(--font-mono);background:var(--code-bg);border:1px solid var(--border-soft);padding:.15rem .42rem;border-radius:5px;font-size:.86em;color:#d9e2df;}
+pre{font-family:var(--font-mono);background:var(--code-bg);border:1px solid var(--border);padding:1rem 1.15rem;border-radius:10px;overflow-x:auto;font-size:.86rem;}
+pre code{background:none;border:none;padding:0;}
+ul{padding-left:1.25rem;}
 li{margin:.5rem 0;}
+.eyebrow{
+  display:inline-flex;align-items:center;gap:.4rem;
+  font-family:var(--font-mono);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--hot);margin-bottom:.9rem;
+}
+.eyebrow::before{content:"";width:6px;height:6px;border-radius:50%;background:var(--hot);box-shadow:0 0 8px var(--hot);}
 
-.callout{background:var(--card-bg);border:1px solid var(--border);border-left:3px solid var(--accent);border-radius:6px;padding:1rem 1.15rem;margin:1.25rem 0;font-size:.95rem;}
+/* ---------- hero ---------- */
+/* ---------- nav ---------- */
+.topnav{
+  position:sticky;top:0;z-index:20;
+  background:rgba(8,9,11,.72);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
+  border-bottom:1px solid transparent;
+}
+.topnav.scrolled{border-bottom-color:var(--border-soft);}
+.topnav-inner{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:.85rem 1.25rem;max-width:960px;margin:0 auto;
+}
+.topnav .brand{display:flex;align-items:center;gap:.55rem;font-family:var(--font-display);font-weight:700;font-size:1.02rem;color:var(--fg);}
+.topnav .brand img{width:26px;height:26px;border-radius:7px;display:block;}
+.topnav nav{display:flex;align-items:center;gap:1.4rem;}
+.topnav nav a{color:var(--muted);font-size:.87rem;font-weight:500;}
+.topnav nav a:hover{color:var(--fg);text-decoration:none;}
+.topnav .btn{padding:.45rem .95rem;font-size:.83rem;}
+@media (max-width:640px){.topnav nav a.nav-link{display:none;}}
 
-table{width:100%;border-collapse:collapse;margin:1.25rem 0;font-size:.92rem;table-layout:fixed;}
-th,td{text-align:left;padding:.6rem .6rem;border-bottom:1px solid var(--border);vertical-align:top;overflow-wrap:break-word;}
-th{color:var(--muted);font-weight:600;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em;}
-td.num{font-variant-numeric:tabular-nums;font-weight:600;}
-.tag{display:inline-block;padding:.1rem .5rem;border-radius:999px;font-size:.72rem;font-weight:600;white-space:nowrap;}
-.tag-solid{background:color-mix(in srgb, var(--good) 18%, transparent);color:var(--good);}
-.delta-pos{color:var(--good);font-weight:700;}
+header.hero{text-align:center;padding:5rem 1rem 3rem;position:relative;}
+.logo-badge{
+  width:104px;height:104px;border-radius:26px;margin:0 auto 1.5rem;
+  background:var(--card-2);
+  background-image:var(--shine);
+  border:1px solid var(--border);
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.18), 0 0 0 1px rgba(0,0,0,.4), 0 20px 50px -20px rgba(0,0,0,.8);
+  display:flex;align-items:center;justify-content:center;
+  overflow:hidden;
+}
+.logo-badge img{width:100%;height:100%;object-fit:cover;}
+header.hero h1{font-size:3rem;margin:.2rem 0;}
+header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:34rem;margin:.75rem auto 2rem;text-wrap:balance;}
+
+.cta-row{display:flex;gap:.7rem;justify-content:center;flex-wrap:wrap;margin-bottom:1.75rem;}
+.btn{
+  font-family:var(--font-body);font-weight:600;font-size:.92rem;
+  padding:.7rem 1.3rem;border-radius:999px;display:inline-flex;align-items:center;gap:.5rem;
+  border:1px solid var(--border);transition:transform .15s ease, border-color .15s ease;
+}
+.btn:hover{text-decoration:none;transform:translateY(-1px);}
+.btn-shine{
+  background:linear-gradient(180deg,#2a2d33,#0a0b0d);
+  background-image:var(--shine), linear-gradient(180deg,#2a2d33,#0a0b0d);
+  color:#fff;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.22), 0 0 22px -6px rgba(78,214,165,.35), 0 12px 26px -14px rgba(0,0,0,.9);
+  border-color:#2e3138;
+}
+.btn-shine:hover{border-color:var(--hot);box-shadow:inset 0 1px 0 rgba(255,255,255,.28), 0 0 26px -4px rgba(78,214,165,.55);}
+.btn-ghost{background:var(--card);color:var(--muted);}
+.btn-ghost:hover{color:var(--fg);border-color:var(--muted-2);}
+
+.badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;}
+.pill{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);border:1px solid var(--border-soft);background:var(--bg-2);padding:.28rem .65rem;border-radius:999px;}
+
+/* ---------- sections ---------- */
+section{margin:5rem 0;scroll-margin-top:5.5rem;}
+h2{font-size:1.65rem;margin:0 0 .5rem;}
+.section-lede{color:var(--muted);max-width:42rem;font-size:1rem;margin:0 0 1.75rem;}
+
+/* ---------- cards ---------- */
+.card{
+  background:var(--card);
+  background-image:var(--shine);
+  border:1px solid var(--border);
+  border-radius:14px;
+  padding:1.4rem 1.5rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 16px 40px -28px rgba(0,0,0,.9);
+  transition:border-color .18s ease, transform .18s ease, box-shadow .18s ease;
+}
+.card-grid{display:grid;grid-template-columns:1fr 1fr;gap:1rem;}
+.card-grid .card{cursor:default;}
+.card-grid .card:hover{border-color:var(--hot-dim);transform:translateY(-2px);box-shadow:inset 0 1px 0 rgba(255,255,255,.08), 0 20px 44px -26px rgba(0,0,0,.95), 0 0 0 1px rgba(78,214,165,.08);}
+.card-grid .card h3{font-size:1.02rem;margin:0 0 .4rem;color:var(--fg);}
+.card-grid .card p{color:var(--muted);font-size:.9rem;margin:0;}
+.card-grid .card code{font-size:.8rem;}
+
+/* ---------- stat cards ---------- */
+.stat-row{display:grid;grid-template-columns:repeat(3,1fr);gap:1rem;margin-bottom:1.5rem;}
+.stat-card{
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:14px;padding:1.25rem 1.35rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
+  transition:border-color .18s ease, transform .18s ease;
+}
+.stat-card:hover{border-color:var(--hot-dim);transform:translateY(-2px);}
+.stat-card .num{font-family:var(--font-display);font-size:2.1rem;font-weight:700;color:var(--hot);line-height:1;font-variant-numeric:tabular-nums;}
+.stat-card .num small{font-size:1.1rem;color:var(--muted);font-weight:600;}
+.stat-card .label{color:var(--muted);font-size:.82rem;margin-top:.5rem;}
+
+.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg-2);}
+table{width:100%;border-collapse:collapse;font-size:.88rem;table-layout:fixed;}
+th,td{text-align:left;padding:.75rem .85rem;border-bottom:1px solid var(--border-soft);vertical-align:top;overflow-wrap:break-word;}
+tr:last-child td{border-bottom:none;}
+th{color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;background:var(--bg-2);}
+td.num{font-variant-numeric:tabular-nums;font-weight:600;font-family:var(--font-mono);font-size:.85rem;}
+.tag{display:inline-block;padding:.14rem .55rem;border-radius:999px;font-size:.68rem;font-weight:700;letter-spacing:.02em;white-space:nowrap;font-family:var(--font-mono);}
+.tag-solid{background:rgba(78,214,165,.14);color:var(--hot);border:1px solid rgba(78,214,165,.3);}
+.delta-pos{color:var(--hot);font-weight:700;}
 .delta-neg{color:var(--bad);font-weight:700;}
-.delta-none{color:var(--muted);}
-.note{color:var(--muted);font-size:.82rem;}
-.tablewrap{overflow-x:auto;}
+.note{color:var(--muted-2);font-size:.8rem;}
 
-.grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem;margin:1.25rem 0;}
-.grid a.card{display:block;background:var(--card-bg);border:1px solid var(--border);border-radius:8px;padding:1rem 1.1rem;text-decoration:none;color:var(--fg);}
-.grid a.card:hover{border-color:var(--accent);}
-.grid a.card .k{font-weight:600;color:var(--accent);}
-.grid a.card .d{color:var(--muted);font-size:.85rem;margin-top:.25rem;}
+.callout{
+  background:var(--bg-2);border:1px solid var(--border);border-left:3px solid var(--hot);
+  border-radius:10px;padding:1.1rem 1.3rem;margin:1.5rem 0;font-size:.94rem;color:var(--fg);
+}
+.callout p{color:inherit;}
 
-footer{margin-top:3rem;padding-top:1.5rem;border-top:1px solid var(--border);color:var(--muted);font-size:.85rem;}
+/* ---------- brain artefact (decorative, echoes the real live view) ---------- */
+.brain-artefact{
+  display:grid;grid-template-columns:repeat(24,1fr);gap:3px;
+  padding:1.1rem;background:var(--bg-2);border:1px solid var(--border);border-radius:12px;margin:1.5rem 0 0;
+}
+.brain-artefact i{display:block;aspect-ratio:1;border-radius:2px;background:#262a30;}
+.brain-legend{display:flex;gap:1.25rem;flex-wrap:wrap;color:var(--muted);font-size:.78rem;margin-top:.85rem;align-items:center;}
+.brain-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.4rem;vertical-align:middle;}
+
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;}
+.grid a.card{display:block;color:var(--fg);}
+.grid a.card:hover{border-color:var(--hot);text-decoration:none;transform:translateY(-2px);}
+.grid a.card .k{font-weight:700;color:var(--hot);font-size:.95rem;}
+.grid a.card .d{color:var(--muted);font-size:.83rem;margin-top:.3rem;}
+.grid a.card img{width:100%;border-radius:8px;margin-bottom:.6rem;display:block;}
+
+footer{margin-top:4rem;padding-top:1.75rem;border-top:1px solid var(--border);color:var(--muted-2);font-size:.85rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;}
 footer a{color:var(--muted);text-decoration:underline;}
-@media (max-width:600px){.grid{grid-template-columns:1fr;}}
+
+@media (max-width:640px){
+  .card-grid,.stat-row,.grid{grid-template-columns:1fr;}
+  header.hero h1{font-size:2.3rem;}
+  .brain-artefact{grid-template-columns:repeat(14,1fr);}
+}
 </style>
+
+<div class="bg-artefacts"><div class="glow g1"></div><div class="glow g2"></div></div>
+
+<div class="topnav" id="topnav">
+<div class="topnav-inner">
+<a class="brand" href="#"><img src="solid.cpp.jpeg" alt=""> solid.cpp</a>
+<nav>
+<a class="nav-link" href="#proof">Proof</a>
+<a class="nav-link" href="#brain-atlas">Brain / Atlas</a>
+<a class="nav-link" href="#docs">Docs</a>
+<a class="btn btn-shine" href="https://github.com/sangharshadhyeta/solid.cpp">GitHub</a>
+</nav>
+</div>
+</div>
 
 <div class="wrap">
 
 <header class="hero">
-<img src="solid.cpp.jpeg" alt="solid.cpp logo">
+<div class="logo-badge"><img src="solid.cpp.jpeg" alt="solid.cpp logo"></div>
 <h1>solid.cpp</h1>
-<div class="tagline">llama.cpp, hardened: real bugs found, root-caused, and measured before they ship</div>
-<div class="badges">
-<img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License">
-<img src="https://img.shields.io/badge/based%20on-llama.cpp-blue.svg" alt="Based on llama.cpp">
+<div class="tagline">llama.cpp, hardened: real bugs found, root-caused, and measured before they ship — with a live view into whether the fix is actually working.</div>
+<div class="cta-row">
+<a class="btn btn-shine" href="https://github.com/sangharshadhyeta/solid.cpp">View on GitHub</a>
+<a class="btn btn-ghost" href="#proof">See the proof</a>
 </div>
-<p><a href="https://github.com/sangharshadhyeta/solid.cpp">github.com/sangharshadhyeta/solid.cpp</a></p>
+<div class="badges">
+<span class="pill">MIT licensed</span>
+<span class="pill">based on llama.cpp</span>
+<span class="pill">CUDA · Metal · Vulkan · CPU</span>
+</div>
 </header>
 
-<h2>What this is</h2>
-<p><code>solid.cpp</code> is a fork of <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> that tracks
-upstream directly and layers on a curated set of performance and correctness fixes - triaged from real, reported
-issues, root-caused in code, and validated with actual measurements before anything is kept. Not a rewrite, not a
-speed pun: every change here is either a measured win or a documented, honest "no" (a fix that was tried, found
-not to be the cause, and kept anyway if it was independently valid, or reverted if it wasn't).</p>
-<p>The two starting focus areas were MoE expert-cache placement and speculative decoding (draft acceptance,
-FR-Spec vocab trimming, MTP correctness), but the scope is the whole inference hot path - kernels, batching,
-KV-cache, sampling, quantization - not just MoE.</p>
+<section>
+<div class="eyebrow">Why this exists</div>
+<h2>Capable inference on hardware people actually own</h2>
+<p>Running a genuinely large model used to mean a rack of enterprise GPUs, or accepting whatever a hosted API
+gives you. The core unlock here — a GPU-resident cache for CPU-offloaded MoE experts — means a 26B-parameter MoE
+model that can't fit in a 12GB card doesn't just technically run: it runs fast, on a single consumer GPU. That's
+the whole point: put capability that used to require a data center within reach of hardware someone actually has
+on their desk.</p>
+<p>But a fork that just claims speedups is exactly as trustworthy as any other unverified benchmark. So the
+second half of the project is making sure every claim can be checked: numbers are measured before/after on real
+hardware and reported honestly even when they're a loss (see the FR-Spec row below), and the cache itself is
+watchable live — not "trust me, it's caching," but a real-time view of which experts are hot right now. Prove it,
+then ship it, then let you go verify it yourself. Not a fork chasing every upstream feature — one willing to slow
+down and prove each claim before it ships.</p>
+</section>
 
-<h2>Proven, not promised</h2>
-<p>The headline claim: MoE models too big for your VRAM don't just run here via CPU offload, they run
-<em>fast</em> - measured, not assumed. Every row below is a real before/after on the same hardware (RTX 3060,
-12GB VRAM - about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config except the
-one thing being measured, chat-templated and content-verified so the number reflects real usage, not a
-synthetic benchmark.</p>
+<section>
+<div class="eyebrow">What this is</div>
+<h2>A fork that measures its own claims</h2>
+<p><code>solid.cpp</code> tracks <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> upstream directly and
+layers on a curated set of performance and correctness fixes — triaged from real, reported issues, root-caused in
+code, and validated with actual measurements before anything is kept. Every change here is either a measured win
+or a documented, honest "no": a fix that was tried, found not to be the cause, and kept anyway if it was
+independently valid, or reverted if it wasn't.</p>
+<p>The starting focus was MoE expert-cache placement and speculative decoding, but the scope covers the whole
+inference hot path — kernels, batching, KV-cache, sampling, quantization — and, increasingly, whether you can
+actually <em>see</em> what any of it is doing while it runs.</p>
+</section>
+
+<section id="proof">
+<div class="eyebrow">Proven, not promised</div>
+<h2>Big MoE models don't just fit here — they run fast</h2>
+<p class="section-lede">Every number below is a real before/after on the same hardware (RTX 3060, 12GB VRAM —
+about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config except the one thing
+being measured. Chat-templated and content-verified, not a synthetic benchmark.</p>
+
+<div class="stat-row">
+<div class="stat-card"><div class="num">+31.3<small>%</small></div><div class="label">MoE expert-cache vs naive CPU offload</div></div>
+<div class="stat-card"><div class="num">+28.1<small>%</small></div><div class="label">MTP speculative decoding</div></div>
+<div class="stat-card"><div class="num">+21.6<small>%</small></div><div class="label"><code>--moe-calibrate</code> vs safe-floor placement</div></div>
+</div>
 
 <div class="tablewrap">
 <table>
 <colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
 <thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
-<tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>, naive CPU-offload)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
@@ -102,81 +304,124 @@ synthetic benchmark.</p>
 </div>
 
 <div class="callout">
-That last row is deliberate. FR-Spec was expected to be a free win and turned out not to be on this hardware -
+<p>That last row is deliberate. FR-Spec was expected to be a free win and turned out not to be on this hardware —
 so it's reported as a loss, not quietly dropped from the table. That's the actual point of <code>solid.cpp</code>:
-every number here is something that was measured and would be reported honestly either way. If a claimed
-improvement doesn't survive contact with a real benchmark, it doesn't ship, and if it does ship, this is where
-you can check the receipts. Full raw numbers, per-row methodology, and the complete working log (including
-investigations that turned out not to apply) live in
-<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a>.
+every number here is something that was measured and would be reported honestly either way. Full raw numbers,
+per-row methodology, and the complete working log — including dead ends — live in
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a>.</p>
+</div>
+</section>
+
+<section id="brain-atlas">
+<div class="eyebrow">Live, not just logged</div>
+<h2>The Brain view: watch the cache, don't just trust it</h2>
+<p class="section-lede">A cache you can't see into is a black box you have to take on faith. The Brain view
+polls the running server and renders, live, which experts are actually resident in GPU memory right now — cold
+(never cached), warm (probation), or hot (protected) — with real-time hit flashes as tokens route through them.</p>
+
+<div class="brain-artefact" aria-hidden="true"></div>
+<div class="brain-legend">
+<span><span class="dot" style="background:#4ed6a5;box-shadow:0 0 6px #4ed6a5"></span>hot / protected</span>
+<span><span class="dot" style="background:#5a9bd8"></span>warm / probation</span>
+<span><span class="dot" style="background:#3a4750"></span>cold / not cached</span>
 </div>
 
-<h2>What's different from upstream</h2>
-<ul>
-<li><strong>MoE expert-cache</strong> - GPU-resident hot-expert cache for CPU-offloaded MoE layers, with LFRU
-eviction (capped SLRU + heat tiebreak), live auto-placement, and <code>--moe-calibrate</code> for empirical,
-concurrency-aware placement search instead of a fixed guess.</li>
-<li><strong>Probabilistic draft acceptance</strong> (<code>--spec-prob-accept</code>) - accepts a draft token
-whenever the target considers it at least as likely as the draft did (<code>min(1, p_target/p_draft)</code>),
-not only on exact match. Opt-in, strict superset of the old behavior - verified byte-identical when off.</li>
-<li><strong>FR-Spec-style MTP draft-vocab trimming</strong>, with its real cost (not assumed-free) measured
-directly: a genuine trade of throughput and accept-rate for VRAM, not a free win - see the notes for the numbers
-and the cache-related correctness bug that was found and fixed along the way.</li>
-<li><strong><code>p_min</code> footgun warning</strong> - a diagnostic (not a silent default change) that fires
-when a drafter's confidence early-stop is left disabled while draft width has been raised, mirroring the
-existing concurrency-cliff warning pattern.</li>
-<li><strong>Backend-sampling validation</strong> - confirmed upstream's on-device sampling path (<code>-bs</code>)
-gives a real, positive throughput gain here too, measured directly rather than assumed from upstream's own numbers.</li>
-<li><strong>Diagnostic instrumentation kept permanently</strong> - <code>LLAMA_DEBUG_VERIFY=1</code> gates
-zero-cost-when-unset traces (drafted-vs-target token mismatches, resolved speculative types, draft-context
-graph-reuse stats) that were directly responsible for finding more than one of the fixes above.</li>
-<li>Ongoing triage of upstream's open issue tracker for real, bounded, evidenced performance and correctness
-bugs - accepted, fixed properly, and measured; or investigated, found not to apply, and documented so the same
-dead end isn't walked twice. Several larger, correctly-scoped-but-not-yet-implemented designs (a CUDA
-many-expert MMVQ dispatch gate, among others) are recorded in the notes rather than rushed.</li>
-</ul>
+<p style="margin-top:1.5rem">Merged into the same view: the <strong>Atlas</strong> — each expert positioned by
+measured topic affinity (code, math, law, medicine, and six other categories, probed with greedy decode and a
+replication gate so one lucky prompt can't fake a specialist), colour still driven by live cache state. Position
+from measurement, colour from reality, one canvas.</p>
 
-<h2>Description</h2>
-<p>Inherited unchanged from upstream: the main goal of <code>llama.cpp</code> is to enable LLM (and VLM)
-inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in
-the cloud.</p>
+<div class="callout">
+<p><strong>What building this actually caught:</strong> live-testing the Brain view against real traffic surfaced
+a genuine, previously-undiscovered engine bug — under backend sampling (<code>-bs</code>), the entire moe-cache
+session was silently destroyed and rebuilt empty on every request, because its lifetime was tied to a scheduler
+object that gets torn down and recreated whenever a new sampler is attached. The cache was working for exactly
+one request, then quietly doing nothing, with no error or warning. Root-caused with temporary per-call logging
+(not guessed at), fixed by detaching the cache session from the old scheduler and re-attaching it to the
+replacement instead of recreating it from scratch. This is exactly why the "proven, not promised" numbers above
+matter — a feature that silently stops working is worse than one that was never built, because you don't find out
+until you go looking.</p>
+</div>
+</section>
+
+<section>
+<div class="eyebrow">What's different from upstream</div>
+<h2>Every fix, one card each</h2>
+<div class="card-grid">
+<div class="card">
+<h3>MoE expert-cache</h3>
+<p>GPU-resident hot-expert cache for CPU-offloaded MoE layers. LFRU eviction (capped SLRU + heat tiebreak), live
+auto-placement, <code>--moe-calibrate</code> for empirical, concurrency-aware placement search instead of a fixed
+guess.</p>
+</div>
+<div class="card">
+<h3>Live Brain + Atlas view</h3>
+<p>Real-time per-expert tier/heat heatmap merged with measured topic-affinity positioning, served straight off
+the running server — see <a href="#proof">above</a>.</p>
+</div>
+<div class="card">
+<h3>Probabilistic draft acceptance</h3>
+<p><code>--spec-prob-accept</code> accepts a draft token whenever the target considers it at least as likely as
+the draft did, not only on exact match. Opt-in, verified byte-identical when off.</p>
+</div>
+<div class="card">
+<h3>FR-Spec-style vocab trimming</h3>
+<p>MTP draft-vocab trimming with its real cost measured directly — a genuine trade of throughput for VRAM, not a
+free win, plus a cache-correctness bug found and fixed along the way.</p>
+</div>
+<div class="card">
+<h3><code>p_min</code> footgun warning</h3>
+<p>A diagnostic that fires when a drafter's confidence early-stop is left disabled while draft width has been
+raised — mirrors the existing concurrency-cliff warning pattern.</p>
+</div>
+<div class="card">
+<h3>Permanent debug instrumentation</h3>
+<p><code>LLAMA_DEBUG_VERIFY=1</code> gates zero-cost-when-unset traces that were directly responsible for finding
+more than one of the fixes on this page.</p>
+</div>
+</div>
+</section>
+
+<section>
+<div class="eyebrow">Description</div>
+<h2>Inherited from upstream, unchanged</h2>
+<p>The core goal of <code>llama.cpp</code> — minimal-setup, state-of-the-art LLM/VLM inference on a wide range of
+hardware, locally and in the cloud — carries through untouched:</p>
 <ul>
 <li>Plain C/C++ implementation without any dependencies</li>
-<li>Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks</li>
-<li>AVX, AVX2, AVX512 and AMX support for x86 architectures</li>
-<li>RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures</li>
-<li>1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use</li>
-<li>Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)</li>
-<li>Vulkan and SYCL backend support</li>
-<li>CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity</li>
+<li>Apple silicon as a first-class citizen — ARM NEON, Accelerate and Metal</li>
+<li>AVX, AVX2, AVX512 and AMX for x86; RVV/ZVFH/ZFH/ZICBOP/ZIHINTPAUSE for RISC-V</li>
+<li>1.5-bit through 8-bit integer quantization for faster inference and reduced memory use</li>
+<li>Custom CUDA kernels for NVIDIA GPUs, plus AMD (HIP) and Moore Threads (MUSA) support</li>
+<li>Vulkan and SYCL backends; CPU+GPU hybrid inference for models bigger than VRAM</li>
 </ul>
-<p>The <code>llama.cpp</code> project is built on top of the <a href="https://github.com/ggml-org/ggml">ggml</a> library. Also see upstream's
-<a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a>,
-<a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md">ops</a>,
-<a href="https://github.com/ggml-org/llama.cpp/issues/9289">lib llama API</a>, and
-<a href="https://github.com/ggml-org/llama.cpp/issues/9291">llama-server REST API</a> references.</p>
+<p>Built on top of <a href="https://github.com/ggml-org/ggml">ggml</a>. See upstream's own
+<a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a> and API references for
+<a href="https://github.com/ggml-org/llama.cpp/issues/9289">lib llama</a> and
+<a href="https://github.com/ggml-org/llama.cpp/issues/9291">llama-server REST</a>.</p>
+</section>
 
-<h2>Quick start</h2>
-<p>A few options to get this build installed on your machine:</p>
-<ul>
-<li>Run with Docker - see upstream's <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker documentation</a></li>
-<li>Build from source by cloning this repository - check out the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a></li>
-</ul>
+<section>
+<div class="eyebrow">Quick start</div>
+<h2>Running in two commands</h2>
 <pre><code>cmake -B build -DGGML_CUDA=ON   # or your backend of choice
 cmake --build build --config Release -j</code></pre>
-<p>Once installed:</p>
 <pre><code># Download and run a model directly from Hugging Face
 ./build/bin/llama-cli -hf ggml-org/Qwen3.5-0.8B-GGUF
 
 # Launch an OpenAI-compatible API server
 ./build/bin/llama-server -m &lt;model.gguf&gt; -ngl 99</code></pre>
+<p class="note">Docker: see the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker docs</a>. Building from source: the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a>.</p>
 
-<div class="grid">
-<a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama-cli" style="width:100%;border-radius:6px;margin-bottom:.5rem;"><div class="d">VLM session with <code>llama-cli</code></div></a>
-<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama-server" style="width:100%;border-radius:6px;margin-bottom:.5rem;"><div class="d">Built-in web UI against <code>llama-server</code></div></a>
+<div class="grid" style="margin-top:1.75rem">
+<a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama-cli"><div class="d">VLM session with <code>llama-cli</code></div></a>
+<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama-server"><div class="d">Built-in web UI against <code>llama-server</code></div></a>
 </div>
+</section>
 
-<h2>Supported backends</h2>
+<section>
+<div class="eyebrow">Supported backends</div>
+<h2>Runs where llama.cpp runs</h2>
 <div class="tablewrap">
 <table>
 <thead><tr><th>Backend</th><th>Target devices</th></tr></thead>
@@ -202,12 +447,15 @@ cmake --build build --config Release -j</code></pre>
 </table>
 </div>
 <p class="note">Per-backend build flags in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>.</p>
+</section>
 
-<h2>Documentation</h2>
+<section id="docs">
+<div class="eyebrow">Documentation</div>
+<h2>Everything, one click away</h2>
 <div class="grid">
 <a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">
 <div class="k">Working log</div>
-<div class="d">docs/moe-cache-colibri-notes.md - measurements, dead ends, and root causes for everything above</div>
+<div class="d">Measurements, dead ends, and root causes for everything on this page</div>
 </a>
 <a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">
 <div class="k">How to build</div>
@@ -254,35 +502,79 @@ cmake --build build --config Release -j</code></pre>
 <div class="d">Apple platform packaging</div>
 </a>
 </div>
+</section>
 
-<h2>Relationship to upstream</h2>
-<p>This repo's git history <em>is</em> <code>llama.cpp</code>'s history, plus the commits on top. Upstream
-changes are pulled in directly rather than re-implemented; nothing here is intended to diverge from upstream's
-own architecture or conventions more than a given fix requires. See upstream's own
+<section>
+<div class="eyebrow">Relationship to upstream</div>
+<h2>Same history, extra commits</h2>
+<p>This repo's git history <em>is</em> <code>llama.cpp</code>'s history, plus the commits on top. Upstream changes
+are pulled in directly rather than re-implemented; nothing here is intended to diverge from upstream's own
+architecture or conventions more than a given fix requires. See upstream's
 <a href="https://github.com/ggml-org/llama.cpp">README</a> and
 <a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a> for the base project this builds on.</p>
+</section>
 
-<h2>Contributing</h2>
+<section>
+<div class="eyebrow">Contributing</div>
+<h2>Open to real fixes</h2>
 <ul>
 <li>Contributors can open PRs</li>
 <li>Collaborators will be invited based on contributions</li>
 <li>Maintainers can push to branches in the repo and merge PRs into the main branch</li>
 <li>Any help with managing issues, PRs, and projects is very appreciated</li>
-<li>Read upstream's <a href="https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a> for more information</li>
+<li>Read upstream's <a href="https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a> for more</li>
 </ul>
+</section>
 
-<h2>License &amp; acknowledgements</h2>
-<p>MIT licensed, same as upstream. Third-party components inherited from upstream, still accurate:</p>
+<section>
+<div class="eyebrow">License &amp; acknowledgements</div>
+<h2>MIT, same as upstream</h2>
 <ul>
-<li><a href="https://github.com/yhirose/cpp-httplib">yhirose/cpp-httplib</a> - single-header HTTP server, used by <code>llama-server</code> - MIT license</li>
-<li><a href="https://github.com/nothings/stb">stb-image</a> - single-header image format decoder, used by multimodal subsystem - public domain</li>
-<li><a href="https://github.com/nlohmann/json">nlohmann/json</a> - single-header JSON library, used by various tools/examples - MIT license</li>
-<li><a href="https://github.com/mackron/miniaudio">miniaudio.h</a> - single-header audio format decoder, used by multimodal subsystem - public domain</li>
-<li><a href="https://github.com/sheredom/subprocess.h">subprocess.h</a> - single-header process launching solution for C and C++ - public domain</li>
+<li><a href="https://github.com/yhirose/cpp-httplib">yhirose/cpp-httplib</a> — single-header HTTP server, used by <code>llama-server</code> — MIT</li>
+<li><a href="https://github.com/nothings/stb">stb-image</a> — single-header image decoder, multimodal subsystem — public domain</li>
+<li><a href="https://github.com/nlohmann/json">nlohmann/json</a> — single-header JSON library — MIT</li>
+<li><a href="https://github.com/mackron/miniaudio">miniaudio.h</a> — single-header audio decoder, multimodal subsystem — public domain</li>
+<li><a href="https://github.com/sheredom/subprocess.h">subprocess.h</a> — single-header process launching — public domain</li>
 </ul>
+</section>
 
 <footer>
-solid.cpp - <a href="https://github.com/sangharshadhyeta/solid.cpp">source on GitHub</a>
+<span>solid.cpp — <a href="https://github.com/sangharshadhyeta/solid.cpp">source on GitHub</a></span>
+<span>MIT licensed</span>
 </footer>
 
 </div>
+<script>
+(function(){
+  var grid = document.querySelector('.brain-artefact');
+  if (!grid) return;
+  var cols = window.innerWidth < 640 ? 14 : 24;
+  var rows = 5;
+  var tiers = [
+    {rgb:'58,71,80', w:.74},
+    {rgb:'90,155,216', w:.13},
+    {rgb:'78,214,165', w:.13}
+  ];
+  for (var i = 0; i < cols * rows; i++) {
+    var r = Math.random(), acc = 0, tier = tiers[0];
+    for (var t = 0; t < tiers.length; t++) { acc += tiers[t].w; if (r <= acc) { tier = tiers[t]; break; } }
+    var heat = tier === tiers[0] ? (.25 + Math.random() * .15) : (.55 + Math.random() * .45);
+    var span = document.createElement('i');
+    span.style.background = 'rgba(' + tier.rgb + ',' + heat.toFixed(2) + ')';
+    if (tier !== tiers[0] && Math.random() < .35) {
+      span.style.boxShadow = '0 0 6px rgba(' + tier.rgb + ',.8)';
+    }
+    grid.appendChild(span);
+  }
+})();
+
+(function(){
+  var nav = document.getElementById('topnav');
+  if (!nav) return;
+  var onScroll = function(){
+    nav.classList.toggle('scrolled', window.scrollY > 8);
+  };
+  window.addEventListener('scroll', onScroll, {passive:true});
+  onScroll();
+})();
+</script>
