@@ -2,7 +2,6 @@
 
 #include "llama.h"
 
-#include <cstring>
 #include <fstream>
 
 // See llama_frspec_set_pending_vocab_map() in llama.h for the full
@@ -53,19 +52,19 @@ std::vector<int64_t> llm_frspec_load_d2t_sidecar(const std::string & path) {
     return d2t;
 }
 
-std::vector<uint8_t> llm_frspec_gather_vocab_rows(
-        const void * full_data, ggml_type type, int64_t n_embd, const std::vector<int64_t> & d2t_ids) {
-    // Row-granularity gather: each row is n_embd elements. This is safe for
-    // block-quantized types as long as n_embd is a whole number of that
-    // type's quant blocks (true for every real embedding dimension - block
-    // sizes are small powers of 2 like 32/256, embedding dims are large
-    // powers of 2/multiples thereof), so no row ever splits a quant block.
-    const size_t row_bytes = ggml_row_size(type, n_embd);
+std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
+        const ggml_tensor * full_weight, const std::vector<int64_t> & d2t_ids) {
+    // Row-granularity gather: each row is full_weight->ne[0] elements.
+    // This is safe for block-quantized types as long as that's a whole
+    // number of the type's quant blocks (true for every real embedding
+    // dimension - block sizes are small powers of 2 like 32/256, embedding
+    // dims are large powers of 2/multiples thereof), so no row ever splits
+    // a quant block.
+    const size_t row_bytes = ggml_row_size(full_weight->type, full_weight->ne[0]);
     std::vector<uint8_t> out(row_bytes * d2t_ids.size());
-    const uint8_t * src = (const uint8_t *) full_data;
     for (size_t i = 0; i < d2t_ids.size(); i++) {
         const int64_t tok = d2t_ids[i];
-        std::memcpy(out.data() + i * row_bytes, src + (size_t) tok * row_bytes, row_bytes);
+        ggml_backend_tensor_get(full_weight, out.data() + i * row_bytes, (size_t) tok * row_bytes, row_bytes);
     }
     return out;
 }
@@ -86,22 +85,35 @@ ggml_tensor * llm_frspec_scatter_to_full_vocab(
 }
 
 void llm_graph_input_frspec_d2t::set_input(const llama_ubatch * /*ubatch*/) {
-    // Constant for the model's whole lifetime - same data on every graph
-    // build, unlike ordinary per-ubatch inputs. Cheap enough (a few
-    // hundred KB at most for any realistic trim size) that redoing this
-    // on every rebuild rather than tracking an "already set" flag isn't
-    // worth the extra state.
+    // d2t: constant for the model's whole lifetime - same data on every
+    // graph build, unlike ordinary per-ubatch inputs. Cheap enough (a few
+    // KB at most for any realistic trim size) that redoing this on every
+    // call rather than tracking an "already set" flag isn't worth the
+    // extra state.
     //
     // Stored/loaded as int64_t (ids, from the plain-text sidecar) but the
-    // tensor itself is I32 (ggml_get_rows() requires it) - real vocab
+    // tensor itself is I32 (ggml_get_rows() requires it, and d2t is also
+    // used directly as an index by build code elsewhere) - real vocab
     // sizes are always far under INT32_MAX, so this narrowing is exact.
     std::vector<int32_t> ids32(ids.begin(), ids.end());
     ggml_backend_tensor_set(d2t, ids32.data(), 0, ids32.size() * sizeof(int32_t));
+
+    // output_w: unlike d2t, genuinely expensive to redo (a real row
+    // gather, not a few KB of index copying) - populated exactly once.
+    // Safe to leave stale-if-ever-repopulated-differently because it
+    // never changes: full_weight is the original, never-modified
+    // checkpoint tensor, and ids is the same sidecar-derived list for
+    // this model instance's entire lifetime.
+    if (output_w && !output_w_populated) {
+        std::vector<uint8_t> gathered = llm_frspec_gather_vocab_rows_from_backend(full_weight, ids);
+        ggml_backend_tensor_set(output_w, gathered.data(), 0, gathered.size());
+        output_w_populated = true;
+    }
 }
 
 bool llm_graph_input_frspec_d2t::can_reuse(const llm_graph_params & /*params*/) {
-    // The d2t mapping never changes once loaded - always safe to reuse
-    // whatever graph this was last built into, regardless of ubatch shape
-    // or other graph params.
+    // Neither d2t nor output_w ever changes once loaded - always safe to
+    // reuse whatever graph this was last built into, regardless of
+    // ubatch shape or other graph params.
     return true;
 }

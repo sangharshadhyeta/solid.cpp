@@ -218,22 +218,29 @@ llama_model_gemma4_assistant::graph::graph(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
 
     // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md):
-    // when this instance was loaded with a sidecar vocab map, gather just
-    // the trimmed rows of the output weight and matmul against those
-    // instead of the full vocab - cuts the dominant draft-time cost
-    // losslessly, since the scattered-back logits below are -inf
-    // everywhere outside the trimmed set and the target always
-    // re-verifies over the real, full vocab regardless.
+    // when this instance was loaded with a sidecar vocab map, matmul
+    // against just the trimmed rows of the output weight instead of the
+    // full vocab - cuts the dominant draft-time cost losslessly, since
+    // the scattered-back logits below are -inf everywhere outside the
+    // trimmed set and the target always re-verifies over the real, full
+    // vocab regardless. The trimmed weight (output_w) is gathered once,
+    // outside the compute graph, not via a live ggml_get_rows() node -
+    // graph/CUDA-graph reuse across decode steps only skips rebuilding
+    // graph topology, not re-executing each node's kernel, so a
+    // genuinely constant gather sitting in the graph would otherwise be
+    // silently re-paid on every single step.
     const auto & gmodel = static_cast<const llama_model_gemma4_assistant &>(model);
 
     ggml_tensor * output_w = model.output;
     llm_graph_input_frspec_d2t * inp_d2t = nullptr;
     if (!gmodel.frspec_d2t_ids.empty()) {
-        auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids);
+        auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids, model.output);
         inp->d2t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) gmodel.frspec_d2t_ids.size());
         ggml_set_input(inp->d2t);
+        inp->output_w = ggml_new_tensor_2d(ctx0, model.output->type, model.output->ne[0], (int64_t) gmodel.frspec_d2t_ids.size());
+        ggml_set_input(inp->output_w);
         inp_d2t = inp.get();
-        output_w = ggml_get_rows(ctx0, model.output, inp->d2t);
+        output_w = inp->output_w;
         res->add_input(std::move(inp));
     }
 

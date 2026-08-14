@@ -164,15 +164,26 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 std::vector<int64_t> llm_frspec_load_d2t_sidecar(const std::string & path);
 
 // Gathers just the rows named by d2t_ids out of a full-vocab weight
-// tensor already resident in `full_data` (n_embd * n_vocab_full elements
-// of `type`, row-major by vocab position - i.e. tok_embd/output.weight's
-// usual layout), producing a new, smaller buffer for just the trimmed
-// vocab, in d2t_ids' order. Row-granularity gather is safe for
-// block-quantized types (Q8_0 etc.) as long as n_embd is a whole number
-// of quant blocks, which it always is for real vocab/embedding
-// dimensions - never splits a quant block across a row boundary.
-std::vector<uint8_t> llm_frspec_gather_vocab_rows(
-        const void * full_data, ggml_type type, int64_t n_embd, const std::vector<int64_t> & d2t_ids);
+// tensor (n_embd * n_vocab_full elements of full_weight->type, row-major
+// by vocab position - i.e. tok_embd/output.weight's usual layout),
+// producing a new, smaller buffer for just the trimmed vocab, in
+// d2t_ids' order. Reads through ggml_backend_tensor_get(), so it works
+// whether full_weight actually lives in CPU or GPU memory. Row-granularity
+// gather is safe for block-quantized types (Q8_0 etc.) as long as n_embd
+// is a whole number of quant blocks, which it always is for real
+// vocab/embedding dimensions - never splits a quant block across a row
+// boundary.
+//
+// Called exactly once per model load (from set_input(), the first time
+// it runs - see llm_graph_input_frspec_d2t below), not from inside the
+// compute graph: gathering via a live ggml_get_rows() graph op instead
+// re-ran the gather as a real GPU kernel on every single forward pass -
+// a real, reproducible decode-speed regression, measured on the sandbox
+// (see docs/moe-cache-colibri-notes.md) - since ordinary ggml graph-node
+// reuse only skips CPU-side graph *construction*, not re-executing each
+// node's kernel once the graph runs.
+std::vector<uint8_t> llm_frspec_gather_vocab_rows_from_backend(
+        const ggml_tensor * full_weight, const std::vector<int64_t> & d2t_ids);
 
 // Scatters compressed (trimmed-vocab-sized) logits back into a
 // full-vocab-shaped tensor (positions outside the trimmed set filled
@@ -194,26 +205,46 @@ ggml_tensor * llm_frspec_scatter_to_full_vocab(
 // later, unrelated model load never accidentally inherits a stale value.
 std::string llm_frspec_take_pending_vocab_map();
 
-// Graph input for the d2t index tensor FR-Spec vocab trimming needs.
-// Shared so each architecture's own graph-building code only needs a few
-// lines (create this, ggml_get_rows the weight, build_lora_mm on the
-// result, scatter back) rather than reimplementing the input-tensor
-// lifecycle - see gemma4.cpp for the one current user. Unlike ordinary
-// per-ubatch inputs (attention masks, positions, ...), d2t is constant
-// for the model's whole lifetime once loaded, so can_reuse() always
-// returns true - this never defeats graph/CUDA-graph reuse across decode
-// steps the way a genuinely per-token-varying input would.
+// Graph input for FR-Spec vocab trimming. Shared so each architecture's
+// own graph-building code only needs a few lines (create this, use
+// output_w in build_lora_mm instead of the full weight, scatter back)
+// rather than reimplementing the input-tensor lifecycle - see
+// gemma4-assistant.cpp for the one current user. Two different
+// lifetimes bundled into one input:
+//   - d2t (the index tensor): constant for the model's whole lifetime,
+//     cheap to rewrite, rewritten on every set_input() call regardless.
+//   - output_w (the pre-gathered trimmed weight): also constant for the
+//     model's whole lifetime, but genuinely expensive to recompute (a
+//     real row-gather over up to a few thousand embedding-width rows) -
+//     populated exactly once, on the first set_input() call, then left
+//     alone. Gathering it via a live ggml_get_rows() graph op instead
+//     (the original design) re-ran that gather as a real GPU kernel on
+//     every single decode step - can_reuse()=true only skips rebuilding
+//     the graph's CPU-side topology, it does not skip executing each
+//     node's kernel once the graph runs, so a "constant" op sitting in
+//     the graph is silently paid for on every step. output_w sidesteps
+//     that entirely by never appearing as a graph node in the first
+//     place - it's a plain input, like d2t itself.
+// can_reuse() always returns true for both: neither ever changes in a
+// way that should defeat graph/CUDA-graph reuse across decode steps the
+// way a genuinely per-token-varying input would.
 class llm_graph_input_frspec_d2t : public llm_graph_input_i {
 public:
-    llm_graph_input_frspec_d2t(const std::vector<int64_t> & ids) : ids(ids) {}
+    llm_graph_input_frspec_d2t(const std::vector<int64_t> & ids, const ggml_tensor * full_weight) :
+        ids(ids), full_weight(full_weight) {}
     virtual ~llm_graph_input_frspec_d2t() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * d2t = nullptr; // I32 [n_trimmed_vocab]
+    ggml_tensor * d2t      = nullptr; // I32 [n_trimmed_vocab]
+    ggml_tensor * output_w = nullptr; // same type as full_weight, [n_embd, n_trimmed_vocab]
 
     const std::vector<int64_t> & ids;
+    const ggml_tensor * full_weight; // source for output_w's one-time gather; never itself modified
+
+private:
+    bool output_w_populated = false;
 };
 
 //
