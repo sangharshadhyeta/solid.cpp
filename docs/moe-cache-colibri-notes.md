@@ -3054,11 +3054,40 @@ been enough to prevent this specific report.
 respect `dp.n_max` as a hard cap on `n_draft` *before* building/decoding
 the block, i.e. `const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;`
 at `speculative.cpp:1146`, matching the check already proven correct at
-line 351. Not applied here: we don't currently have a DFlash/DSpark-
-compatible draft model pair on this sandbox (only MTP's co-trained
-head for Gemma-4), so there's no way to validate the fix empirically
-before committing it, and this session's whole methodology has been to
-measure rather than assume. Ready to implement the moment a compatible
-model pair is available - the fix is a one-line, well-understood
-mirror of an already-proven pattern, not open design work like the
-MMVQ item above.
+line 351.
+
+**Implemented and A/B tested, 2026-08-14 (later same day).** Got a real
+DFlash/DSpark-compatible model pair after all: `Qwen/Qwen3-4B` (target) +
+`deepseek-ai/dspark_qwen3_4b_block7` (draft), converted directly via
+`convert_hf_to_gguf.py --target-model-dir` using the registered
+`Qwen3DSparkModel` converter - no synthetic/toy model, a real checkpoint
+pair. (First tried the much smaller `LiquidAI/LFM2.5-1.2B-Instruct` +
+`tugot17/LFM2.5-1.2B-Instruct-DSpark-3L` for faster download, but our
+conversion tooling only has registered DSpark support for specific
+architectures - Qwen, DeepSeek-V4, Llama/EAGLE-3, MuseGlimmer/DFlash -
+`Lfm2DSparkDraftModel` isn't one of them, so that pair was a dead end for
+conversion despite downloading fine.)
+
+Applied the one-line fix, then did a genuine A/B: rebuilt and tested both
+with and without it, using prompts sized precisely to leave a small
+positive remaining context budget (narrower than the configured block
+width) right at the boundary - the exact "danger zone" devesssi's upstream
+diagnosis describes. **Could not reproduce the crash in our fork's current
+state either way**, across several context sizes and prompt-length
+targeting attempts (including one landing the danger zone on the very
+first speculative round, not requiring multi-round arithmetic alignment).
+Some other layer in our fork already prevents this - not fully traced,
+but real: this is the third case this session (after #26100, and MTP's own
+architectural immunity to this same bug class under #26478 itself) where a
+plausible, well-diagnosed community report doesn't actually reproduce here.
+
+**Kept the fix anyway, honestly labeled as preventive, not a confirmed
+fix**: it can only ever reduce draft width relative to before, never
+increase it, so it's strictly safer by construction regardless of whether
+the crash it targets is reachable here - and it mirrors a pattern already
+proven correct elsewhere in this same file, at effectively zero cost.
+Correctness re-verified after applying it: coherent output, real
+speculative decoding measured on the fresh, untuned Qwen3-4B/DSpark
+pairing (235 drafted / 64 accepted on a simple prompt - modest accept rate
+expected, this pairing has had no calibration or trim work done on it,
+unlike the Gemma-4/MTP setup this session spent most of its effort on).
