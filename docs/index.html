@@ -262,9 +262,14 @@ down and prove each claim before it ships.</p>
 <p class="note">Scope, honestly: the expert-cache fits the model's <em>parameters</em> into limited VRAM - it
 doesn't and can't stretch VRAM to hold arbitrary context length, which is a separate, unrelated resource that
 scales with sequence length regardless of how the weights are cached. Pushed this to a real boundary on our own
-12GB card: 32k context, real workload, no problem; 1M context crashes outright, a hard ceiling no amount of
-placement cleverness gets around. Every project in this space (Colibri, ktransformers, ik_llama.cpp included)
-draws this same line for the same reason - it's physics, not a missing feature.</p>
+12GB card: requesting 1M context used to hard-crash the whole process rather than fail gracefully - found and
+fixed that (<code>--fit</code> now searches by doubling from a safe floor and lands on a real, measured context
+size instead of guessing or crashing), but the physical ceiling is still real: on this card, with this model,
+that search lands at 8192 tokens/slot with 4 concurrent slots, or 16384 with just one - nowhere near the 1M
+asked for. No amount of placement cleverness moves that ceiling; it just means asking for more than fits now
+gets you the most that actually does, measured, instead of a crash. Every project in this space (Colibri,
+ktransformers, ik_llama.cpp included) draws this same line for the same reason - it's physics, not a missing
+feature.</p>
 </section>
 
 <section>
@@ -392,6 +397,12 @@ raised — mirrors the existing concurrency-cliff warning pattern.</p>
 <h3>Permanent debug instrumentation</h3>
 <p><code>LLAMA_DEBUG_VERIFY=1</code> gates zero-cost-when-unset traces that were directly responsible for finding
 more than one of the fixes on this page.</p>
+</div>
+<div class="card">
+<h3>Context-size fitting doesn't hard-crash</h3>
+<p>An explicit <code>-c</code> request too large for VRAM used to abort the whole process - upstream's <code>--fit</code>
+only auto-adjusts <em>unset</em> arguments. Now searches by doubling from a safe floor and lands on the real,
+measured context that fits instead - see <a href="#brain-atlas">above</a> for how this one was actually found.</p>
 </div>
 </div>
 </section>

@@ -2588,9 +2588,10 @@ mutable state there.
 
 UI side (`tools/ui`): Svelte 5 port of `Brain.tsx` - Canvas 2D grid, tier
 colour + heat brightness + pulse-decay flash on hit, hover tooltip. Dropped
-the expert-affinity atlas overlay (a separate, much bigger measured-topic-
-clustering system this fork doesn't have) and full i18n wiring for a first
-cut.
+full i18n wiring for a first cut. The expert-affinity atlas overlay was
+scoped out of this first cut (a separate, much bigger measured-topic-
+clustering system this fork didn't have yet) - since built and merged in,
+see section 3b below.
 
 **Validated, not just built**: `svelte-check` 0 errors across the whole
 project (6288 files), production build succeeds, and confirmed live against
@@ -2610,6 +2611,133 @@ constants reorganization found sitting uncommitted in the working tree (not
 a pure rename: real content moved between files, e.g. `MCP_RECONNECT`'s own
 shape changed) that isn't safe to bundle in sight-unseen. See the Brain-view
 commit message for the exact file list still pending.
+
+## 3b. Merging in the affinity-atlas overlay — BUILT AND VALIDATED, 2026-08-14
+
+Colibri's README shows a third view (`docs/media/colibri-atlas.png`) that
+plots experts by *measured topic affinity* rather than a fixed grid. Checked
+whether the frontend for it actually ships in Colibri's repo before building
+anything: no. `web/src/` only has `App.tsx`, `Brain.tsx`, `ErrorBoundary.tsx`,
+`Profiling.tsx`, `main.tsx` plus `components/`/`i18n/`/`lib/` - no
+`Atlas.tsx` anywhere. Direct raw-URL fetch of `web/src/Atlas.tsx` 404s on
+both `main` and `dev` (checked all branches for the file's existence, not
+just guessed). The screenshot doesn't correspond to shipped code on any
+branch. What *is* real and reused as-is: the measurement methodology in
+`c/tools/expert_atlas/` (`probes.json`, `sweep.sh`, `analyze.py`) - labeled
+probe prompts per topic category, greedy decode with speculative decoding
+off (draft/MTP contamination and `--topp` pruning are exactly the confounds
+that would poison a routing measurement), a replication gate (an expert only
+counts as affine to a category if it fired on >=2 of that category's
+independent probes, not one lucky prompt), and a specialization score
+`1 - H(p(c|e))/log(C)`.
+
+Built new (nothing to port, since no frontend existed for this piece):
+
+- `tools/expert-atlas/expert-atlas.cpp` - new standalone CLI, same shape as
+  `tools/imatrix` (own CMake target, `common_init_from_params`, hooks
+  `cb_eval`). Ships 27 original probe prompts across 9 categories (code,
+  math, science, law, medicine, creative, casual, format, history). Reads
+  the `ffn_moe_topk-<layer>` tensor that `llm_graph_context::build_moe_ffn`
+  already names via the existing `cb()` mechanism (`src/llama-graph.cpp`) -
+  this is the router's own top-k selection, upstream of moe-cache entirely,
+  so the measurement is valid with or without caching enabled. Clears the KV
+  cache between probes (no cross-probe autocorrelation), accumulates
+  per-(layer,expert,category) counts, and writes a JSON atlas: for every
+  cell with >=1 observation, a specialization score and an (x,y) position -
+  the category-count vector's weighted centroid over category anchors laid
+  out evenly on a unit circle, gated by the replication rule above.
+- `--expert-atlas-file <path>` server flag (`common/arg.cpp`,
+  `common_params::expert_atlas_file`), loaded lazily (`std::call_once`) on
+  first `/experts` request and merged into the existing response as an
+  `atlas` field. Fully backward compatible - omitted when the flag isn't
+  set, so existing Brain-only deployments are unaffected.
+- `Brain.svelte`: a Grid/Atlas toggle (only shown when atlas data is
+  present). Atlas mode plots the same cache-tier/heat colour encoding the
+  Grid view already had, but positions each point by measured (x,y) instead
+  of (layer,expert) grid coordinates, with category labels around the rim
+  and a point radius that grows with specialization. Position from the
+  atlas, colour from the live cache state - the same lookup key
+  (`layer*cols+expert`) joins both data sources per point.
+
+**Validated, not just built**: `svelte-check` 0 errors, production UI build
+succeeds, `llama-expert-atlas` and `llama-server` both build clean. Ran the
+tool for real against the live deployment's own model (Gemma-4-26B-A4B,
+CPU-only via `CUDA_VISIBLE_DEVICES=` since the persistent 8099 server was
+kept up per standing instruction and the sandbox GPU had no spare VRAM for a
+second context) - 27 probes across 30 layers in ~22s, 3635 cells written,
+specialization scores spanning 0.0-1.0 (mean 0.47), sane per-layer spread.
+Restarted the 8099 server once (necessary - a new CLI flag can't be picked
+up without a restart) pointed at the atlas file, sent a real chat completion,
+and confirmed by direct JSON inspection: `/experts` returns both `stats`
+(hit_rate 0.16, 64/64 slots used, 32 protected) and `atlas` (3635 cells) in
+the same response, and every one of the 64 currently-cached (warm/hot) grid
+cells has a matching atlas position - the merge join works on real data, not
+just compiles.
+
+**UI iteration after first real usage (2026-08-14, same day)**: live testing
+against the actual running deployment surfaced three more issues, one of
+which turned out to be a real pre-existing engine bug, not a frontend one:
+
+- Grid cells rendered stretched into tall rectangles instead of squares, and
+  the whole grid looked far taller than it needed to be. Cause: the canvas
+  had `class="h-full w-full"`, which CSS-stretches it to the wrapper's box
+  regardless of its intrinsic pixel size - `canvas.width`/`canvas.height`
+  were being set correctly (square cells, `cols*(cell+gap)` x
+  `rows*(cell+gap)`), but the *displayed* size was whatever the wrapper
+  happened to be. Fixed by setting `canvas.style.width`/`height` in JS to
+  match the intrinsic size exactly, and centering the (now often much
+  smaller) canvas in its wrapper via flex instead of stretching it.
+- Atlas points overlapped with hard edges, making dense clusters look like
+  bitten "half-moons" where a later-drawn circle fully overwrote an earlier
+  one. Fixed with per-point transparency (`rgba(...,0.55)`), a light stroke
+  so overlapping edges stay visible, and drawing more-specialized (larger)
+  points last so a big generalist blob never fully buries a specialist.
+- Per user feedback ("do we even need grid? it can be a very small PiP"),
+  replaced the Grid/Atlas toggle button entirely: when an atlas is loaded,
+  Atlas is now always the primary view and the plain (layer, expert) grid
+  is tucked into a small 220x130 picture-in-picture inset in the corner,
+  redrawn from the same `cellColor()`/pulse state. Deployments without
+  `--expert-atlas-file` still get the full-size grid as before, unchanged.
+
+**Real bug found and fixed, not a rendering issue**: "brain shows nothing
+while chat is happening" and "colours seem fixed, not changing between
+requests" were reported together, and turned out to share one root cause,
+confirmed with hard evidence rather than guessed at - added temporary
+per-call logging to `moe_cache_get_expert_map()` (`-lv 4` to actually see
+GGML_LOG_INFO, which llama.cpp's own logger maps to its most-suppressed
+TRACE level by default) and reproduced live: the moe-cache session's
+identity (its pointer, `tensor_layer.size()`, `n_expert_hint`) changed on
+essentially every second request, always immediately preceded by a
+`sched_reserve: reserving ...` log line. Traced to
+`llama_context::sched_reserve()` (`src/llama-context.cpp`): it is not a
+one-time startup call as the rest of the scheduler-construction code
+suggested on first read - it's gated by a `sched_need_reserve` flag that
+`set_sampler()` sets on every backend-sampler (re)installation, which this
+deployment's `-bs` flag triggers per-request. When that flag is set, the
+*entire* `ggml_backend_sched_t` gets destroyed and rebuilt
+(`sched.reset(ggml_backend_sched_new(...))`), and moe-cache's session was
+parented 1:1 to that scheduler's lifetime, so every rebuild silently threw
+away all cached-expert state and started a fresh, empty session - with no
+error or warning, because from the scheduler's point of view this is normal,
+expected behavior.
+
+Fix (additive, does not touch `sched_reserve()`'s actual reservation logic):
+a moe-cache session tracks GPU-resident expert state tied to physical
+devices and host weight-buffer addresses, neither of which change when the
+scheduler is rebuilt - so its lifetime shouldn't be tied to the scheduler
+object at all. Added `ggml_backend_sched_take_moe_cache_session()` /
+`_adopt_moe_cache_session()` (`ggml-backend.cpp`/`.h`) to detach a session
+from a scheduler about to be freed and re-attach it to the replacement
+instead of going through `session_create`/`session_destroy`. Wired into both
+`sched.reset(...)` call sites in `sched_reserve()` (the normal path and the
+pipeline-parallel-fallback retry path).
+
+**Validated on the real deployment**: 4 sequential real chat completions
+against the persistent 8099 server, `hits` accumulating cleanly across all
+of them (13,044 -> 24,470 -> 37,979 -> 50,570) instead of resetting to zero
+after the first - confirms the fix holds under this deployment's actual
+`-bs`/`--spec-type draft-mtp`/`--parallel 4` configuration, not just in
+isolation.
 
 ## 4. Static pre-flight resource planner — NOT dynamic, no running server needed
 
@@ -3091,3 +3219,83 @@ speculative decoding measured on the fresh, untuned Qwen3-4B/DSpark
 pairing (235 drafted / 64 accepted on a simple prompt - modest accept rate
 expected, this pairing has had no calibration or trim work done on it,
 unlike the Gemma-4/MTP setup this session spent most of its effort on).
+
+# `--fit` hard-crashes on an explicit context request that doesn't fit, real fix (2026-08-15)
+
+Found live, not gone looking for it: asked for `-c 32768` in the WebUI
+model-info dialog (`default_generation_settings.n_ctx` was showing 2048,
+the per-slot value with `--parallel 4` on `-c 8192` - correct but
+confusing), then user asked to push toward much larger context ("1M").
+`-c 1000000` on the 12GB RTX 3060 didn't fail gracefully - it hard-aborted
+the whole process (`ggml_abort` -> SIGABRT from a CUDA OOM inside
+`cudaStreamCreateWithFlags`, deep in `ggml_backend_sched_reserve_size`).
+Root cause: `common_fit_params`'s own *measurement* pass (in
+`common_get_device_memory_data_impl`, `common/fit.cpp`) creates a real
+`llama_context` to simulate the allocation at whatever `cparams->n_ctx` was
+requested. `ggml` aborts hard on CUDA errors by design (no try/catch can
+intercept a SIGABRT), so an oversized *explicit* `-c` could crash the
+measurement itself, before any of `--fit`'s own reduction logic got a
+chance to run.
+
+Why the `n_ctx==0` (auto) path was already safe: unset context resolves to
+the model's own trained context internally before anything allocates, so
+the "full" probe size was always bounded by something the model itself
+was actually built for. An explicit request has no such bound.
+
+**Two narrower fixes tried first, both wrong on real measurement:**
+1. Clamp to the model's own trained context (`llama_model_n_ctx_train`)
+   before probing. Reasonable-sounding, wrong in practice: Gemma-4-26B-A4B's
+   trained context is 262144, and *that* also crashes the measurement pass
+   on this 12GB card. "The model's own trained context" is not a
+   universally safe stand-in ceiling - it depends on the hardware, which is
+   exactly the thing we don't know yet at this point in the function.
+2. Two-point linear extrapolation (probe at `n_ctx_min`=4096 and
+   `2*n_ctx_min`=8192, derive bytes-per-ctx, extrapolate to the requested
+   size). Prevented the crash, but the extrapolated number was badly wrong
+   once fed back into the *existing* reduction-search block further down
+   (gated by `cparams->n_ctx == 0`, loosened to also fire when this step
+   had already clamped something): that block's interpolation math
+   (`bytes_per_ctx = (sum_projected_used - sum_projected_used_min_ctx) /
+   (hp_nct - n_ctx_min)`) assumes the "full" measurement was taken *at*
+   `hp_nct` (the model's trained context) - once step 0 clamps to something
+   else, that assumption breaks and the formula computes a bogus (much too
+   large) result. Confirmed live: `-c 262144 -ncmoe 15` landed the real
+   downstream KV-cache allocation on something far larger than the
+   estimated-safe value, and failed (not a hard crash this time, but not
+   the intended fix either).
+
+**Final design**: search by doubling from `n_ctx_min`. Each step is at
+most 2x the size of the last one that was *actually measured* (not
+extrapolated) to fit, so any single probe's potential overshoot stays
+bounded and the final answer is a real, checked measurement rather than a
+guess from a distant sample. Scoped to the common single-device (or
+host-only) case, where the free-memory budget is unambiguous; multi-device
+setups fall back to `n_ctx_min` (the one size every other path in this
+file already trusts unconditionally) rather than trying to be clever.
+Also fixed the interaction bug: when this step 0 search has already found
+and validated a safe context, the old reduction-search block no longer
+re-runs its (now-invalid) interpolation over it - if the real remeasurement
+in step 1 still somehow disagrees (e.g. minor driver-level allocator
+variance right at the boundary this deliberately searches up to), it falls
+straight back to `n_ctx_min` rather than trusting stale math.
+
+**Validated live, both configurations, on the real deployment** (RTX 3060,
+12GB, Gemma-4-26B-A4B + MTP draft, `-ncmoe 15`, GPU confirmed fully free
+before each test to avoid a false negative from the live 8099 deployment
+competing for the same VRAM):
+- `-c 1000000 --parallel 4`: no crash, real generation succeeds,
+  landed on 8192 ctx/slot (32768 total across 4 slots).
+- `-c 1000000 --parallel 1`: no crash, real generation succeeds,
+  landed on 16384 ctx/slot.
+- `-c 262144` (the model's actual trained context) with the fix: same
+  8192/slot result as the 1M request, confirming the search correctly
+  finds the real hardware ceiling regardless of how far beyond it the
+  request goes.
+
+Neither number is close to 262144 - that's a genuine hardware ceiling for
+this model+card combination, not a bug. The fix's job was never to make
+more context magically fit; it's to make the program discover and report
+the real number instead of crashing or silently guessing wrong. Restarted
+the persistent 8099 deployment on the fixed binary with `-c 262144`
+(letting `--fit` decide the rest) - landed on the same 8192/slot x 4,
+confirmed via a real chat completion.
