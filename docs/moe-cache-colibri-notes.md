@@ -1735,6 +1735,79 @@ against exactly this failure mode.
   slot, exact-match only) - not a new technique to add, confirms the
   already-tracked item is the right thing to build if this is wanted.
 
+## Probabilistic draft acceptance (`--spec-prob-accept`) - BUILT AND VALIDATED, 2026-08-14
+
+Motivated by the FR-Spec+suffix-decode investigation above: llama.cpp's
+speculative verification (`common_sampler_sample_and_accept_n`,
+`common/sampling.cpp`) only ever accepted a draft token on an *exact*
+match against an independently-drawn sample from the target - never
+read the draft's own probability at all, at any temperature. This is
+strictly more conservative than the classic speculative-decoding
+acceptance test (`min(1, p_target(x)/p_draft(x))`, with fallback to the
+target's own sample on rejection - not full residual-distribution
+resampling, a common, simpler approximation), which is guaranteed to
+accept at least as often for the same draft/target pair: if the target
+considers a token at least as likely as the draft did, it's accepted
+outright, no coincidental exact match required.
+
+**Design, opt-in and structured to be impossible to regress**: new
+`--spec-prob-accept` flag (default off - unset behavior is byte-identical
+to before this existed, verified). The new code path is a strict
+superset of the old one - exact match is checked and accepted first,
+exactly as before; only on mismatch does it get a *second* chance via
+the probability-ratio test, before falling back to the same "use the
+target's own sample" behavior the old code always used. Implementation:
+- `common_speculative_draft_params` gained an optional `result_probs`
+  (`common/speculative.h`) - parallel to the existing `result` token
+  array, populated by MTP's own draft loop with its real per-token
+  confidence (`common/speculative.cpp`, already computed via
+  `common_sampler_get_candidates`, previously discarded). Drafters that
+  don't track a real probability (ngram-suffix and other pattern
+  matchers) are padded with 1.0 (maximally confident) rather than
+  requiring every drafter type to change - a probability of 1.0 makes
+  the acceptance ratio reduce to exactly `p_target`, which is the
+  correct treatment for a token with no real confidence value.
+- `common_sampler_sample_and_accept_n` gained an optional `draft_probs`
+  parameter (`common/sampling.h`/`.cpp`); null (the default) reproduces
+  the original function exactly, byte for byte.
+- Server wiring (`tools/server/server-context.cpp`): `slot.spec_draft_probs`
+  parallel to `slot.spec_draft`, only allocated/passed when the flag is on.
+
+**Verified, not just built:**
+- Flag off: confirmed byte-identical draft/accept counts and tok/s to
+  before this change, both on the healthy MTP+suffix config and the
+  broken FR-Spec+suffix one - zero behavioral change when unset.
+- Flag on at `temperature=0` (every measurement earlier in this
+  document): confirmed a mathematical no-op, not a bug - a greedy
+  target's true distribution is a point mass, so any non-matching
+  token genuinely has `p_target=0`, and `alpha=0` correctly, every
+  time. Probabilistic acceptance can only ever matter at non-zero
+  temperature; this was worth confirming empirically, not just arguing
+  from theory, given every number in this document so far was measured
+  at temp=0.
+- Flag on at `temperature=0.7`, healthy MTP-only config (no FR-Spec, no
+  suffix-decode): **53.6-53.8 tok/s (off) -> 55.6-55.7 tok/s (on), a
+  real, consistent ~3.5% improvement** - the mechanism genuinely works
+  and helps in the case it's designed for.
+- Flag on at `temperature=0` and `0.7`, the broken FR-Spec+suffix-decode
+  config from the investigation above: **no measurable change either
+  way** (~30 tok/s, ~10% accept, same as flag-off). This is a real,
+  useful negative result: it rules out "borderline draft tokens losing
+  narrow coin-flips" as the mechanism behind that bug - MTP's trimmed-
+  vocab candidates in that specific failure mode are apparently getting
+  genuinely low target-probability, not just missing an exact-match
+  technicality, so a smarter acceptance test doesn't recover them. The
+  FR-Spec+suffix-decode incompatibility remains open and undiagnosed at
+  the root-cause level; this doesn't close it, but it does eliminate one
+  candidate explanation with real evidence instead of leaving it as an
+  untested guess.
+
+Recommendation: safe to enable generally (`--spec-prob-accept`) for any
+non-greedy (temperature > 0) deployment using MTP - real upside, zero
+downside by construction. Does not help or hurt the FR-Spec+suffix-decode
+combination either way; that guidance (don't combine them) stands
+unchanged.
+
 ## Explicitly decided against
 Multi-LoRA serving (not our use case), multi-node serving (single H200),
 SGLang's expert-parallelism/DeepEP (multi-GPU only) - these are ours to

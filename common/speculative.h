@@ -57,6 +57,22 @@ struct common_speculative_draft_params {
 
     // the generated draft from the last _draft() call
     llama_tokens * result;
+
+    // optional: when non-null, drafters that track a real per-token
+    // confidence (currently just MTP) push the drafter's own probability
+    // for each token here, parallel to `result` - enables probabilistic
+    // draft acceptance (common_sampler_sample_and_accept_n's draft_probs
+    // parameter) instead of requiring an exact match against the
+    // target's independently-sampled token. Drafters that don't track a
+    // real probability (pattern-matching ones like ngram-suffix) may
+    // leave this unpopulated for their own tokens; common_speculative_draft()
+    // pads any gap with 1.0 (maximally confident) so the array always
+    // ends up the same length as `result` when this is set at all - a
+    // pattern-matched token has no real confidence value to report, and
+    // treating it as fully confident just makes its acceptance
+    // probability equal to the target's own probability for it, which is
+    // the same effect a real probability of 1.0 would have in the ratio.
+    std::vector<float> * result_probs = nullptr;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
