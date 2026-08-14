@@ -440,11 +440,13 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
         LLAMA_LOG_WARN("%s: FR-Spec vocab trim configured but model.output_s is set "
                 "(quantized output scale) - trim is not supported here, using full vocab\n", __func__);
     } else if (!gmodel.frspec_d2t_ids.empty()) {
-        auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids);
+        auto inp = std::make_unique<llm_graph_input_frspec_d2t>(gmodel.frspec_d2t_ids, model.output);
         inp->d2t = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) gmodel.frspec_d2t_ids.size());
         ggml_set_input(inp->d2t);
+        inp->output_w = ggml_new_tensor_2d(ctx0, model.output->type, model.output->ne[0], (int64_t) gmodel.frspec_d2t_ids.size());
+        ggml_set_input(inp->output_w);
         inp_d2t = inp.get();
-        output_w = ggml_get_rows(ctx0, model.output, inp->d2t);
+        output_w = inp->output_w;
         res->add_input(std::move(inp));
     }
 

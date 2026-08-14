@@ -1334,32 +1334,64 @@ against exactly this failure mode.
   always re-verifies over the real, full vocab, so a wrong/rejected
   draft proposal can only cost a fallback token, never wrong output.
 
-  **Honest speed finding: no net win measured in this sandbox, possibly
-  a small regression.** Repeated timing on a 200-token completion
-  (temp=0): untrimmed baseline ~61-63 tok/s; trimmed ~55-59 tok/s -
-  reproduced with two different sidecars, including one built directly
-  from 12 real repetitions of the *exact* benchmark prompt itself (645
-  tokens, 100% coverage of its own observed traffic - about as
-  favorable a real-traffic match as this technique could ever get).
-  Working theory, not yet confirmed at the kernel level: the trim is
-  applied via a live `ggml_get_rows` gather inside the compute graph on
-  *every* forward pass (not a persistent pre-gathered weight - deliberately
-  avoided per Option B, and blocked architecturally besides: no clean
-  way found in `llama_model_loader` to create a GGUF-independent
-  constant weight tensor, which is *why* this uses a live
-  `llm_graph_input_i` gather instead). At the very small per-step batch
-  sizes real MTP drafting uses (`--parallel 1`, `spec-draft-n-max=3`
-  here), the fixed launch/dispatch overhead of an extra GPU kernel per
-  step may be outweighing whatever the smaller LM-head matmul saves -
-  plausible on this GPU/draft-size/vocab combination, but genuinely
-  untested at GLM-5.2/H200 scale (a much larger draft, a different vocab
-  size, real concurrent multi-user batches rather than solo
-  `--parallel 1`). **Do not treat this as validating or invalidating the
-  technique for the real deployment target** - it's a real result on the
-  sandbox proxy only, in the direction opposite to what the technique
-  promises, and the honest next step before porting to GLM's
-  `glm-dsa.cpp` is re-measuring closer to the real target's scale, not
-  extrapolating either way from this number.
+  **Speed finding, revised after a follow-up fix (2026-08-14, same
+  day).** The first pass measured a real 5-11% regression and named a
+  working theory: the trim ran a live `ggml_get_rows` gather inside the
+  compute graph on *every* forward pass, re-executed as a real GPU
+  kernel every step even though the result never changes -
+  `can_reuse()=true` only skips rebuilding the graph's CPU-side
+  topology, it does not skip re-running each node's kernel once the
+  graph executes. Checked this empirically before acting on it: "graphs
+  reused" counts from the server logs were statistically identical
+  between trimmed and untrimmed runs (same ~198-per-200-token increment
+  in both), ruling out "the trim breaks graph reuse" as the cause and
+  confirming the cost really was per-step kernel execution time, not
+  launch-dispatch overhead.
+
+  **Fix:** moved the gather out of the compute graph entirely.
+  `llm_graph_input_frspec_d2t` now also owns `output_w`, a
+  pre-gathered-weight graph *input* (not a graph *node*) populated
+  exactly once - on the first `set_input()` call, via a new
+  `llm_frspec_gather_vocab_rows_from_backend()` helper that reads the
+  needed rows straight off the original weight's backend buffer
+  (`ggml_backend_tensor_get()`, works whether it's CPU- or
+  GPU-resident) - and left untouched on every call after that. This
+  didn't need the GGUF-independent-constant-tensor mechanism that was
+  architecturally blocked earlier in the session; it reuses the exact
+  `llm_graph_input_i`/`set_input()` pattern already built for the d2t
+  index tensor, just with a "populate once" guard instead of "populate
+  every call." The scatter-back step (`ggml_set_rows` placing the
+  trimmed logits into a full-vocab-shaped, -inf-filled tensor) still
+  runs every step, unavoidably - its *data* genuinely changes every
+  token, unlike the weight gather.
+
+  **Re-measured, correctness first:** temp=0 output on "The capital of
+  France is" stayed byte-identical to both the untrimmed baseline and
+  the pre-fix trimmed run - the fix only changes *when* the gather
+  computation happens, never its result.
+
+  **Re-measured, speed:** 9 samples each, same 200-token photosynthesis
+  prompt, temp=0, on the same 645-token real-traffic sidecar as before.
+  Cache-once trim: 57.8-62.7 tok/s (mean 60.5). A matched fresh
+  untrimmed baseline, run immediately after: 55.0-59.8 tok/s (mean
+  57.4) - lower than the *first* untrimmed baseline measured earlier in
+  the session (61.6-62.7), despite being the same build and config. That
+  drift between two untrimmed baselines, taken minutes apart, is bigger
+  than the trimmed-vs-untrimmed difference either measurement showed -
+  the sandbox's own run-to-run noise (thermal state, background load,
+  moe-cache warm-up) is evidently larger than this technique's effect
+  size at this scale. **Honest conclusion: the cache-once fix closed the
+  previously-measured gap** (regression shrank from a consistent 5-11%
+  to something indistinguishable from noise across two independently-run
+  9-sample sets), but this sandbox cannot cleanly separate "the
+  technique helps a little" from "the technique is a wash" at
+  `--parallel 1` on an RTX 3060. A real read either way needs either
+  interleaved back-to-back sampling to cancel drift, many more samples,
+  or - more usefully - just measuring on hardware closer to the actual
+  GLM-5.2/H200 target, where the vocab size, draft size, and batch
+  dynamics are all different anyway. What's no longer in question: the
+  earlier "clear net regression" finding was partly a measurement
+  artifact, and the fix that was supposed to help genuinely did.
 
   Toggling is clean either way: `--spec-vocab-map` unset (the default)
   is a verified no-op - `frspec_d2t_ids` stays empty, `load_arch_tensors`
@@ -1545,9 +1577,76 @@ against exactly this failure mode.
   already-tracked item is the right thing to build if this is wanted.
 
 ## Explicitly decided against
-Full PagedAttention (maintainers want the narrower path), multi-LoRA
-serving (not our use case), multi-node serving (single H200), SGLang's
-expert-parallelism/DeepEP (multi-GPU only).
+Multi-LoRA serving (not our use case), multi-node serving (single H200),
+SGLang's expert-parallelism/DeepEP (multi-GPU only) - these are ours to
+decide and the deployment shape rules them out cleanly.
+
+Full PagedAttention is different and was mis-filed here originally:
+not-building-it was llama.cpp's own maintainers' architectural call
+(discussion #21961 - "we can obviously implement the same scheduling
+for cross-request KV reuse at server level" instead of adopting vLLM's
+block-pool architecture), not an independent evaluation on this branch.
+Re-examined 2026-08-14, prompted directly by being called out for that
+conflation - see "PagedAttention re-examined" below for what's actually
+built into llama.cpp already and whether it matters for us specifically.
+
+## PagedAttention re-examined - llama.cpp already has the practical
+## equivalent, and this deployment isn't using it (2026-08-14)
+
+Checked the source directly rather than relying on the earlier
+maintainer-thread read. Without `--kv-unified`, `n_ctx_seq = n_ctx /
+n_seq_max` (`llama-context.cpp`) - each `--parallel` slot gets a fixed,
+equal, contiguously pre-reserved share of the context budget, whether
+or not that slot's actual conversation ever comes close to using it.
+That's exactly the waste PagedAttention exists to eliminate - a
+concurrency-count argument (26->247 sequences on an A10G) isn't the
+only place this bites; VRAM wasted on unused reservation is a cost
+regardless of concurrency level.
+
+With `--kv-unified`, `n_ctx_seq = n_ctx` and `n_stream = 1`: a single
+pool shared across all active sequences, drawn from dynamically rather
+than pre-split. Combined with `--cache-idle-slots` (already validated
+this session, ties into `server_prompt_cache`/`--cache-ram`), idle
+slots' KV cache is actively reclaimed and handed back to the pool for
+busy ones - `try_clear_idle_slots()` in `server-context.cpp` is a
+no-op entirely unless `kv_unified` is set. Checked both for
+compatibility with the rest of this stack: `llama_kv_cache_iswa`
+computes `size_swa` correctly for the unified case
+(`hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch`,
+`llama-kv-cache-iswa.cpp`) - a real, tested path (referenced from
+`llama-memory-hybrid-iswa.cpp` for hellaswag/winogrande eval), not
+experimental - and no MTP-specific special-casing anywhere in
+`common/speculative.cpp` or the server's spec-loading code suggests an
+incompatibility either.
+
+**The catch, and why this deployment doesn't get this for free:**
+`kv_unified` only auto-enables when `--parallel` is left at "auto"
+(`server.cpp`: `if (params.n_parallel < 0) { params.n_parallel = 4;
+params.kv_unified = true; }`). Any explicit `--parallel N` - which is
+exactly what this session's concurrency-aware `--moe-calibrate` work
+does (deliberately reuses `--parallel` as the concurrency target), and
+what a real deployment pinned to "5-10 users" would do - silently keeps
+the wasteful fixed-division default instead.
+
+Given GLM-5.2 is VRAM-constrained enough to need moe-cache's CPU/GPU
+expert split in the first place, wasted KV reservation isn't just
+"fewer raw concurrent connections" - it directly competes with
+moe-cache's own expert-cache budget for the same free VRAM. That's a
+more concrete case for us than the raw concurrency-count number the
+maintainer thread was actually debating.
+
+**Action, not yet taken:** add `--kv-unified` (paired with the
+already-validated `--cache-idle-slots`/`--cache-ram`) to the real
+deployment config and to this session's own calibration/sweep commands
+going forward - all of which have been running with explicit
+`--parallel N` the entire session and have therefore never exercised
+unified mode. Every concurrency-related number measured so far in this
+document (the 9-31 sweep, the concurrency=32 cliff, the
+concurrency-aware calibration cross-validation) was measured under the
+fixed-division default, not unified mode - worth flagging as a caveat
+on those results, not just a forward-looking TODO, since unified mode
+could plausibly change where cliffs/optimal placements land by
+changing how much VRAM is actually free at a given `--parallel N`.
 
 ## Honest calibration on the combined number
 RFC-thread testers got low-to-mid-20s tok/s with moe-cache alone on WORSE
