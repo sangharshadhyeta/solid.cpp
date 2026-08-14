@@ -169,8 +169,9 @@ h2{font-size:1.65rem;margin:0 0 .5rem;}
 .stat-card .num small{font-size:1.1rem;color:var(--muted);font-weight:600;}
 .stat-card .label{color:var(--muted);font-size:.82rem;margin-top:.5rem;}
 
-.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg-2);}
-table{width:100%;border-collapse:collapse;font-size:.88rem;table-layout:fixed;}
+.tablewrap{overflow-x:auto;border:1px solid var(--border);border-radius:12px;background:var(--bg-2);-webkit-overflow-scrolling:touch;}
+table{width:100%;min-width:640px;border-collapse:collapse;font-size:.88rem;table-layout:fixed;}
+@media (max-width:640px){table{font-size:.82rem;}th,td{padding:.65rem .7rem;}}
 th,td{text-align:left;padding:.75rem .85rem;border-bottom:1px solid var(--border-soft);vertical-align:top;overflow-wrap:break-word;}
 tr:last-child td{border-bottom:none;}
 th{color:var(--muted);font-weight:600;font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;background:var(--bg-2);}
@@ -281,9 +282,9 @@ about as constrained as it gets for a 26B-parameter MoE model), same prompt, sam
 being measured. Chat-templated and content-verified, not a synthetic benchmark.</p>
 
 <div class="stat-row">
+<div class="stat-card"><div class="num">+36.0<small>%</small></div><div class="label">Expert-prefetch, prefill <span class="note">(via thecodacus)</span></div></div>
 <div class="stat-card"><div class="num">+31.3<small>%</small></div><div class="label">MoE expert-cache vs naive CPU offload</div></div>
 <div class="stat-card"><div class="num">+28.1<small>%</small></div><div class="label">MTP speculative decoding</div></div>
-<div class="stat-card"><div class="num">+21.6<small>%</small></div><div class="label"><code>--moe-calibrate</code> vs safe-floor placement</div></div>
 </div>
 
 <div class="tablewrap">
@@ -294,6 +295,7 @@ being measured. Chat-templated and content-verified, not a synthetic benchmark.<
 <tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Expert-prefetch, prefill <span class="note">(overlapped weight uploads, ncmoe=20, pp2048)</span></td><td class="num">1403 tok/s</td><td class="num">1908 tok/s</td><td class="num delta-pos">+36.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>LFRU eviction <span class="note">(vs plain LRU)</span></td><td class="num">63.8% hit rate</td><td class="num">65.0% hit rate</td><td class="num delta-pos">+1.2pp</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Probabilistic draft acceptance <span class="note">(<code>--spec-prob-accept</code>, temp 0.7)</span></td><td class="num">53.6 tok/s</td><td class="num">55.7 tok/s</td><td class="num delta-pos">+3.5%</td><td><span class="tag tag-solid">solid</span></td></tr>
@@ -357,7 +359,13 @@ guess.</p>
 <div class="card">
 <h3>Live Brain + Atlas view</h3>
 <p>Real-time per-expert tier/heat heatmap merged with measured topic-affinity positioning, served straight off
-the running server — see <a href="#proof">above</a>.</p>
+the running server — see <a href="#brain-atlas">above</a>.</p>
+</div>
+<div class="card">
+<h3>Expert-prefetch + host-pinning</h3>
+<p>Overlaps an offloaded expert's weight upload with the previous expert's compute instead of blocking on it, plus
+lifetime host-page pinning for <code>-ncmoe</code>'s repeated CPU→GPU copies. +36.0% prefill, measured on our own
+hardware — ported from <a href="https://github.com/thecodacus/llama.cpp">thecodacus</a>.</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
@@ -407,15 +415,22 @@ hardware, locally and in the cloud — carries through untouched:</p>
 <pre><code>cmake -B build -DGGML_CUDA=ON   # or your backend of choice
 cmake --build build --config Release -j</code></pre>
 <pre><code># Download and run a model directly from Hugging Face
-./build/bin/llama-cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
 
 # Launch an OpenAI-compatible API server
-./build/bin/llama-server -m &lt;model.gguf&gt; -ngl 99</code></pre>
-<p class="note">Docker: see the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker docs</a>. Building from source: the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a>.</p>
+llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+
+# A MoE model too big for VRAM - the expert-cache does the work
+llama serve -hf &lt;big-moe-model-gguf&gt; -ngl 99 -ncmoe 15 --moe-cache auto</code></pre>
+<p class="note">Docker: <code>.devops/*.Dockerfile</code> builds from this source tree, so it includes every fix
+on this page - the pre-built <code>ghcr.io/ggml-org/llama.cpp</code> images in the
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker docs</a> are
+upstream-only and won't have them. Full guide either way in
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>.</p>
 
 <div class="grid" style="margin-top:1.75rem">
-<a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama-cli"><div class="d">VLM session with <code>llama-cli</code></div></a>
-<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama-server"><div class="d">Built-in web UI against <code>llama-server</code></div></a>
+<a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama cli"><div class="d">VLM session with <code>llama cli</code></div></a>
+<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama serve"><div class="d">Built-in web UI against <code>llama serve</code></div></a>
 </div>
 </section>
 
@@ -529,6 +544,13 @@ architecture or conventions more than a given fix requires. See upstream's
 <section>
 <div class="eyebrow">License &amp; acknowledgements</div>
 <h2>MIT, same as upstream</h2>
+<p class="section-lede">Real sources for real ported work, not vendored libraries but genuine prior art this fork builds directly on:</p>
+<ul>
+<li><a href="https://github.com/leloch/llama.cpp">leloch/llama.cpp</a> (<code>moe-cache-pr</code> branch) — original design for the GPU-resident MoE expert-cache this whole fork is built around. The core feature, not a footnote.</li>
+<li><a href="https://github.com/thecodacus/llama.cpp">thecodacus/llama.cpp</a> (<code>fable5/prefetch-experts</code> branch, via the <a href="https://www.youtube.com/@Codacus">Codacus</a> YouTube channel) — expert-prefetch + lifetime host-pinning, overlapping expert-weight uploads with compute instead of blocking on them. Cherry-picked and re-measured on our own hardware: +36.0% prefill (1403 → 1908 tok/s, RTX 3060, Gemma-4-26B-A4B).</li>
+<li><a href="https://github.com/JustVugg/colibri">JustVugg/colibri</a> — LFRU eviction design (probation/protected segments, heat-based promotion) and the Expert Atlas topic-affinity measurement methodology (labeled probes, replication gate, specialization scoring) the Brain/Atlas view's positioning is built on.</li>
+</ul>
+<p class="section-lede" style="margin-top:2rem">Third-party libraries, inherited unchanged from upstream:</p>
 <ul>
 <li><a href="https://github.com/yhirose/cpp-httplib">yhirose/cpp-httplib</a> — single-header HTTP server, used by <code>llama-server</code> — MIT</li>
 <li><a href="https://github.com/nothings/stb">stb-image</a> — single-header image decoder, multimodal subsystem — public domain</li>
