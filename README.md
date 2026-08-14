@@ -24,6 +24,32 @@ FR-Spec vocab trimming, MTP correctness), but the scope is the whole inference h
 KV-cache, sampling, quantization - not just MoE. See [`docs/moe-cache-colibri-notes.md`](docs/moe-cache-colibri-notes.md)
 for the full, honest working log: what was tried, what worked, what didn't, and why.
 
+## Proven, not promised
+
+The headline claim: MoE models too big for your VRAM don't just run here via CPU offload, they run
+*fast* - measured, not assumed. Every row below is a real before/after on the same hardware (RTX 3060,
+12GB VRAM - about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config
+except the one thing being measured, chat-templated and content-verified so the number reflects real
+usage, not a synthetic benchmark. Full methodology and raw numbers in
+[`docs/moe-cache-colibri-notes.md`](docs/moe-cache-colibri-notes.md).
+
+| What | Before | After | Change |
+|---|---|---|---|
+| MoE expert-cache (vs `--moe-cache off`, the naive CPU-offload port) | 39.37 tok/s | 51.71 tok/s | **+31.3%** |
+| Real placement optimum (vs a conservative `-ncmoe` guess) | 46.995 tok/s | 51.71 tok/s | **+10.0%** |
+| `--moe-calibrate` empirical search (vs safe-floor placement) | 41.68 tok/s | 50.70 tok/s | **+21.6%** |
+| MTP speculative decoding | 50.70 tok/s | 64.92 tok/s | **+28.1%** |
+| LFRU eviction (vs plain LRU) | 63.8% hit rate | 65.0% hit rate | **+1.2pp** |
+| Probabilistic draft acceptance (`--spec-prob-accept`, temp 0.7) | 53.6 tok/s | 55.7 tok/s | **+3.5%** |
+| Backend sampling (`-bs`, concurrent load) | 103.6 tok/s | 107.5 tok/s | **+3.8%** |
+| FR-Spec draft-vocab trim (measured, not assumed free) | 75.93 tok/s | 56.2 tok/s | **-26%** |
+
+That last row is deliberate. FR-Spec was expected to be a free win and turned out not to be on this
+hardware - so it's reported as a loss, not quietly dropped from the table. That's the actual point of
+`solid.cpp`: every number here is something that was measured and would be reported honestly either way.
+If a claimed improvement doesn't survive contact with a real benchmark, it doesn't ship, and if it does
+ship, this is where you can check the receipts.
+
 ## What's different from upstream
 
 - **MoE expert-cache** - GPU-resident hot-expert cache for CPU-offloaded MoE layers, with LFRU eviction
