@@ -136,16 +136,72 @@ dead end isn't walked twice. Several larger, correctly-scoped-but-not-yet-implem
 many-expert MMVQ dispatch gate, among others) are recorded in the notes rather than rushed.</li>
 </ul>
 
+<h2>Description</h2>
+<p>Inherited unchanged from upstream: the main goal of <code>llama.cpp</code> is to enable LLM (and VLM)
+inference with minimal setup and state-of-the-art performance on a wide range of hardware - locally and in
+the cloud.</p>
+<ul>
+<li>Plain C/C++ implementation without any dependencies</li>
+<li>Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks</li>
+<li>AVX, AVX2, AVX512 and AMX support for x86 architectures</li>
+<li>RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures</li>
+<li>1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use</li>
+<li>Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)</li>
+<li>Vulkan and SYCL backend support</li>
+<li>CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity</li>
+</ul>
+<p>The <code>llama.cpp</code> project is built on top of the <a href="https://github.com/ggml-org/ggml">ggml</a> library. Also see upstream's
+<a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a>,
+<a href="https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md">ops</a>,
+<a href="https://github.com/ggml-org/llama.cpp/issues/9289">lib llama API</a>, and
+<a href="https://github.com/ggml-org/llama.cpp/issues/9291">llama-server REST API</a> references.</p>
+
 <h2>Quick start</h2>
-<p>Build from source - see upstream's <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a>, which still applies unchanged:</p>
+<p>A few options to get this build installed on your machine:</p>
+<ul>
+<li>Run with Docker - see upstream's <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker documentation</a></li>
+<li>Build from source by cloning this repository - check out the <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">build guide</a></li>
+</ul>
 <pre><code>cmake -B build -DGGML_CUDA=ON   # or your backend of choice
 cmake --build build --config Release -j</code></pre>
-<pre><code># Launch an OpenAI-compatible API server
+<p>Once installed:</p>
+<pre><code># Download and run a model directly from Hugging Face
+./build/bin/llama-cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+
+# Launch an OpenAI-compatible API server
 ./build/bin/llama-server -m &lt;model.gguf&gt; -ngl 99</code></pre>
 
+<div class="grid">
+<a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama-cli" style="width:100%;border-radius:6px;margin-bottom:.5rem;"><div class="d">VLM session with <code>llama-cli</code></div></a>
+<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama-server" style="width:100%;border-radius:6px;margin-bottom:.5rem;"><div class="d">Built-in web UI against <code>llama-server</code></div></a>
+</div>
+
 <h2>Supported backends</h2>
-<p>Unchanged from upstream - see <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>
-for the full table and per-backend build flags (CUDA, HIP, Vulkan, Metal, SYCL, CANN, and more).</p>
+<div class="tablewrap">
+<table>
+<thead><tr><th>Backend</th><th>Target devices</th></tr></thead>
+<tbody>
+<tr><td>BLAS</td><td>All</td></tr>
+<tr><td>BLIS</td><td>All</td></tr>
+<tr><td>CANN</td><td>Ascend NPU</td></tr>
+<tr><td>CUDA</td><td>Nvidia GPU</td></tr>
+<tr><td>HIP</td><td>AMD GPU</td></tr>
+<tr><td>Hexagon <span class="note">(in progress)</span></td><td>Snapdragon</td></tr>
+<tr><td>IBM zDNN</td><td>IBM Z &amp; LinuxONE</td></tr>
+<tr><td>MUSA</td><td>Moore Threads GPU</td></tr>
+<tr><td>Metal</td><td>Apple Silicon</td></tr>
+<tr><td>OpenCL</td><td>Adreno GPU</td></tr>
+<tr><td>OpenVINO <span class="note">(in progress)</span></td><td>Intel CPUs, GPUs, and NPUs</td></tr>
+<tr><td>RPC</td><td>All</td></tr>
+<tr><td>SYCL</td><td>Intel GPU</td></tr>
+<tr><td>VirtGPU</td><td>VirtGPU APIR</td></tr>
+<tr><td>Vulkan</td><td>GPU</td></tr>
+<tr><td>WebGPU</td><td>All</td></tr>
+<tr><td>ZenDNN</td><td>AMD CPU</td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">Per-backend build flags in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>.</p>
 
 <h2>Documentation</h2>
 <div class="grid">
@@ -153,9 +209,49 @@ for the full table and per-backend build flags (CUDA, HIP, Vulkan, Metal, SYCL, 
 <div class="k">Working log</div>
 <div class="d">docs/moe-cache-colibri-notes.md - measurements, dead ends, and root causes for everything above</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/tree/moe-cache-port/docs">
-<div class="k">Everything else</div>
-<div class="d">Upstream's own docs - build instructions, backend guides, server API, model support</div>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">
+<div class="k">How to build</div>
+<div class="d">Full build guide, all backends</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/tools/server/README.md">
+<div class="k">Server</div>
+<div class="d">llama-server usage and API</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/tools/cli/README.md">
+<div class="k">CLI</div>
+<div class="d">llama-cli usage</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">
+<div class="k">Docker</div>
+<div class="d">Running on Docker</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/android.md">
+<div class="k">Android</div>
+<div class="d">Build on Android</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/multi-gpu.md">
+<div class="k">Multi-GPU</div>
+<div class="d">Multi-GPU usage</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/development/token_generation_performance_tips.md">
+<div class="k">Performance tips</div>
+<div class="d">Token generation troubleshooting</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/models.md">
+<div class="k">Models</div>
+<div class="d">Supported model formats and sources</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/grammars/README.md">
+<div class="k">GBNF grammars</div>
+<div class="d">Constrained-output grammar syntax</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/completions.md">
+<div class="k">Completions</div>
+<div class="d">Completion endpoint reference</div>
+</a>
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/xcframework.md">
+<div class="k">XCFramework</div>
+<div class="d">Apple platform packaging</div>
 </a>
 </div>
 
@@ -165,6 +261,15 @@ changes are pulled in directly rather than re-implemented; nothing here is inten
 own architecture or conventions more than a given fix requires. See upstream's own
 <a href="https://github.com/ggml-org/llama.cpp">README</a> and
 <a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a> for the base project this builds on.</p>
+
+<h2>Contributing</h2>
+<ul>
+<li>Contributors can open PRs</li>
+<li>Collaborators will be invited based on contributions</li>
+<li>Maintainers can push to branches in the repo and merge PRs into the main branch</li>
+<li>Any help with managing issues, PRs, and projects is very appreciated</li>
+<li>Read upstream's <a href="https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md">CONTRIBUTING.md</a> for more information</li>
+</ul>
 
 <h2>License &amp; acknowledgements</h2>
 <p>MIT licensed, same as upstream. Third-party components inherited from upstream, still accurate:</p>
