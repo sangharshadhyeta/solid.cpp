@@ -2855,3 +2855,60 @@ so the investigation doesn't need to be redone, but deliberately not
 started without a dedicated pass - the blast radius (MUL_MAT_ID feeds
 every MoE FFN forward pass) means a subtle bug here is a correctness risk
 across the whole model, not a contained feature.
+
+## Backend sampling (`-bs`) validated on this sandbox - real, modest, safe (2026-08-14)
+
+Investigated as a moe.cpp throughput candidate, prompted by upstream
+[ggml-org/llama.cpp#27050](https://github.com/ggml-org/llama.cpp/issues/27050)
+(same-day issue: `-bs` measured +48% aggregate throughput at 32 concurrent
+slots on an RTX 5090, 706 -> 1046 tok/s, greedy output byte-identical,
+single-slot unchanged). Unlike the other candidates this session, nothing
+needed building or porting - `--backend-sampling`/`-bs` already exists in
+this fork, fully wired end to end (`arg.cpp`, `common.h`,
+`server-context.cpp`, `sampling.cpp`), marked experimental and off by
+default. The open question was purely: does it deliver a real, safe gain
+on our own hardware/model, worth recommending for our multi-user serving
+config.
+
+**Mechanism** (per the issue, confirmed by reading our own
+`server-context.cpp`): the default path copies the full logits matrix
+device-to-host every decode step so `common_sampler_sample()` can run on
+CPU; at higher slot counts that transfer plus CPU-side sampling/sorting
+becomes the bottleneck. `-bs` samples on-device and skips the transfer.
+Already self-gates safely: `common/sampling.cpp` disables it automatically
+(with a warning) when combined with grammar or a reasoning budget, and
+`server-context.cpp` disables it when pre-sampling logits are requested
+(`n_probs` without `post_sampling_probs`) - none of that needed building,
+it was already there.
+
+**Measured directly on this sandbox** (Gemma-4-26B-A4B, `-ncmoe 15`, RTX
+3060, greedy, 200-token completions, aggregate tok/s = total completion
+tokens / wall time across all concurrent requests):
+
+| config | bs off | bs on | delta |
+|---|---|---|---|
+| `--parallel 4` (below this card's MMVQ concurrency cliff - clean comparison) | 103.59 tok/s | 107.48 tok/s | **+3.76%** |
+| `--parallel 8` (past the cliff - both arms equally confounded, comparison still fair) | 99.66 tok/s | 104.62 tok/s | **+4.98%** |
+
+Real and consistent in both configs, not an artifact of the concurrency
+cliff (the clean `--parallel 4` run shows the same direction and similar
+magnitude). Far short of the issue's own +48% at 32 slots - expected: this
+sandbox tops out at single-digit `--parallel` on a 12GB card, and the
+win's mechanism (D2H copy + CPU sampling overhead relative to per-step GPU
+compute) scales with both slot count and GPU speed, neither of which this
+sandbox has much of relative to an RTX 5090 at 32 slots. Correctness
+spot-checked: coherent, non-garbled output, `system_fingerprint` intact,
+no incompatibility warnings triggered (config used no grammar/reasoning
+budget/`n_probs`).
+
+**Recommendation**: enable `-bs` for this deployment's multi-slot serving
+config - real, positive, low-risk (already-gated, self-disabling on known
+incompatibilities, upstream-authored and upstream-tested at real scale).
+Not flipping the compiled-in default: it's still marked experimental
+upstream, and this sandbox has only validated one model/quant/prompt
+shape at modest concurrency, not the breadth upstream would want before
+changing what every caller gets by default. The GLM-5.2/H200 target,
+running at real multi-user concurrency on much faster hardware, is exactly
+the regime where the issue's own +48% figure suggests this matters more,
+not less - worth re-validating there specifically once that deployment is
+reachable, rather than assuming this sandbox's modest ~4% ceilings it.
