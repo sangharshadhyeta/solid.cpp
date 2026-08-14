@@ -649,6 +649,12 @@ struct server_slot {
                 "   graphs reused = %10d\n",
                 llama_perf_context(ctx_tgt).n_reused);
 
+        if (getenv("LLAMA_DEBUG_VERIFY") && ctx_dft) {
+            SLT_INF(*this,
+                    "dft graphs reused = %10d\n",
+                    llama_perf_context(ctx_dft).n_reused);
+        }
+
         if (n_draft_total > 0) {
             const float  draft_ratio  = (float) n_draft_accepted / n_draft_total;
             const double mean_acc_len = n_draft_verif_steps > 0 ? 1.0 + (double) n_draft_accepted / (double) n_draft_verif_steps : 1.0;
@@ -1066,6 +1072,10 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        if (getenv("LLAMA_DEBUG_VERIFY")) {
+            fprintf(stderr, "[DEBUG-TYPES] resolved speculative.types = %s\n",
+                    common_speculative_type_name_str(params_base.speculative.types).c_str());
+        }
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1350,6 +1360,10 @@ private:
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
+                if (getenv("LLAMA_DEBUG_VERIFY")) {
+                    fprintf(stderr, "[DEBUG-TYPES] spec = %p (can_speculate would be %s)\n",
+                            (void *) spec.get(), spec ? "true" : "FALSE");
+                }
             } catch (const std::exception & e) {
                 SRV_ERR("failed to initialize speculative decoding context: %s\n", e.what());
             }

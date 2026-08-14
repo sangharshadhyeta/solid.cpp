@@ -693,6 +693,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
             continue;
         }
 
+        if (getenv("LLAMA_DEBUG_VERIFY")) {
+            fprintf(stderr, "[VERIFY] pos=%zu draft=%d '%s' vs target=%d '%s'\n",
+                    i, draft[i], common_token_to_piece(ctx, draft[i]).c_str(),
+                    id, common_token_to_piece(ctx, id).c_str());
+        }
+
         // exact match failed - optionally give the draft token one more chance via
         // probabilistic acceptance (see the doc comment in sampling.h) before falling
         // back to the target's own independently-sampled token
