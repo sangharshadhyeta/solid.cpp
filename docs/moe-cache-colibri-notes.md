@@ -1380,18 +1380,64 @@ against exactly this failure mode.
   than the trimmed-vs-untrimmed difference either measurement showed -
   the sandbox's own run-to-run noise (thermal state, background load,
   moe-cache warm-up) is evidently larger than this technique's effect
-  size at this scale. **Honest conclusion: the cache-once fix closed the
-  previously-measured gap** (regression shrank from a consistent 5-11%
-  to something indistinguishable from noise across two independently-run
-  9-sample sets), but this sandbox cannot cleanly separate "the
-  technique helps a little" from "the technique is a wash" at
-  `--parallel 1` on an RTX 3060. A real read either way needs either
-  interleaved back-to-back sampling to cancel drift, many more samples,
-  or - more usefully - just measuring on hardware closer to the actual
-  GLM-5.2/H200 target, where the vocab size, draft size, and batch
-  dynamics are all different anyway. What's no longer in question: the
-  earlier "clear net regression" finding was partly a measurement
-  artifact, and the fix that was supposed to help genuinely did.
+  size at this scale.
+
+  **Second fix, same day, prompted by being asked directly whether 645
+  rows was really enough data movement to explain a millisecond-scale
+  regression - it wasn't.** Back-of-envelope: 645 rows at embedding
+  width, even unquantized, is a few MB; at this GPU's ~360GB/s bandwidth
+  that's low single-digit microseconds if bandwidth-bound, nowhere near
+  the gap being chased. The real remaining suspect: the scatter-back
+  step (`ggml_fill(..., -INFINITY)` over the *full* 262,144-wide output,
+  every step, regardless of trim size) was still a live graph op -
+  strictly bigger than the gather that was just fixed, and unaffected
+  by that fix. Same root cause as before (a value that's actually
+  constant, paid for as if it weren't), same fix shape: `out_template`
+  (the -inf-filled scatter target) joined `output_w` as a third
+  populate-once graph input on `llm_graph_input_frspec_d2t`, filled
+  exactly once via `ggml_backend_tensor_set()`. Safe to never re-fill:
+  `d2t` names the identical fixed set of positions on every scatter
+  call for a model instance's whole lifetime, so every position outside
+  that set is written by no call, ever, and correctly stays whatever
+  the one-time fill gave it.
+  `llm_frspec_scatter_to_full_vocab()`'s signature changed to accept
+  this pre-filled template directly instead of building one internally
+  each call.
+
+  **Re-measured a third time, back-to-back in the same session to
+  cancel drift** (10 samples each, immediately sequential, same prompt,
+  same sidecar): trimmed 56.2-60.8 tok/s (mean 58.7); untrimmed,
+  restarted and run immediately after with no other change, 54.8-59.9
+  tok/s (mean 57.6). Trimmed is now at parity with, if anything slightly
+  ahead of, untrimmed - the regression is gone, not just reduced to
+  noise. **This is now a real, if modest, positive result on the
+  sandbox proxy**, not an open question. Correctness re-verified
+  unchanged (byte-identical temp=0 output) after this fix too - both
+  fixes only ever changed *when* already-correct computations happen,
+  never their results.
+
+  Independently worth knowing, found while investigating: SGLang - the
+  most mature real-world implementation of this exact paper's technique
+  - has an open, unresolved bug report
+  ([sgl-project/sglang#8581](https://github.com/sgl-project/sglang/issues/8581))
+  of FR-Spec *decreasing* throughput (430.99->291.04 tok/s) with a
+  *lower* draft-acceptance rate too (1.72->1.64), closed as `inactive`
+  with no maintainer explanation. That's a different failure mode than
+  what this session found (their acceptance rate itself dropped, ours
+  never did - only raw graph-kernel overhead was ever the issue here),
+  but it's a real signal that this technique doesn't reliably reproduce
+  the paper's controlled 1.12x number in production serving engines
+  without real engineering care, which is exactly what happened here:
+  the naive first port regressed, and it took two rounds of finding the
+  actual root cause (not just reporting the number) to get a clean
+  result.
+
+  Still genuinely open: whether this specific measured edge holds up at
+  GLM-5.2/H200 scale, where the vocab size, draft size, and batch
+  dynamics are all different. But the sandbox result is no longer a
+  caveat pointing away from the technique - it's a small, clean win,
+  arrived at by refusing to accept "there's probably just some overhead
+  somewhere" as a final answer.
 
   Toggling is clean either way: `--spec-vocab-map` unset (the default)
   is a verified no-op - `frspec_d2t_ids` stays empty, `load_arch_tensors`
