@@ -1486,18 +1486,51 @@ against exactly this failure mode.
   with MTP was healthy (measured earlier this session), but the three
   together break badly.
 
-  Working theory, not yet root-caused at the code level: suffix-decode
-  proposes candidates by n-gram matching against real context tokens,
-  completely independent of FR-Spec's 645-token trim - those candidates
-  are very often outside the trimmed set. If the combined-drafter
-  verification path uses MTP's (now -inf-outside-trimmed-set) logits to
-  help score or rank candidates from *either* drafter rather than only
-  MTP's own, a suffix-decode candidate landing outside the trim would
-  read as -inf and get suppressed regardless of how good a match it
-  actually was - which would produce exactly this shape of damage (most
-  candidates from either source getting rejected, not just MTP's
-  trimmed-out ones). Not confirmed by reading the verification code
-  yet; flagging as the leading hypothesis, not a diagnosis.
+  **Investigated properly, not just theorized (2026-08-14, later same
+  day)** - asked directly to solve it, not just document it. Ruled out
+  two plausible theories by reading the actual code and tracing a live
+  `-lv 5` debug session, in order:
+  1. *"MTP's own `p_min` confidence gate fires more often under the
+     trim, handing more rounds to suffix-decode, which does worse on
+     this content."* Ruled out: `p_min` defaults to `0.0f`
+     (`common/common.h`), meaning the gate (`common/speculative.cpp`,
+     the MTP drafter's per-token `if (cur_p->data[0].p < params.p_min)`
+     check) never fires with default settings.
+  2. *"The combined-drafter verification path uses MTP's own reported
+     probability - now inflated, since it's normalized over only 645
+     candidates instead of the true 262,144-token distribution - in a
+     probabilistic accept/reject test, unfairly rejecting good
+     candidates."* Ruled out by reading the actual verification call
+     (`tools/server/server-context.cpp`,
+     `common_sampler_sample_and_accept_n`): at `temperature=0` (every
+     test in this doc), acceptance is a plain greedy comparison against
+     the target's own independently-computed top pick - it never reads
+     the *drafter's* probability at all, so trim-induced probability
+     inflation can't be the mechanism.
+
+  What the live trace actually shows: `-lv 5` confirms MTP is the
+  implementation producing every single round's draft (suffix-decode's
+  fallback path is never reached - `common_speculative_draft()` only
+  calls the next configured impl for a sequence still needing a draft,
+  and MTP always returns a non-empty result here) - so this isn't
+  "suffix-decode drafting badly," it's MTP's *own* drafted tokens being
+  rejected far more than usual specifically when suffix-decode is also
+  configured. Per-round accept counts (`accepted N/3 draft tokens` in
+  the trace) show the *very first* drafted position failing in 30 of 42
+  rounds (71%) - immediate rejection, not a late-position falloff.
+  Suspicious correlate, not yet proven causal: the single most
+  over-represented token in this session's thin 645-token histogram
+  (id 236772, a dash/hyphen the model uses heavily in its own
+  markdown-style formatting) accounts for 630 of 6114 total real-traffic
+  observations (~10.3%) - MTP's confidence in proposing it is very high
+  within the trimmed 645-candidate view (0.99+ in the trace) but the
+  target frequently disagrees. This alone doesn't explain why FR-Spec
+  alone (no suffix-decode) stayed at parity with the identical trim and
+  identical prompt - the actual trigger for *why this specific
+  combination* surfaces the mismatch (state/scheduling interaction
+  between multiple configured drafter types, not drafted-token content
+  itself) is still not pinned down at the code level despite this
+  investigation ruling out two concrete, testable theories.
 
   **Action taken: do not enable both together.** FR-Spec trim
   (`--spec-vocab-map`) should not be used alongside `--spec-type
