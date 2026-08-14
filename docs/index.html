@@ -259,6 +259,12 @@ hardware and reported honestly even when they're a loss (see the FR-Spec row bel
 watchable live — not "trust me, it's caching," but a real-time view of which experts are hot right now. Prove it,
 then ship it, then let you go verify it yourself. Not a fork chasing every upstream feature — one willing to slow
 down and prove each claim before it ships.</p>
+<p class="note">Scope, honestly: the expert-cache fits the model's <em>parameters</em> into limited VRAM - it
+doesn't and can't stretch VRAM to hold arbitrary context length, which is a separate, unrelated resource that
+scales with sequence length regardless of how the weights are cached. Pushed this to a real boundary on our own
+12GB card: 32k context, real workload, no problem; 1M context crashes outright, a hard ceiling no amount of
+placement cleverness gets around. Every project in this space (Colibri, ktransformers, ik_llama.cpp included)
+draws this same line for the same reason - it's physics, not a missing feature.</p>
 </section>
 
 <section>
