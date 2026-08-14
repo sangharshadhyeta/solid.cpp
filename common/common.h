@@ -934,6 +934,14 @@ std::ifstream fs_open_ifstream(const std::string & fname, std::ios_base::openmod
 // Auto-detect if colors can be enabled based on terminal and environment
 bool tty_can_use_colors();
 
+// Snapshot of moe-cache's live per-(layer,expert) tier/heat state, for a
+// debugging/demo UI view (tools/ui's "Brain" page). One byte per
+// (layer,expert) cell: top 2 bits = tier (0=not cached, 1=probation/warm,
+// 2=protected/hot), bottom 6 bits = heat. Returns false (and clears
+// out_bytes) if no CUDA moe-cache session has cached anything yet, or the
+// backend wasn't built with moe-cache support at all.
+bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out_rows, int & out_cols);
+
 //
 // Model utils
 //

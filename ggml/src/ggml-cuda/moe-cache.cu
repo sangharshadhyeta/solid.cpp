@@ -249,6 +249,16 @@ struct moe_cache_session {
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
 
+    // Debug/demo view only (the "Brain" page, tools/ui): host_base -> parsed
+    // layer number, reusing moe_cache_layer_number()'s existing name parse
+    // rather than re-deriving layer identity. Purely additive bookkeeping -
+    // never read by any routing/eviction decision, so it carries none of
+    // their correctness risk. n_expert_hint is the widest n_expert seen
+    // across begin() calls, used only to size the snapshot grid's column
+    // count for the same view.
+    std::unordered_map<const void *, int> tensor_layer;
+    int64_t n_expert_hint = 0;
+
     std::mutex mu;
     std::mutex fill_mu;
     std::condition_variable cv;
@@ -1638,6 +1648,14 @@ static void * moe_cache_begin(
         int layer = -1;
         const bool has_layer = moe_cache_layer_number(name, layer);
         bool tensor_override = !has_layer;
+
+        // Brain-view bookkeeping (see the struct comment) - independent of
+        // routing, so record it unconditionally whenever a layer number was
+        // parsed, regardless of how the routing decision below turns out.
+        if (has_layer) {
+            session->tensor_layer.try_emplace(host_base, layer);
+        }
+        session->n_expert_hint = std::max(session->n_expert_hint, n_expert);
         auto find_routed_device = [&](int physical) -> moe_cache_device * {
             for (const auto & device_ptr : session->devices) {
                 if (device_ptr->physical == physical) {
@@ -2387,6 +2405,83 @@ static void moe_cache_get_stats(long long * out_hits, long long * out_misses) {
     if (out_misses) *out_misses = misses;
 }
 
+// Snapshot the live per-(layer,expert) cache state for a debugging/demo UI
+// view (the "Brain" page, tools/ui - ported from Colibri's, see
+// docs/moe-cache-colibri-notes.md). One byte per (layer,expert) cell: top 2
+// bits = tier (0=not cached right now, 1=probation/warm, 2=protected/hot),
+// bottom 6 bits = heat, saturated. Read-only and best-effort: takes each
+// session's mutex only briefly per session, same as the hot dispatch path
+// already does, so this competes for the same lock but doesn't add a new
+// one. Grid shape comes from bookkeeping populated in moe_cache_begin();
+// if no session has cached anything yet, returns 0 with rows=cols=0 - the
+// caller (the server's /experts handler) treats that as "not ready yet",
+// not an error.
+static int moe_cache_get_expert_map(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols) {
+    if (out_rows) *out_rows = 0;
+    if (out_cols) *out_cols = 0;
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->tensor_layer.empty() || session->n_expert_hint <= 0) {
+            continue;
+        }
+        int n_rows = 0;
+        for (const auto & kv : session->tensor_layer) {
+            n_rows = std::max(n_rows, kv.second + 1);
+        }
+        const int n_cols = (int) std::min<int64_t>(session->n_expert_hint, INT_MAX);
+        if (n_rows <= 0 || n_cols <= 0) {
+            continue;
+        }
+        const long long need = (long long) n_rows * (long long) n_cols;
+        if (need > max_bytes) {
+            // Buffer too small for this session's grid - report the real
+            // shape anyway so the caller can size a retry, but don't write
+            // out of bounds.
+            if (out_rows) *out_rows = n_rows;
+            if (out_cols) *out_cols = n_cols;
+            return 0;
+        }
+        std::fill(out_bytes, out_bytes + need, (uint8_t) 0);
+        for (const auto & kv : session->tensor_layer) {
+            const void * host_base = kv.first;
+            const int    row       = kv.second;
+            for (int expert = 0; expert < n_cols; expert++) {
+                const moe_cache_key key{host_base, expert};
+                for (const auto & device_ptr : session->devices) {
+                    for (const auto & pool_ptr : device_ptr->pools) {
+                        auto found = pool_ptr->map.find(key);
+                        if (found == pool_ptr->map.end()) {
+                            continue;
+                        }
+                        const moe_cache_slot & slot = pool_ptr->slots[found->second];
+                        if (slot.state != moe_cache_slot_state::valid) {
+                            continue;
+                        }
+                        const uint8_t tier = slot.segment == moe_cache_segment::protected_ ? 2 : 1;
+                        // MOE_CACHE_HEAT_MAX is 2^20; a slot realistically
+                        // saturates the 6-bit display range long before
+                        // that (64 steps of 4 = 256 hits), which is exactly
+                        // the point - this is a "how hot lately" indicator,
+                        // not a raw counter.
+                        const uint8_t heat = (uint8_t) std::min<uint32_t>(63, slot.heat / 4);
+                        out_bytes[(size_t) row * n_cols + expert] = (uint8_t)((tier << 6) | heat);
+                        goto next_expert;
+                    }
+                }
+                next_expert:;
+            }
+        }
+        if (out_rows) *out_rows = n_rows;
+        if (out_cols) *out_cols = n_cols;
+        return 1;
+    }
+    return 0;
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -2404,6 +2499,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.invalidate = moe_cache_invalidate;
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
+    ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
 }
 
 #endif
