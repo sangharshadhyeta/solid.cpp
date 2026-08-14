@@ -347,6 +347,14 @@ struct common_params_speculative_draft {
     std::vector<ggml_backend_dev_t> devices; // devices to use for offloading
 
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // FR-Spec-style draft-vocab trim: path to a sidecar mapping file (see
+    // tools/frspec-vocab-trim) produced from real serving traffic. Empty
+    // (default) = no trim, draft scores the full vocab as normal. Only
+    // ever applied to the draft model's own output projection, never the
+    // target's - see docs/moe-cache-colibri-notes.md, "FR-Spec draft-vocab
+    // trimming", for the full design.
+    std::string frspec_vocab_map;
 };
 
 struct common_params_speculative_ngram_mod {
@@ -626,6 +634,7 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    bool    token_freq_log      = true;  // log real generated-token frequency for FR-Spec-style MTP draft-vocab trimming
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

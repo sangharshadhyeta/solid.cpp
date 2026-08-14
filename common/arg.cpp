@@ -1725,6 +1725,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--token-freq-log"},
+        {"--no-token-freq-log"},
+        "accumulate a persistent per-token generation-frequency histogram from real serving "
+        "traffic, driven by real requests as they're served (default: enabled) - used to derive "
+        "a frequency-ranked vocabulary subset for FR-Spec-style MTP draft-vocab trimming (see "
+        "docs/moe-cache-colibri-notes.md); negligible per-token cost, survives restarts, stored "
+        "under the llama.cpp cache directory keyed by model path",
+        [](common_params & params, bool value) {
+            params.token_freq_log = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),
@@ -4152,6 +4164,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_min = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MIN"));
+    add_opt(common_arg(
+        {"--spec-vocab-map"}, "PATH",
+        "FR-Spec-style draft-vocab trim: path to a sidecar mapping file (see "
+        "llama-frspec-vocab-trim) trimming the draft's output projection to a "
+        "frequency-ranked vocab subset, cutting draft-time LM-head compute losslessly "
+        "(verification always runs on the full vocab on the target - see "
+        "docs/moe-cache-colibri-notes.md). Default: empty, no trim. Currently honored by "
+        "gemma4-family draft models only",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.frspec_vocab_map = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

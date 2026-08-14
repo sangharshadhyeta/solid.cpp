@@ -3,6 +3,7 @@
 #include "server-common.h"
 #include "server-http.h"
 #include "server-task.h"
+#include "server-token-freq.h"
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
@@ -970,6 +971,8 @@ private:
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
 
+    std::unique_ptr<server_token_freq_logger> token_freq_logger;
+
     server_metrics metrics;
 
     json json_ui_settings = json::object();
@@ -986,6 +989,10 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        if (token_freq_logger) {
+            token_freq_logger->flush();
+        }
+
         spec.reset();
         spec_init.reset();
 
@@ -1229,6 +1236,14 @@ private:
                 params_dft.load_progress_callback           = load_progress_callback;
                 params_dft.load_progress_callback_user_data = &load_progress_spec;
 
+                // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md):
+                // hint the very next model load (which the constructor below
+                // triggers, for the draft specifically) to apply this trim if
+                // configured. Consumed (cleared) by that load, so this is
+                // safe to call unconditionally even when no trim is set
+                // (clears any stale hint with an empty path).
+                llama_frspec_set_pending_vocab_map(params_base.speculative.draft.frspec_vocab_map.c_str());
+
                 spec_init = common_speculative_init_from_params(params_dft, model_tgt, ctx_tgt);
                 model_dft = spec_init->model();
                 ctx_dft   = spec_init->context();
@@ -1409,6 +1424,19 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+
+        // Real-traffic token frequency logging for FR-Spec-style MTP
+        // draft-vocab trimming (see docs/moe-cache-colibri-notes.md).
+        // Always on by default - a plain array increment is negligible
+        // next to actual token generation - but a calibration benchmark
+        // subprocess (common_moe_bench_candidate_server) explicitly
+        // disables it, since its handful of canned probe prompts run
+        // across many candidates would badly skew a histogram meant to
+        // reflect real deployment traffic.
+        if (params_base.token_freq_log) {
+            token_freq_logger = std::make_unique<server_token_freq_logger>(
+                    params_base.model.path, llama_vocab_n_tokens(vocab));
         }
         SRV_TRC("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
@@ -1863,6 +1891,10 @@ private:
         // remember which tokens were sampled - used for repetition penalties during sampling
         const std::string token_str = result.text_to_send;
         slot.sampled = result.tok;
+
+        if (token_freq_logger) {
+            token_freq_logger->record(result.tok);
+        }
 
         slot.generated_text += token_str;
         if (slot.task->params.return_tokens) {
@@ -4020,6 +4052,12 @@ void server_context::start_loop() {
 
 void server_context::terminate() {
     impl->queue_tasks.terminate();
+}
+
+void server_context::flush_token_freq() {
+    if (impl->token_freq_logger) {
+        impl->token_freq_logger->flush();
+    }
 }
 
 llama_context * server_context::get_llama_context() const {

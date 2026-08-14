@@ -131,6 +131,92 @@ struct llm_build_rwkv7_base : public llm_graph_context {
 };
 
 //
+// FR-Spec-style MTP draft-vocab trim (shared helpers)
+//
+// A standalone MTP-only draft can score a frequency-ranked subset of the
+// vocabulary instead of the full one, cutting the dominant draft-time cost
+// (the LM-head projection) losslessly - verification still runs over the
+// full vocab on the target model, so output is unchanged. These helpers
+// are architecture-agnostic (they only touch tensor shapes/data, not
+// anything model-specific), so each architecture's own load_arch_tensors/
+// graph_mtp only needs a few lines calling into these, not a fresh
+// reimplementation of the underlying ggml graph operations - see
+// docs/moe-cache-colibri-notes.md, "FR-Spec draft-vocab trimming", for the
+// full design writeup and the one architecture (gemma4) that currently
+// uses this.
+//
+// Unlike upstream's EAGLE3/qwen35 precedent (a d2t tensor baked into the
+// draft GGUF itself, produced by a conversion-time tool that doesn't
+// exist upstream yet), this version reads the trim from an external
+// sidecar file at load time and gathers the relevant rows out of the
+// already-loaded full-vocab weight - the original draft GGUF is never
+// modified, and the sidecar can be regenerated from real serving traffic
+// (see server-token-freq.h) without touching the checkpoint at all.
+
+// Reads a sidecar vocab-trim mapping file (see server-token-freq.h /
+// the frspec regeneration tool for the producer side). Returns the
+// ordered list of original (full-vocab) token ids, one per trimmed-vocab
+// position - i.e. exactly the d2t convention EAGLE3/qwen35 already use,
+// just sourced from an external file instead of a GGUF tensor. Returns
+// an empty vector (not an error) if the path doesn't exist or is
+// unreadable - callers should treat that as "no trim configured", never
+// fail model load over it.
+std::vector<int64_t> llm_frspec_load_d2t_sidecar(const std::string & path);
+
+// Gathers just the rows named by d2t_ids out of a full-vocab weight
+// tensor already resident in `full_data` (n_embd * n_vocab_full elements
+// of `type`, row-major by vocab position - i.e. tok_embd/output.weight's
+// usual layout), producing a new, smaller buffer for just the trimmed
+// vocab, in d2t_ids' order. Row-granularity gather is safe for
+// block-quantized types (Q8_0 etc.) as long as n_embd is a whole number
+// of quant blocks, which it always is for real vocab/embedding
+// dimensions - never splits a quant block across a row boundary.
+std::vector<uint8_t> llm_frspec_gather_vocab_rows(
+        const void * full_data, ggml_type type, int64_t n_embd, const std::vector<int64_t> & d2t_ids);
+
+// Scatters compressed (trimmed-vocab-sized) logits back into a
+// full-vocab-shaped tensor (positions outside the trimmed set filled
+// -inf), so downstream verify/sampling code never has to know the draft
+// scored a reduced vocab. Identical pattern to eagle3.cpp/qwen35.cpp's
+// own d2t handling, extracted here so it's written and tested once, not
+// once per architecture. `d2t` must be an I32 tensor of the same
+// trimmed-vocab size as `cur`'s first dimension (I32, not I64, so the
+// same tensor doubles as the index argument to ggml_get_rows() when
+// gathering the trimmed weight rows - ggml_get_rows() requires I32).
+ggml_tensor * llm_frspec_scatter_to_full_vocab(
+        ggml_context * ctx0, ggml_tensor * cur, ggml_tensor * d2t, int64_t n_vocab_full);
+
+// Internal-only read side of the pending-vocab-map hint - see
+// llama_frspec_set_pending_vocab_map() in llama.h for the public setter
+// and the full explanation of why this side channel exists (Gemma-4's
+// MTP draft has no in-file signal distinguishing it from the trunk, unlike
+// qwen35's mtp_only detection). Consumes (clears) the hint on read, so a
+// later, unrelated model load never accidentally inherits a stale value.
+std::string llm_frspec_take_pending_vocab_map();
+
+// Graph input for the d2t index tensor FR-Spec vocab trimming needs.
+// Shared so each architecture's own graph-building code only needs a few
+// lines (create this, ggml_get_rows the weight, build_lora_mm on the
+// result, scatter back) rather than reimplementing the input-tensor
+// lifecycle - see gemma4.cpp for the one current user. Unlike ordinary
+// per-ubatch inputs (attention masks, positions, ...), d2t is constant
+// for the model's whole lifetime once loaded, so can_reuse() always
+// returns true - this never defeats graph/CUDA-graph reuse across decode
+// steps the way a genuinely per-token-varying input would.
+class llm_graph_input_frspec_d2t : public llm_graph_input_i {
+public:
+    llm_graph_input_frspec_d2t(const std::vector<int64_t> & ids) : ids(ids) {}
+    virtual ~llm_graph_input_frspec_d2t() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * d2t = nullptr; // I32 [n_trimmed_vocab]
+
+    const std::vector<int64_t> & ids;
+};
+
+//
 // models
 //
 
@@ -856,6 +942,14 @@ struct llama_model_gemma4 : public llama_model_base {
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
 
+    // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md).
+    // Populated once at load time from an external sidecar file (never
+    // from the GGUF itself - this model instance's own weights are never
+    // modified) when llama_frspec_set_pending_vocab_map() was called
+    // before this load. Empty (the common case) = no trim, this model's
+    // own output.weight is used unmodified at its full size.
+    std::vector<int64_t> frspec_d2t_ids;
+
     struct graph : public llm_graph_context {
         const llama_model & model;
 
@@ -876,6 +970,14 @@ struct llama_model_gemma4_assistant : public llama_model_base {
     llama_model_gemma4_assistant(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    // FR-Spec-style draft-vocab trim (see docs/moe-cache-colibri-notes.md).
+    // This is the class that actually loads as Gemma-4's MTP draft (GGUF
+    // arch string "gemma4-assistant" - a genuinely separate architecture
+    // from the "gemma4" trunk, not a mode flag on it), so this is where
+    // the trim hint set by llama_frspec_set_pending_vocab_map() actually
+    // gets consumed in practice. Empty (the common case) = no trim.
+    std::vector<int64_t> frspec_d2t_ids;
 
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);

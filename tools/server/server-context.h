@@ -96,6 +96,13 @@ struct server_context {
     // terminate main loop (will unblock start_loop)
     void terminate();
 
+    // flush the real-traffic token-frequency histogram (see
+    // server-token-freq.h) to disk. terminate() does not do this itself -
+    // call explicitly before process exit, or counts since the last
+    // periodic flush are lost. Safe to call even when logging is disabled
+    // or no model is loaded (no-op).
+    void flush_token_freq();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

@@ -441,6 +441,13 @@ int llama_server(common_params & params, int argc, char ** argv) {
             // stop the session GC first, it finalizes live sessions and wakes pending readers
             server_stream_session_manager_stop();
             ctx_http.stop();
+            // terminate() itself doesn't persist the token-frequency
+            // histogram (see server-token-freq.h) - without this, every
+            // restart loses any counts recorded since the last periodic
+            // flush, which for the "restart to regenerate the FR-Spec
+            // sidecar" workflow this exists for could be most or all of a
+            // session's traffic.
+            ctx_server.flush_token_freq();
             ctx_server.terminate();
             mcp_mgr.shutdown();
             llama_backend_free();
