@@ -2232,6 +2232,46 @@ static void common_warn_concurrency_cliff(const common_params & params) {
     }
 }
 
+// The shared p_min confidence gate (common_params_speculative_draft::p_min -
+// read by draft-simple, EAGLE3, DFlash/DSpark, and MTP; the ngram-family
+// types don't use it, they're pattern matchers with no per-token
+// confidence) defaults to 0.0f. That default can never actually gate
+// anything: every real sampled probability satisfies p >= 0.0, so the
+// "only collect very high-confidence draft tokens" early-stop in each of
+// those drafters' draft() loops (e.g. `if (cur_p->data[0].p < params.p_min)`)
+// is dead code at the default. At n_max's own default of 3 this is bounded
+// (at most a couple of low-confidence forward passes wasted, already
+// measured this session as immaterial for MTP specifically) - which is
+// presumably why it went unnoticed here. But raising n_max on any
+// p_min-honoring drafter without also raising p_min removes the only
+// mechanism that stops a drafter once its confidence has collapsed, and it
+// then burns compute drafting every remaining slot up to n_max regardless,
+// tokens verification is going to reject anyway. Reported upstream with
+// measured costs at exactly this combination: 2.6x slower at n_max=16,
+// 3.7x at n_max=48, 8.6x at n_max=64, for the same output
+// (ggml-org/llama.cpp#25908, #26100). Purely diagnostic, mirrors
+// common_warn_concurrency_cliff just below - never changes behavior or
+// silently picks a value on the operator's behalf.
+static void common_warn_p_min_disabled(const common_params & params) {
+    if (!params.speculative.has_dft()) {
+        return; // no p_min-honoring drafter configured
+    }
+    if (params.speculative.draft.p_min > 0.0f) {
+        return; // gate is live - an explicit choice already made here
+    }
+    if (params.speculative.draft.n_max <= 3) {
+        return; // at or below the validated default width; cost is bounded
+    }
+    LOG_WRN("%s: --spec-draft-n-max %d with --spec-draft-p-min left at its default (0.0) - "
+            "the confidence early-stop can never fire at 0.0 (every real probability is >= 0.0), "
+            "so the draft model will draft all %d tokens every round even once its own confidence "
+            "has collapsed, burning compute on tokens verification is going to reject anyway. "
+            "Measured cost elsewhere at this kind of width: 2.6x-8.6x slower wall time for the same "
+            "output (see ggml-org/llama.cpp#25908). Consider setting --spec-draft-p-min explicitly "
+            "(e.g. 0.5-0.75) now that n_max is above its default of 3.\n",
+            __func__, params.speculative.draft.n_max, params.speculative.draft.n_max);
+}
+
 // moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults
 // from a live hint set by llama_context (real n_seq_max, floored at 8,
 // ceilinged at 64 - see moe-cache.cu's MOE_CACHE_MAX_BATCH_CEILING) - but
@@ -2357,6 +2397,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // batch size.
     common_warn_concurrency_cliff(params);
     common_moe_apply_mtp_aware_max_batch_hint(params);
+    common_warn_p_min_disabled(params);
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
