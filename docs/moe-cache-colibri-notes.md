@@ -2952,3 +2952,58 @@ separate Vulkan driver component, outside normal repos, genuine
 infrastructure work with uncertain success. Not pursued further without
 that. If the H200 target ever has a working Vulkan install, worth
 re-attempting the differential comparison there directly.
+
+## KV cache position crash at context boundary - real, but scoped to DFlash/DSpark, not MTP (2026-08-14)
+
+Investigated [ggml-org/llama.cpp#26478](https://github.com/ggml-org/llama.cpp/issues/26478)
+("llama-spec failure at 16k boundary due to non-consecutive KV cache
+position tracking (Y != X+1)"). A commenter (devesssi) diagnosed it as
+DFlash/DSpark's draft-batching always building a block at the full
+configured `params.n_max` regardless of the caller's remaining
+per-sequence context budget, opened a draft fix (PR #26575, unmerged,
+not yet validated end-to-end).
+
+**Confirmed directly in our code**: `common_speculative_impl_draft_dflash::draft()`
+(`common/speculative.cpp:1146`, shared by DSpark via the `is_dspark`
+flag) has exactly this - `const int32_t n_draft = params.n_max;`,
+unconditional, then decodes a block of that fixed width immediately.
+
+**Live-tested whether this reaches us via MTP** (our actual drafter,
+`--spec-type draft-mtp`, `-c 64` forcing `n_ctx_slot` down to its
+observed floor of 256, prompt + `max_tokens` deliberately sized to blow
+past it): completed cleanly, stopped exactly at the 256-token boundary
+(60 prompt + 196 generated), `finish_reason: length`, no crash, no
+assertion, server still healthy afterward. **MTP is not affected.**
+
+**Why the difference, traced precisely**: `server_slot::get_n_draft_max()`
+(`tools/server/server-context.cpp:460-479`) recomputes a live,
+budget-aware cap every round (`n_ctx - prompt.n_tokens() - 2`, further
+capped by remaining `n_predict`) and passes it down as `dp.n_max`. A
+generic safety net in the shared dispatcher
+(`common_speculative_draft()`, `speculative.cpp:2687-2690`, confirmed via
+`git log -L` to be long-standing upstream code from PR #22838, not
+fork-specific) truncates *any* drafter's returned result to `dp.n_max` -
+but only *after* that drafter has already decoded its own batch.
+Draft-simple already respects `dp.n_max` as a live stopping condition
+inside its own per-token loop (`speculative.cpp:351`) before ever
+issuing the next decode - so does MTP, which drafts incrementally one
+token per round rather than committing a fixed-width block upfront.
+DFlash/DSpark's block-at-once architecture is the odd one out: it
+decodes the full `params.n_max`-wide block *before* the post-hoc
+truncation ever runs, so by the time the result list gets trimmed, the
+KV cache has already been written past the safe boundary - explaining
+why the generic safety net (present upstream for a long time) hasn't
+been enough to prevent this specific report.
+
+**Scoped fix, not implemented**: mirror draft-simple's own pattern -
+respect `dp.n_max` as a hard cap on `n_draft` *before* building/decoding
+the block, i.e. `const int32_t n_draft = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;`
+at `speculative.cpp:1146`, matching the check already proven correct at
+line 351. Not applied here: we don't currently have a DFlash/DSpark-
+compatible draft model pair on this sandbox (only MTP's co-trained
+head for Gemma-4), so there's no way to validate the fix empirically
+before committing it, and this session's whole methodology has been to
+measure rather than assume. Ready to implement the moment a compatible
+model pair is available - the fix is a one-line, well-understood
+mirror of an already-proven pattern, not open design work like the
+MMVQ item above.
