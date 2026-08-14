@@ -4176,6 +4176,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.frspec_vocab_map = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-prob-accept"}, {"--no-spec-prob-accept"},
+        "probabilistic draft acceptance: a draft token that doesn't exactly match the "
+        "target's independently-sampled token is given a second chance, accepted anyway "
+        "with probability min(1, p_target/p_draft) instead of always falling back to the "
+        "target's own sample (default: off, exact-match-only - this only ever raises or "
+        "matches the accept rate versus exact-match, never lowers it)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.prob_accept = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
     add_opt(common_arg(
         {"--spec-draft-p-split", "--draft-p-split"}, "P",

@@ -83,10 +83,20 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 //
 // returns at least 1 token, up to idxs.size()
 //
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false);
+//
+// draft_probs (optional, default nullptr): the drafter's own reported probability for
+// each token in `draft`, same length as `draft`. When null, behavior is unchanged from
+// before this parameter existed - exact-match-only acceptance. When set, a draft token
+// that doesn't exactly match the target's independently-sampled token at that position
+// gets one more chance: accepted anyway with probability min(1, p_target/p_draft) - the
+// classic speculative-decoding acceptance test - before falling back to the target's own
+// sample. This is a strict superset of exact-match acceptance (every case it accepts,
+// exact-match also accepts, plus some it doesn't), so it can only raise or match the
+// accept rate for the same draft/target pair, never lower it.
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, const std::vector<float> * draft_probs = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false, const std::vector<float> * draft_probs = nullptr);
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 

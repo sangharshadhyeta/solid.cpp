@@ -331,6 +331,17 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // off by default - exact-match-only verification, unchanged from before this existed.
+    // when on, a draft token that doesn't exactly match the target's independently-sampled
+    // token gets a second chance: accepted anyway with probability min(1, p_target/p_draft)
+    // (the classic speculative-decoding acceptance test) before falling back to the
+    // target's own sample. Strictly raises or matches accept rate versus exact-match-only,
+    // never lowers it - see common_sampler_sample_and_accept_n() in common/sampling.h.
+    // Currently only MTP tracks a real per-token probability; other drafters (pattern-
+    // matching ones like ngram-suffix) are treated as maximally confident (1.0) for their
+    // own tokens, which still lets this help without requiring every drafter to change.
+    bool prob_accept = false;
+
     common_params_model mparams;
 
     llama_context * ctx_tgt = nullptr;

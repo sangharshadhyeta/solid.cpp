@@ -12,6 +12,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <random>
 #include <unordered_map>
 #include <vector>
 
@@ -675,8 +676,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, const std::vector<float> * draft_probs) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(!draft_probs || draft_probs->size() == draft.size());
 
     std::vector<llama_token> result;
     result.reserve(idxs.size());
@@ -685,13 +687,47 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
-        common_sampler_accept(gsmpl, id, true);
-
-        result.push_back(id);
-
-        if (draft[i] != id) {
-            break;
+        if (draft[i] == id) {
+            common_sampler_accept(gsmpl, id, true);
+            result.push_back(id);
+            continue;
         }
+
+        // exact match failed - optionally give the draft token one more chance via
+        // probabilistic acceptance (see the doc comment in sampling.h) before falling
+        // back to the target's own independently-sampled token
+        if (draft_probs) {
+            const float p_draft = (*draft_probs)[i];
+
+            if (p_draft > 0.0f) {
+                const auto * cur_p = common_sampler_get_candidates(gsmpl, true);
+
+                float p_target = 0.0f;
+                for (size_t k = 0; k < cur_p->size; k++) {
+                    if (cur_p->data[k].id == draft[i]) {
+                        p_target = cur_p->data[k].p;
+                        break;
+                    }
+                }
+
+                const float alpha = std::min(1.0f, p_target / p_draft);
+
+                if (alpha > 0.0f) {
+                    static thread_local std::mt19937 rng{std::random_device{}()};
+                    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+                    if (dist(rng) < alpha) {
+                        common_sampler_accept(gsmpl, draft[i], true);
+                        result.push_back(draft[i]);
+                        continue;
+                    }
+                }
+            }
+        }
+
+        common_sampler_accept(gsmpl, id, true);
+        result.push_back(id);
+        break;
     }
 
     if (i == draft.size()) {
@@ -705,13 +741,13 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return result;
 }
 
-std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first, const std::vector<float> * draft_probs) {
     std::vector<int> idxs(draft.size() + 1);
     for (size_t i = 0; i < idxs.size(); ++i) {
         idxs[i] = i;
     }
 
-    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first, draft_probs);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

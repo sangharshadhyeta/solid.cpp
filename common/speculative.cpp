@@ -1610,6 +1610,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
+                if (dp.result_probs) {
+                    dp.result_probs->push_back(cur_p->data[0].p);
+                }
+
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
@@ -2669,6 +2673,18 @@ void common_speculative_draft(common_speculative * spec) {
                     if (!result.empty() && (int) result.size() > dp.n_max) {
                         SPC_DBG("truncating draft to %d tokens\n", dp.n_max);
                         result.resize(dp.n_max);
+                    }
+                }
+
+                // keep result_probs parallel to result regardless of whether this
+                // impl tracks real per-token confidence (see common_speculative_draft_params::result_probs) -
+                // truncate to match, then pad any shortfall with 1.0 (maximally
+                // confident) for drafters that never populated it at all.
+                if (dp.result_probs) {
+                    if (dp.result_probs->size() > result.size()) {
+                        dp.result_probs->resize(result.size());
+                    } else if (dp.result_probs->size() < result.size()) {
+                        dp.result_probs->resize(result.size(), 1.0f);
                     }
                 }
 

@@ -209,6 +209,7 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+    std::vector<float> spec_draft_probs; // parallel to spec_draft, only populated/used when --spec-prob-accept is on
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -347,6 +348,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_draft_probs.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -3064,13 +3066,16 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        slot.spec_draft_probs.clear();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .n_past   = */ slot.prompt.n_tokens(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
+                            /* .drafting     = */ true,
+                            /* .n_max        = */ n_draft_max,
+                            /* .n_past       = */ slot.prompt.n_tokens(),
+                            /* .id_last      = */ slot.sampled,
+                            /* .prompt       = */ &slot.spec_prompt,
+                            /* .result       = */ &slot.spec_draft,
+                            /* .result_probs = */ params_base.speculative.draft.prob_accept ? &slot.spec_draft_probs : nullptr,
                         };
 
                         drafting.push_back(&slot);
@@ -3916,7 +3921,10 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const std::vector<float> * draft_probs =
+                    (params_base.speculative.draft.prob_accept && slot.spec_draft_probs.size() == slot.spec_draft.size())
+                        ? &slot.spec_draft_probs : nullptr;
+                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, false, draft_probs);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
