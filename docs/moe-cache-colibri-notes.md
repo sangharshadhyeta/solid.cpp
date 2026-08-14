@@ -2912,3 +2912,43 @@ running at real multi-user concurrency on much faster hardware, is exactly
 the regime where the issue's own +48% figure suggests this matters more,
 not less - worth re-validating there specifically once that deployment is
 reachable, rather than assuming this sandbox's modest ~4% ceilings it.
+
+## draft-mtp CUDA vs Vulkan acceptance collapse - one hypothesis ruled out, blocked on tooling (2026-08-14)
+
+Investigated [ggml-org/llama.cpp#26750](https://github.com/ggml-org/llama.cpp/issues/26750)
+as a moe.cpp candidate - directly relevant, since it's our exact drafter
+(MTP) on our exact backend (CUDA). Reporter measured 35.8-40.7% draft
+acceptance on CUDA vs 91-92% on Vulkan, same GGUF/build/settings,
+"parameter-invariant" and fully deterministic. A second reporter
+(zanphear) independently reproduced a related regression on different
+CUDA hardware (Grace Blackwell) and bisected it to PR #26510
+("speculative: refactor enabled configs common_speculative_init"),
+offering "the CUDA-side build window and direction of travel" as evidence
+- not a precise single-commit bisection.
+
+**Checked directly**: our fork already carries #26510
+(`7bd8282c3`). Read the full commit diff (it's small, 16
+insertions/45 deletions, entirely contained in one function) - it's a
+purely mechanical refactor: identical drafter priority order, identical
+gating conditions (`params.draft.ctx_dft != nullptr`), replacing repeated
+`if` blocks with a lambda. `configs.emplace_back(type, params)` vs the old
+`configs.push_back(common_speculative_config(type, params))` are
+behaviorally identical for a value type. Nothing in this diff is
+CUDA-specific or could plausibly explain a CUDA-vs-Vulkan divergence.
+**This is very likely not the actual cause** - the "before/after this PR"
+comparison zanphear ran almost certainly spans more than just this one
+commit. A real, useful negative result: don't waste time reverting or
+"fixing" this refactor expecting it to resolve #26750.
+
+**Where this leaves it**: the original issue's own text already suspects
+"the MTP head forward pass itself producing degraded predictions on the
+CUDA path" - a kernel-level claim, not a dispatch-order one. Properly
+investigating that needs a direct CUDA-vs-Vulkan A/B on the same
+hardware, which this sandbox can't do right now: `glslang`/shader-compiler
+tooling is available via `dnf`, but there's no NVIDIA Vulkan ICD packaged
+here (only Intel/AMD/software drivers via `mesa-vulkan-drivers`) - a real
+hardware-accelerated Vulkan backend on this RTX 3060 would need NVIDIA's
+separate Vulkan driver component, outside normal repos, genuine
+infrastructure work with uncertain success. Not pursued further without
+that. If the H200 target ever has a working Vulkan install, worth
+re-attempting the differential comparison there directly.
