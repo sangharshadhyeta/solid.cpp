@@ -14,6 +14,7 @@
 	 */
 	import { Flame } from '@lucide/svelte';
 	import { ExpertsService } from '$lib/services';
+	import { serverStore } from '$lib/stores/server.svelte';
 	import type { ApiExpertAtlas, ApiExpertAtlasCell, ApiExpertMapStats } from '$lib/types/api';
 
 	const TIER_LABELS = ['not cached', 'warm (probation)', 'hot (protected)'];
@@ -38,6 +39,31 @@
 	let stats = $state<ApiExpertMapStats>({});
 	let atlas = $state<ApiExpertAtlas | undefined>(undefined);
 	let probeErr = $state(false);
+
+	// Where the model actually lives, and why it was split that way. Static
+	// per launch (unlike everything else here, which polls), so it reads from
+	// the already-fetched /props rather than adding a second poll.
+	let placement = $derived.by(() => {
+		const solid = serverStore.props?.solid_cpp;
+		const p = solid?.placement;
+		if (!p || p.n_cpu_moe_final === undefined || !p.n_layer) {
+			return null;
+		}
+		const onCpu = p.n_cpu_moe_final;
+		const onGpu = Math.max(0, p.n_layer - onCpu);
+		const requested = p.n_cpu_moe_requested ?? -1;
+		return {
+			onCpu,
+			onGpu,
+			nLayer: p.n_layer,
+			nExpert: solid?.n_expert ?? 0,
+			// Only a raise is worth explaining: it means the layout was chosen
+			// for the context, not asked for.
+			raisedFrom: requested >= 0 && onCpu > requested ? requested : null,
+			nCtx: serverStore.props?.default_generation_settings?.n_ctx ?? p.n_ctx_requested ?? 0,
+			nSlots: serverStore.props?.total_slots ?? 0
+		};
+	});
 	let tip = $state<{
 		x: number;
 		y: number;
@@ -467,6 +493,65 @@
 			</div>
 		{/if}
 	</div>
+
+	{#if placement}
+		<div class="border-border bg-card rounded-lg border p-3">
+			<div class="mb-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
+				<span class="text-xs font-medium">Placement</span>
+
+				<span class="text-muted-foreground text-xs tabular-nums">
+					{placement.nCtx.toLocaleString()} token context
+					{#if placement.nSlots}· {placement.nSlots} slot{placement.nSlots === 1 ? '' : 's'}{/if}
+				</span>
+			</div>
+
+			<!-- One bar for the whole model: GPU-resident layers vs layers whose
+			     experts were pushed to CPU to make the context fit. -->
+			<div class="bg-muted flex h-2.5 w-full overflow-hidden rounded-full">
+				<div
+					class="h-full"
+					style:width="{(placement.onGpu / placement.nLayer) * 100}%"
+					style:background-color="rgb(78, 214, 165)"
+				></div>
+
+				<div
+					class="h-full"
+					style:width="{(placement.onCpu / placement.nLayer) * 100}%"
+					style:background-color="rgb(90, 155, 216)"
+				></div>
+			</div>
+
+			<div class="text-muted-foreground mt-2 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+				<span class="inline-flex items-center gap-1.5">
+					<span class="size-2 rounded-full" style:background-color="rgb(78, 214, 165)"></span>
+					<strong class="text-foreground tabular-nums">{placement.onGpu}</strong> layer{placement.onGpu ===
+					1
+						? ''
+						: 's'} on GPU
+				</span>
+
+				<span class="inline-flex items-center gap-1.5">
+					<span class="size-2 rounded-full" style:background-color="rgb(90, 155, 216)"></span>
+					<strong class="text-foreground tabular-nums">{placement.onCpu}</strong> with experts in CPU
+					RAM
+					{#if placement.nExpert}
+						<span class="text-muted-foreground"
+							>({(placement.onCpu * placement.nExpert).toLocaleString()} experts, cached on demand)</span
+						>
+					{/if}
+				</span>
+			</div>
+
+			{#if placement.raisedFrom !== null}
+				<div class="text-muted-foreground mt-2 text-xs">
+					Raised from {placement.raisedFrom} to {placement.onCpu} CPU layer{placement.onCpu === 1
+						? ''
+						: 's'} so the requested {placement.nCtx.toLocaleString()}-token context would fit — the context
+					was kept, the placement gave way.
+				</div>
+			{/if}
+		</div>
+	{/if}
 
 	{#if stats.slots_total}
 		<div class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">

@@ -322,6 +322,17 @@ export interface ApiLlamaCppServerProps {
 		n_expert?: number;
 		/** Number of layers whose MoE experts are offloaded to CPU (moe-cache tracked). */
 		n_cpu_moe?: number;
+		/** What the placement search decided, and what it was decided against. */
+		placement?: {
+			/** -ncmoe as requested on the command line (-1 when not specified). */
+			n_cpu_moe_requested?: number;
+			/** -ncmoe actually used, after raising it to fit the requested context. */
+			n_cpu_moe_final?: number;
+			/** Total layers in the model, for "N of M" framing. */
+			n_layer?: number;
+			/** Context size as requested, before any fit reduction. */
+			n_ctx_requested?: number;
+		};
 	};
 }
 

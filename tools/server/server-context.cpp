@@ -4818,6 +4818,17 @@ void server_routes::init_routes() {
                 solid_cpp["n_cpu_moe"] = map_rows; // one moe-cache-tracked row per CPU-offloaded MoE layer
             }
         }
+        // Why this layout, not just what it is: the placement search raises CPU
+        // offload until the *requested* context fits, so "23 of 30 layers on CPU"
+        // is only meaningful next to the context it was chosen to preserve.
+        if (params.placed_n_cpu_moe_final >= 0) {
+            solid_cpp["placement"] = json {
+                { "n_cpu_moe_requested", params.placed_n_cpu_moe_req   },
+                { "n_cpu_moe_final",     params.placed_n_cpu_moe_final },
+                { "n_layer",             params.placed_n_layer         },
+                { "n_ctx_requested",     params.placed_n_ctx_req       },
+            };
+        }
 
         json props = {
             { "solid_cpp",                   solid_cpp },
