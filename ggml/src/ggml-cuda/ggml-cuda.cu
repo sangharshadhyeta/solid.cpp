@@ -951,6 +951,18 @@ static const ggml_backend_buffer_i ggml_backend_cuda_vmm_buffer_interface = {
     /* .reset           = */ NULL,
 };
 
+// Lazy commit is only ever correct for allocations whose *use* lags their
+// reservation. The KV cache is that; model weights are the opposite - read in
+// full the moment they load - so a size threshold alone picks the wrong
+// buffers. It did exactly that: a 64 MiB floor captured the 6.6 GiB weights
+// buffer and faulted on first use. The caller now says which allocation this
+// is, rather than the buffer type guessing from size.
+static thread_local bool g_cuda_vmm_next_alloc = false;
+
+void ggml_backend_cuda_vmm_next_alloc(bool enable) {
+    g_cuda_vmm_next_alloc = enable;
+}
+
 bool ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer) {
     return buffer && buffer->iface.free_buffer == ggml_backend_cuda_vmm_buffer_free_buffer;
 }
@@ -1136,7 +1148,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
         return env && atoi(env) != 0;
     }();
     static const size_t vmm_min_size = 64ull << 20; // below this the bookkeeping outweighs the saving
-    if (vmm_kv && ggml_cuda_info().devices[buft_ctx->device].vmm && size >= vmm_min_size) {
+    if (vmm_kv && g_cuda_vmm_next_alloc && ggml_cuda_info().devices[buft_ctx->device].vmm && size >= vmm_min_size) {
         try {
             ggml_backend_cuda_vmm_buffer_context * vctx =
                 new ggml_backend_cuda_vmm_buffer_context(buft_ctx->device, size);
