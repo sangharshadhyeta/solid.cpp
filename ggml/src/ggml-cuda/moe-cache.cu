@@ -221,9 +221,20 @@ struct moe_cache_device {
         // no information from us at all. What matters is how many routing
         // decisions ago an expert was last wanted, not how many seconds.
         std::vector<uint64_t> last_epoch;
+        // Offset of this expert's copy in the host hot-buffer, or -1. Read
+        // lock-free from CPU compute threads, written only under session.mu.
+        std::vector<std::atomic<int64_t>> host_slot;
     };
     std::unordered_map<const void *, cpu_residency> residency;
     uint64_t plan_epoch = 0; // one tick per MoE node planned
+
+    // Host hot-expert buffer: memory we own, holding the experts the kernel
+    // would otherwise be free to evict.
+    char * host_pool = nullptr;
+    size_t host_pool_bytes = 0;
+    size_t host_slot_bytes = 0;
+    std::vector<int64_t> host_free;   // free offsets
+    size_t host_promoted = 0;
     std::chrono::steady_clock::time_point residency_epoch{};
     std::chrono::steady_clock::time_point last_cold_sweep{};
     size_t pinned_bytes = 0;
@@ -894,6 +905,9 @@ static uint64_t moe_cache_cold_after_epochs() {
 }
 static constexpr std::chrono::seconds MOE_CACHE_HISTORY_SAVE_INTERVAL{60};
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
+static void moe_cache_host_promote(
+        moe_cache_device & device, moe_cache_device::cpu_residency & res,
+        const void * host_base, int expert, size_t expert_size);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
 
 // Host RAM this process may pin for hot CPU-resident experts.
@@ -2735,6 +2749,10 @@ static int moe_cache_plan(
                 entry.selections.assign((size_t) node->n_expert, 0);
                 entry.is_pinned.assign((size_t) node->n_expert, false);
                 entry.last_epoch.assign((size_t) node->n_expert, 0);
+                entry.host_slot = std::vector<std::atomic<int64_t>>((size_t) node->n_expert);
+                for (auto & hs : entry.host_slot) {
+                    hs.store(-1, std::memory_order_relaxed);
+                }
             }
             residency = &entry;
         } catch (...) {
@@ -2759,6 +2777,11 @@ static int moe_cache_plan(
             // from that policy by growing steadily less responsive over time.
             residency->selections[expert] =
                 std::min(MOE_CACHE_HEAT_MAX, residency->selections[expert] + MOE_CACHE_HEAT_STEP);
+            // Promote once an expert has proven itself over several selections,
+            // so a single fluke does not claim a slot.
+            if (residency->selections[expert] >= MOE_CACHE_HEAT_STEP * 4) {
+                moe_cache_host_promote(device, *residency, node->host_base, expert, node->expert_size);
+            }
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
             residency->is_cold[expert] = false;
@@ -3437,6 +3460,175 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
     *out = sum;
 }
 
+
+// ---------------------------------------------------------------------------
+// Host hot-expert buffer: own the memory the hot set lives in.
+//
+// mmap and the page cache stay exactly as they are - they remain the backing
+// store, they still serve everything not promoted, and the load path is
+// untouched. What changes is that the *hot* experts are copied into memory this
+// cache owns, where LFRU is enforced rather than merely advised. That is the one
+// thing no amount of madvise could deliver: the kernel interface is
+// demotion-only, with no way to say "protect this", so under pressure it evicts
+// a expert that fires every token as readily as one never selected. Measured,
+// that costs 21x.
+//
+// Promotion releases the corresponding mmap pages (MADV_DONTNEED). Without that
+// the same weights are resident twice - once in the page cache, once here - and
+// the duplication costs exactly what this was built to save. That step is what
+// makes the two mechanisms a mixture rather than a stack: each holds the part it
+// is good at, and neither holds the other's part.
+//
+// Budget is derived, never constant, on the same rule already used for the VRAM
+// budget and the prompt cache: a share of what is actually available, clamped by
+// any cgroup limit, because a fixed number is wrong on both a 16GB laptop and a
+// 1TB server. GGML_CUDA_MOE_CACHE_HOST_MB overrides; 0 disables.
+static size_t moe_cache_host_budget_bytes() {
+    static const size_t value = [] () -> size_t {
+        if (const char * env = getenv("GGML_CUDA_MOE_CACHE_HOST_MB")) {
+            const long long parsed = atoll(env);
+            return parsed <= 0 ? 0 : (size_t) parsed << 20;
+        }
+        return 0; // opt-in: this allocates real host memory, never by surprise
+    }();
+    return value;
+}
+
+// Release the mmap pages behind an expert now that we hold our own copy.
+// Page-aligned inward so a partial page shared with a neighbouring expert is
+// never discarded.
+static void moe_cache_release_source_pages(const void * base, size_t offset, size_t bytes) {
+#if defined(__linux__)
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+    const uintptr_t begin = (uintptr_t) base + offset;
+    const uintptr_t end   = begin + bytes;
+    const uintptr_t first = (begin + page_size - 1) & ~((uintptr_t) page_size - 1);
+    const uintptr_t last  = end & ~((uintptr_t) page_size - 1);
+    if (last > first) {
+        // DONTNEED on a clean file-backed mapping simply drops the pages; the
+        // data is still on disk and re-faults if this expert is ever demoted.
+        madvise((void *) first, (size_t) (last - first), MADV_DONTNEED);
+    }
+#else
+    (void) base; (void) offset; (void) bytes;
+#endif
+}
+
+// Called under session.mu from the planning path, where heat has just been
+// updated. Promotes `expert` into the host buffer if it is hot enough and there
+// is room, evicting the coldest resident expert when there is not.
+static void moe_cache_host_promote(
+        moe_cache_device & device, moe_cache_device::cpu_residency & res,
+        const void * host_base, int expert, size_t expert_size) {
+    const size_t budget = moe_cache_host_budget_bytes();
+    if (budget == 0 || expert_size == 0) {
+        return;
+    }
+    if ((size_t) expert >= res.host_slot.size()) {
+        return;
+    }
+    if (res.host_slot[expert].load(std::memory_order_relaxed) >= 0) {
+        return; // already held
+    }
+
+    // Lazily create the pool, sized to the budget and sliced by expert size.
+    if (!device.host_pool) {
+        const size_t slots = budget / expert_size;
+        if (slots == 0) {
+            return;
+        }
+        device.host_slot_bytes = expert_size;
+        device.host_pool_bytes = slots * expert_size;
+        device.host_pool = (char *) std::malloc(device.host_pool_bytes);
+        if (!device.host_pool) {
+            device.host_pool_bytes = 0;
+            return;
+        }
+        device.host_free.reserve(slots);
+        for (size_t i = slots; i-- > 0; ) {
+            device.host_free.push_back((int64_t) (i * expert_size));
+        }
+        MOE_CACHE_LOG("[moe-cache] host hot-expert buffer: %zu MiB, %zu slots of %zu KiB\n",
+                device.host_pool_bytes >> 20, slots, expert_size >> 10);
+    }
+
+    // A pool is sliced for one expert size; a differently-shaped tensor is left
+    // to mmap rather than wasting a slot or corrupting one.
+    if (expert_size != device.host_slot_bytes) {
+        return;
+    }
+
+    int64_t off = -1;
+    if (!device.host_free.empty()) {
+        off = device.host_free.back();
+        device.host_free.pop_back();
+    } else {
+        // Full: evict the coldest resident expert, but only if the candidate is
+        // genuinely colder than the one asking to come in. Otherwise a cold
+        // newcomer would churn a hot incumbent out on every miss.
+        uint32_t victim_heat = UINT32_MAX;
+        moe_cache_device::cpu_residency * victim_res = nullptr;
+        size_t victim_expert = 0;
+        for (auto & [vb, vres] : device.residency) {
+            for (size_t e = 0; e < vres.host_slot.size(); e++) {
+                if (vres.host_slot[e].load(std::memory_order_relaxed) < 0) {
+                    continue;
+                }
+                if (vres.selections[e] < victim_heat) {
+                    victim_heat = vres.selections[e];
+                    victim_res = &vres;
+                    victim_expert = e;
+                }
+            }
+        }
+        if (!victim_res || victim_heat >= res.selections[expert]) {
+            return;
+        }
+        off = victim_res->host_slot[victim_expert].exchange(-1, std::memory_order_release);
+        if (off < 0) {
+            return;
+        }
+    }
+
+    std::memcpy(device.host_pool + off, (const char *) host_base + (size_t) expert * expert_size, expert_size);
+    // Publish only after the copy is complete: a CPU thread that observes the
+    // offset must find valid weights behind it.
+    res.host_slot[expert].store(off, std::memory_order_release);
+    device.host_promoted++;
+
+    moe_cache_release_source_pages(host_base, (size_t) expert * expert_size, expert_size);
+}
+
+// Hot path, called per expert per MoE node from CPU compute threads. Lock-free
+// by construction: the only mutable state read is one atomic offset, published
+// after its contents are written.
+static const void * moe_cache_host_ptr(const void * host_base, int expert) {
+    if (moe_cache_host_budget_bytes() == 0 ||
+        g_session_count.load(std::memory_order_acquire) <= 0 || expert < 0) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        for (const auto & device_ptr : session->devices) {
+            auto it = device_ptr->residency.find(host_base);
+            if (it == device_ptr->residency.end()) {
+                continue;
+            }
+            if ((size_t) expert >= it->second.host_slot.size() || !device_ptr->host_pool) {
+                continue;
+            }
+            const int64_t off = it->second.host_slot[expert].load(std::memory_order_acquire);
+            if (off >= 0) {
+                return device_ptr->host_pool + off;
+            }
+        }
+    }
+    return nullptr;
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -3456,6 +3648,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
+    ggml_moe_cache.host_ptr = moe_cache_host_ptr;
 }
 
 #endif

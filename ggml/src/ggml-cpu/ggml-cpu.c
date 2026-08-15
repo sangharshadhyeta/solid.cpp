@@ -1724,6 +1724,18 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+
+        // If the cache holds its own copy of this expert, read that instead of
+        // the mmap'd weights. Same bytes either way - the difference is that the
+        // cache's copy cannot be evicted behind our back, whereas the mapped
+        // pages are at the kernel's discretion and it cannot tell a hot expert
+        // from a cold one. NULL means "not held", i.e. exactly today's path.
+        if (ggml_moe_cache.host_ptr) {
+            const void * cached = ggml_moe_cache.host_ptr(src0->data, (int) cur_a);
+            if (cached) {
+                src0_cur = (const char *) cached;
+            }
+        }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
