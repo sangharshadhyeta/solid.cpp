@@ -4122,3 +4122,27 @@ speculation:
   window and already bounded at 4608 cells. On a non-SWA model, or on an H200
   running a large model at full context, the proportion is far more favourable,
   which is the case this was built for.
+
+# Eviction on pressure (2026-08-15)
+
+The live budget re-check notices pressure and then, by design, refuses to act on
+it: lowering the budget below what is already allocated makes the cache inert
+(documented above - that bug froze every counter and cost 24 tok/s). Correct, but
+it left the cache able to see pressure and unable to yield to it.
+
+Pool slabs are one allocation each and cannot be partially freed, so the memory
+that can actually be returned is the dispatch scratch (`d_ids`, `d_act`,
+`d_act_q8`, `d_out`). `moe_cache_grow_device()` regrows those on demand before
+the next dispatch, so releasing them costs one reallocation and no cached expert.
+Released only when nothing is in flight and the queue is drained, since a
+dispatch in progress is reading exactly those buffers.
+
+Verified not to fire when VRAM is free, and not to break normal operation
+(loads, serves, zero CUDA errors). The pressure path itself is untested here for
+the usual reason - producing genuine VRAM pressure requires a second large
+consumer on the card, and the earlier attempt at that (two full model instances)
+simply fails to load rather than creating graceful pressure.
+
+Returning cached experts themselves under pressure would need pool slabs
+subdivided into independently freeable chunks. That is a real change to the
+allocation structure, not a tuning knob, and is not attempted here.
