@@ -45,3 +45,12 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 #ifdef  __cplusplus
 }
 #endif
+
+// Lazily-committed (VMM) buffers: see ggml_backend_cuda_vmm_buffer_context in
+// ggml-cuda.cu. Both are no-ops/0 for ordinary buffers, so callers need not
+// know which kind they hold.
+GGML_BACKEND_API bool   ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer);
+// Ensure the leading `fraction` of every tensor in the buffer is backed by
+// physical memory. Returns false if the mapping failed (out of memory).
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction);
+GGML_BACKEND_API size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffer_t buffer);

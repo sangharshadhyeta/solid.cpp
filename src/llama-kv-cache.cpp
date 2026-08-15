@@ -1,5 +1,9 @@
 #include "llama-kv-cache.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
@@ -1104,6 +1108,40 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
     }
 
     assert(ubatch.n_tokens == sinfo.n_stream()*sinfo.size());
+
+    // Back the cells about to be written with physical memory, for buffers that
+    // were reserved lazily (GGML_CUDA_VMM_KV). Attention kernels address the KV
+    // tensors directly and cannot fault memory in for themselves, so the mapping
+    // has to happen here - before this ubatch is applied, never after.
+    //
+    // The high-water mark only ever rises: cells are reused rather than
+    // released, so committed memory tracks the deepest point the conversation
+    // has reached, and a long context costs what it actually used rather than
+    // what it reserved.
+    {
+        uint32_t idx_max = 0;
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {
+                idx_max = std::max(idx_max, (uint32_t) sinfo.idxs[s][ii]);
+            }
+        }
+        const uint32_t n_cells = v_cells.empty() ? 0 : v_cells[0].size();
+        if (n_cells > 0) {
+            // One granule of slack, so the next few tokens do not each trigger a
+            // fresh mapping call.
+            const double frac = std::min(1.0, (double) (idx_max + 1) / (double) n_cells + 0.01);
+#ifdef GGML_USE_CUDA
+            for (auto & [ctx, buf] : ctxs_bufs) {
+                if (!ggml_backend_cuda_vmm_commit_fraction(buf.get(), frac)) {
+                    LLAMA_LOG_ERROR("%s: failed to commit KV memory at %.1f%% of context - "
+                                    "out of VRAM\n", __func__, 100.0 * frac);
+                }
+            }
+#else
+            (void) frac;
+#endif
+        }
+    }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         for (uint32_t ii = 0; ii < sinfo.size(); ++ii) {

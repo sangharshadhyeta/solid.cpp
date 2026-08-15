@@ -755,6 +755,225 @@ struct ggml_backend_cuda_buffer_context {
     }
 };
 
+
+// ---------------------------------------------------------------------------
+// VMM-backed buffer: reserve the whole address range, commit physical memory
+// as it is actually used.
+//
+// This is PagedAttention's core saving - do not pay for context nobody uses -
+// without PagedAttention's cost. vLLM reaches it with a block table and gather
+// kernels, which is why porting it here was rejected: llama.cpp would need new
+// attention kernels for every backend. CUDA's virtual memory API gets the same
+// result differently. Reserve contiguous *virtual* addresses for the full
+// n_ctx, then map physical pages behind them only as positions fill. Addresses
+// stay contiguous and linear, so every existing attention kernel works
+// unmodified - there is nothing for them to know about.
+//
+// Committed memory is tracked per granule over the whole reservation rather
+// than per tensor, because a KV buffer holds one tensor per layer per K/V and
+// "cells 0..N are in use" maps to a *strided* set of byte ranges, one prefix
+// per tensor, not a single prefix of the buffer. Granule bookkeeping is
+// indifferent to that layout.
+struct ggml_backend_cuda_vmm_buffer_context {
+    int device;
+    int physical_device;
+    CUdeviceptr base = 0;
+    size_t reserved = 0;
+    size_t granularity = 0;
+    std::vector<bool> granule_committed;
+    std::vector<CUmemGenericAllocationHandle> handles;
+    std::string name;
+
+    // (offset, size) of each tensor placed in this buffer, recorded at
+    // init_tensor, so a "fraction in use" can be turned into the per-tensor
+    // prefixes that actually need backing.
+    std::vector<std::pair<size_t, size_t>> slices;
+
+    ggml_backend_cuda_vmm_buffer_context(int device, size_t size) :
+        device(device),
+        physical_device(ggml_cuda_get_physical_device(device)),
+        granularity(ggml_cuda_info().devices[device].vmm_granularity),
+        name(GGML_CUDA_NAME + std::to_string(device) + "_VMM") {
+        reserved = GGML_PAD(size, granularity);
+        CU_CHECK(cuMemAddressReserve(&base, reserved, 0, 0, 0));
+        granule_committed.assign(reserved / granularity, false);
+    }
+
+    ~ggml_backend_cuda_vmm_buffer_context() {
+        for (size_t i = 0; i < granule_committed.size(); i++) {
+            if (granule_committed[i]) {
+                cuMemUnmap(base + i * granularity, granularity);
+            }
+        }
+        for (CUmemGenericAllocationHandle h : handles) {
+            cuMemRelease(h);
+        }
+        if (base) {
+            cuMemAddressFree(base, reserved);
+        }
+    }
+
+    // Back [offset, offset+size) with physical memory. Idempotent, and cheap
+    // when already committed - the common case once a conversation stabilises.
+    bool commit(size_t offset, size_t size) {
+        if (size == 0 || offset >= reserved) {
+            return true;
+        }
+        size = std::min(size, reserved - offset);
+        const size_t first = offset / granularity;
+        const size_t last  = (offset + size + granularity - 1) / granularity;
+
+        CUmemAllocationProp prop = {};
+        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        prop.location.id   = physical_device;
+
+        CUmemAccessDesc access = {};
+        access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        access.location.id   = physical_device;
+        access.flags         = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+
+        for (size_t g = first; g < last && g < granule_committed.size(); g++) {
+            if (granule_committed[g]) {
+                continue;
+            }
+            CUmemGenericAllocationHandle handle;
+            if (cuMemCreate(&handle, granularity, &prop, 0) != CUDA_SUCCESS) {
+                return false; // out of memory - caller decides what that means
+            }
+            if (cuMemMap(base + g * granularity, granularity, 0, handle, 0) != CUDA_SUCCESS) {
+                cuMemRelease(handle);
+                return false;
+            }
+            if (cuMemSetAccess(base + g * granularity, granularity, &access, 1) != CUDA_SUCCESS) {
+                cuMemUnmap(base + g * granularity, granularity);
+                cuMemRelease(handle);
+                return false;
+            }
+            handles.push_back(handle);
+            granule_committed[g] = true;
+        }
+        return true;
+    }
+
+    // Commit the leading `fraction` of every tensor in this buffer. This is the
+    // growth hook: the KV cache knows how many of its cells are live, and every
+    // tensor in a given cache advances in lockstep, so one fraction describes
+    // all of them.
+    bool commit_fraction(double fraction) {
+        fraction = std::min(1.0, std::max(0.0, fraction));
+        {
+            static int n = 0;
+            if (n++ < 3) {
+                GGML_LOG_INFO("[vmm] commit_fraction %.4f over %zu slices (reserved %.1f MiB)\n",
+                        fraction, slices.size(), reserved / 1048576.0);
+            }
+        }
+        for (const auto & [off, size] : slices) {
+            if (!commit(off, (size_t) (size * fraction) + granularity)) {
+                return false;
+            }
+        }
+        return true;
+    }
+};
+
+static void ggml_backend_cuda_vmm_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    delete (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+}
+
+static void * ggml_backend_cuda_vmm_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return (void *) ((ggml_backend_cuda_vmm_buffer_context *) buffer->context)->base;
+}
+
+static enum ggml_status ggml_backend_cuda_vmm_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    if (tensor->view_src != NULL) {
+        return GGML_STATUS_SUCCESS;
+    }
+    const size_t off = (size_t) ((char *) tensor->data - (char *) ctx->base);
+    ctx->slices.emplace_back(off, ggml_backend_buft_get_alloc_size(buffer->buft, tensor));
+    return GGML_STATUS_SUCCESS;
+}
+
+// Every path that touches memory through the buffer API commits what it is
+// about to touch. Kernels reach the KV tensors directly and cannot do this for
+// themselves, which is what the explicit growth hook above is for; these are
+// belt and braces for everything else (clears, state save/restore, copies).
+static void ggml_backend_cuda_vmm_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    ctx->commit((size_t) ((char *) tensor->data + offset - (char *) ctx->base), size);
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static void ggml_backend_cuda_vmm_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    ctx->commit((size_t) ((char *) tensor->data + offset - (char *) ctx->base), size);
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static void ggml_backend_cuda_vmm_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    ctx->commit((size_t) ((char *) tensor->data + offset - (char *) ctx->base), size);
+    ggml_cuda_set_device(ctx->device);
+    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static void ggml_backend_cuda_vmm_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    // Only clear what exists; uncommitted pages have no contents to clear, and
+    // committing the whole reservation here would defeat the entire point.
+    ggml_cuda_set_device(ctx->device);
+    for (size_t g = 0; g < ctx->granule_committed.size(); g++) {
+        if (ctx->granule_committed[g]) {
+            CUDA_CHECK(cudaMemsetAsync((char *) ctx->base + g * ctx->granularity, value, ctx->granularity, cudaStreamPerThread));
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+static const ggml_backend_buffer_i ggml_backend_cuda_vmm_buffer_interface = {
+    /* .free_buffer     = */ ggml_backend_cuda_vmm_buffer_free_buffer,
+    /* .get_base        = */ ggml_backend_cuda_vmm_buffer_get_base,
+    /* .init_tensor     = */ ggml_backend_cuda_vmm_buffer_init_tensor,
+    /* .memset_tensor   = */ ggml_backend_cuda_vmm_buffer_memset_tensor,
+    /* .set_tensor      = */ ggml_backend_cuda_vmm_buffer_set_tensor,
+    /* .get_tensor      = */ ggml_backend_cuda_vmm_buffer_get_tensor,
+    /* .set_tensor_2d   = */ NULL,
+    /* .get_tensor_2d   = */ NULL,
+    /* .cpy_tensor      = */ NULL,
+    /* .clear           = */ ggml_backend_cuda_vmm_buffer_clear,
+    /* .reset           = */ NULL,
+};
+
+bool ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer) {
+    return buffer && buffer->iface.free_buffer == ggml_backend_cuda_vmm_buffer_free_buffer;
+}
+
+bool ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction) {
+    if (!ggml_backend_cuda_buffer_is_vmm(buffer)) {
+        return true; // ordinary buffer: already fully backed, nothing to do
+    }
+    return ((ggml_backend_cuda_vmm_buffer_context *) buffer->context)->commit_fraction(fraction);
+}
+
+size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_cuda_buffer_is_vmm(buffer)) {
+        return 0;
+    }
+    ggml_backend_cuda_vmm_buffer_context * ctx = (ggml_backend_cuda_vmm_buffer_context *) buffer->context;
+    size_t n = 0;
+    for (bool c : ctx->granule_committed) {
+        n += c;
+    }
+    return n * ctx->granularity;
+}
+
 static void ggml_backend_cuda_buffer_free_buffer(ggml_backend_buffer_t buffer) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
     delete ctx;
@@ -901,6 +1120,34 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+#if defined(GGML_USE_VMM)
+    // Opt-in lazily-committed allocation, for buffers whose size is dictated by
+    // a context length the user may never reach. Reserves the address range and
+    // maps physical memory only as it is used, so `-c 262144` costs what the
+    // conversation actually needs rather than what it might.
+    //
+    // Deliberately not the default and deliberately not applied to weights:
+    // model weights are read in full immediately, so lazy commit buys nothing
+    // and only adds a mapping path to something that works. The KV cache is the
+    // case where reservation and use diverge.
+    static const bool vmm_kv = [] {
+        const char * env = getenv("GGML_CUDA_VMM_KV");
+        return env && atoi(env) != 0;
+    }();
+    static const size_t vmm_min_size = 64ull << 20; // below this the bookkeeping outweighs the saving
+    if (vmm_kv && ggml_cuda_info().devices[buft_ctx->device].vmm && size >= vmm_min_size) {
+        try {
+            ggml_backend_cuda_vmm_buffer_context * vctx =
+                new ggml_backend_cuda_vmm_buffer_context(buft_ctx->device, size);
+            GGML_LOG_INFO("%s: reserved %.2f MiB on device %d with lazy commit (VMM)\n",
+                    __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+            return ggml_backend_buffer_init(buft, ggml_backend_cuda_vmm_buffer_interface, vctx, size);
+        } catch (const std::exception & e) {
+            GGML_LOG_WARN("%s: VMM reservation failed (%s), falling back to cudaMalloc\n", __func__, e.what());
+        }
+    }
+#endif
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
