@@ -4204,3 +4204,41 @@ cgroup limit), never a constant. The heat signal, decay and eviction rule are
 already implemented for the RAM tier and sitting behind
 `GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS`; what changes is that they would govern
 memory we hold rather than advice we offer.
+
+## Host hot-expert buffer: implemented and tested (2026-08-16)
+
+Built as described above: an owned host buffer holding the hot experts, mmap
+retained for everything else, and promotion releasing the corresponding mmap
+pages (`MADV_DONTNEED`) so nothing is resident twice.
+
+Interception is one line in `ggml-cpu.c`, at `src0_cur` - the single point where
+the CPU reads an expert's weights. `ggml_moe_cache.host_ptr()` returns the
+cache's own copy or NULL, and NULL is exactly today's path, so the fallback is
+the existing code rather than new code.
+
+Promotion happens in the planning path (under `session.mu`, where heat has just
+been updated) once an expert has been selected several times, so a single fluke
+cannot claim a slot. Eviction takes the coldest resident expert, and only if it
+is genuinely colder than the candidate - otherwise a cold newcomer would churn a
+hot incumbent out on every miss. The offset is published with a release store
+after the copy completes, so a CPU thread that observes it always finds valid
+weights. Opt-in via `GGML_CUDA_MOE_CACHE_HOST_MB`; it allocates real host memory
+and should never do so by surprise.
+
+**Testing, including the control that mattered most.** Buffer ON vs OFF gave
+3/5 byte-identical outputs at temperature 0 - which looks like corruption until
+the right control is run: **OFF vs OFF differs on exactly the same two prompts,
+at the same 3/5 rate.** The nondeterminism is pre-existing (whether an expert is
+served from VRAM or CPU changes the arithmetic path between runs) and has nothing
+to do with the buffer. Without that control this would have been reported as a
+corruption bug that does not exist.
+
+Edge cases exercised, all clean and crash-free:
+
+- **4 MiB budget** - 2 slots against thousands of experts, i.e. maximum eviction
+  churn, including the "do not evict a hotter incumbent" guard.
+- **Six concurrent requests** - `host_ptr` is called from many CPU compute
+  threads simultaneously and is lock-free by construction on the read side.
+- **Buffer disabled** (unset / 0) - the default, unchanged behaviour.
+- **Mixed expert sizes** - a pool is sliced for one expert size; differently
+  shaped tensors are left to mmap rather than wasting or corrupting a slot.

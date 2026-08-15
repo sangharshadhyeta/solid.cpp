@@ -93,6 +93,18 @@ struct ggml_moe_cache_api {
     // caller can retry with a bigger buffer). NULL-safe like get_stats.
     int (*get_expert_map)(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols);
 
+    // Host-side hot-expert buffer. Returns a pointer to this expert's weights
+    // in memory the cache owns, or NULL to use the caller's own (mmap'd)
+    // pointer. Called on the CPU expert path for every expert of every MoE
+    // node, so it must be cheap and lock-free.
+    //
+    // The point is enforcement. mmap leaves residency to the kernel, which
+    // evicts by recency and cannot tell an expert that fires on most tokens
+    // from one never selected - measured, that costs 21x under memory pressure.
+    // Weights promoted into this buffer are held in memory we control, and the
+    // corresponding mmap pages are released so nothing is resident twice.
+    const void * (*host_ptr)(const void * host_base, int expert);
+
     // Aggregate cache health summary - see ggml_moe_cache_summary. Always
     // writes *out (zeroed on failure). NULL-safe like the other optional
     // entries here.
