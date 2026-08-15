@@ -4280,3 +4280,51 @@ Left opt-in and off by default. The correctness work stands (the control run
 showed the nondeterminism was pre-existing, and every edge case was clean); it
 is the eager allocation that must change before the performance claim can be
 revisited.
+
+# What the literature actually does, and why our buffer was on the wrong axis (2026-08-16)
+
+Searched after three buffer variants all measured worse. The field has converged
+on something we did not try, and it explains the failures.
+
+Sources: Speculating Experts (arxiv 2603.19289), MoE-Infinity, FineMoE
+(EuroSys'26), SP-MoE (arxiv 2510.10302), CommitMoE (AAAI), ADEPT.
+
+**The consensus mechanism is prediction, not capacity.** Expert selection at
+layer N+1 is predictable from layer N's activations, so these systems run the
+next layer's router early, learn which experts it will want, and transfer them
+*while the current layer is still computing*. Speculating Experts constructs a
+"quasi-hidden state" (normalised residual stream plus a default vector
+approximating typical expert contributions) to approximate what the next
+router will see; it predicts one layer ahead at roughly 90% hit rate, dropping
+to ~70% in early layers where representational drift is high.
+
+Its own summary of the memory strategy is the sentence that matters here:
+*"rather than holding experts in memory, the system uses asynchronous
+prefetching"* - overlapping transfer with compute to mask latency.
+
+**Two corrections to the work above.**
+
+1. *We were solving for capacity; the constraint is latency.* The host buffer,
+   mlock pinning and MADV_WILLNEED all tried to **hold** the hot set resident.
+   Prediction removes the need to hold anything - the transfer merely has to
+   start early enough. That is why all three variants failed the same way
+   regardless of allocation shape, thread, or policy: they addressed the wrong
+   axis, and each one bought residency by taking memory from the page cache.
+
+2. *The 21x was never a realistic target.* Speculating Experts reports up to
+   **14% TPOT reduction** over on-demand expert loading, and larger gains on
+   weaker GPUs (12-14% on an A6000 against 5-8% on A100/GH200) - which places
+   this 12GB card in the favourable regime, but nowhere near an order of
+   magnitude. Their baseline is on-demand loading from *CPU RAM*; the 21x
+   measured here was disk-bound under RAM pressure, a worse regime the papers do
+   not target.
+
+**What already exists here, and what does not.** moe-cache's fill queue is
+already asynchronous - a miss enqueues a fill and compute continues - so the
+overlap machinery is built. What is missing is that our fills are *reactive*
+(issued after the miss, too late for the token that caused it) where the
+literature's are *predictive* (issued before it). Closing that gap means running
+the next layer's router early against the current layer's output and enqueuing
+fills for what it selects, which is a bounded change to the planning path rather
+than a new subsystem - and it is the thing that should have been built instead of
+the buffer.
