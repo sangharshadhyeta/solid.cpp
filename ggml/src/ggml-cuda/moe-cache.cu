@@ -1088,8 +1088,19 @@ static bool moe_cache_prepare_budget(
     if (session.config.budget_mb > 0) {
         available = std::min(available, session.config.budget_mb << 20);
     }
+    // Never re-evaluate the budget below what is already allocated. Pools that
+    // exist cannot be un-allocated here, so a lower number does not free
+    // anything - it only makes every routing weight zero (the eligibility check
+    // is `allocated_bytes > slab_limit`), which takes the cache inert: begin()
+    // returns NULL for every node, so no hits, no misses, no evictions, and no
+    // heat updates are ever recorded again. Found exactly that way: after this
+    // live re-check was introduced, an 800-token generation left every counter
+    // frozen at its warmup value, because the recomputed budget landed a few MiB
+    // under allocated_bytes once the reserve was subtracted. Growth still
+    // responds to real pressure; only shrink-below-committed is refused.
     const size_t previous_limit = device.budget_limit;
-    device.budget_limit = available;
+    const size_t committed = device.allocated_bytes + moe_cache_scratch_total(device.scratch_reserve);
+    device.budget_limit = std::max(available, committed);
 
     if (!first_check && available != previous_limit) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d cache budget re-evaluated: %zu -> %zu MiB (%zu MiB free, %zu MiB already cached)\n",
