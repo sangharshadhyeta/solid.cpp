@@ -3889,3 +3889,52 @@ harness has run. The reasoning for preferring it over pinning is sound on its ow
 terms - advisory hints cost nothing when RAM is short, where pinned pages
 actively starve everything else - but "the reasoning is sound" is exactly what
 was said about pinning before it measured worse.
+
+# Benchmark results, and a retraction (2026-08-15)
+
+`scripts/moe-residency-bench.sh`, 5 interleaved rounds, 5 GiB cap (~2x
+oversubscription of the ~10 GiB CPU-side expert set), 1 cold + 5 warm samples
+per server start, page cache dropped and server restarted before every sample.
+
+| config | cold, n=5 | warm, n=25 |
+| --- | --- | --- |
+| baseline | median 2.34 (IQR 2.22-2.46) | median 12.12 (IQR 10.27-14.63) |
+| history | median 2.47 (IQR 2.34-2.51) | median 11.92 (IQR 9.75-17.77) |
+| history + readahead | median 2.45 (IQR 2.35-2.58) | median 11.10 (IQR 9.45-14.07) |
+
+Interleaving allows a paired comparison per round, which is the stronger test:
+history beat baseline on cold in 4 of 5 rounds (+5.6% median), readahead in 4 of
+5 (+4.7%). Neither improved warm throughput; baseline was highest, and readahead
+was ~8% worse.
+
+**Retraction.** The usage-history commit claimed "+21% to +50%" from three
+single-sample runs. That was noise. The measured effect is **+5.6% on the first
+request and nothing afterwards**. The claim was committed with a caveat about
+n=1, and the caveat turned out to be the only accurate part of it. Similarly, the
+33.37 tok/s readahead reading that prompted building this harness was noise -
+nothing across 30 samples came near it (cold max 2.66, warm max 19.38).
+
+Readahead is now **default-off**: +4.7% cold against -8% warm and 3.4 GiB of
+page-cache pressure is a bad trade for anything serving more than one request.
+History stays on - a small consistent cold gain at no warm cost, for one file.
+
+**The finding that matters more than either number.** Both mechanisms move cold
+throughput about 5%, against a 21x gap. That is not a tuning problem, it is the
+ceiling of the approach: the kernel's interface is asymmetric. `MADV_COLD` and
+`MADV_PAGEOUT` let us say "drop this one first"; `MADV_WILLNEED` is advisory and
+routinely ignored under pressure; and there is no hint at all for "this expert is
+hot, protect it" - the only way to express that is `mlock`, which is not a hint
+but a command, and measured worse for exactly that reason (unreclaimable pages
+starve everything else).
+
+So any cooperative strategy has to be demotion-only: we cannot protect the hot
+set, only demote the cold set and let the hot set be what survives. That is worth
+one more attempt, and cheaply - the current cold threshold is 120 seconds of
+wall-clock idleness swept every 30 seconds, which in a 40-second benchmark run
+classifies almost nothing, meaning these results largely measure the kernel
+operating with *no* information from us. Classifying by recent routing (last N
+hundred tokens) rather than wall clock, sweeping every few seconds, and using
+`MADV_PAGEOUT` for the confidently-dormant would actually deliver the
+information. If that still yields single-digit percentages, the conclusion is
+that the interface cannot express what this access pattern needs, and owning the
+buffer is the only remaining answer.

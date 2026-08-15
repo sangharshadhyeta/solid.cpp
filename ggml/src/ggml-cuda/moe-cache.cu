@@ -1613,8 +1613,14 @@ static void moe_cache_prewarm_from_history(
     // if RAM is short the kernel simply declines, and nothing else is starved.
 #if defined(__linux__)
     static const bool readahead_enabled = [] {
+        // Off by default, and this is a measured decision. Over 5 interleaved
+        // rounds it won 4/5 on the cold request (+4.7% median) but cost ~8% on
+        // warm throughput (median 11.10 vs 12.12 tok/s baseline), for 3.4 GiB of
+        // page-cache pressure - a bad trade for any workload that serves more
+        // than its first request. Kept because the cold-start gain is real and
+        // may matter where restarts are frequent.
         const char * env = getenv("GGML_CUDA_MOE_CACHE_READAHEAD");
-        return !env || atoi(env) != 0; // on unless explicitly disabled
+        return env && atoi(env) != 0;
     }();
     static const long page_size_w = sysconf(_SC_PAGESIZE);
     if (readahead_enabled && page_size_w > 0) {
