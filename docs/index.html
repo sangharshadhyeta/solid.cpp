@@ -260,16 +260,21 @@ watchable live — not "trust me, it's caching," but a real-time view of which e
 then ship it, then let you go verify it yourself. Not a fork chasing every upstream feature — one willing to slow
 down and prove each claim before it ships.</p>
 <p class="note">Scope, honestly: the expert-cache fits the model's <em>parameters</em> into limited VRAM - it
-doesn't and can't stretch VRAM to hold arbitrary context length, which is a separate, unrelated resource that
-scales with sequence length regardless of how the weights are cached. Pushed this to a real boundary on our own
-12GB card: requesting 1M context used to hard-crash the whole process rather than fail gracefully - found and
-fixed that (<code>--fit</code> now searches by doubling from a safe floor and lands on a real, measured context
-size instead of guessing or crashing), but the physical ceiling is still real: on this card, with this model,
-that search lands at 8192 tokens/slot with 4 concurrent slots, or 16384 with just one - nowhere near the 1M
-asked for. No amount of placement cleverness moves that ceiling; it just means asking for more than fits now
-gets you the most that actually does, measured, instead of a crash. Every project in this space (Colibri,
-ktransformers, ik_llama.cpp included) draws this same line for the same reason - it's physics, not a missing
-feature.</p>
+doesn't and can't stretch VRAM to hold arbitrary context length, which is a separate resource that scales with
+sequence length regardless of how the weights are cached. Pushed this to a real boundary on our own 12GB card:
+requesting 1M context used to hard-crash the whole process rather than fail gracefully - found and fixed that
+(<code>--fit</code> now searches by doubling from a safe floor and lands on a real, measured context size
+instead of guessing or crashing). A physical ceiling still exists - ask for 1M on a 12GB card and you will not
+get 1M - but it sits much higher than we first reported, and finding out why was the more useful result.</p>
+<p class="note">The first version of that fix asked the wrong question. It picked a placement, then shrank
+context until the model fit around it - so a 12GB card landed on 8192 tokens/slot, and we wrote that down as the
+hardware ceiling. It wasn't. The expert placement had been fixed first (by a command-line flag nobody revisited),
+and context was quietly paying for it. Inverting the order - decide placement <em>from</em> the context actually
+asked for, pushing more expert weights to CPU RAM until the request fits - gives <strong>65,536 tokens across 4
+concurrent slots</strong> on that same card and model, 8x the context and 4x the concurrency, at higher
+throughput than before. Nothing about the hardware changed; the program simply stopped trading away the one
+thing the user explicitly asked for. The lesson we'd pass on: when two automatic systems each optimise locally,
+check what the pair does to the number the user actually cares about.</p>
 </section>
 
 <section>
