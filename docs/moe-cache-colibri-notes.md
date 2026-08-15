@@ -4328,3 +4328,41 @@ the next layer's router early against the current layer's output and enqueuing
 fills for what it selects, which is a bounded change to the planning path rather
 than a new subsystem - and it is the thing that should have been built instead of
 the buffer.
+
+## Predictor survey, and why we are not building one yet (2026-08-16)
+
+Best predictors currently published, with what each needs:
+
+| predictor | recall | requires |
+| --- | --- | --- |
+| PILOT router-lookahead | 73.6% | layer L's post-attention state + L+1's router weights |
+| Two-step shared-expert (Colibri #200) | 76.7% | the above plus shared-expert compute (3 small matmuls) |
+| Fate (cosine similarity of gate inputs) | 78.8%, no training | gate inputs |
+| LLaPor | Top-4 hit rate >=94% | more machinery |
+
+All of them need model-level state - the residual stream and the next layer's
+router weights - which moe-cache, living at the ggml op level, never sees. That
+alone makes any of them a llama.cpp graph change rather than a cache change.
+
+**The decisive finding is not in the accuracy column.** Colibri built the best of
+these (76.7%, beating PILOT by 3.1% over 13,616 samples on GLM-5.2) and reported:
+*"end-to-end throughput showed no improvement on the 24 GB test hardware due to
+cache constraints (capacity limited to 2 experts per layer)."* A better predictor
+bought nothing because the cache could not hold what it prefetched.
+
+Checked whether we are in the same position, and we are: **1316 of 1316 slots
+used, 100% full**, hit rate 57.3%. Capacity binds here too. A prefetch needs a
+slot to land in; with the cache saturated it is either refused by the admission
+gate or evicts an expert already earning its place. Prediction cannot help until
+there is somewhere to put the prediction.
+
+So the predictor is not the next thing to build - it is the thing after the next
+thing. What moves first is effective capacity: more VRAM for the cache (the
+gigabyte freed by q8_0 KV went to placing more expert layers on the GPU rather
+than to the cache - that is a tunable trade), or fewer CPU-offloaded layers.
+Once slots are no longer saturated, prediction has something to buy, and the
+survey above says which predictor to port and what recall to expect.
+
+Recorded rather than built, deliberately. Three mechanisms today failed by
+addressing capacity when the constraint was elsewhere; building a fourth that
+addresses timing while capacity binds would be the same error inverted.
