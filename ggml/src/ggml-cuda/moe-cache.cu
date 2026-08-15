@@ -221,20 +221,26 @@ struct moe_cache_device {
         // no information from us at all. What matters is how many routing
         // decisions ago an expert was last wanted, not how many seconds.
         std::vector<uint64_t> last_epoch;
-        // Offset of this expert's copy in the host hot-buffer, or -1. Read
-        // lock-free from CPU compute threads, written only under session.mu.
-        std::vector<std::atomic<int64_t>> host_slot;
+        // This expert's own copy, or nullptr. Allocated per expert at promotion
+        // rather than carved from a pre-reserved pool: reserving the whole
+        // budget up front took memory from the page cache before anything had
+        // been promoted into it, which measured 30% slower. Allocating on
+        // promotion means every byte taken is a byte MADV_DONTNEED has just
+        // released. Read lock-free from CPU compute threads, written only under
+        // session.mu.
+        std::vector<std::atomic<void *>> host_slot;
     };
     std::unordered_map<const void *, cpu_residency> residency;
     uint64_t plan_epoch = 0; // one tick per MoE node planned
 
     // Host hot-expert buffer: memory we own, holding the experts the kernel
     // would otherwise be free to evict.
-    char * host_pool = nullptr;
-    size_t host_pool_bytes = 0;
-    size_t host_slot_bytes = 0;
-    std::vector<int64_t> host_free;   // free offsets
+    size_t host_bytes = 0;      // currently held by promoted experts
     size_t host_promoted = 0;
+    // Evicted blocks awaiting release. A CPU compute thread may hold a pointer
+    // it read moments ago, so freeing at eviction would be a use-after-free.
+    // Blocks are released once the cache has quiesced instead.
+    std::vector<std::pair<void *, size_t>> host_retired;
     std::chrono::steady_clock::time_point residency_epoch{};
     std::chrono::steady_clock::time_point last_cold_sweep{};
     size_t pinned_bytes = 0;
@@ -908,6 +914,7 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 static void moe_cache_host_promote(
         moe_cache_device & device, moe_cache_device::cpu_residency & res,
         const void * host_base, int expert, size_t expert_size);
+static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
 
 // Host RAM this process may pin for hot CPU-resident experts.
@@ -2749,9 +2756,9 @@ static int moe_cache_plan(
                 entry.selections.assign((size_t) node->n_expert, 0);
                 entry.is_pinned.assign((size_t) node->n_expert, false);
                 entry.last_epoch.assign((size_t) node->n_expert, 0);
-                entry.host_slot = std::vector<std::atomic<int64_t>>((size_t) node->n_expert);
+                entry.host_slot = std::vector<std::atomic<void *>>((size_t) node->n_expert);
                 for (auto & hs : entry.host_slot) {
-                    hs.store(-1, std::memory_order_relaxed);
+                    hs.store(nullptr, std::memory_order_relaxed);
                 }
             }
             residency = &entry;
@@ -3524,82 +3531,81 @@ static void moe_cache_host_promote(
         moe_cache_device & device, moe_cache_device::cpu_residency & res,
         const void * host_base, int expert, size_t expert_size) {
     const size_t budget = moe_cache_host_budget_bytes();
-    if (budget == 0 || expert_size == 0) {
+    if (budget == 0 || expert_size == 0 || (size_t) expert >= res.host_slot.size()) {
         return;
     }
-    if ((size_t) expert >= res.host_slot.size()) {
-        return;
-    }
-    if (res.host_slot[expert].load(std::memory_order_relaxed) >= 0) {
+    if (res.host_slot[expert].load(std::memory_order_relaxed) != nullptr) {
         return; // already held
     }
 
-    // Lazily create the pool, sized to the budget and sliced by expert size.
-    if (!device.host_pool) {
-        const size_t slots = budget / expert_size;
-        if (slots == 0) {
-            return;
-        }
-        device.host_slot_bytes = expert_size;
-        device.host_pool_bytes = slots * expert_size;
-        device.host_pool = (char *) std::malloc(device.host_pool_bytes);
-        if (!device.host_pool) {
-            device.host_pool_bytes = 0;
-            return;
-        }
-        device.host_free.reserve(slots);
-        for (size_t i = slots; i-- > 0; ) {
-            device.host_free.push_back((int64_t) (i * expert_size));
-        }
-        MOE_CACHE_LOG("[moe-cache] host hot-expert buffer: %zu MiB, %zu slots of %zu KiB\n",
-                device.host_pool_bytes >> 20, slots, expert_size >> 10);
-    }
-
-    // A pool is sliced for one expert size; a differently-shaped tensor is left
-    // to mmap rather than wasting a slot or corrupting one.
-    if (expert_size != device.host_slot_bytes) {
-        return;
-    }
-
-    int64_t off = -1;
-    if (!device.host_free.empty()) {
-        off = device.host_free.back();
-        device.host_free.pop_back();
-    } else {
-        // Full: evict the coldest resident expert, but only if the candidate is
-        // genuinely colder than the one asking to come in. Otherwise a cold
-        // newcomer would churn a hot incumbent out on every miss.
+    // Make room by evicting colder experts, and only ones genuinely colder than
+    // the candidate - otherwise a cold newcomer churns a hot incumbent out on
+    // every miss. Freeing here releases host memory immediately, so the page
+    // cache gets it back rather than the buffer sitting on a reservation.
+    while (device.host_bytes + expert_size > budget) {
         uint32_t victim_heat = UINT32_MAX;
         moe_cache_device::cpu_residency * victim_res = nullptr;
         size_t victim_expert = 0;
         for (auto & [vb, vres] : device.residency) {
             for (size_t e = 0; e < vres.host_slot.size(); e++) {
-                if (vres.host_slot[e].load(std::memory_order_relaxed) < 0) {
+                if (vres.host_slot[e].load(std::memory_order_relaxed) == nullptr) {
                     continue;
                 }
                 if (vres.selections[e] < victim_heat) {
-                    victim_heat = vres.selections[e];
-                    victim_res = &vres;
+                    victim_heat  = vres.selections[e];
+                    victim_res   = &vres;
                     victim_expert = e;
                 }
             }
         }
         if (!victim_res || victim_heat >= res.selections[expert]) {
+            return; // nothing colder than the candidate - leave it to mmap
+        }
+        void * old = victim_res->host_slot[victim_expert].exchange(nullptr, std::memory_order_acq_rel);
+        if (!old) {
             return;
         }
-        off = victim_res->host_slot[victim_expert].exchange(-1, std::memory_order_release);
-        if (off < 0) {
-            return;
-        }
+        // A CPU thread may still be mid-read of this pointer. Freeing it now
+        // would be a use-after-free, so evicted blocks are retired rather than
+        // released - see moe_cache_host_retire below.
+        moe_cache_host_retire(device, old, victim_res->expert_size);
     }
 
-    std::memcpy(device.host_pool + off, (const char *) host_base + (size_t) expert * expert_size, expert_size);
-    // Publish only after the copy is complete: a CPU thread that observes the
-    // offset must find valid weights behind it.
-    res.host_slot[expert].store(off, std::memory_order_release);
+    void * copy = std::malloc(expert_size);
+    if (!copy) {
+        return;
+    }
+    std::memcpy(copy, (const char *) host_base + (size_t) expert * expert_size, expert_size);
+    // Publish only after the copy is complete: a reader that observes the
+    // pointer must find valid weights behind it.
+    res.host_slot[expert].store(copy, std::memory_order_release);
+    device.host_bytes += expert_size;
     device.host_promoted++;
 
+    // Now that we hold our own copy, let the kernel reclaim the mapped pages.
+    // This is what keeps the two mechanisms complementary rather than additive:
+    // without it the same weights are resident twice and the buffer costs
+    // exactly what it was built to save.
     moe_cache_release_source_pages(host_base, (size_t) expert * expert_size, expert_size);
+
+    if (device.host_promoted == 1) {
+        MOE_CACHE_LOG("[moe-cache] host hot-expert buffer active (budget %zu MiB, grown on promotion)\n",
+                budget >> 20);
+    }
+}
+
+// Retire an evicted block. Released later, when no dispatch is in flight and
+// the queue is drained, which is the same quiescence condition the scratch
+// release uses. Bounded: if the list grows large the oldest are freed first.
+static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes) {
+    device.host_bytes -= std::min(device.host_bytes, bytes);
+    device.host_retired.emplace_back(block, bytes);
+    if (device.host_retired.size() > 256 && !device.inflight && device.queue.empty()) {
+        for (auto & [p, n] : device.host_retired) {
+            std::free(p);
+        }
+        device.host_retired.clear();
+    }
 }
 
 // Hot path, called per expert per MoE node from CPU compute threads. Lock-free
@@ -3617,12 +3623,12 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
             if (it == device_ptr->residency.end()) {
                 continue;
             }
-            if ((size_t) expert >= it->second.host_slot.size() || !device_ptr->host_pool) {
+            if ((size_t) expert >= it->second.host_slot.size()) {
                 continue;
             }
-            const int64_t off = it->second.host_slot[expert].load(std::memory_order_acquire);
-            if (off >= 0) {
-                return device_ptr->host_pool + off;
+            void * held = it->second.host_slot[expert].load(std::memory_order_acquire);
+            if (held) {
+                return held;
             }
         }
     }
