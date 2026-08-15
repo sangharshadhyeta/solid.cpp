@@ -3763,3 +3763,38 @@ cache, but persistence widens the window from one process lifetime to whenever
 the entry is evicted. `--cache-disk` is opt-in for exactly these reasons; it
 should not be enabled on shared storage or for sensitive prompts without
 encryption at rest underneath it.
+
+# Overlapped prefill (DwarfStar point 2): already covered, by moe-cache not the scheduler (2026-08-15)
+
+DwarfStar reserves headroom for two full routed layers so expert I/O for the
+next layer overlaps compute on the current one. The nearest thing here is
+thecodacus's expert-prefetch port in `ggml_backend_sched`
+(`GGML_SCHED_PREFETCH_EXPERTS`), previously measured at +36% prefill, and off by
+default (`prefetch_n_slots = 0`). Enabling it looked like free money.
+
+Measured A/B on the live config (26B MoE, `-ncmoe` auto-raised to 23, 65536 ctx),
+three distinct ~4.8k-token prompts so the prompt cache could not confound:
+
+| prefill tok/s | p1 | p2 | p3 |
+| --- | ---: | ---: | ---: |
+| prefetch off | 626.1 | 683.8 | 650.0 |
+| prefetch on  | 628.6 | 685.5 | 647.9 |
+
+Identical within 0.5%. Not because there was nothing to overlap - the cache was
+running at a 70.4% hit rate, so roughly a third of expert accesses still required
+a CPU->GPU transfer. The scheduler-level prefetch simply never engages here:
+moe-cache intercepts MoE `MUL_MAT_ID` nodes through its own `begin`/`plan`/
+`dispatch` hooks before the scheduler's `op_offload` path can consider them, so
+the two mechanisms do not compose. Whichever owns the node owns the transfer.
+
+Which means the overlap DwarfStar describes is already present in this design,
+implemented in the wrong place to be recognised as such: a miss enqueues a fill
+on moe-cache's worker thread and compute continues, so the copy is already
+asynchronous. The real remaining difference is narrower than "we lack overlapped
+prefill" - it is that their prefetch is *predictive* (reserve two layers, fetch
+ahead) while ours is *reactive* (fill on miss, which arrives too late for the
+current token and only helps later ones). Closing that would mean prefetching
+inside moe-cache, not enabling the scheduler flag.
+
+Recorded as a negative result for the flag, and as a correction to the DwarfStar
+review above, which listed overlapped prefill as something we lacked.
