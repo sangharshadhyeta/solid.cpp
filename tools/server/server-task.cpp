@@ -1885,12 +1885,18 @@ void server_prompt_cache::update() {
 // reading a few KiB per file and seeking past the state blob, which is the part
 // measured in gigabytes.
 //
-// Checkpoints are deliberately not persisted in this version: they are an
-// optimisation for context shifting that the server regenerates on demand, and
-// carrying them would roughly double the on-disk size for no correctness gain.
+// Checkpoints are persisted too, and that is not an optimisation. On a
+// sliding-window (iSWA) model most layers only retain the last n_swa positions,
+// so a restored state's KV legitimately begins partway through the prompt -
+// measured here, a 3642-token state came back with pos_min = 2618, exactly 1024
+// (the window) from the end. Without checkpoints the server cannot reuse a
+// prefix that starts before that window and re-prefills the whole prompt, which
+// is precisely what v1 of this format did: it restored correctly, in 27 ms, and
+// then threw the result away. The in-RAM tier never hit this because it moves
+// the whole server_prompt, checkpoints included.
 
 static constexpr uint64_t SERVER_PROMPT_DISK_MAGIC   = 0x3145484341435053ull; // "SPCACHE1"
-static constexpr uint32_t SERVER_PROMPT_DISK_VERSION = 1;
+static constexpr uint32_t SERVER_PROMPT_DISK_VERSION = 2;
 
 template <typename T> static void spc_write_pod(std::ofstream & f, const T & v) {
     f.write(reinterpret_cast<const char *>(&v), sizeof(v));
@@ -2032,6 +2038,20 @@ void server_prompt_cache::disk_save(const server_prompt_cache_state & state) {
         spc_write_pod(f, drft_bytes);
         if (main_bytes) f.write(reinterpret_cast<const char *>(state.data.main.data()), main_bytes);
         if (drft_bytes) f.write(reinterpret_cast<const char *>(state.data.drft.data()), drft_bytes);
+
+        const uint32_t n_ckpt = (uint32_t) state.prompt.checkpoints.size();
+        spc_write_pod(f, n_ckpt);
+        for (const auto & c : state.prompt.checkpoints) {
+            spc_write_pod(f, (int64_t)   c.n_tokens);
+            spc_write_pod(f, (int32_t)   c.id_task);
+            spc_write_pod(f, (int32_t)   c.pos_min);
+            spc_write_pod(f, (int32_t)   c.pos_max);
+            const uint64_t tgt = c.data_tgt.size(), dft = c.data_dft.size(), spec = c.data_spec.size();
+            spc_write_pod(f, tgt); spc_write_pod(f, dft); spc_write_pod(f, spec);
+            if (tgt)  f.write(reinterpret_cast<const char *>(c.data_tgt.data()),  tgt);
+            if (dft)  f.write(reinterpret_cast<const char *>(c.data_dft.data()),  dft);
+            if (spec) f.write(reinterpret_cast<const char *>(c.data_spec.data()), spec);
+        }
         if (!f) {
             f.close();
             std::error_code ec;
@@ -2145,7 +2165,31 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
     }
 
     prompt.tokens = entry.tokens.clone();
-    prompt.checkpoints.clear(); // not persisted - regenerated on demand
+    prompt.checkpoints.clear();
+
+    // Restore the checkpoints - on an iSWA model these are what make a prefix
+    // before the sliding window reusable at all.
+    uint32_t n_ckpt = 0;
+    if (spc_read_pod(f, n_ckpt) && n_ckpt <= 64) {
+        for (uint32_t i = 0; i < n_ckpt; i++) {
+            common_prompt_checkpoint c;
+            int64_t n_tokens = 0; int32_t id_task = 0, pos_min = 0, pos_max = 0;
+            uint64_t tgt = 0, dft = 0, spec = 0;
+            if (!spc_read_pod(f, n_tokens) || !spc_read_pod(f, id_task) ||
+                !spc_read_pod(f, pos_min)  || !spc_read_pod(f, pos_max) ||
+                !spc_read_pod(f, tgt) || !spc_read_pod(f, dft) || !spc_read_pod(f, spec)) {
+                break;
+            }
+            c.n_tokens = n_tokens; c.id_task = id_task; c.pos_min = pos_min; c.pos_max = pos_max;
+            c.data_tgt.resize(tgt); c.data_dft.resize(dft); c.data_spec.resize(spec);
+            if ((tgt  && !f.read(reinterpret_cast<char *>(c.data_tgt.data()),  tgt))  ||
+                (dft  && !f.read(reinterpret_cast<char *>(c.data_dft.data()),  dft))  ||
+                (spec && !f.read(reinterpret_cast<char *>(c.data_spec.data()), spec))) {
+                break;
+            }
+            prompt.checkpoints.push_back(std::move(c));
+        }
+    }
 
     SRV_INF("prompt cache: restored %d tokens from disk in %.2f ms (%.3f MiB) - skipped a full prefill\n",
             prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0,

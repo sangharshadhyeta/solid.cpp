@@ -3701,8 +3701,8 @@ file that a later scan would trust. The scan reads only each file's header and
 token list, seeking past the state blob, so building the index costs a few KiB
 per entry rather than gigabytes.
 
-**Status: half working, and shipped opt-in because of it.** Measured end to end
-on a 3623-token prompt:
+**Status: working, after one wrong assumption was corrected (see below).**
+Measured end to end on a 3623-token prompt:
 
 - cold prefill: 5887 ms
 - state persisted to disk: 271 MiB, written on cache update
@@ -3710,21 +3710,33 @@ on a 3623-token prompt:
   `restored 3642 tokens from disk in 26.95 ms` - a 200x saving against
   re-prefilling, and the number that makes the feature worth finishing
 
-- **but the request still re-prefilled anyway** (5760 ms, `cached_tokens: 0`).
+- v1 of the format: the request still re-prefilled anyway (5760 ms,
+  `cached_tokens: 0`)
+- v2, after the fix: **271 ms, 3618 of 3623 tokens cached** - a 21x speedup on a
+  prompt the server had never seen in this process
 
-So the persistence layer is correct and fast; the restored state simply isn't
-being adopted by the slot afterwards. The in-RAM path on the same build is fine
-(106 ms, 3622 cached on a repeat), which localises the bug to the disk path's
-hand-off rather than to caching generally: `disk_load()` restores via
-`llama_state_seq_set_data_ext` into `id_slot` and sets `prompt.tokens`, mirroring
-what the RAM path does with a move, yet the slot proceeds to re-process the
-prompt. The likely difference is the RAM path moving the whole `server_prompt`
-(tokens *and* checkpoints) where the disk path clears checkpoints, or a sequence
--id mismatch between the restore target and the slot's actual sequence. Not yet
-run to ground.
+**The wrong assumption.** v1 deliberately skipped persisting checkpoints, on the
+reasoning that they are an optimisation for context shifting which the server
+regenerates on demand, and carrying them would roughly double the file size for
+no correctness gain. Both halves of that were wrong on this model.
 
-Left default-off (`--cache-disk` is opt-in), so nothing changes for anyone who
-doesn't ask for it, and documented here rather than quietly shipped as done.
+Instrumenting the slot after a restore gave the answer immediately:
+`prompt_tok=3642 input_tok=3623 n_past=3623 pos_min=2618`. `n_past` was correct -
+the hand-off worked fine - but `pos_min` was 2618, exactly 1024 (the sliding
+window) back from the end. Gemma is an iSWA model: most layers retain only the
+last `n_swa` positions, so a restored state's KV legitimately begins partway
+through the prompt. Checkpoints are what let the server reuse a prefix that
+starts before that window; without them it correctly concluded it could not, and
+re-prefilled. The in-RAM tier never hit this because it moves the whole
+`server_prompt`, checkpoints included - the difference was invisible until the
+same state had to survive a process boundary.
+
+Persisting them (format v2) costs what was predicted - the file grew from 271 MiB
+to 705 MiB - and buys the entire feature. "Roughly double the size for no
+correctness gain" was exactly half right.
+
+Still opt-in (`--cache-disk`), because of the data-at-rest properties below
+rather than any doubt about whether it works.
 
 ## Disk prompt cache: it is user content at rest (2026-08-15)
 
