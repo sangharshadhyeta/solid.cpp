@@ -4389,3 +4389,67 @@ harder to see later than what we did:
   the field prefetches by prediction rather than holding experts resident, and
   that realistic gains are around 14%, not the order of magnitude assumed here.
   Three residency experiments ship disabled because of that correction.
+
+## Correction: capacity does not block prefetch here (2026-08-16)
+
+The previous section concluded a predictor was pointless because our cache is
+100% full. That conflated *full* with *too small*, and they are different.
+
+| | Colibri's failed case | here |
+| --- | --- | --- |
+| cache capacity | 2 experts/layer | **62.7 experts/layer** |
+| needed per layer (top-k) | 8 | 8 |
+| holds one layer's lookahead? | no, 2 < 8 | **yes, by ~8x** |
+
+Colibri's cache could not hold even one layer's routed experts, so a prefetch was
+overwritten before use - a real capacity failure. Ours holds roughly half of
+every layer's experts. And a full LFRU cache is a working one, not a blocked one:
+prefetching evicts the *coldest* resident to make room for one about to be used
+with ~77% confidence, which is a good trade, not a conflict.
+
+The staging requirement is also much smaller than assumed. Prefetch is a pipeline
+buffer, not a cache - it needs room for one layer's top-k (about 8 experts) while
+the current layer computes, not for the working set. That is exactly why it
+succeeds where holding experts fails: it converts a blocking transfer into an
+overlapped one and needs almost no space to do it.
+
+The error is worth naming: after three residency experiments failed on capacity,
+capacity was assumed to be the constraint again without checking the number that
+mattered.
+
+## Scope: router-lookahead prefetch (the change that is actually blocking)
+
+The real obstacle is where the signal lives, not whether it would help.
+
+Verified in the code: the router is `logits = build_lora_mm(gate_inp, cur)` in
+`llm_graph_context::build_moe_ffn` (`src/llama-graph.cpp:1947`) - a plain matmul
+of the layer's gate weights against the hidden state. Running layer L+1's router
+early therefore needs only tensors that already exist: `model.layers[il+1]
+.ffn_gate_inp` and layer L's pre-MoE `cur`.
+
+What the change involves:
+
+1. At layer `il`, after attention and before the MoE block, build one extra
+   matmul against `layers[il+1].ffn_gate_inp`, then `ggml_argsort_top_k` for the
+   predicted expert ids. Cost is one `n_embd x n_expert` matmul per layer -
+   negligible beside expert compute.
+2. Deliver those ids to moe-cache *before* layer `il+1`'s `MUL_MAT_ID` executes,
+   so fills are already in flight. moe-cache has no entry point for this today;
+   it learns of experts only when `plan()` is called with the real ids. A hint
+   entry (`ggml_moe_cache.prefetch(host_base, ids, n_ids)`) plus a small custom
+   op or eval-callback hook to invoke it is the missing plumbing.
+3. Prefetched fills must not evict warmer entries than the ones they replace -
+   speculation should lose ties to certainty. The existing eviction already picks
+   coldest-in-window, so this is a policy flag rather than new machinery.
+
+Known caveats, from the literature rather than guessed: predicting from the
+post-attention state alone is "stale by one MoE residual" and measures 73.6%
+recall (PILOT); adding the shared expert's contribution first raises it to 76.7%
+(Colibri #200) at the cost of three small matmuls. `gate_inp` location is
+architecture-specific, so this needs guarding for models without a standard MoE
+gate, and the interaction with MTP/draft contexts is untested.
+
+Realistic payoff, stated before building so it can be checked: the literature
+reports up to ~14% TPOT improvement over on-demand loading, larger on weaker
+GPUs (12-14% on an A6000 against 5-8% on A100/GH200), which places this 12GB card
+in the favourable regime.
