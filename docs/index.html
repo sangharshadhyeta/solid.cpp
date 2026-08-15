@@ -356,13 +356,24 @@ being measured. Chat-templated and content-verified, not a synthetic benchmark.<
 <tr><td>Probabilistic draft acceptance <span class="note">(<code>--spec-prob-accept</code>, temp 0.7)</span></td><td class="num">53.6 tok/s</td><td class="num">55.7 tok/s</td><td class="num delta-pos">+3.5%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Backend sampling <span class="note">(<code>-bs</code>, concurrent load)</span></td><td class="num">103.6 tok/s</td><td class="num">107.5 tok/s</td><td class="num delta-pos">+3.8%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>FR-Spec draft-vocab trim <span class="note">(measured, not assumed free)</span></td><td class="num">75.93 tok/s</td><td class="num">56.2 tok/s</td><td class="num delta-neg">-26%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Context from placement <span class="note">(<code>-ncmoe 15 -c 65536</code>, same command)</span></td><td class="num">4,096 tokens</td><td class="num">65,536 tokens</td><td class="num delta-pos">16&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Concurrent slots <span class="note">(same placement fix)</span></td><td class="num">1 slot</td><td class="num">4 slots</td><td class="num delta-pos">4&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Restart re-prefill <span class="note">(disk prompt cache, 3,623-token prompt)</span></td><td class="num">5,775 ms</td><td class="num">271 ms</td><td class="num delta-pos">21&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>KV cache size <span class="note">(<code>q8_0</code>, 65,536 ctx &times; 4 slots)</span></td><td class="num">2,180 MiB</td><td class="num">1,158 MiB</td><td class="num delta-pos">-47%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Frozen expert-cache bug <span class="note">(budget latch, found live)</span></td><td class="num">37.2 tok/s</td><td class="num">61.3 tok/s</td><td class="num delta-pos">+65%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Host hot-expert buffer <span class="note">(3 variants, 5 GiB cap &mdash; ships disabled)</span></td><td class="num">11.31 tok/s</td><td class="num">5.03 tok/s</td><td class="num delta-neg">-56%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td><code>mlock</code> pinning hot experts <span class="note">(ships disabled)</span></td><td class="num">11.74 tok/s</td><td class="num">10.30 tok/s</td><td class="num delta-neg">-12%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after 5-round harness)</span></td><td class="num">2.34 tok/s</td><td class="num">2.47 tok/s</td><td class="num delta-pos">+5.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="callout">
-<p>That last row is deliberate. FR-Spec was expected to be a free win and turned out not to be on this hardware —
-so it's reported as a loss, not quietly dropped from the table. That's the actual point of <code>solid.cpp</code>:
+<p>Four of those rows are losses, and they are deliberate. FR-Spec was expected to be a free win and wasn't.
+The host buffer and <code>mlock</code> pinning both tried to hold hot experts in RAM and measured
+<em>worse</em> than doing nothing — so both ship disabled. And the usage-history row was first published at
+&ldquo;+21% to +50%&rdquo; from a single sample; a proper 5-round interleaved harness put it at +5.6%, so the
+claim was retracted and the harness committed alongside it. That's the actual point of <code>solid.cpp</code>:
 every number here is something that was measured and would be reported honestly either way. Full raw numbers,
 per-row methodology, and the complete working log — including dead ends — live in
 <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a>.</p>
