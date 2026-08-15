@@ -286,6 +286,16 @@ struct moe_cache_session {
     std::unordered_map<const void *, int> tensor_layer;
     int64_t n_expert_hint = 0;
 
+    // Cross-run selection history, keyed (layer << 32 | expert). The cache
+    // otherwise starts empty on every launch and re-learns the hot set through
+    // misses, which is why the first request after a restart is consistently
+    // the slowest one measured. Persisting the counts lets a fresh session
+    // pre-admit what the last one proved hot. Purely advisory: it seeds
+    // admission, never overrides a live eviction or routing decision.
+    std::unordered_map<uint64_t, uint32_t> history;
+    bool history_loaded = false;
+    std::chrono::steady_clock::time_point last_history_save{};
+
     std::mutex mu;
     std::mutex fill_mu;
     std::condition_variable cv;
@@ -842,7 +852,9 @@ static bool moe_cache_grow_host(
 }
 
 static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{30};
+static constexpr std::chrono::seconds MOE_CACHE_HISTORY_SAVE_INTERVAL{60};
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
+static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
 
 // Host RAM this process may pin for hot CPU-resident experts.
 //
@@ -966,7 +978,14 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 // Timed out with an empty queue: idle. Safe to sweep here - the
                 // session lock is held, and no fill is in flight to contend with.
                 if (!device->dead.load()) {
-                    moe_cache_cold_sweep(*device, std::chrono::steady_clock::now());
+                    const auto now_idle = std::chrono::steady_clock::now();
+                    moe_cache_cold_sweep(*device, now_idle);
+                    // Idle is also the right moment to write out usage history:
+                    // nothing is decoding, and the file is small.
+                    if (now_idle - session->last_history_save >= MOE_CACHE_HISTORY_SAVE_INTERVAL) {
+                        session->last_history_save = now_idle;
+                        moe_cache_history_save(*session, *device);
+                    }
                 }
                 continue;
             }
@@ -1152,6 +1171,131 @@ static int moe_cache_find_pool(
 // keeping the sync call rate low enough (well under 1/s under any real
 // decode throughput) to not show up as measurable overhead.
 static constexpr std::chrono::milliseconds MOE_CACHE_BUDGET_RECHECK_INTERVAL{2000};
+
+// Cross-run usage history (see moe_cache_session::history).
+//
+// Format is deliberately plain text and versioned, following the reference
+// implementation described in docs/moe-cache-colibri-notes.md: a header record
+// carrying version and an identity hash, then "layer expert count" lines. The
+// identity hash covers layer count, expert count and expert size, so a file
+// written for one model can never seed another's placement - a mismatch is
+// refused outright rather than silently degrading routing.
+//
+// Written atomically (.tmp + rename) so a crash mid-save cannot leave a
+// truncated file that the next launch would half-read.
+
+static constexpr uint32_t MOE_CACHE_HISTORY_VERSION = 1;
+
+static const char * moe_cache_history_path() {
+    static const char * path = getenv("GGML_CUDA_MOE_CACHE_HISTORY");
+    return path;
+}
+
+static uint64_t moe_cache_history_identity(const moe_cache_session & session, const moe_cache_device & device) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+    mix((uint64_t) session.tensor_layer.size());
+    mix((uint64_t) session.n_expert_hint);
+    for (const auto & shape : device.shapes) {
+        mix((uint64_t) shape.expert_size);
+        mix((uint64_t) shape.wtype);
+    }
+    return h;
+}
+
+static void moe_cache_history_load(moe_cache_session & session, const moe_cache_device & device) {
+    if (session.history_loaded) {
+        return;
+    }
+    session.history_loaded = true;
+
+    const char * path = moe_cache_history_path();
+    if (!path) {
+        return;
+    }
+
+    std::ifstream f(path);
+    if (!f) {
+        return;
+    }
+
+    uint32_t version = 0;
+    unsigned long long identity = 0;
+    std::string tag;
+    if (!(f >> tag >> version >> identity) || tag != "moe-cache-history" ||
+        version != MOE_CACHE_HISTORY_VERSION) {
+        MOE_CACHE_LOG("[moe-cache] usage history '%s' unreadable or wrong version - ignoring\n", path);
+        return;
+    }
+    if (identity != moe_cache_history_identity(session, device)) {
+        MOE_CACHE_LOG("%s", "[moe-cache] usage history was written for a different model/shape - ignoring\n");
+        return;
+    }
+
+    int layer = 0, expert = 0;
+    unsigned long long count = 0;
+    size_t n = 0;
+    while (f >> layer >> expert >> count) {
+        if (layer < 0 || expert < 0 || count == 0) {
+            continue;
+        }
+        session.history[((uint64_t) (uint32_t) layer << 32) | (uint32_t) expert] =
+            (uint32_t) std::min<unsigned long long>(count, UINT32_MAX);
+        n++;
+    }
+    if (n) {
+        MOE_CACHE_LOG("[moe-cache] loaded usage history for %zu expert(s) from '%s'\n", n, path);
+    }
+}
+
+static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device) {
+    const char * path = moe_cache_history_path();
+    if (!path) {
+        return;
+    }
+
+    // Merge this run's live selections into whatever was loaded, so history
+    // accumulates across runs instead of each launch overwriting the last.
+    for (const auto & [host_base, res] : device.residency) {
+        auto it = session.tensor_layer.find(host_base);
+        if (it == session.tensor_layer.end()) {
+            continue;
+        }
+        for (size_t expert = 0; expert < res.selections.size(); expert++) {
+            if (res.selections[expert] == 0) {
+                continue;
+            }
+            const uint64_t key = ((uint64_t) (uint32_t) it->second << 32) | (uint32_t) expert;
+            uint32_t & slot = session.history[key];
+            const uint64_t sum = (uint64_t) slot + res.selections[expert];
+            slot = (uint32_t) std::min<uint64_t>(sum, UINT32_MAX);
+        }
+    }
+    if (session.history.empty()) {
+        return;
+    }
+
+    const std::string tmp = std::string(path) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) {
+            return;
+        }
+        f << "moe-cache-history " << MOE_CACHE_HISTORY_VERSION << " "
+          << (unsigned long long) moe_cache_history_identity(session, device) << "\n";
+        for (const auto & [key, count] : session.history) {
+            f << (uint32_t) (key >> 32) << " " << (uint32_t) (key & 0xffffffffull) << " " << count << "\n";
+        }
+        if (!f) {
+            f.close();
+            std::remove(tmp.c_str());
+            return;
+        }
+    }
+    if (std::rename(tmp.c_str(), path) != 0) {
+        std::remove(tmp.c_str());
+    }
+}
 
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
@@ -1353,6 +1497,109 @@ static bool moe_cache_allocate_pool(
     return true;
 }
 
+// Seed freshly-created pools from the previous run's history.
+//
+// Deliberately placed here, immediately after pool creation, because every slot
+// is still free at this point: admission is a pop from free_slots with no
+// eviction, no heat comparison and no LRU surgery. That keeps this out of the
+// path where a mistake could corrupt live cache state - it can only ever fill
+// slots that nothing is using yet.
+//
+// Bounded to half of each pool so a stale or over-large history cannot claim the
+// whole cache before the live workload has said anything; the remaining half is
+// left for what this run actually routes to.
+static void moe_cache_prewarm_from_history(
+        moe_cache_session & session, moe_cache_device & device) {
+    moe_cache_history_load(session, device);
+    if (session.history.empty()) {
+        return;
+    }
+
+    // Rank the recorded experts, hottest first.
+    struct warm_candidate { uint32_t count; int layer; int expert; };
+    std::vector<warm_candidate> ranked;
+    ranked.reserve(session.history.size());
+    for (const auto & [key, count] : session.history) {
+        ranked.push_back({count, (int) (uint32_t) (key >> 32), (int) (uint32_t) (key & 0xffffffffull)});
+    }
+    std::sort(ranked.begin(), ranked.end(), [](const warm_candidate & a, const warm_candidate & b) {
+        if (a.count != b.count) return a.count > b.count;
+        if (a.layer != b.layer) return a.layer < b.layer;
+        return a.expert < b.expert;
+    });
+
+    // layer -> host_base, so a recorded (layer, expert) can be turned back into
+    // an address to copy from.
+    std::unordered_map<int, const void *> base_of_layer;
+    for (const auto & [host_base, layer] : session.tensor_layer) {
+        base_of_layer.emplace(layer, host_base);
+    }
+
+    size_t warmed = 0;
+    for (const warm_candidate & c : ranked) {
+        auto it_base = base_of_layer.find(c.layer);
+        if (it_base == base_of_layer.end()) {
+            continue;
+        }
+        const void * host_base = it_base->second;
+
+        auto it_seen = device.seen_tensors.find(host_base);
+        if (it_seen == device.seen_tensors.end()) {
+            continue;
+        }
+        const size_t expert_size = it_seen->second.expert_size;
+        const int    wtype       = it_seen->second.wtype;
+
+        const int pool_index = moe_cache_find_pool(device, expert_size, wtype);
+        if (pool_index < 0) {
+            continue;
+        }
+        moe_cache_pool & pool = *device.pools[pool_index];
+
+        // Half-pool ceiling, and never touch anything but free slots.
+        if (pool.free_slots.size() <= pool.n_slots / 2 || pool.free_slots.empty()) {
+            continue;
+        }
+        const moe_cache_key key{host_base, c.expert};
+        if (pool.map.find(key) != pool.map.end()) {
+            continue;
+        }
+        if ((int) device.queue.size() >= session.config.queue_max) {
+            break;
+        }
+
+        const int slot_index = pool.free_slots.back();
+        pool.free_slots.pop_back();
+
+        moe_cache_slot & slot = pool.slots[slot_index];
+        slot.key = key;
+        slot.generation++;
+        slot.readers = 0;
+        slot.state = moe_cache_slot_state::copying;
+        try {
+            if (!pool.map.emplace(key, slot_index).second) {
+                moe_cache_slot_reset(pool, slot_index, true);
+                continue;
+            }
+            device.queue.push_back({
+                    pool_index, slot_index, slot.generation, key,
+                    (const char *) host_base + (size_t) c.expert * expert_size,
+                    expert_size});
+            device.queued_bytes += expert_size;
+        } catch (...) {
+            moe_cache_slot_reset(pool, slot_index, true);
+            continue;
+        }
+        warmed++;
+    }
+
+    if (warmed) {
+        session.cv.notify_all();
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pre-warmed %zu expert(s) from previous runs' usage history\n",
+                device.physical, warmed);
+    }
+}
+
 static void moe_cache_build_pending(
         moe_cache_session & session, moe_cache_device & device) {
     if (!moe_cache_prepare_budget(session, device)) {
@@ -1408,6 +1655,8 @@ static void moe_cache_build_pending(
         remaining = consumed <= remaining ? remaining - consumed : 0;
         total_weight -= weight;
     }
+
+    moe_cache_prewarm_from_history(session, device);
 }
 
 static int moe_cache_discover_pool(

@@ -3798,3 +3798,55 @@ inside moe-cache, not enabling the scheduler flag.
 
 Recorded as a negative result for the flag, and as a correction to the DwarfStar
 review above, which listed overlapped prefill as something we lacked.
+
+# Cross-run usage history: pre-warming the cache from what the last run learned (2026-08-15)
+
+Chosen as the narrow, design-consistent version of DwarfStar point 2 after the
+broad options were rejected: the scheduler prefetch doesn't compose with
+moe-cache (above), and a predictive prefetch inside `plan()` would mean editing
+slot allocation and eviction - the highest-risk code in the file - for an
+uncertain gain. This is Colibri idea #2 from this document's own list, and it
+attacks something measured repeatedly across this session rather than something
+theoretical: the first request after every restart is by far the slowest, because
+the cache starts empty and re-learns the hot set through misses.
+
+Per-(layer, expert) selection counts are written to the path in
+`GGML_CUDA_MOE_CACHE_HISTORY` (opt-in; no path, no file - the server does not
+write files nobody asked for) and merged with what was already there, so history
+accumulates across runs. On the next launch a fresh session ranks them and
+pre-admits the hottest.
+
+Safety follows the recipe recorded in section 2 above: versioned plain-text
+format, an identity hash over layer count, expert count and expert shapes so a
+file written for one model can never seed another's placement (mismatch is
+refused, not silently used), and an atomic `.tmp` + `rename()` write.
+
+Placement of the pre-warm matters as much as the idea. It runs immediately after
+pools are created, where every slot is still free, so admission is a pop from
+`free_slots` with no eviction, no heat comparison and no LRU surgery - it cannot
+corrupt live cache state because there is none yet. It is bounded to half of each
+pool, so a stale or over-large history can't claim the whole cache before the
+live workload has said anything.
+
+**Measured.** Unpressured (65536 ctx, three distinct ~4.8k prompts): 936 experts
+loaded, 128 pre-warmed, hit rate 70.5% -> 73.7%, and prefill throughput
+*unchanged* (627.4/682.2/648.1 vs 628.1/683.5/647.5). Prefill here is
+compute-bound and the async fills already hide the misses, so a better hit rate
+has nothing to convert into.
+
+Under memory pressure (5 GiB cgroup cap, `-ncmoe 23`), which is where cold start
+actually costs:
+
+| generation tok/s | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| baseline | 2.20 | 8.73 | 11.74 |
+| mlock pinning (rejected, above) | 2.03 | 7.59 | 10.30 |
+| usage history | 2.66 | 13.11 | 14.82 |
+
+Better on every run, +21% to +50%. Stated with the caveat it deserves: n=1 per
+configuration and run-to-run variance in this rig is visibly large (the pinning
+A/B moved 2.03-2.30 and 10.30-11.74 between otherwise identical runs), so treat
+the direction as established and the magnitude as approximate. It is the first
+of the three residency ideas tried today to improve anything - the CUDA-graph
+change was reverted for resting on a wrong diagnosis and pinning measured worse
+than doing nothing.
