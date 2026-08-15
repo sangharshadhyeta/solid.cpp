@@ -3976,3 +3976,29 @@ here) while a VRAM miss costs a RAM read. The tier with the costlier miss should
 if anything be *more* conservative about what it lets go, not less - which the
 unified design expresses naturally as a different cut point on the same ranking,
 rather than as a second policy to maintain.
+
+## Decision: LFRU stays in VRAM, RAM-tier demotion ships behind a flag (2026-08-15)
+
+The RAM tier now computes exactly what the VRAM tier computes - same heat signal
+(`+MOE_CACHE_HEAT_STEP`, saturating at `MOE_CACHE_HEAT_MAX`, halved on decay),
+same coldest-pays rule, cut at the median rather than a hand-invented threshold.
+Reusing those parameters rather than designing new ones was deliberate: they were
+settled by a lot of measurement upstream, and a second policy competing with a
+proven one is a step backwards however reasonable it looks.
+
+It is nonetheless **off by default** (`GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS=N`
+enables it), because the policy is not what limits this tier - enforcement is.
+VRAM picks its own victim slot; RAM can only advise, through an interface that is
+demotion-only. Advisory demotion measured a few percent against a 21x gap across
+several runs.
+
+The wider judgement, recorded because it is the reason to stop rather than
+iterate further: the 21x collapse only occurs when the expert set genuinely
+exceeds RAM, which never happens on this hardware with the models available here
+- the condition has to be manufactured with a cgroup cap to study it at all, and
+the models that would really need it (GLM-5.2, Kimi-K2, Qwen3.8: 200GB+) cannot
+be obtained on this connection. Rewriting residency management to own the RAM
+buffer would be weeks of work, validated only against a synthetic cap, for
+hardware not in use here. The mechanism is implemented, measured, documented and
+one flag away; that is the right place to leave it until a model that needs it
+actually lands.

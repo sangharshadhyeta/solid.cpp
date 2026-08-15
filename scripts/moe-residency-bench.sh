@@ -28,6 +28,8 @@ MODEL=${MODEL:-/home/Projects/llama.cpp/models/moe-test2/gemma-4-26B-A4B-it-UD-Q
 BIN=${BIN:-/home/Projects/llama.cpp/build/bin/llama-server}
 PORT=${PORT:-8095}
 CAP=${CAP:-5G}
+LOAD_CAP=${LOAD_CAP:-24G}
+CAP_BYTES=${CAP_BYTES:-5368709120}
 REPS=${REPS:-5}
 WARM=${WARM:-5}
 NCMOE=${NCMOE:-23}
@@ -64,7 +66,13 @@ measure() { # $1 label, $2 rep
     /root/.claude/jobs/a804561e/tmp/dropfile "$MODEL" 2>/dev/null
 
     # shellcheck disable=SC2046
-    systemd-run --scope --quiet -p MemoryMax="$CAP" -p MemorySwapMax=0 \
+    # Load with a loose cap, then tighten. Loading *under* pressure thrashes and
+    # dominated the runtime (~2 of every 2.4 min), and it is not what we set out
+    # to measure - inference under pressure is. Lowering memory.max on a live
+    # cgroup forces immediate reclaim, which is also the more realistic shape:
+    # a server that was fine and then came under pressure, rather than one
+    # starved from birth.
+    systemd-run --scope --quiet -p MemoryMax="$LOAD_CAP" -p MemorySwapMax=0 \
         --unit="llama-bench-$PORT" env $(env_for "$label") \
         "$BIN" -m "$MODEL" -ncmoe "$NCMOE" --jinja --moe-cache auto \
         -c "$CTX" -fit off --host 127.0.0.1 --port "$PORT" \
@@ -77,6 +85,16 @@ measure() { # $1 label, $2 rep
         sleep 3
     done
     [ "$up" = 1 ] || { echo "  $label rep$rep: server did not start"; return; }
+
+    # Apply the real cap now that the weights are in. Reclaim happens here, once,
+    # instead of fighting the loader page by page.
+    local cg="/sys/fs/cgroup/system.slice/llama-bench-$PORT.scope"
+    if [ -w "$cg/memory.max" ]; then
+        echo "$CAP_BYTES" > "$cg/memory.max"
+        sleep 3   # let the kernel settle the forced reclaim before timing anything
+    else
+        echo "  WARNING: could not tighten memory.max - sample not under pressure"
+    fi
 
     local out
     for i in $(seq 0 "$WARM"); do
