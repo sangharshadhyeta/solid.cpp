@@ -3850,3 +3850,42 @@ the direction as established and the magnitude as approximate. It is the first
 of the three residency ideas tried today to improve anything - the CUDA-graph
 change was reverted for resting on a wrong diagnosis and pinning measured worse
 than doing nothing.
+
+# Stopping to fix the measurement (2026-08-15)
+
+Three residency policies were tried today - CUDA-graph disabling (reverted, wrong
+diagnosis), mlock pinning (shipped off, measured worse), and cross-run usage
+history (shipped on, measured better) - and a fourth, `MADV_WILLNEED` readahead
+of historically-hot CPU experts, was written next. Its first run produced the
+best number of the session, 33.37 tok/s against a 11.74 baseline.
+
+That number is why this section exists rather than a fifth feature. Look at the
+spread across nominally identical configurations measured today:
+
+| config | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| baseline | 2.20 | 8.73 | 11.74 |
+| pinning | 2.03 | 7.59 | 10.30 |
+| history | 2.66 | 13.11 | 14.82 |
+| history + readahead | 2.49 | 11.47 | 33.37 |
+
+Run 2 ranges 7.59-13.11 and run 3 ranges 10.30-33.37 *within* this table. The
+run-to-run variance is larger than every effect claimed from it. Which means the
+honest status of two things already committed is weaker than their commit
+messages imply: history's "+21% to +50%" and pinning's "measured worse" were both
+n=1 per configuration, and either could be an artefact of which runs happened to
+land where. The caveat was stated, but a caveat is not evidence.
+
+So: `scripts/moe-residency-bench.sh`. Each configuration runs N repetitions, with
+the page cache dropped and the server restarted before every one, so each is a
+genuine cold start rather than a measurement of how warm the previous test left
+things. One warm-up request per repetition, then the timed one, so what is
+reported is steady-state decode rather than whatever the first tokens cost.
+Median with min/max and spread, not a single number.
+
+Readahead is committed behind `GGML_CUDA_MOE_CACHE_READAHEAD` (on by default, 0
+to disable) so the harness can A/B it, but no claim is made for it until the
+harness has run. The reasoning for preferring it over pinning is sound on its own
+terms - advisory hints cost nothing when RAM is short, where pinned pages
+actively starve everything else - but "the reasoning is sound" is exactly what
+was said about pinning before it measured worse.
