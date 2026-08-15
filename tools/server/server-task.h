@@ -635,11 +635,45 @@ struct server_prompt_cache_state {
     }
 };
 
+// One prompt state that lives on disk rather than in RAM. Only the tokens are
+// held in memory - enough to score a prefix match - while the state blob, which
+// is the large part, stays in the file until something actually wants it.
+struct server_prompt_disk_entry {
+    std::string   path;
+    server_tokens tokens;
+    size_t        size_bytes = 0;
+};
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
         this->limit_tokens = limit_tokens;
     }
+
+    // Disk tier. The RAM cache above dies with the process, so every restart
+    // re-prefills prompts it had already computed - the expensive half of a
+    // request, and the one most likely to repeat (a long document, a system
+    // prompt, a conversation being resumed). Persisting it makes a restart cost
+    // a sequential read instead of a full prefill.
+    std::string disk_dir;                          // empty = disabled
+    uint64_t    disk_fingerprint = 0;              // model identity; entries from another model are ignored
+    size_t      disk_limit = 0;                    // bytes, 0 = no limit
+    std::vector<server_prompt_disk_entry> disk_entries;
+
+    // Scans disk_dir and populates disk_entries. Cheap: reads only each file's
+    // header and token list, never the state blob.
+    void disk_scan();
+
+    // Writes one state to disk if it isn't already there. No-op when disabled.
+    void disk_save(const server_prompt_cache_state & state);
+
+    // Best prefix match among disk entries, restored directly into the context.
+    // Returns false when nothing suitable was found or the read failed.
+    bool disk_load(server_prompt & prompt, const server_tokens & tokens_new,
+                   llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // Evicts oldest disk entries until the tier is under disk_limit.
+    void disk_trim();
 
     std::list<server_prompt_cache_state> states;
 
