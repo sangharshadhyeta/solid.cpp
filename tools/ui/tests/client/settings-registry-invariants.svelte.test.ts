@@ -1,4 +1,5 @@
-import { CONFIG_LOCALSTORAGE_KEY, SETTING_CONFIG_DEFAULT } from '$lib/constants';
+import { SETTING_CONFIG_DEFAULT } from '$lib/constants/settings-registry';
+import { CONFIG_LOCALSTORAGE_KEY } from '$lib/constants/storage';
 import { ParameterSyncService } from '$lib/services/parameter-sync.service';
 import { serverStore } from '$lib/stores/server.svelte';
 import { config, settingsStore } from '$lib/stores/settings.svelte';

@@ -1,5 +1,6 @@
 export * from './actions';
 export * from './badges';
+export * from './brain';
 export * from './chat';
 export * from './content';
 export * from './dialogs';

@@ -4,17 +4,15 @@
 	import { goto } from '$app/navigation';
 	import { base } from '$app/paths';
 	import { page } from '$app/state';
-	import { SidebarNavigation } from '$lib/components/app';
+	import { ActionIcon, SidebarNavigation } from '$lib/components/app';
+	import McpLogo from '$lib/components/app/mcp/McpLogo.svelte';
 	import { PwaMetaTags, PwaRefreshAlert } from '$lib/components/pwa';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import {
-		FAVICON_PATHS,
-		FAVICON_SELECTORS,
-		HEADERS,
-		ROUTES,
-		SETTINGS_KEYS,
-		TOOLTIP_DELAY_DURATION
-	} from '$lib/constants';
+	import { AUTHORIZATION_HEADER, BEARER_PREFIX, TOOLTIP_DELAY_DURATION } from '$lib/constants';
+	import { SETTINGS_KEYS } from '$lib/constants';
+	import { FAVICON_PATHS, FAVICON_SELECTORS } from '$lib/constants/pwa';
+	import { ROUTES } from '$lib/constants/routes';
+	import { TooltipSide } from '$lib/enums';
 	import { useKeyboardShortcuts } from '$lib/hooks/use-keyboard-shortcuts.svelte';
 	import { usePwa } from '$lib/hooks/use-pwa.svelte';
 	import { RouterService } from '$lib/services/router.service';
@@ -26,7 +24,8 @@
 	import { isRouterMode, serverStore } from '$lib/stores/server.svelte';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
 	import { theme } from '$lib/stores/theme.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { isMobile, sidebarState } from '$lib/stores/viewport.svelte';
+	import { BrainCircuit, Settings } from '@lucide/svelte';
 	import { ModeWatcher } from 'mode-watcher';
 	import { untrack } from 'svelte';
 	import { onMount } from 'svelte';
@@ -45,6 +44,8 @@
 		| undefined = $state();
 
 	let showBuildVersion = $derived(config()[SETTINGS_KEYS.SHOW_BUILD_VERSION] as boolean);
+	let isSettingsActive = $derived(!!page.route.id?.startsWith('/settings'));
+	let isMcpActive = $derived(page.route.id === '/mcp-servers');
 
 	// Keep the hook object intact: destructuring needRefreshByStorage reads the getter once and freezes it
 	const pwa = usePwa();
@@ -116,8 +117,8 @@
 				page.status !== 403
 			) {
 				const headers: Record<string, string> = {
-					'Content-Type': 'application/json',
-					[HEADERS.AUTHORIZATION]: `${HEADERS.BEARER}${apiKey.trim()}`
+					[AUTHORIZATION_HEADER]: `${BEARER_PREFIX}${apiKey.trim()}`,
+					'Content-Type': 'application/json'
 				};
 
 				fetch(`${base}/props`, { headers })
@@ -280,6 +281,52 @@
 
 		<div class="flex-1">
 			{@render children?.()}
+		</div>
+
+		<div
+			class="fixed top-[13px] right-2 z-10 flex items-center gap-1.5 {isMobile.current &&
+			sidebarState.expanded
+				? 'hidden'
+				: ''}"
+		>
+			<ActionIcon
+				icon={Settings}
+				size="lg"
+				iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
+				class="md:h-9 md:w-9 h-10 w-10 rounded-full pointer-events-auto {isSettingsActive
+					? 'bg-muted! md:bg-foreground/5!'
+					: 'bg-transparent! md:hover:bg-foreground/10!'}"
+				onclick={() => goto(isSettingsActive ? ROUTES.START : `${ROUTES.SETTINGS}/general`)}
+				tooltip={isSettingsActive ? 'Close Settings' : 'Settings'}
+				tooltipSide={TooltipSide.BOTTOM}
+				ariaLabel={isSettingsActive ? 'Close Settings' : 'Settings'}
+			/>
+
+			<ActionIcon
+				icon={McpLogo}
+				size="lg"
+				iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
+				class="md:h-9 md:w-9 h-10 w-10 rounded-full pointer-events-auto {isMcpActive
+					? 'bg-muted! md:bg-foreground/5!'
+					: 'bg-transparent! md:hover:bg-foreground/10!'}"
+				onclick={() => goto(isMcpActive ? ROUTES.START : ROUTES.MCP_SERVERS)}
+				tooltip={isMcpActive ? 'Close MCP Servers' : 'MCP Servers'}
+				tooltipSide={TooltipSide.BOTTOM}
+				ariaLabel={isMcpActive ? 'Close MCP Servers' : 'MCP Servers'}
+			/>
+
+			<ActionIcon
+				icon={BrainCircuit}
+				size="lg"
+				iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
+				class="md:h-9 md:w-9 h-10 w-10 rounded-full pointer-events-auto {page.route.id === '/brain'
+					? 'bg-gradient-to-b! from-neutral-700 to-black text-white shadow-[inset_0_1px_0_rgba(255,255,255,0.25),0_0_10px_rgba(0,0,0,0.5)]! hover:from-neutral-600! hover:to-black!'
+					: 'bg-muted! md:bg-foreground/5! md:hover:bg-foreground/10!'}"
+				onclick={() => goto(page.route.id === '/brain' ? ROUTES.START : ROUTES.BRAIN)}
+				tooltip={page.route.id === '/brain' ? 'Close Brain' : 'Brain — live expert cache map'}
+				tooltipSide={TooltipSide.LEFT}
+				ariaLabel={page.route.id === '/brain' ? 'Close Brain' : 'Brain — live expert cache map'}
+			/>
 		</div>
 	</div>
 

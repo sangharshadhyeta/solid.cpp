@@ -14,11 +14,9 @@
 	import * as Sheet from '$lib/components/ui/sheet';
 	import { Switch } from '$lib/components/ui/switch';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import {
-		ATTACHMENT_FILE_ITEMS,
-		ICON_CLASS_DEFAULT,
-		TOOLTIP_DELAY_DURATION
-	} from '$lib/constants';
+	import { TOOLTIP_DELAY_DURATION } from '$lib/constants';
+	import { ATTACHMENT_FILE_ITEMS } from '$lib/constants/attachment-menu';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { HealthCheckStatus } from '$lib/enums';
 	import { AttachmentAction } from '$lib/enums/attachment.enums';
 	import { useAttachmentMenu } from '$lib/hooks/use-attachment-menu.svelte';

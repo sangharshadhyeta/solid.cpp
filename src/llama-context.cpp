@@ -610,7 +610,17 @@ void llama_context::sched_reserve() {
         ggml_moe_cache.set_max_batch_hint((int) n_seqs);
     }
 
+    // sched_reserve() can run again mid-life (e.g. every time backend sampling attaches a new
+    // sampler - see set_sampler()), which tears down and rebuilds the whole scheduler. The
+    // moe-cache session tracks GPU-resident expert state that's tied to the physical devices,
+    // not to this scheduler object, so carry it over instead of losing it on every rebuild.
+    void * moe_cache_session = sched ? ggml_backend_sched_take_moe_cache_session(sched.get()) : nullptr;
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    if (moe_cache_session) {
+        ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session);
+        moe_cache_session = nullptr;
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -645,7 +655,11 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
+                void * moe_cache_session_retry = ggml_backend_sched_take_moe_cache_session(sched.get());
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                if (moe_cache_session_retry) {
+                    ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session_retry);
+                }
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {

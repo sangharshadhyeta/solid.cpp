@@ -10,7 +10,8 @@
 		ChatFormContextGauge
 	} from '$lib/components/app';
 	import { Button } from '$lib/components/ui/button';
-	import { ICON_CLASS_DEFAULT, ROUTES } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import { ROUTES } from '$lib/constants/routes';
 	import { FileTypeCategory, MessageRole } from '$lib/enums';
 	import { ChatService } from '$lib/services';
 	import {

@@ -319,6 +319,14 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Detach the moe-cache session (if any) from `sched` without destroying it, so it can be
+    // handed to a freshly (re)created scheduler for the same physical devices instead of being
+    // torn down - callers that rebuild the scheduler mid-life (e.g. llama_context::sched_reserve())
+    // use this pair so the cache doesn't silently reset every time that happens. Returns NULL if
+    // no session was attached.
+    GGML_API void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched);
+    GGML_API void   ggml_backend_sched_adopt_moe_cache_session(ggml_backend_sched_t sched, void * session);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

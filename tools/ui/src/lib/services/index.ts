@@ -139,6 +139,13 @@ export { DatabaseService } from './database.service';
 export { ModelsService } from './models.service';
 
 /**
+ * **ExpertsService** - Live moe-cache per-expert tier/heat snapshot (Brain view)
+ *
+ * @see Brain.svelte in components/app/brain — primary consumer, polls this every 1.5s
+ */
+export { ExpertsService } from './experts.service';
+
+/**
  * **PropsService** - Server properties and capabilities retrieval
  *
  * Fetches server configuration, model information, and capabilities from the `/props`
@@ -276,7 +283,7 @@ export { MCPService } from './mcp.service';
  * - **toolsStore**: Exposes the tool definition when the sandbox is enabled
  * - **agenticStore**: Dispatches ToolSource.FRONTEND calls here
  *
- * @see buildSandboxToolDefinition in utils/sandbox-tool - tool schema sent to the LLM
+ * @see buildSandboxToolDefinition in constants/sandbox.ts - tool schema sent to the LLM
  * @see agenticStore in stores/agentic.svelte.ts - tool dispatch
  */
 export { SandboxService } from './sandbox.service';

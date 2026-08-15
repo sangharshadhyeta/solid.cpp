@@ -4,7 +4,11 @@
 	import HighlightedMatch from '$lib/components/app/forms/HighlightedMatch.svelte';
 	import * as Popover from '$lib/components/ui/popover';
 	import * as Tooltip from '$lib/components/ui/tooltip';
-	import { FILE_GLOB_SEARCH_PICKERS, HOME_TILDE, SEARCH } from '$lib/constants';
+	import {
+		FILE_GLOB_SEARCH_PICKERS_DEFAULT_SEARCH_DEPTH,
+		HOME_TILDE,
+		SEARCH_DEBOUNCE_MS
+	} from '$lib/constants';
 	import { BuiltInTool, FileMentionEntryType, GlobSearchType, KeyboardKey } from '$lib/enums';
 	import { useDebouncedSearch } from '$lib/hooks/use-debounced-search.svelte';
 	import { usePickerNavigation } from '$lib/hooks/use-picker-navigation.svelte';
@@ -66,7 +70,7 @@
 	const searchDepth = $derived.by(() => {
 		const n = Number(config().mentionSearchMaxDepth);
 
-		return Number.isInteger(n) && n > 0 ? n : FILE_GLOB_SEARCH_PICKERS.DEFAULT_SEARCH_DEPTH;
+		return Number.isInteger(n) && n > 0 ? n : FILE_GLOB_SEARCH_PICKERS_DEFAULT_SEARCH_DEPTH;
 	});
 
 	const home = $derived(toolsStore.serverHome);
@@ -76,7 +80,7 @@
 
 	const search = useDebouncedSearch({
 		canRun: () => isOpen && fileSearchEnabled,
-		debounceMs: SEARCH.DEBOUNCE_MS,
+		debounceMs: SEARCH_DEBOUNCE_MS,
 		getQuery: () => trimmedQuery,
 		run: async (query, signal, isCurrent) => {
 			try {

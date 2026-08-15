@@ -604,6 +604,8 @@ struct common_params {
     bool moe_cache_force   = false; // explicit on/budget mode requires canonical CPU weights
     bool no_host           = false; // bypass host buffer allowing extra buffers to be used
 
+    std::string expert_atlas_file; // path to a JSON file produced by llama-expert-atlas (topic-affinity positions for the Brain view)
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
@@ -941,6 +943,29 @@ bool tty_can_use_colors();
 // out_bytes) if no CUDA moe-cache session has cached anything yet, or the
 // backend wasn't built with moe-cache support at all.
 bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out_rows, int & out_cols);
+
+// Aggregate moe-cache health, for the Brain view's stats panel. Mirrors
+// ggml_moe_cache_summary (see ggml-backend-moe-cache.h) one field at a
+// time rather than exposing that C struct directly, so this header
+// doesn't need to include the CUDA-specific one.
+struct common_moe_cache_summary {
+    long long hits            = 0;
+    long long misses          = 0;
+    long long evictions       = 0;
+    long long fill_failures   = 0;
+    long long admission_skips = 0;
+    size_t slots_used         = 0;
+    size_t slots_total        = 0;
+    size_t protected_slots    = 0;
+    double avg_heat           = 0.0;
+    size_t allocated_bytes    = 0;
+    size_t budget_bytes       = 0;
+};
+
+// Returns false (out left zeroed) if no CUDA moe-cache session has
+// allocated a pool yet, or the backend wasn't built with moe-cache
+// support at all.
+bool common_moe_cache_get_summary(common_moe_cache_summary & out);
 
 //
 // Model utils

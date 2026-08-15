@@ -4,12 +4,13 @@
 	import { Button } from '$lib/components/ui/button';
 	import * as Dialog from '$lib/components/ui/dialog';
 	import {
+		BEARER_PREFIX,
 		BOOL_FALSE_STRING,
 		BOOL_TRUE_STRING,
 		DISMISSED_RECOMMENDED_MCP_SERVERS_LOCALSTORAGE_KEY,
-		HEADERS,
 		MCP_SERVER_ID_PREFIX,
-		RECOMMENDED_MCP_SERVERS
+		RECOMMENDED_MCP_SERVERS,
+		REDACTED_HEADERS
 	} from '$lib/constants';
 	import { HealthCheckStatus } from '$lib/enums';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
@@ -60,10 +61,10 @@
 
 	let bearerTokenFilled = $derived.by(() => {
 		const pairs = parseHeadersToArray(newServerHeaders);
-		const bearerPrefix = HEADERS.BEARER.toLowerCase();
+		const bearerPrefix = BEARER_PREFIX.toLowerCase();
 		const bearer = pairs.find(
 			(p) =>
-				HEADERS.REDACTED.has(p.key.trim().toLowerCase()) &&
+				REDACTED_HEADERS.has(p.key.trim().toLowerCase()) &&
 				p.value.trim().toLowerCase().startsWith(bearerPrefix)
 		);
 

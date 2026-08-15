@@ -1,5 +1,3 @@
-import { CONVERSATION_ID_SEPARATOR } from '$lib/constants';
-
 /**
  * Build the conversation identity used by the server side replay buffer.
  *
@@ -13,5 +11,5 @@ export function streamIdentity(conversationId: string, model?: string | null): s
 
 	if (!model) return conversationId;
 
-	return `${conversationId}${CONVERSATION_ID_SEPARATOR}${model}`;
+	return `${conversationId}::${model}`;
 }

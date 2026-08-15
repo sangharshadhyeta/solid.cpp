@@ -2,12 +2,13 @@
 	import { browser } from '$app/environment';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
-	import { SearchInput, SidebarNavigationSearchResults } from '$lib/components/app';
-	import { ROUTES } from '$lib/constants';
+	import { ActionIcon, SearchInput, SidebarNavigationSearchResults } from '$lib/components/app';
+	import { ROUTES } from '$lib/constants/routes';
 	import { RouterService } from '$lib/services/router.service';
 	import { chatStore } from '$lib/stores/chat.svelte';
 	import { conversations, conversationsStore } from '$lib/stores/conversations.svelte';
 	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { Search } from '@lucide/svelte';
 
 	let searchQuery = $state('');
 	let searchInputRef = $state<HTMLInputElement | null>(null);
@@ -77,13 +78,25 @@
 	<title>Search · llama.cpp</title>
 </svelte:head>
 
-<div class="fixed top-0 z-10 left-0 right-0 p-2">
+<div class="fixed top-0 z-10 left-0 right-0 flex items-center gap-2 p-2">
+	<ActionIcon
+		icon={Search}
+		size="lg"
+		iconSize="h-4.5 w-4.5"
+		class="bg-muted! h-10 w-10 rounded-full pointer-events-auto"
+		onclick={handleBack}
+		tooltip="Back"
+		ariaLabel="Back"
+	/>
+
 	<SearchInput
 		autofocus
 		bind:value={searchQuery}
 		bind:ref={searchInputRef}
 		onClose={handleBack}
+		hideIcon
 		placeholder="Search conversations..."
+		class="flex-1"
 	/>
 </div>
 

@@ -26,7 +26,7 @@
 	} from '$lib/components/app';
 	import {
 		BOOL_TRUE_STRING,
-		CODE_BLOCK_CLASS,
+		CODE_BLOCK_HEADER_CLASS,
 		DATA_ERROR_BOUND_ATTR,
 		DATA_ERROR_HANDLED_ATTR,
 		DIAGRAM_VIEW_MODE_ATTR,
@@ -39,8 +39,15 @@
 		MERMAID_SYNTAX_ATTR,
 		MERMAID_WRAPPER_CLASS,
 		SETTINGS_KEYS,
-		SVG,
-		TOGGLE_SOURCE_BTN_CLASS
+		SVG_BLOCK_CLASS,
+		SVG_INLINE_SHADOW_STYLE,
+		SVG_LANGUAGE,
+		SVG_RENDERED_ATTR,
+		SVG_SOURCE_ATTR,
+		SVG_TAG_PREFIX,
+		SVG_WRAPPER_CLASS,
+		TOGGLE_SOURCE_BTN_CLASS,
+		XML_LANGUAGE
 	} from '$lib/constants';
 	import { ColorMode, UrlProtocol } from '$lib/enums';
 	import { FileTypeText } from '$lib/enums/files.enums';
@@ -98,9 +105,9 @@
 
 		if (!block) return null;
 
-		if (block.language === SVG.LANGUAGE) return block.code;
+		if (block.language === SVG_LANGUAGE) return block.code;
 
-		if (block.language === SVG.XML_LANGUAGE && block.code.trimStart().startsWith(SVG.TAG_PREFIX))
+		if (block.language === XML_LANGUAGE && block.code.trimStart().startsWith(SVG_TAG_PREFIX))
 			return block.code;
 
 		return null;
@@ -130,7 +137,7 @@
 
 	// Mount the streaming svg into its shadow host on every chunk so it renders live
 	$effect(() => {
-		if (streamingSvgHost) mountSvgShadow(streamingSvgHost, liveSvgHtml, SVG.INLINE_SHADOW_STYLE);
+		if (streamingSvgHost) mountSvgShadow(streamingSvgHost, liveSvgHtml, SVG_INLINE_SHADOW_STYLE);
 	});
 
 	let streamingCodeScrollContainer = $state<HTMLDivElement>();
@@ -528,7 +535,7 @@
 			event.preventDefault();
 			event.stopPropagation();
 
-			const wrapper = toggleBtn.closest(`.${MERMAID_WRAPPER_CLASS}, .${SVG.WRAPPER_CLASS}`);
+			const wrapper = toggleBtn.closest(`.${MERMAID_WRAPPER_CLASS}, .${SVG_WRAPPER_CLASS}`);
 
 			if (!wrapper) return;
 
@@ -586,16 +593,16 @@
 		}
 
 		// Check if clicking on copy or preview button in svg block
-		const svgCopyBtn = target.closest(`.${SVG.WRAPPER_CLASS} .copy-code-btn`);
-		const svgPreviewBtn = target.closest(`.${SVG.WRAPPER_CLASS} .preview-code-btn`);
+		const svgCopyBtn = target.closest(`.${SVG_WRAPPER_CLASS} .copy-code-btn`);
+		const svgPreviewBtn = target.closest(`.${SVG_WRAPPER_CLASS} .preview-code-btn`);
 
 		if (svgCopyBtn || svgPreviewBtn) {
-			const wrapper = target.closest(`.${SVG.WRAPPER_CLASS}`);
+			const wrapper = target.closest(`.${SVG_WRAPPER_CLASS}`);
 
 			if (!wrapper) return;
 
 			const preElement = wrapper.querySelector<HTMLElement>(
-				`pre.${SVG.BLOCK_CLASS}[${SVG.SOURCE_ATTR}]`
+				`pre.${SVG_BLOCK_CLASS}[${SVG_SOURCE_ATTR}]`
 			);
 
 			if (!preElement) return;
@@ -604,7 +611,7 @@
 				event.preventDefault();
 				event.stopPropagation();
 				try {
-					await copyToClipboard(preElement.getAttribute(SVG.SOURCE_ATTR) ?? '');
+					await copyToClipboard(preElement.getAttribute(SVG_SOURCE_ATTR) ?? '');
 				} catch (error) {
 					console.error('Failed to copy svg source:', error);
 				}
@@ -615,7 +622,7 @@
 			if (svgPreviewBtn) {
 				event.preventDefault();
 				event.stopPropagation();
-				mermaidPreviewSvgHtml = sanitizeSvg(preElement.getAttribute(SVG.SOURCE_ATTR) ?? '');
+				mermaidPreviewSvgHtml = sanitizeSvg(preElement.getAttribute(SVG_SOURCE_ATTR) ?? '');
 				svgPreviewLive = false;
 				mermaidPreviewOpen = true;
 
@@ -626,14 +633,14 @@
 		// A click on the header chrome targets the action buttons, never the
 		// diagram. Guard so a header click can not fall through to the click to
 		// zoom branches below, whatever the scroll position or stacking.
-		if (target.closest(`.${CODE_BLOCK_CLASS.HEADER}`)) return;
+		if (target.closest(`.${CODE_BLOCK_HEADER_CLASS}`)) return;
 
 		// Open preview when clicking the svg block itself. A final block carries its
 		// source, a streaming block does not and is mirrored live into the dialog.
-		const svgEl = target.closest(`.${SVG.BLOCK_CLASS}`);
+		const svgEl = target.closest(`.${SVG_BLOCK_CLASS}`);
 
 		if (svgEl) {
-			const source = svgEl.getAttribute(SVG.SOURCE_ATTR);
+			const source = svgEl.getAttribute(SVG_SOURCE_ATTR);
 
 			if (source !== null) {
 				mermaidPreviewSvgHtml = sanitizeSvg(source);
@@ -732,15 +739,15 @@
 		if (!containerRef) return;
 
 		const nodes = containerRef.querySelectorAll<HTMLElement>(
-			`pre.${SVG.BLOCK_CLASS}:not([${SVG.RENDERED_ATTR}])`
+			`pre.${SVG_BLOCK_CLASS}:not([${SVG_RENDERED_ATTR}])`
 		);
 
 		if (nodes.length === 0) return;
 
 		nodes.forEach((node) => {
-			node.setAttribute(SVG.RENDERED_ATTR, 'true');
+			node.setAttribute(SVG_RENDERED_ATTR, 'true');
 
-			const source = node.getAttribute(SVG.SOURCE_ATTR) ?? node.textContent ?? '';
+			const source = node.getAttribute(SVG_SOURCE_ATTR) ?? node.textContent ?? '';
 			const clean = sanitizeSvg(source);
 
 			if (clean) {
@@ -748,7 +755,7 @@
 				const host = document.createElement('div');
 
 				node.appendChild(host);
-				mountSvgShadow(host, clean, SVG.INLINE_SHADOW_STYLE);
+				mountSvgShadow(host, clean, SVG_INLINE_SHADOW_STYLE);
 			}
 		});
 	}
@@ -912,7 +919,7 @@
 				</div>
 				{#if liveSvgHtml}
 					<div class="svg-scroll-container">
-						<div class={SVG.BLOCK_CLASS}>
+						<div class={SVG_BLOCK_CLASS}>
 							<div bind:this={streamingSvgHost}></div>
 						</div>
 					</div>

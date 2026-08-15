@@ -1,4 +1,4 @@
-import { URI_TEMPLATE_SYMBOLS } from '../../src/lib/constants/uri-template.constants';
+import { URI_TEMPLATE_OPERATORS } from '../../src/lib/constants/uri-template';
 import {
 	expandTemplate,
 	extractTemplateVariables,
@@ -26,7 +26,7 @@ describe('extractTemplateVariables', () => {
 	it('extracts variables with operators', () => {
 		const vars = extractTemplateVariables('http://example.com{+path}');
 
-		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_SYMBOLS.RESERVED }]);
+		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_OPERATORS.RESERVED }]);
 	});
 
 	it('extracts comma-separated variable lists', () => {
@@ -48,13 +48,13 @@ describe('extractTemplateVariables', () => {
 	it('handles fragment expansion', () => {
 		const vars = extractTemplateVariables('http://example.com/page{#section}');
 
-		expect(vars).toEqual([{ name: 'section', operator: URI_TEMPLATE_SYMBOLS.FRAGMENT }]);
+		expect(vars).toEqual([{ name: 'section', operator: URI_TEMPLATE_OPERATORS.FRAGMENT }]);
 	});
 
 	it('handles path segment expansion', () => {
 		const vars = extractTemplateVariables('http://example.com{/path}');
 
-		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_SYMBOLS.PATH_SEGMENT }]);
+		expect(vars).toEqual([{ name: 'path', operator: URI_TEMPLATE_OPERATORS.PATH_SEGMENT }]);
 	});
 
 	it('returns empty array for template without variables', () => {

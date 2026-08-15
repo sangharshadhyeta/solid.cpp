@@ -2482,6 +2482,53 @@ static int moe_cache_get_expert_map(uint8_t * out_bytes, int max_bytes, int * ou
     return 0;
 }
 
+// Aggregate cache health, summed across every currently-live session's
+// devices - the exact same fields moe_cache_log_stats() already computes
+// per device (MOE_CACHE_LOG), just returned instead of only logged. Used
+// by the Brain view's stats sidepanel (tools/ui) and available generally
+// for anyone else who wants real numbers instead of grepping server logs.
+static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
+    ggml_moe_cache_summary sum{};
+    unsigned long long heat_sum_total = 0;
+    size_t heat_n_total = 0;
+    if (g_session_count.load(std::memory_order_acquire) > 0) {
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        for (moe_cache_session * session : g_sessions) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            for (const auto & device_ptr : session->devices) {
+                const moe_cache_device & device = *device_ptr;
+                sum.hits            += device.hits;
+                sum.misses          += device.misses;
+                sum.evictions       += device.evictions;
+                sum.fill_failures   += device.fill_failures;
+                sum.admission_skips += device.admission_skips;
+                sum.allocated_bytes += device.allocated_bytes;
+                sum.budget_bytes    += device.budget_limit;
+
+                for (const auto & pool_ptr : device.pools) {
+                    const moe_cache_pool & pool = *pool_ptr;
+                    sum.slots_total += (size_t) pool.n_slots;
+                    sum.slots_used  += (size_t) pool.n_slots - pool.free_slots.size();
+                    for (int i = pool.protected_head; i >= 0; i = pool.slots[i].next) {
+                        sum.protected_slots++;
+                        heat_sum_total += pool.slots[i].heat;
+                        heat_n_total++;
+                    }
+                    for (int i = pool.lru_head; i >= 0; i = pool.slots[i].next) {
+                        heat_sum_total += pool.slots[i].heat;
+                        heat_n_total++;
+                    }
+                }
+            }
+        }
+    }
+    // Single division over the true combined sum/count across every device,
+    // not an average-of-per-device-averages (which would silently misweight
+    // devices with different slot counts).
+    sum.avg_heat = heat_n_total ? (double) heat_sum_total / (double) heat_n_total : 0.0;
+    *out = sum;
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -2500,6 +2547,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
+    ggml_moe_cache.get_summary = moe_cache_get_summary;
 }
 
 #endif

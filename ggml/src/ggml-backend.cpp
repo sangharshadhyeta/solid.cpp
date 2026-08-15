@@ -2103,6 +2103,27 @@ ggml_backend_sched_t ggml_backend_sched_new(
     return sched;
 }
 
+void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched) {
+    if (!sched) {
+        return NULL;
+    }
+    void * session = sched->moe_cache_session;
+    sched->moe_cache_session = NULL;
+    return session;
+}
+
+void ggml_backend_sched_adopt_moe_cache_session(ggml_backend_sched_t sched, void * session) {
+    if (!sched || !session) {
+        return;
+    }
+    if (sched->moe_cache_session && ggml_moe_cache.session_destroy) {
+        // Not expected in normal use (adoption targets a freshly created scheduler with no
+        // session of its own yet) but avoid leaking one if it happens.
+        ggml_moe_cache.session_destroy(sched->moe_cache_session);
+    }
+    sched->moe_cache_session = session;
+}
+
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;

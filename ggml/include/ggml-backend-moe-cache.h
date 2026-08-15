@@ -7,6 +7,24 @@
 extern "C" {
 #endif
 
+// Aggregate cache health, summed across every currently-live session's
+// devices - the same numbers moe-cache.cu already logs per device
+// (MOE_CACHE_LOG), exposed for a UI/monitoring caller instead of only the
+// log. All-zero when no session has recorded anything yet.
+struct ggml_moe_cache_summary {
+	long long hits;
+	long long misses;
+	long long evictions;
+	long long fill_failures;
+	long long admission_skips;
+	size_t slots_used;
+	size_t slots_total;
+	size_t protected_slots;
+	double avg_heat;
+	size_t allocated_bytes;
+	size_t budget_bytes;
+};
+
 struct ggml_moe_cache_api {
     const void * owner;
 
@@ -74,6 +92,11 @@ struct ggml_moe_cache_api {
     // which case out_rows/out_cols still report the real shape so the
     // caller can retry with a bigger buffer). NULL-safe like get_stats.
     int (*get_expert_map)(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols);
+
+    // Aggregate cache health summary - see ggml_moe_cache_summary. Always
+    // writes *out (zeroed on failure). NULL-safe like the other optional
+    // entries here.
+    void (*get_summary)(struct ggml_moe_cache_summary * out);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

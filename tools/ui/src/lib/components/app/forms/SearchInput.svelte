@@ -1,7 +1,7 @@
 <script lang="ts">
 	import { Search, X } from '@lucide/svelte';
 	import { Input } from '$lib/components/ui/input';
-	import { ICON_CLASS_DEFAULT } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 
 	interface Props {
 		autofocus?: boolean;
@@ -14,11 +14,13 @@
 		id?: string;
 		ref?: HTMLInputElement | null;
 		isCancelAlwaysVisible?: boolean;
+		hideIcon?: boolean;
 	}
 
 	let {
 		autofocus,
 		class: className,
+		hideIcon = false,
 		id,
 		isCancelAlwaysVisible = false,
 		onClose,
@@ -50,16 +52,18 @@
 </script>
 
 <div class="relative {className}">
-	<Search
-		class="absolute top-1/2 left-3 z-10 {ICON_CLASS_DEFAULT} -translate-y-1/2 transform text-muted-foreground"
-	/>
+	{#if !hideIcon}
+		<Search
+			class="absolute top-1/2 left-3 z-10 {ICON_CLASS_DEFAULT} -translate-y-1/2 transform text-muted-foreground"
+		/>
+	{/if}
 
 	<Input
 		{autofocus}
 		{id}
 		bind:value
 		bind:ref
-		class="pl-9 {showClearButton ? 'pr-9' : ''}"
+		class="{hideIcon ? 'pl-3' : 'pl-9'} {showClearButton ? 'pr-9' : ''}"
 		oninput={handleInput}
 		onkeydown={onKeyDown}
 		{placeholder}
