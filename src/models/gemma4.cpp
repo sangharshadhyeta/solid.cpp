@@ -334,6 +334,17 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                     model.layers[il].ffn_up_exps_s,
                     model.layers[il].ffn_gate_exps_s,
                     model.layers[il].ffn_down_exps_s);
+            // Predict the next layer's experts from this layer's router input and
+            // hand it to moe-cache, so its fills overlap the expert compute just
+            // queued above rather than blocking the next layer. `tmp` is the
+            // normalised router input, which is what the next gate would see.
+            if (il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp) {
+                build_moe_lookahead(tmp,
+                        model.layers[il + 1].ffn_gate_inp,
+                        model.layers[il + 1].ffn_down_exps,
+                        n_expert_used, il);
+            }
+
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);

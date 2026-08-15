@@ -4453,3 +4453,51 @@ Realistic payoff, stated before building so it can be checked: the literature
 reports up to ~14% TPOT improvement over on-demand loading, larger on weaker
 GPUs (12-14% on an A6000 against 5-8% on A100/GH200), which places this 12GB card
 in the favourable regime.
+
+## Router-lookahead prefetch: built, works, no throughput change here (2026-08-16)
+
+Implemented the mechanism the literature converged on. At layer L, the next
+layer's gate is run against this layer's router input, `ggml_argsort_top_k` gives
+the predicted experts, and a `ggml_map_custom1` node hands them to moe-cache -
+firing in graph order, while layer L is still computing and before layer L+1's
+expert matmul is reached.
+
+Pieces: `ggml_moe_cache.prefetch()` (cache side, fills into free slots only),
+`llm_graph_context::build_moe_lookahead()` (graph side), and one call in
+`gemma4.cpp`. The graph context has no access to `model`, so the helper takes the
+next layer's tensors and the model builder supplies them - which also keeps this
+opt-in per architecture rather than silently applying where it has not been
+checked.
+
+Speculation never evicts. At ~77% accuracy a wrong guess that displaced a
+known-hot expert would cost more than a right one saves, so prefetch takes free
+slots or does nothing, and respects the same queue bounds as demand fills.
+
+**Measured, `-ncmoe 21`, 8192 ctx:**
+
+| | run 1 | run 2 | run 3 | hit rate | prefetches |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| prefetch on | 50.4 | 56.7 | 57.9 | 89.4% | 673 |
+| prefetch off | 51.5 | 57.7 | 57.3 | 88.3% | 0 |
+
+The mechanism demonstrably works - 673 fills issued, hit rate up 1.1pp - and
+throughput does not move. The reason is in the hit rate: at 88% this
+configuration is not transfer-bound. Roughly one access in nine misses, and those
+were already being filled asynchronously, so there is very little exposed
+transfer left for prefetch to hide behind compute.
+
+Where it should matter is the opposite regime: heavy offload with a low hit rate,
+where misses are frequent and each one blocks. That is also where the literature
+measures its ~14%, on GPUs too small to hold the working set. Kept on by default
+(`GGML_CUDA_MOE_CACHE_PREFETCH=0` disables) because it is cheap, correct, and
+costs nothing when there is nothing to hide - unlike the residency experiments,
+which actively took memory from something else.
+
+**The signal is reusable, and that is the more interesting part.** The prediction
+says which experts are about to be needed. Today's host buffer promotes by
+historical heat - backward-looking, and it tried to hold a large hot set, which
+is the capacity play that failed three times. Feeding the same prediction to the
+buffer would make it forward-looking and much smaller: a staging area for what is
+imminently required rather than a cache of what was recently popular. That is the
+same shift from capacity to timing the literature made, applied one tier down,
+and it is the natural next step for the buffer rather than another sizing attempt.

@@ -17,6 +17,7 @@ struct ggml_moe_cache_summary {
 	long long evictions;
 	long long fill_failures;
 	long long admission_skips;
+	long long prefetches;
 	size_t slots_used;
 	size_t slots_total;
 	size_t protected_slots;
@@ -104,6 +105,16 @@ struct ggml_moe_cache_api {
     // Weights promoted into this buffer are held in memory we control, and the
     // corresponding mmap pages are released so nothing is resident twice.
     const void * (*host_ptr)(const void * host_base, int expert);
+
+    // Speculative prefetch. `ids` are the experts a *later* layer is predicted
+    // to select, so their fills can be issued while the current layer is still
+    // computing - converting a blocking transfer into an overlapped one.
+    //
+    // This is the mechanism the MoE-offload literature converged on
+    // (Speculating Experts, PILOT, Fate, FineMoE): prediction is only ~77%
+    // accurate, so these fills must never displace an expert the cache is
+    // confident about. Speculation loses ties to certainty.
+    void (*prefetch)(const void * host_base, const int32_t * ids, int n_ids);
 
     // Aggregate cache health summary - see ggml_moe_cache_summary. Always
     // writes *out (zeroed on failure). NULL-safe like the other optional

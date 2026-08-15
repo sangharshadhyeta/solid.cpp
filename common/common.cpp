@@ -2317,6 +2317,7 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
     out.evictions        = raw.evictions;
     out.fill_failures    = raw.fill_failures;
     out.admission_skips  = raw.admission_skips;
+    out.prefetches       = raw.prefetches;
     out.slots_used       = raw.slots_used;
     out.slots_total      = raw.slots_total;
     out.protected_slots  = raw.protected_slots;

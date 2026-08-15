@@ -1,5 +1,7 @@
 #include "llama-graph.h"
 
+#include "ggml-backend-moe-cache.h"
+
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-batch.h"
@@ -1866,6 +1868,58 @@ ggml_tensor * llm_graph_context::build_ffn(
     }
 
     return cur;
+}
+
+// Hands a lookahead prediction to moe-cache. Runs on the CPU backend as a
+// custom op, so it executes in graph order rather than at build time.
+// `userdata` is the next layer's expert-weight base pointer, which is how
+// moe-cache identifies the tensor being prefetched.
+void llm_graph_context::moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    if (ith != 0 || !ggml_moe_cache.prefetch || !userdata || a->type != GGML_TYPE_I32) {
+        return;
+    }
+    // Only the first token's row is used: prefetching is per-layer, and the
+    // experts the first token routes to are as good a sample as any for what
+    // the layer is about to touch.
+    ggml_moe_cache.prefetch(userdata, (const int32_t *) a->data, (int) a->ne[0]);
+}
+
+
+// Router lookahead: predict the *next* layer's experts now, so their weights can
+// be fetched while this layer's expert compute is still running.
+//
+// The signal is what the real router uses - this layer's hidden state through
+// the next layer's gate - available here and stale only by this layer's MoE
+// residual. The literature measures that staleness at ~73-77% recall (PILOT,
+// and Colibri's shared-expert correction), which is ample for a hint: a wrong
+// guess costs one unused transfer into a free slot, and moe-cache refuses to
+// evict anything for a speculative fill.
+//
+// Called by the model builders, which have the next layer's tensors; the graph
+// context itself does not. No-op unless a cache is registered and wants it, so
+// the extra n_embd x n_expert matmul is never paid on a build with no offloaded
+// experts to prefetch.
+void llm_graph_context::build_moe_lookahead(
+        ggml_tensor * cur,
+        ggml_tensor * next_gate_inp,
+        ggml_tensor * next_exps,
+            int64_t   n_expert_used,
+                int   il) const {
+    if (!ggml_moe_cache.prefetch || !cur || !next_gate_inp || !next_exps || !next_exps->data) {
+        return;
+    }
+
+    ggml_tensor * next_logits = build_lora_mm(next_gate_inp, cur);
+    ggml_tensor * next_top    = ggml_argsort_top_k(ctx0, next_logits, n_expert_used);
+    cb(next_top, "ffn_moe_lookahead", il);
+
+    // Fires in graph order - while this layer is still computing and before the
+    // next layer's expert matmul is reached, which is the whole point.
+    ggml_tensor * hint = ggml_map_custom1(ctx0, next_top,
+            llm_graph_context::moe_prefetch_cb, 1, next_exps->data);
+    ggml_build_forward_expand(gf, hint);
 }
 
 ggml_tensor * llm_graph_context::build_moe_ffn(

@@ -974,6 +974,7 @@ struct common_moe_cache_summary {
     long long evictions       = 0;
     long long fill_failures   = 0;
     long long admission_skips = 0;
+    long long prefetches      = 0;
     size_t slots_used         = 0;
     size_t slots_total        = 0;
     size_t protected_slots    = 0;
