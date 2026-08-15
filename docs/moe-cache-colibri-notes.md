@@ -2070,6 +2070,31 @@ on those results, not just a forward-looking TODO, since unified mode
 could plausibly change where cliffs/optimal placements land by
 changing how much VRAM is actually free at a given `--parallel N`.
 
+**Action taken and confirmed live (2026-08-15):** turned out to need no
+change at all on the real deployment - `params.kv_unified` auto-enables
+whenever `--parallel` is left unset (the exact "auto" condition described
+above), and the 8099 deployment's launch command has never passed
+`--parallel` explicitly. `--cache-idle-slots` (default `true`) and
+`--cache-ram`/`cache_ram_mib` (default 8192 MiB, so already non-zero) were
+already on too - every precondition `server-context.cpp`'s own gate checks
+(`cache_idle_slots && cache_ram_mib != 0`) was already satisfied by
+defaults. Confirmed genuinely active, not just theoretically satisfied, two
+ways: the startup trace line `idle slots will be saved to prompt cache and
+cleared upon starting a new task` fires on every launch, and a real 4-slot
+test (small enough context, `-c 2048`, to actually get 4 slots instead of
+the 1 this hardware's tight VRAM margin usually forces at larger requests -
+see the fit.cpp margin-widening fix above) showed it firing live under real
+traffic: `saving idle slot to prompt cache` / `clearing prompt with N
+tokens` / `updating prompt cache`, once per slot, immediately after each of
+4 concurrent requests completed.
+
+The caveat two paragraphs up still stands as written: this session's own
+calibration/sweep commands (`--moe-calibrate`, concurrency sweeps) pass
+`--parallel N` explicitly and therefore still run under the fixed-division
+default, not unified mode - that's a property of those specific commands,
+not the live deployment, and would need the same explicit `--kv-unified`
+override if those sweeps are re-run and unified-mode numbers are wanted.
+
 ## Honest calibration on the combined number
 RFC-thread testers got low-to-mid-20s tok/s with moe-cache alone on WORSE
 hardware (2x3090 + repaired 8-channel DDR4) running the HARDER case
