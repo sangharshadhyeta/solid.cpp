@@ -42,6 +42,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <fstream>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -211,10 +212,13 @@ struct moe_cache_device {
         size_t expert_size = 0;
         std::vector<uint32_t> last_seen; // coarse seconds, 0 = never selected
         std::vector<bool> is_cold;       // already advised, don't re-advise every sweep
+        std::vector<uint32_t> selections; // saturating per-expert selection count
+        std::vector<bool> is_pinned;      // held resident with mlock
     };
     std::unordered_map<const void *, cpu_residency> residency;
     std::chrono::steady_clock::time_point residency_epoch{};
     std::chrono::steady_clock::time_point last_cold_sweep{};
+    size_t pinned_bytes = 0;
 
     int stable_visits = 0;
     bool saw_repeat = false;
@@ -840,6 +844,105 @@ static bool moe_cache_grow_host(
 static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{30};
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
 
+// Host RAM this process may pin for hot CPU-resident experts.
+//
+// Why pinning at all: CPU-placed experts are mmap'd, so when RAM cannot hold
+// them the kernel reclaims by recency alone. It has no idea that 8 of 128
+// experts per layer are selected every token, so a hot expert is exactly as
+// likely to be dropped as one never selected since load - and the re-faults
+// that follow are small and scattered rather than sequential. Measured on this
+// host under an 8 GiB cap: generation fell from 10.80 to 0.51 tok/s, a 21x
+// collapse, against an SSD that reads 513 MB/s sequentially. The bandwidth was
+// never the problem; the eviction policy was. MADV_COLD (see the sweep below)
+// can only lower a page's priority - it cannot hold the hot ones down. mlock
+// can, and moe-cache already knows which those are.
+//
+// Budget: derived live from MemAvailable rather than a constant, for the same
+// reason the VRAM budget is - a fixed number is wrong on both a 16 GiB laptop
+// and a 512 GiB server. An eighth, clamped hard: pinned pages are by definition
+// unreclaimable, so over-pinning under a cgroup cap converts a slow machine
+// into an OOM kill. Deliberately far more conservative than the VRAM side.
+// GGML_CUDA_MOE_CACHE_PIN_MB overrides (0 disables).
+static size_t moe_cache_pin_budget_bytes() {
+    static const size_t value = [] () -> size_t {
+        if (const char * env = getenv("GGML_CUDA_MOE_CACHE_PIN_MB")) {
+            if (strcmp(env, "auto") == 0) {
+                // fall through to the derived budget below
+            } else {
+                const long parsed = strtol(env, nullptr, 10);
+                return parsed <= 0 ? 0 : (size_t) parsed << 20;
+            }
+        } else {
+            // Off by default, and this is a measured decision rather than
+            // caution. Under a 5 GiB cap with ~12 GiB of CPU-side experts, the
+            // derived budget (an eighth of the cap, 640 MiB) covers about 5% of
+            // the working set: generation measured 2.03/7.59/10.30/11.40 tok/s
+            // with pinning against 2.20/8.73/11.74 without, and reclaim events
+            // rose from 69150 to 83058. Pinning a small slice cannot fix a large
+            // shortfall, and because pinned pages are unreclaimable it shrinks
+            // the pool every other page competes for - so it costs slightly more
+            // than it saves. It should help when the shortfall is modest enough
+            // that the budget covers a real share of the hot set, which is what
+            // GGML_CUDA_MOE_CACHE_PIN_MB=<N>|auto is for.
+            return 0;
+        }
+#if defined(__linux__)
+        size_t avail = 0;
+        {
+            std::ifstream meminfo("/proc/meminfo");
+            std::string key, unit;
+            size_t value_kib = 0;
+            while (meminfo >> key >> value_kib >> unit) {
+                if (key == "MemAvailable:") {
+                    avail = value_kib << 10;
+                    break;
+                }
+            }
+        }
+        if (avail == 0) {
+            return 0;
+        }
+
+        // A cgroup cap is the real ceiling when there is one, and it is not
+        // visible in MemAvailable - that reports the host's view, which can be
+        // far larger than what this process may actually use. Pinned pages
+        // cannot be reclaimed, so budgeting against the host figure inside a
+        // small cgroup is precisely how a memory-pressured-but-working server
+        // becomes an OOM kill. Take the smaller of the two.
+        {
+            std::string self_cgroup;
+            {
+                std::ifstream f("/proc/self/cgroup");
+                std::string line;
+                while (std::getline(f, line)) {
+                    // cgroup v2 has a single "0::<path>" entry
+                    const size_t pos = line.rfind("0::");
+                    if (pos == 0) {
+                        self_cgroup = line.substr(3);
+                        break;
+                    }
+                }
+            }
+            if (!self_cgroup.empty()) {
+                std::ifstream f("/sys/fs/cgroup" + self_cgroup + "/memory.max");
+                std::string value;
+                if (f >> value && value != "max") {
+                    const unsigned long long cap = strtoull(value.c_str(), nullptr, 10);
+                    if (cap > 0) {
+                        avail = std::min<size_t>(avail, (size_t) cap);
+                    }
+                }
+            }
+        }
+
+        const size_t eighth = avail / 8;
+        return std::min<size_t>(8ull << 30, std::max<size_t>(256ull << 20, eighth));
+#endif
+        return 0; // no reliable availability figure - pin nothing rather than guess
+    }();
+    return value;
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -866,6 +969,20 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     moe_cache_cold_sweep(*device, std::chrono::steady_clock::now());
                 }
                 continue;
+            }
+            // Not idle - but the sweep still has to run. Under real memory
+            // pressure this thread never goes idle (every miss queues a fill),
+            // which is exactly when residency decisions matter most; gating them
+            // on an idle timeout meant they never ran in the one situation they
+            // exist for. Measured: a 5 GiB-capped run with 69150 reclaim events
+            // completed without a single sweep. So drive it on elapsed time
+            // instead, independent of queue state.
+            if (!device->dead.load()) {
+                const auto now_tick = std::chrono::steady_clock::now();
+                if (now_tick - device->last_cold_sweep >= MOE_CACHE_COLD_SWEEP_INTERVAL) {
+                    device->last_cold_sweep = now_tick;
+                    moe_cache_cold_sweep(*device, now_tick);
+                }
             }
             if ((session->stopping || device->dead.load()) &&
                 device->queue.empty()) {
@@ -1960,24 +2077,27 @@ static uint32_t moe_cache_cold_after_s() {
 
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now) {
 #if MOE_CACHE_HAS_MADV_COLD
-    const uint32_t cold_after = moe_cache_cold_after_s();
-    if (cold_after == 0) {
-        return;
-    }
-    const uint32_t age_now = (uint32_t) std::chrono::duration_cast<std::chrono::seconds>(
-            now - device.residency_epoch).count();
-    if (age_now < cold_after) {
-        return; // nothing can be dormant long enough yet
-    }
-
     static const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0) {
         return;
     }
 
+    // Two independent halves, deliberately not sharing a gate. Advising cold
+    // pages needs an expert to have been unused for a while, so it waits on the
+    // dormancy threshold. Pinning hot ones does not: which experts are hot is
+    // known from the first tokens, and under memory pressure the pinning is
+    // wanted immediately - gating it behind a 120s dormancy timer meant it never
+    // ran in short-lived or heavily-loaded sessions, which are exactly the ones
+    // that need it.
+    const uint32_t cold_after = moe_cache_cold_after_s();
+    const uint32_t age_now = (uint32_t) std::chrono::duration_cast<std::chrono::seconds>(
+            now - device.residency_epoch).count();
+    const bool do_cold = cold_after > 0 && age_now >= cold_after;
+
     size_t advised_experts = 0;
     size_t advised_bytes = 0;
     for (auto & [host_base, res] : device.residency) {
+        if (!do_cold) break;
         for (size_t expert = 0; expert < res.last_seen.size(); expert++) {
             if (res.is_cold[expert]) {
                 continue; // already advised; a later hit clears this
@@ -2030,6 +2150,107 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
         MOE_CACHE_LOG("[moe-cache] CUDA%d advised %zu dormant CPU expert(s) (%zu MiB) as reclaimable\n",
                 device.physical, advised_experts, advised_bytes >> 20);
     }
+
+    // Second half of the same policy: having told the kernel what it may drop,
+    // hold down what it must not. Rank every tracked expert by how often it has
+    // actually been selected and pin the top of that ranking with mlock, up to
+    // the budget. This is the part MADV_COLD cannot do - an advisory hint lowers
+    // priority, it never protects.
+    const size_t pin_budget = moe_cache_pin_budget_bytes();
+    if (pin_budget == 0) {
+        return;
+    }
+
+    struct pin_candidate {
+        uint32_t selections;
+        const void * host_base;
+        size_t expert;
+    };
+    std::vector<pin_candidate> candidates;
+    for (auto & [host_base, res] : device.residency) {
+        for (size_t expert = 0; expert < res.selections.size(); expert++) {
+            if (res.selections[expert] > 0) {
+                candidates.push_back({res.selections[expert], host_base, expert});
+            }
+        }
+    }
+    // Descending by selection count; ties broken by address so the ordering is
+    // stable across sweeps and an expert doesn't churn in and out of the pinned
+    // set for no reason.
+    std::sort(candidates.begin(), candidates.end(), [](const pin_candidate & a, const pin_candidate & b) {
+        if (a.selections != b.selections) {
+            return a.selections > b.selections;
+        }
+        if (a.host_base != b.host_base) {
+            return a.host_base < b.host_base;
+        }
+        return a.expert < b.expert;
+    });
+
+    std::unordered_set<const void *> keep; // packed (base, expert) identities to retain
+    keep.reserve(candidates.size());
+    size_t want_bytes = 0;
+    size_t want_count = 0;
+    for (const pin_candidate & c : candidates) {
+        auto & res = device.residency[c.host_base];
+        const uintptr_t begin = (uintptr_t) c.host_base + (uintptr_t) c.expert * res.expert_size;
+        const uintptr_t end   = begin + res.expert_size;
+        const uintptr_t first = (begin + page_size - 1) & ~((uintptr_t) page_size - 1);
+        const uintptr_t last  = end & ~((uintptr_t) page_size - 1);
+        if (last <= first) {
+            continue;
+        }
+        const size_t len = (size_t) (last - first);
+        if (want_bytes + len > pin_budget) {
+            break; // ranking is descending, so everything after this is colder
+        }
+        want_bytes += len;
+        want_count++;
+        keep.insert((const void *) first);
+
+        if (res.is_pinned[c.expert]) {
+            continue; // already held
+        }
+        if (mlock((void *) first, len) != 0) {
+            // ENOMEM (RLIMIT_MEMLOCK or cgroup) or EPERM: stop trying this
+            // sweep rather than hammering the syscall for every candidate.
+            // Not fatal - unpinned simply means "same behaviour as before".
+            MOE_CACHE_LOG("[moe-cache] CUDA%d could not pin hot experts (%s) - continuing without pinning\n",
+                    device.physical, strerror(errno));
+            break;
+        }
+        res.is_pinned[c.expert] = true;
+        device.pinned_bytes += len;
+    }
+
+    // Release anything pinned that no longer makes the cut, so the pinned set
+    // tracks the workload instead of only ever growing.
+    size_t released = 0;
+    for (auto & [host_base, res] : device.residency) {
+        for (size_t expert = 0; expert < res.is_pinned.size(); expert++) {
+            if (!res.is_pinned[expert]) {
+                continue;
+            }
+            const uintptr_t begin = (uintptr_t) host_base + (uintptr_t) expert * res.expert_size;
+            const uintptr_t end   = begin + res.expert_size;
+            const uintptr_t first = (begin + page_size - 1) & ~((uintptr_t) page_size - 1);
+            const uintptr_t last  = end & ~((uintptr_t) page_size - 1);
+            if (last <= first || keep.count((const void *) first)) {
+                continue;
+            }
+            munlock((void *) first, (size_t) (last - first));
+            res.is_pinned[expert] = false;
+            device.pinned_bytes -= std::min(device.pinned_bytes, (size_t) (last - first));
+            released++;
+        }
+    }
+
+    static size_t last_reported = SIZE_MAX;
+    if (want_count > 0 && device.pinned_bytes != last_reported) {
+        last_reported = device.pinned_bytes;
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pinned %zu hot CPU expert(s) (%zu MiB of %zu MiB budget, %zu released)\n",
+                device.physical, want_count, device.pinned_bytes >> 20, pin_budget >> 20, released);
+    }
 #else
     (void) device; (void) now;
 #endif
@@ -2078,6 +2299,8 @@ static int moe_cache_plan(
                 entry.expert_size = node->expert_size;
                 entry.last_seen.assign((size_t) node->n_expert, 0);
                 entry.is_cold.assign((size_t) node->n_expert, false);
+                entry.selections.assign((size_t) node->n_expert, 0);
+                entry.is_pinned.assign((size_t) node->n_expert, false);
             }
             residency = &entry;
         } catch (...) {
@@ -2094,6 +2317,11 @@ static int moe_cache_plan(
 
         if (residency && (size_t) expert < residency->last_seen.size()) {
             residency->last_seen[expert] = age_now;
+            // Saturating, so a long-running server ranks by sustained use
+            // rather than letting an early burst dominate forever.
+            if (residency->selections[expert] < UINT32_MAX) {
+                residency->selections[expert]++;
+            }
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
             residency->is_cold[expert] = false;
