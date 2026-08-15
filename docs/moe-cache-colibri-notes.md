@@ -3520,3 +3520,52 @@ An earlier 83 tok/s reading was briefly mistaken for a regression against these
 numbers. It came from a shorter prompt with a different token budget, not a
 comparable run - the baseline above was measured with the identical prompt and
 config specifically to settle that.
+
+# DwarfStar / ds4 reviewed (antirez/ds4, dwarfstar.sh) — 2026-08-15
+
+Reviewed at the user's request, on the premise that it "launches large models
+like DeepSeek on 8GB of VRAM" and that crashing where such projects succeed
+would be the more serious failure. Two things need correcting before drawing
+any lessons, because the premise doesn't survive contact with their docs.
+
+**It does not claim 8GB.** The smallest platform listed on dwarfstar.sh is a
+32GB Apple Silicon Mac, and the only published throughput figures are from a
+128GB M5 Max: 34.3 tok/s generation, 87.3 tok/s prefill. There is no 8GB or
+12GB benchmark in their documentation at all. (A separate community fork,
+peppe200175/ds4_RTX_5080_cuda, targets a 16GB RTX 5080 + NVMe.) For contrast,
+this fork currently does 61.3 tok/s generation on a 12GB RTX 3060 with a 26B
+MoE at 65536 context - a different model on different hardware, so not a like
+-for-like comparison, but enough to retire the idea that we're behind a class
+of tool that solved something we haven't.
+
+**Its architecture is the one we already have.** Three tiers: non-routed
+weights resident, a dynamic cache for routed MoE experts with a configurable
+budget, and the GGUF on SSD for misses - on the same reasoning we followed
+("routed experts dominate model size", cache misses dominate generation more
+than prefill). Their budget defaults to 80% of the backend's recommended
+working set; ours is free VRAM minus a live 5% reserve. Ours additionally has
+LFRU eviction with heat and admission control, which their docs don't describe.
+
+Two genuine differences worth recording:
+
+1. **Explicit read/write I/O instead of mmap**, deliberately, to avoid
+   excessive VM mappings on systems already mapping large files. We rely on
+   mmap plus the page cache, now steered by MADV_COLD (see the section above).
+   Theirs gives exact control over what's resident; ours gets the kernel's LRU
+   for free and only hints at it. Not obviously worse - but it is the one place
+   where a machine whose RAM cannot hold the CPU-side experts behaves
+   differently, and we have not tested that case.
+
+2. **Overlapped streaming prefill**: they reserve headroom for two full routed
+   layers so expert I/O for the next layer overlaps compute on the current one.
+   The nearest thing we have is thecodacus's expert prefetch (+36% prefill,
+   credited in the acknowledgements). Same idea, different mechanism.
+
+**The one concrete thing they have that we don't**, and it is worth building:
+*KV cache as a disk citizen* - long prefixes saved to SSD and resumed by prompt
+hash, so a restart doesn't force a full re-prefill. Our prompt cache
+(`--cache-ram`, 8192 MiB by default, confirmed active) is RAM-only and dies
+with the process. Persisting it keyed by prompt hash is a well-scoped feature,
+it is exactly the "cold things belong on SSD" principle applied to the tier we
+had not applied it to, and unlike weight streaming it needs no new tier - just
+durability for a cache that already exists.
