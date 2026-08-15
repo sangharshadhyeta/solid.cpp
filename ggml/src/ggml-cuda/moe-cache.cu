@@ -875,7 +875,20 @@ static uint64_t moe_cache_cold_after_epochs() {
             const long long parsed = atoll(env);
             return parsed <= 0 ? 0 : (uint64_t) parsed;
         }
-        return 4600;
+        // Off by default. The policy itself is sound - it is the same LFRU
+        // signal, decay and coldest-pays rule the VRAM tier uses, and that tier
+        // holds ~70% hit rate with it. What does not carry over is enforcement:
+        // in VRAM we choose the victim slot, whereas here we can only advise,
+        // and the kernel's interface is demotion-only (no hint expresses
+        // "protect this"; mlock, the only mechanism that does, measured worse by
+        // making pages unreclaimable). Measured across several runs, advisory
+        // demotion moves cold throughput a few percent against a 21x gap.
+        //
+        // Kept implemented and one env var away, because the situation it
+        // addresses is real - it simply cannot be validated here, where the
+        // condition has to be manufactured with a cgroup cap and the models that
+        // would genuinely need it are 200GB+.
+        return 0;
     }();
     return value;
 }
@@ -2431,6 +2444,25 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
         ? device.plan_epoch > cold_epochs
         : (cold_after > 0 && age_now >= cold_after);
 
+    // Heat decay on the same schedule as the pools', so the RAM tier ages its
+    // signal exactly as the VRAM tier does, then take the cut point. Demoting
+    // the coldest half leaves the hot set standing without needing a "protect"
+    // hint the kernel does not offer.
+    uint32_t heat_cut = 0;
+    if (cold_epochs > 0) {
+        std::vector<uint32_t> heats;
+        for (auto & [host_base_d, res_d] : device.residency) {
+            for (uint32_t & h : res_d.selections) {
+                h >>= 1;
+                heats.push_back(h);
+            }
+        }
+        if (!heats.empty()) {
+            std::sort(heats.begin(), heats.end());
+            heat_cut = heats[heats.size() / 2]; // median: demote the colder half
+        }
+    }
+
     size_t advised_experts = 0;
     size_t advised_bytes = 0;
     for (auto & [host_base, res] : device.residency) {
@@ -2439,12 +2471,11 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
             if (res.is_cold[expert]) {
                 continue; // already advised; a later hit clears this
             }
-            // Dormant if it has not been routed to for cold_epochs routing
-            // decisions. last_epoch == 0 means never selected since load -
-            // dormant by definition, and the strongest candidate of all.
+            // Demote by rank, not by a threshold: anything at or below the heat
+            // cut computed for this sweep. Same LFRU signal and the same
+            // "coldest pays" rule the VRAM tier uses, applied one tier down.
             if (cold_epochs > 0) {
-                if (expert < res.last_epoch.size() && res.last_epoch[expert] != 0 &&
-                    device.plan_epoch - res.last_epoch[expert] < cold_epochs) {
+                if (res.selections[expert] > heat_cut) {
                     continue;
                 }
             } else if (res.last_seen[expert] != 0 && age_now - res.last_seen[expert] < cold_after) {
@@ -2692,11 +2723,13 @@ static int moe_cache_plan(
         if (residency && (size_t) expert < residency->last_seen.size()) {
             residency->last_seen[expert] = age_now;
             residency->last_epoch[expert] = device.plan_epoch;
-            // Saturating, so a long-running server ranks by sustained use
-            // rather than letting an early burst dominate forever.
-            if (residency->selections[expert] < UINT32_MAX) {
-                residency->selections[expert]++;
-            }
+            // The same heat signal the VRAM tier uses - +STEP per hit, saturating
+            // at HEAT_MAX, halved on decay - rather than a raw cumulative count.
+            // LFRU's parameters were settled by a lot of measurement upstream;
+            // reusing them is the point, and a cumulative counter would drift
+            // from that policy by growing steadily less responsive over time.
+            residency->selections[expert] =
+                std::min(MOE_CACHE_HEAT_MAX, residency->selections[expert] + MOE_CACHE_HEAT_STEP);
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
             residency->is_cold[expert] = false;
