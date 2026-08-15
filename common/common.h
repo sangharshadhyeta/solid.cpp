@@ -606,6 +606,17 @@ struct common_params {
 
     std::string expert_atlas_file; // path to a JSON file produced by llama-expert-atlas (topic-affinity positions for the Brain view)
 
+    // What the placement/fit logic actually decided, recorded for reporting
+    // (the server's /props -> Brain view). These are outputs, never inputs: set
+    // during common_init_result, ignored if set by a caller. Kept so the UI can
+    // show *why* a layout was chosen - "23 of 30 layers on CPU because you asked
+    // for 65536 context" is the answer to a question the raw numbers don't
+    // answer on their own.
+    int32_t placed_n_cpu_moe_req   = -1; // -ncmoe as requested (-1 = not specified)
+    int32_t placed_n_cpu_moe_final = -1; // -ncmoe actually used after fitting
+    int32_t placed_n_layer         = -1; // total layers, for "N of M" framing
+    int32_t placed_n_ctx_req       = -1; // context as requested, before any fit reduction
+
     bool single_turn       = false; // single turn chat conversation
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K

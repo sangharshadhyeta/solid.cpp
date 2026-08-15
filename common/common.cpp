@@ -2484,6 +2484,17 @@ static bool common_maybe_raise_moe_for_ctx(
 
     const common_moe_fit_probe_result probe =
         common_moe_find_safe_layers(path_model, mparams, cparams, margin);
+
+    // Record what was asked for regardless of the outcome below, so the Brain
+    // view can distinguish "23 layers because you asked for it" from "23 layers
+    // because 65536 context demanded it".
+    params.placed_n_cpu_moe_req   = (int32_t) current_n;
+    params.placed_n_cpu_moe_final = (int32_t) current_n;
+    params.placed_n_ctx_req       = params.n_ctx;
+    if (probe.n_layer > 0) {
+        params.placed_n_layer = (int32_t) probe.n_layer;
+    }
+
     if (!probe.is_moe || probe.already_fits) {
         return false; // dense model, or the requested context already fits as configured
     }
@@ -2501,6 +2512,7 @@ static bool common_maybe_raise_moe_for_ctx(
 
     params.tensor_buft_overrides  = common_moe_build_cpu_overrides(probe.safe_n);
     mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    params.placed_n_cpu_moe_final = (int32_t) probe.safe_n;
     return true;
 }
 
