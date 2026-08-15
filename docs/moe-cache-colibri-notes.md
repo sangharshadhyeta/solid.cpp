@@ -3465,3 +3465,58 @@ cache's own pools), but the reconstructed budget held nearly flat (926 to
 919 MiB) - exactly the "notice real external pressure, ignore your own
 footprint" behavior this was meant to produce, not a coincidence of the
 specific numbers involved.
+
+# Dormant CPU experts: telling the kernel which pages to drop (2026-08-15)
+
+User's question, after the placement fix above: "can the program choose some
+of the long standing dormant ones to the disk?"
+
+The tiering already exists, by accident rather than design. MoE weights placed
+on CPU are mmap'd straight from the GGUF, so they sit on a VRAM -> RAM -> NVMe
+ladder already: the page cache holds what's been touched, the kernel re-faults
+the rest from the file on demand. What was missing was any *say* in which pages
+get dropped first. llama.cpp issues `posix_madvise` exactly twice, both at load
+time, both blanket calls over the whole mapping (`src/llama-mmap.cpp`), so the
+kernel's own LRU is the sole decider - and it cannot tell an expert that fires
+on most tokens from one that hasn't been selected since startup. moe-cache
+already knows the difference, because it sees every expert selection.
+
+**What was added**: per-(tensor, expert) last-use tracking on the existing hot
+path (one hash lookup per tensor per call, then plain array stores), plus a
+periodic sweep that calls `madvise(MADV_COLD)` on experts that are neither
+VRAM-resident nor recently selected. MADV_COLD deactivates pages without
+freeing them - nothing is evicted outright, correctness never depends on it,
+and under plentiful RAM the pages simply stay. Linux-only, no-op elsewhere.
+`GGML_CUDA_MOE_CACHE_COLD_AFTER_S` tunes the dormancy threshold (default 120s,
+0 disables).
+
+**The bug worth recording - trigger placement**: the sweep was first hung off
+`moe_cache_plan()`, the per-tensor decode path, gated on elapsed time. It never
+fired once. The reason is the design error, not the timer: dormancy is an
+idle-state property, and hanging the check off decode traffic means it can only
+run while the system is busy - the one state where nothing has gone cold yet.
+Moved to the fill worker thread, whose `cv.wait` became a `wait_for` on the
+sweep interval, so a timeout *is* the idle signal. It fired on the first try
+there.
+
+**Two testing faults cost more time than the feature did**, both worth naming
+because neither was a product bug: `pkill -f "port 8099"` returning nonzero
+aborted the rest of the command chain, so a *stale* server kept serving while
+each "new" launch silently failed to bind - several rounds of debugging a
+binary that was never running. Then the debug counter used `% 4000` when each
+plan call registers up to 64 hits, so ~700 real calls never reached the
+threshold and the probe looked dead. Verify the process under test is the one
+you built, before concluding anything about the code.
+
+**Measured (12GB card, 26B MoE, -ncmoe auto-raised to 23, 65536 ctx)**: sweep
+advised 4499 dormant experts (7957 MiB) ~30s after a request. Generation stayed
+correct afterward. Throughput with the sweep on (37.8 / 42.8 / 47.8 tok/s) vs
+off (43.1 / 40.9 tok/s) is the same within noise - expected, since this machine
+has RAM to spare, so advised pages stay resident and re-faulting never happens.
+The value is strictly under memory pressure; the honest claim is
+"free when it doesn't help", not "faster".
+
+An earlier 83 tok/s reading was briefly mistaken for a regression against these
+numbers. It came from a shorter prompt with a different token budget, not a
+comparable run - the baseline above was measured with the identical prompt and
+config specifically to settle that.

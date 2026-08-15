@@ -24,6 +24,10 @@ void ggml_moe_cache_register(const void * owner) {
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
@@ -198,6 +202,20 @@ struct moe_cache_device {
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
+    // Per-CPU-resident-tensor last-use tracking, for the MADV_COLD sweep. An
+    // expert that is neither in the VRAM cache nor recently selected is pure
+    // page-cache ballast; telling the kernel so lets it reclaim those pages
+    // ahead of anything still in use. Indexed by expert so the hot path is an
+    // array store, not a hash insert.
+    struct cpu_residency {
+        size_t expert_size = 0;
+        std::vector<uint32_t> last_seen; // coarse seconds, 0 = never selected
+        std::vector<bool> is_cold;       // already advised, don't re-advise every sweep
+    };
+    std::unordered_map<const void *, cpu_residency> residency;
+    std::chrono::steady_clock::time_point residency_epoch{};
+    std::chrono::steady_clock::time_point last_cold_sweep{};
+
     int stable_visits = 0;
     bool saw_repeat = false;
     bool budget_ready = false;
@@ -819,6 +837,9 @@ static bool moe_cache_grow_host(
     return true;
 }
 
+static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{30};
+static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -828,10 +849,24 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         moe_cache_job job;
         {
             std::unique_lock<std::mutex> lock(session->mu);
-            session->cv.wait(lock, [&] {
+            // Bounded wait rather than an indefinite one, so this thread doubles
+            // as the cache's periodic maintenance tick. The dormant-page sweep
+            // below has to run when nothing is being decoded - that is precisely
+            // when experts have gone cold and when reclaiming their pages costs
+            // nothing - so hanging it off decode traffic (where it started out)
+            // meant it could never fire in the one state it exists for.
+            const bool have_work = session->cv.wait_for(lock, MOE_CACHE_COLD_SWEEP_INTERVAL, [&] {
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty();
             });
+            if (!have_work) {
+                // Timed out with an empty queue: idle. Safe to sweep here - the
+                // session lock is held, and no fill is in flight to contend with.
+                if (!device->dead.load()) {
+                    moe_cache_cold_sweep(*device, std::chrono::steady_clock::now());
+                }
+                continue;
+            }
             if ((session->stopping || device->dead.load()) &&
                 device->queue.empty()) {
                 break;
@@ -1869,6 +1904,126 @@ static void * moe_cache_begin(
     return node.release();
 }
 
+// Third memory tier, by hint rather than by copy.
+//
+// MoE weights placed on CPU (-ncmoe / --moe-cache auto) are mmap'd straight
+// from the GGUF, so they already live on a VRAM -> RAM -> NVMe ladder: the
+// page cache holds what's been touched and the kernel re-faults the rest from
+// the file on demand. What was missing is any say in *which* pages get dropped
+// when RAM gets tight. llama.cpp issues posix_madvise exactly twice, both at
+// load time and both blanket calls over the whole mapping, so the kernel's LRU
+// is the only thing deciding - and it can't distinguish an expert that fires
+// on most tokens from one that hasn't been selected since startup.
+//
+// moe-cache already knows the difference: it sees every expert selection. This
+// sweep tells the kernel, for experts that are neither VRAM-resident nor
+// recently selected, that their pages are reclaim candidates (MADV_COLD -
+// deactivate, don't free). Nothing is evicted outright and correctness doesn't
+// depend on it; if RAM is plentiful the pages simply stay. The effect only
+// shows up under pressure, which is exactly when a dormant expert should lose
+// to a hot one instead of to blind recency.
+//
+// Linux-only (MADV_COLD is 5.4+); a no-op everywhere else, and harmless on an
+// older kernel, where madvise just returns EINVAL and the sweep is disabled.
+#if defined(__linux__) && defined(MADV_COLD)
+#define MOE_CACHE_HAS_MADV_COLD 1
+#else
+#define MOE_CACHE_HAS_MADV_COLD 0
+#endif
+
+// Seconds an expert must go unselected before its pages are advised cold, and
+// how often the sweep runs at all. Both deliberately coarse: this is a hint
+// whose whole value is being right about "dormant for a long time", and a
+// sweep walks every CPU-resident expert, so it should be rare next to decode.
+static uint32_t moe_cache_cold_after_s() {
+    static const uint32_t value = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_COLD_AFTER_S");
+        if (!env) {
+            return 120u;
+        }
+        const long parsed = strtol(env, nullptr, 10);
+        return parsed < 0 ? 0u : (uint32_t) parsed; // 0 disables
+    }();
+    return value;
+}
+
+static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now) {
+#if MOE_CACHE_HAS_MADV_COLD
+    const uint32_t cold_after = moe_cache_cold_after_s();
+    if (cold_after == 0) {
+        return;
+    }
+    const uint32_t age_now = (uint32_t) std::chrono::duration_cast<std::chrono::seconds>(
+            now - device.residency_epoch).count();
+    if (age_now < cold_after) {
+        return; // nothing can be dormant long enough yet
+    }
+
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        return;
+    }
+
+    size_t advised_experts = 0;
+    size_t advised_bytes = 0;
+    for (auto & [host_base, res] : device.residency) {
+        for (size_t expert = 0; expert < res.last_seen.size(); expert++) {
+            if (res.is_cold[expert]) {
+                continue; // already advised; a later hit clears this
+            }
+            // last_seen == 0 means never selected since load - dormant by
+            // definition, and the strongest candidate of all.
+            if (res.last_seen[expert] != 0 && age_now - res.last_seen[expert] < cold_after) {
+                continue;
+            }
+            // Skip anything currently held in VRAM: its host pages back a live
+            // cache entry and re-reading them is exactly what a refill does.
+            const moe_cache_key key{host_base, (int32_t) expert};
+            bool resident = false;
+            for (const auto & pool_ptr : device.pools) {
+                if (pool_ptr->map.find(key) != pool_ptr->map.end()) {
+                    resident = true;
+                    break;
+                }
+            }
+            if (resident) {
+                continue;
+            }
+
+            // Align outward to page boundaries, but only advise whole pages
+            // that lie strictly inside this expert - a partial page at either
+            // end is shared with a neighbouring expert that may well be hot.
+            const uintptr_t begin = (uintptr_t) host_base + (uintptr_t) expert * res.expert_size;
+            const uintptr_t end   = begin + res.expert_size;
+            const uintptr_t first = (begin + page_size - 1) & ~((uintptr_t) page_size - 1);
+            const uintptr_t last  = end & ~((uintptr_t) page_size - 1);
+            if (last <= first) {
+                continue; // expert smaller than a page, or straddling one
+            }
+            if (madvise((void *) first, (size_t) (last - first), MADV_COLD) != 0) {
+                if (errno == EINVAL) {
+                    // kernel without MADV_COLD - stop trying for this process
+                    MOE_CACHE_LOG("%s", "[moe-cache] MADV_COLD unsupported on this kernel, cold-page hinting disabled\n");
+                    setenv("GGML_CUDA_MOE_CACHE_COLD_AFTER_S", "0", 1);
+                    return;
+                }
+                continue; // transient (e.g. ENOMEM on an unmapped hole) - skip
+            }
+            res.is_cold[expert] = true;
+            advised_experts++;
+            advised_bytes += (size_t) (last - first);
+        }
+    }
+
+    if (advised_experts > 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d advised %zu dormant CPU expert(s) (%zu MiB) as reclaimable\n",
+                device.physical, advised_experts, advised_bytes >> 20);
+    }
+#else
+    (void) device; (void) now;
+#endif
+}
+
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -1891,10 +2046,46 @@ static int moe_cache_plan(
     if (session.stopping) {
         return 0;
     }
+
+    // Record which experts were selected, for the dormant-page sweep below.
+    // One hash lookup per tensor per call, then plain array stores - the entry
+    // is found once here rather than per expert.
+    moe_cache_device::cpu_residency * residency = nullptr;
+    uint32_t age_now = 0;
+    if (moe_cache_cold_after_s() > 0 && node->n_expert > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (device.residency_epoch.time_since_epoch().count() == 0) {
+            device.residency_epoch = now;
+            device.last_cold_sweep = now;
+        }
+        // +1 so a just-selected expert is never confused with "never selected"
+        age_now = 1 + (uint32_t) std::chrono::duration_cast<std::chrono::seconds>(
+                now - device.residency_epoch).count();
+        try {
+            auto & entry = device.residency[node->host_base];
+            if (entry.last_seen.empty()) {
+                entry.expert_size = node->expert_size;
+                entry.last_seen.assign((size_t) node->n_expert, 0);
+                entry.is_cold.assign((size_t) node->n_expert, false);
+            }
+            residency = &entry;
+        } catch (...) {
+            residency = nullptr; // tracking is best-effort, never fail a decode for it
+        }
+
+    }
+
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
             continue;
+        }
+
+        if (residency && (size_t) expert < residency->last_seen.size()) {
+            residency->last_seen[expert] = age_now;
+            // A selected expert is live again: clear the cold mark so a later
+            // dormant stretch re-advises rather than being skipped forever.
+            residency->is_cold[expert] = false;
         }
 
         const moe_cache_key key{node->host_base, expert};
