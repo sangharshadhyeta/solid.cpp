@@ -4146,3 +4146,61 @@ simply fails to load rather than creating graceful pressure.
 Returning cached experts themselves under pressure would need pool slabs
 subdivided into independently freeable chunks. That is a real change to the
 allocation structure, not a tuning knob, and is not attempted here.
+
+# The RAM buffer, reframed: supplement mmap rather than replace it (2026-08-16)
+
+The explicit-buffer rewrite was deferred as multi-week and unvalidatable here.
+That assessment was of the wrong design. It assumed replacing mmap: stop mapping
+the GGUF, own the allocation, implement read()-based population, reroute every
+CPU expert access. Large, and risky precisely because the fallback path
+disappears - a bug means wrong weights or no weights.
+
+The better shape, and the one to build: **keep mmap and add an owned buffer,
+each holding the part it is good at, with the boundary actively managed.** Not
+"buffer first, mmap as fallback" - that still treats mmap as the loser and gives
+up what it is genuinely better at. The split:
+
+- **mmap keeps the cold tail.** Zero-copy, shared across processes, faulted
+  lazily, and managed by an OS that can see global pressure we cannot. Nothing
+  about the load path changes, and the long tail of a 500GB model is exactly the
+  case mmap handles well.
+- **The buffer holds the hot set.** Enforced LFRU over memory we own - the one
+  thing no amount of `madvise` could deliver, because the kernel interface is
+  demotion-only and has no way to express "protect this".
+- **The boundary is coordinated, and this is the part that makes it a mixture
+  rather than a stack.** When an expert is promoted into the buffer, its mmap
+  pages are released (`MADV_DONTNEED`). Without that step the same expert is
+  resident twice - once in the page cache, once in the buffer - and the
+  duplication costs precisely what the buffer was built to save. The machinery
+  for this already exists: the demotion sweep that currently advises cold experts
+  would instead advise *promoted* ones, which is a better signal because it is
+  certain rather than inferred.
+
+Structurally it is the same thing moe-cache already does one tier up - VRAM
+buffer over CPU-resident weights - applied to CPU RAM over disk-backed pages,
+with the addition that the lower tier is told what the upper tier has taken.
+
+Why it answers the objections that stopped the previous design:
+
+- **Correctness is preserved by construction.** The fallback is today's code
+  path, so a buffer miss behaves exactly as the system does now. The buffer is
+  pure optimisation, not a replacement, and can be disabled at runtime.
+- **It gets the one thing hinting could not: enforcement.** Everything tried
+  through `madvise` moved a few percent against a 21x gap, because the kernel
+  interface is demotion-only and no hint expresses "protect this". Within memory
+  we own, LFRU is enforced outright - the same policy that holds ~70% hit rate in
+  VRAM.
+- **The kernel's blind LRU still governs the cold tail, which is where it does no
+  harm.** The pathological case measured earlier - hot experts evicted as readily
+  as never-used ones - only hurts for the hot set, and the hot set is exactly
+  what the buffer removes from the kernel's jurisdiction.
+- **It scales to the target.** For a 1.5TB model compressed to ~500GB, no design
+  holds everything; the question is only whether the hot working set is held
+  deliberately or by accident. This holds it deliberately while the tail streams.
+
+Sizing follows the same rule already used for the VRAM budget and the prompt
+cache: derive it from what is actually available (`MemAvailable`, clamped by any
+cgroup limit), never a constant. The heat signal, decay and eviction rule are
+already implemented for the RAM tier and sitting behind
+`GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS`; what changes is that they would govern
+memory we hold rather than advice we offer.
