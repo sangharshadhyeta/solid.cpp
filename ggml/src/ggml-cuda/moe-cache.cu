@@ -237,6 +237,12 @@ struct moe_cache_device {
     // would otherwise be free to evict.
     size_t host_bytes = 0;      // currently held by promoted experts
     size_t host_promoted = 0;
+    // Experts decode has marked worth promoting. The copy itself is done by the
+    // fill worker: doing it inline cost a malloc, a 1.4 MiB memcpy and a madvise
+    // syscall on the decode path under the session lock, which measured slower
+    // than not having the buffer at all. Decode now only records the intent.
+    std::deque<std::pair<const void *, int>> host_promote_queue;
+
     // Evicted blocks awaiting release. A CPU compute thread may hold a pointer
     // it read moments ago, so freeing at eviction would be a use-after-free.
     // Blocks are released once the cache has quiesced instead.
@@ -911,9 +917,10 @@ static uint64_t moe_cache_cold_after_epochs() {
 }
 static constexpr std::chrono::seconds MOE_CACHE_HISTORY_SAVE_INTERVAL{60};
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
-static void moe_cache_host_promote(
+static void moe_cache_host_promote_locked_free(
         moe_cache_device & device, moe_cache_device::cpu_residency & res,
         const void * host_base, int expert, size_t expert_size);
+static size_t moe_cache_host_budget_bytes();
 static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
 
@@ -1035,6 +1042,27 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty();
             });
+            // Promotions first, and the expensive part outside the lock. Decode
+            // only recorded intent; the malloc, the copy and the madvise happen
+            // here, where they cost the fill worker's time rather than a token's.
+            if (!device->dead.load() && !device->host_promote_queue.empty()) {
+                auto req = device->host_promote_queue.front();
+                device->host_promote_queue.pop_front();
+                auto it = device->residency.find(req.first);
+                if (it != device->residency.end() &&
+                    (size_t) req.second < it->second.host_slot.size() &&
+                    it->second.host_slot[req.second].load(std::memory_order_relaxed) == nullptr) {
+                    const size_t esz = it->second.expert_size;
+                    moe_cache_device::cpu_residency & res = it->second;
+                    const void * base = req.first;
+                    const int    exp  = req.second;
+                    lock.unlock();
+                    moe_cache_host_promote_locked_free(*device, res, base, exp, esz);
+                    lock.lock();
+                }
+                continue;
+            }
+
             if (!have_work) {
                 // Timed out with an empty queue: idle. Safe to sweep here - the
                 // session lock is held, and no fill is in flight to contend with.
@@ -2784,10 +2812,16 @@ static int moe_cache_plan(
             // from that policy by growing steadily less responsive over time.
             residency->selections[expert] =
                 std::min(MOE_CACHE_HEAT_MAX, residency->selections[expert] + MOE_CACHE_HEAT_STEP);
-            // Promote once an expert has proven itself over several selections,
-            // so a single fluke does not claim a slot.
-            if (residency->selections[expert] >= MOE_CACHE_HEAT_STEP * 4) {
-                moe_cache_host_promote(device, *residency, node->host_base, expert, node->expert_size);
+            // Mark for promotion once an expert has proven itself over several
+            // selections, so a single fluke does not claim a slot. The copy is
+            // the worker's job - see host_promote_queue. Bounded so a burst
+            // cannot grow the queue without limit.
+            if (moe_cache_host_budget_bytes() > 0 &&
+                residency->selections[expert] >= MOE_CACHE_HEAT_STEP * 4 &&
+                residency->host_slot[expert].load(std::memory_order_relaxed) == nullptr &&
+                device.host_promote_queue.size() < 64) {
+                device.host_promote_queue.emplace_back(node->host_base, expert);
+                wake_worker = true;
             }
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
@@ -3527,7 +3561,10 @@ static void moe_cache_release_source_pages(const void * base, size_t offset, siz
 // Called under session.mu from the planning path, where heat has just been
 // updated. Promotes `expert` into the host buffer if it is hot enough and there
 // is room, evicting the coldest resident expert when there is not.
-static void moe_cache_host_promote(
+// Runs on the fill worker with the session lock released. The only shared
+// state it mutates is the atomic slot pointer (published after the copy) and
+// the byte counters, which only this thread writes.
+static void moe_cache_host_promote_locked_free(
         moe_cache_device & device, moe_cache_device::cpu_residency & res,
         const void * host_base, int expert, size_t expert_size) {
     const size_t budget = moe_cache_host_budget_bytes();
