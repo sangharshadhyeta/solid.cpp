@@ -1534,6 +1534,16 @@ private:
 
                 prompt_cache->disk_scan();
                 prompt_cache->disk_trim();
+
+                if (!prompt_cache->disk_dir.empty()) {
+                    // Say this plainly and every time. Prompt caching normally
+                    // lives and dies inside one process; writing it down changes
+                    // who can read it and for how long, and that is a decision
+                    // the operator should be reminded they made.
+                    SRV_WRN("prompt cache: persisting prompt content and KV state to '%s' "
+                            "(owner-readable only). Prompts are recoverable from these files until evicted.\n",
+                            prompt_cache->disk_dir.c_str());
+                }
             }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");

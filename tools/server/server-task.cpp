@@ -1916,6 +1916,21 @@ void server_prompt_cache::disk_scan() {
         return;
     }
 
+    // These files contain the serialized token list, which detokenizes straight
+    // back to whatever the user typed, plus the KV state derived from it. That
+    // is user content at rest, so it is owner-only - both the directory (so the
+    // filenames, which are content hashes, can't be enumerated or probed) and
+    // every file written below. Default umask would leave them 0644.
+    std::filesystem::permissions(disk_dir,
+            std::filesystem::perms::owner_all,
+            std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        SRV_WRN("prompt cache: cannot restrict permissions on '%s' (%s) - refusing to write "
+                "prompt content to a directory others can read\n", disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+
     size_t total = 0;
     for (const auto & de : std::filesystem::directory_iterator(disk_dir, ec)) {
         if (ec || !de.is_regular_file()) {
@@ -2026,9 +2041,20 @@ void server_prompt_cache::disk_save(const server_prompt_cache_state & state) {
         }
     }
 
+    // Restrict before the rename, so the file is never visible at its final name
+    // with default permissions - not even for the width of one syscall.
+    std::error_code ec;
+    std::filesystem::permissions(path_tmp,
+            std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
+            std::filesystem::perm_options::replace, ec);
+    if (ec) {
+        std::filesystem::remove(path_tmp, ec);
+        SRV_WRN("%s", "prompt cache: cannot restrict permissions on a cache file - not persisting it\n");
+        return;
+    }
+
     // Rename only after a complete write, so a crash mid-save can never leave a
     // truncated file that a later scan would treat as valid.
-    std::error_code ec;
     std::filesystem::rename(path_tmp, path, ec);
     if (ec) {
         std::filesystem::remove(path_tmp, ec);

@@ -1719,7 +1719,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_KV_UNIFIED").set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_BATCHED, LLAMA_EXAMPLE_BENCH, LLAMA_EXAMPLE_PARALLEL}));
     add_opt(common_arg(
         {"--cache-disk"}, "DIR",
-        "persist the prompt cache to DIR so restarts skip re-prefilling prompts already computed "
+        "persist the prompt cache to DIR so restarts skip re-prefilling prompts already computed. "
+        "NOTE: stores prompt content (tokens, recoverable as plaintext) and its KV state on disk, "
+        "owner-readable only, until evicted - do not enable on shared storage or where prompts are sensitive "
         "(default: disabled; size derived from free disk space unless --cache-disk-size is given)",
         [](common_params & params, const std::string & value) {
             params.cache_disk_dir = value;

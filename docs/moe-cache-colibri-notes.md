@@ -3725,3 +3725,29 @@ run to ground.
 
 Left default-off (`--cache-disk` is opt-in), so nothing changes for anyone who
 doesn't ask for it, and documented here rather than quietly shipped as done.
+
+## Disk prompt cache: it is user content at rest (2026-08-15)
+
+Flagged by the user on review, and correct: the first version wrote cache files
+with the default umask. Verified concretely before fixing - directory `755`,
+files `644`, both world-readable, and the token blob is a plain array of token
+ids that detokenizes straight back to whatever the user typed. The KV state
+beside it is derived from the same content. This is user data at rest, and it
+survives restarts by design, so the exposure is durable rather than momentary.
+
+Fixed: the directory is created `0700` and every file written `0600`. The
+permission change is applied to the `.tmp` *before* the rename, so the file is
+never visible at its final name with default permissions, not even for the width
+of one syscall. If permissions cannot be restricted the tier refuses to write at
+all rather than falling back to a readable file. The server logs a warning naming
+the directory on every launch that enables it, and `--cache-disk`'s help text
+says outright that prompts are recoverable from these files.
+
+What this does *not* solve, and should be stated rather than implied: the files
+are unencrypted, so anyone who can read them as the server's user (or read the
+disk offline) recovers the prompts. Prefix matching also means a cached prefix
+can serve a later request from a different caller - already true of the in-RAM
+cache, but persistence widens the window from one process lifetime to whenever
+the entry is evicted. `--cache-disk` is opt-in for exactly these reasons; it
+should not be enabled on shared storage or for sensitive prompts without
+encryption at rest underneath it.
