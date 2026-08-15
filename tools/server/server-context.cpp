@@ -1431,6 +1431,65 @@ private:
             batch.init(std::max(n_batch, params_base.n_parallel), n_embd);
         }
 
+        // Derive the prompt-cache limit from memory that is actually available
+        // rather than a fixed default. 8 GiB is most of a 16 GiB laptop and a
+        // rounding error on a 512 GiB server, and the cache is pure upside right
+        // up to the point where it competes with the model's own host
+        // allocations - CPU-offloaded MoE experts especially, which on this fork
+        // can be most of the model.
+        //
+        // "Available", not "free" and not "total". ggml's CPU device reports
+        // total RAM for both of its outputs (verified: it returned 31671 MiB
+        // free of 31671 MiB total on a host with ~3 GiB genuinely free), so
+        // sizing off it would hand a quarter of *all* RAM to the cache on a
+        // machine that has none to spare. Linux publishes the number that
+        // actually accounts for reclaimable page cache as MemAvailable, which is
+        // the right basis here precisely because our own mmap'd weights are a
+        // large part of that reclaimable set. Fall back to ggml's figure where
+        // MemAvailable isn't readable, since a too-large cache still only
+        // evicts, never fails.
+        if (params_base.cache_ram_auto) {
+            size_t avail_mib = 0;
+            size_t basis_total_mib = 0;
+            bool   from_meminfo = false;
+            {
+                std::ifstream meminfo("/proc/meminfo");
+                std::string key;
+                size_t value_kib = 0;
+                std::string unit;
+                while (meminfo >> key >> value_kib >> unit) {
+                    if (key == "MemAvailable:") {
+                        avail_mib = value_kib / 1024;
+                        from_meminfo = true;
+                    } else if (key == "MemTotal:") {
+                        basis_total_mib = value_kib / 1024;
+                    }
+                    if (avail_mib && basis_total_mib) {
+                        break;
+                    }
+                }
+            }
+            if (!from_meminfo) {
+                ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+                size_t free_ram = 0, total_ram = 0;
+                if (cpu_dev) {
+                    ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+                }
+                avail_mib       = free_ram  >> 20;
+                basis_total_mib = total_ram >> 20;
+            }
+            if (avail_mib > 0) {
+                // A quarter of what's available, clamped to [512 MiB, 32 GiB]:
+                // enough for several long prefixes, never enough to be the
+                // reason the machine starts swapping.
+                const int32_t derived = (int32_t) std::min<size_t>(32 * 1024, std::max<size_t>(512, avail_mib / 4));
+                SRV_INF("prompt cache limit derived from available host RAM: %d MiB "
+                        "(%zu MiB available of %zu MiB total, via %s) - pass --cache-ram N to override\n",
+                        derived, avail_mib, basis_total_mib, from_meminfo ? "MemAvailable" : "ggml");
+                params_base.cache_ram_mib = derived;
+            }
+        }
+
         if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_TRC("prompt cache is enabled, size limit: %s\n", "no limit");
