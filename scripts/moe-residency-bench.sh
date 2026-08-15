@@ -3,12 +3,25 @@
 #
 # Exists because single-run comparisons on this rig proved unusable: nominally
 # identical configurations ranged 7.59-13.11 and 10.30-33.37 tok/s, i.e. the
-# run-to-run spread was larger than the effects being claimed. Every policy
-# decision made from one sample is a coin flip dressed as a measurement.
+# run-to-run spread was larger than the effects being claimed.
 #
-# Method: N repetitions per configuration, page cache dropped and the server
-# restarted between every repetition so each one is a genuine cold start, first
-# repetition of each *series* discarded, median and min/max reported.
+# Three design points, each learned the hard way:
+#
+#  - Configurations are INTERLEAVED (A,B,C,A,B,C...), not blocked (AAA,BBB,CCC).
+#    A blocked run charges any drift over the session - thermal, memory
+#    fragmentation, disk state - entirely to whichever configuration happened to
+#    run last, which is indistinguishable from a real effect. This matters more
+#    than the wall-clock cost.
+#
+#  - Each server start yields ONE cold sample and several warm ones. Startup
+#    under a memory cap dominates the cost (~90s of ~130s), so taking a single
+#    warm sample per start throws away most of what was paid for. Cold samples
+#    still need their own restart - that is irreducible, and cold is the metric
+#    the pre-warm policies exist to move.
+#
+#  - Page cache dropped and server restarted before every repetition, so a cold
+#    sample is genuinely cold rather than a measure of how warm the last test
+#    left the machine.
 set -u
 
 MODEL=${MODEL:-/home/Projects/llama.cpp/models/moe-test2/gemma-4-26B-A4B-it-UD-Q4_K_M.gguf}
@@ -16,13 +29,23 @@ BIN=${BIN:-/home/Projects/llama.cpp/build/bin/llama-server}
 PORT=${PORT:-8095}
 CAP=${CAP:-5G}
 REPS=${REPS:-5}
+WARM=${WARM:-5}
 NCMOE=${NCMOE:-23}
 CTX=${CTX:-8192}
 HIST=${HIST:-/root/.claude/jobs/a804561e/tmp/moe-history.txt}
 OUT=${OUT:-/root/.claude/jobs/a804561e/tmp/bench}
 PROMPT='{"messages":[{"role":"user","content":"Write three sentences about the ocean and three about mountains."}],"max_tokens":80}'
 
-mkdir -p "$OUT"
+mkdir -p "$OUT"; rm -f "$OUT"/*.samples
+
+CONFIGS=("baseline" "history" "history+readahead")
+env_for() {
+    case "$1" in
+        baseline)           echo "GGML_CUDA_MOE_CACHE_HISTORY=/nonexistent GGML_CUDA_MOE_CACHE_READAHEAD=0" ;;
+        history)            echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_READAHEAD=0" ;;
+        history+readahead)  echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_READAHEAD=1" ;;
+    esac
+}
 
 stop_server() {
     systemctl stop "llama-bench-$PORT.scope" >/dev/null 2>&1
@@ -30,60 +53,73 @@ stop_server() {
     sleep 2
 }
 
-# $1 = label, $2..$n = env assignments
-run_config() {
-    local label=$1; shift
-    local results=()
-    for rep in $(seq 1 "$REPS"); do
-        stop_server
-        sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
-
-        systemd-run --scope --quiet -p MemoryMax="$CAP" -p MemorySwapMax=0 \
-            --unit="llama-bench-$PORT" env "$@" \
-            "$BIN" -m "$MODEL" -ncmoe "$NCMOE" --jinja --moe-cache auto \
-            -c "$CTX" -fit off --host 127.0.0.1 --port "$PORT" \
-            > "$OUT/$label-$rep.log" 2>&1 &
-        disown
-
-        local up=0
-        for _ in $(seq 1 100); do
-            curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { up=1; break; }
-            sleep 3
-        done
-        [ "$up" = 1 ] || { echo "  $label rep$rep: server did not start"; continue; }
-
-        # One warm-up request, then the measured one - so we time steady-state
-        # decode rather than whatever the very first tokens happened to cost.
-        curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H "Content-Type: application/json" \
-            -d "$PROMPT" -o /dev/null --max-time 900
-        curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H "Content-Type: application/json" \
-            -d "$PROMPT" -o "$OUT/$label-$rep.json" --max-time 900
-
-        local v
-        v=$(python3 -c "
-import json
-try:
-    print('%.2f' % json.load(open('$OUT/$label-$rep.json'))['timings']['predicted_per_second'])
-except Exception:
-    print('nan')")
-        echo "  $label rep$rep: $v tok/s"
-        [ "$v" != "nan" ] && results+=("$v")
-    done
+measure() { # $1 label, $2 rep
+    local label=$1 rep=$2
     stop_server
+    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
 
-    printf '%s\n' "${results[@]}" | python3 -c "
-import sys, statistics
-xs=[float(x) for x in sys.stdin if x.strip()]
-if not xs:
-    print('$label: no data'); raise SystemExit
-xs.sort()
-print('RESULT %-22s n=%d  median %6.2f   min %6.2f   max %6.2f   spread %.0f%%'
-      % ('$label', len(xs), statistics.median(xs), xs[0], xs[-1],
-         100*(xs[-1]-xs[0])/max(xs[0],1e-9)))"
+    # shellcheck disable=SC2046
+    systemd-run --scope --quiet -p MemoryMax="$CAP" -p MemorySwapMax=0 \
+        --unit="llama-bench-$PORT" env $(env_for "$label") \
+        "$BIN" -m "$MODEL" -ncmoe "$NCMOE" --jinja --moe-cache auto \
+        -c "$CTX" -fit off --host 127.0.0.1 --port "$PORT" \
+        > "$OUT/$label-$rep.log" 2>&1 &
+    disown
+
+    local up=0
+    for _ in $(seq 1 100); do
+        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && { up=1; break; }
+        sleep 3
+    done
+    [ "$up" = 1 ] || { echo "  $label rep$rep: server did not start"; return; }
+
+    local out
+    for i in $(seq 0 "$WARM"); do
+        curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H "Content-Type: application/json" \
+            -d "$PROMPT" -o "$OUT/tmp.json" --max-time 900
+        out=$(python3 -c "
+import json
+try:    print('%.2f' % json.load(open('$OUT/tmp.json'))['timings']['predicted_per_second'])
+except Exception: print('nan')")
+        [ "$out" = "nan" ] && continue
+        if [ "$i" = 0 ]; then
+            echo "$out" >> "$OUT/$label.cold.samples"
+            echo "  $label rep$rep: cold $out tok/s"
+        else
+            echo "$out" >> "$OUT/$label.warm.samples"
+        fi
+    done
 }
 
-echo "=== moe-cache residency benchmark: cap=$CAP reps=$REPS ncmoe=$NCMOE ctx=$CTX ==="
-run_config baseline          GGML_CUDA_MOE_CACHE_HISTORY=/nonexistent-baseline GGML_CUDA_MOE_CACHE_READAHEAD=0
-run_config history           GGML_CUDA_MOE_CACHE_HISTORY="$HIST" GGML_CUDA_MOE_CACHE_READAHEAD=0
-run_config history+readahead GGML_CUDA_MOE_CACHE_HISTORY="$HIST" GGML_CUDA_MOE_CACHE_READAHEAD=1
-run_config history+ra+pin    GGML_CUDA_MOE_CACHE_HISTORY="$HIST" GGML_CUDA_MOE_CACHE_READAHEAD=1 GGML_CUDA_MOE_CACHE_PIN_MB=auto
+echo "=== moe-cache residency benchmark ==="
+echo "cap=$CAP reps=$REPS warm-per-start=$WARM ncmoe=$NCMOE ctx=$CTX (interleaved)"
+for rep in $(seq 1 "$REPS"); do
+    echo "--- round $rep/$REPS ---"
+    for cfg in "${CONFIGS[@]}"; do
+        measure "$cfg" "$rep"
+    done
+done
+stop_server
+
+echo
+echo "=== RESULTS ==="
+for cfg in "${CONFIGS[@]}"; do
+    python3 - "$cfg" "$OUT" <<'PY'
+import sys, statistics, os
+cfg, out = sys.argv[1], sys.argv[2]
+def load(kind):
+    p = os.path.join(out, f"{cfg}.{kind}.samples")
+    if not os.path.exists(p): return []
+    return [float(l) for l in open(p) if l.strip()]
+def fmt(xs):
+    xs = sorted(xs)
+    med = statistics.median(xs)
+    iqr = (statistics.quantiles(xs, n=4)[0], statistics.quantiles(xs, n=4)[2]) if len(xs) >= 4 else (xs[0], xs[-1])
+    return "n=%2d  median %6.2f  IQR %6.2f-%-6.2f  min %6.2f  max %6.2f" % (
+        len(xs), med, iqr[0], iqr[1], xs[0], xs[-1])
+c, w = load("cold"), load("warm")
+print("%-20s" % cfg)
+if c: print("    cold  " + fmt(c))
+if w: print("    warm  " + fmt(w))
+PY
+done
