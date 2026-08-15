@@ -3629,3 +3629,56 @@ a weak version of it to the kernel - weak because an advisory hint can only
 lower a page's priority, never pin the hot ones. An explicit residency budget
 would decide directly. Note the sweep does not apply to the measurement above:
 it lives on the CUDA moe-cache path, and this test ran `-ngl 0`.
+
+# Pinning hot CPU experts with mlock: built, measured, default-off (2026-08-15)
+
+The 21x collapse above has an obvious-looking fix: the kernel evicts by recency
+and cannot tell a hot expert from one never selected, but moe-cache already
+knows. So rank experts by how often they are actually selected and hold the top
+of that ranking down with `mlock`, which is the one thing `MADV_COLD` cannot do -
+an advisory hint lowers a page's priority, it never protects.
+
+Built exactly that: per-expert selection counts on the existing hot path (the
+same tracking the MADV_COLD sweep already needed), a descending rank, and an
+mlock/munlock pass in the periodic sweep that keeps the pinned set tracking the
+workload. Budget derived from MemAvailable, additionally clamped by the process's
+own cgroup `memory.max` - pinned pages are unreclaimable, so budgeting against
+the host's figure inside a small cgroup is precisely how a slow-but-working
+server becomes an OOM kill.
+
+**Two trigger bugs found on the way, both the same shape as the CUDA-graph
+mistake earlier: right logic, wrong place.**
+1. The sweep ran only on the fill worker's *idle* timeout. Under real memory
+   pressure that thread is never idle - every miss queues a fill - so a 5 GiB
+   -capped run with 69150 reclaim events completed without a single sweep.
+   Fixed by driving it on elapsed time regardless of queue state.
+2. Pinning sat *after* the sweep's dormancy gate (`age_now < cold_after`,
+   default 120s), so it never ran in sessions shorter than two minutes. Which
+   experts are hot is known from the first tokens and pinning is wanted
+   immediately; only the cold-advise half needs to wait. Split the two gates.
+
+**Then it worked, and the result was negative.** With pinning engaged (365
+experts, 639 of 640 MiB budget, releasing 188 and 78 on later sweeps as the hot
+set shifted - so the set really was tracking the workload):
+
+| 5 GiB cap, generation tok/s | run 1 | run 2 | run 3 | run 4 | reclaim events |
+| --- | --- | --- | --- | --- | --- |
+| pinning off | 2.20 | 8.73 | 11.74 | - | 69150 |
+| pinning on  | 2.03 | 7.59 | 10.30 | 11.40 | 83058 |
+
+Slightly worse, with *more* reclaim. The arithmetic explains it: an eighth of a
+5 GiB cap is 640 MiB against ~12 GiB of CPU-side experts, about 5% of the
+working set. A single token touches 8 experts x 23 layers ~ 405 MiB, but across
+hundreds of tokens the union of hot experts is far larger than the 365 that fit.
+Pinning 5% cannot fix a 3x shortfall, and because pinned pages are unreclaimable
+it shrinks the pool every other page competes for - so it costs slightly more
+than it saves.
+
+**Shipped default-off** (`GGML_CUDA_MOE_CACHE_PIN_MB=<N>|auto` to enable),
+because a feature that measures worse than not having it should not be on by
+default no matter how good the reasoning behind it was. The reasoning still
+looks right for a *modest* shortfall, where the budget covers a real share of
+the hot set; it is wrong for the 3x shortfall tested here. The honest summary is
+that explicit residency control needs to own most of the working set to beat the
+kernel, which is an argument for DwarfStar's explicit read/write buffer rather
+than for hinting at the page cache from the side.
