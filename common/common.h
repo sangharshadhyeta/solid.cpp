@@ -663,6 +663,10 @@ struct common_params {
     // server-context.cpp). A fixed 8 GiB default is wrong in both directions -
     // it's most of a 16 GiB laptop and a rounding error on a 512 GiB server.
     bool    cache_ram_auto      = true;
+    // Disk tier for the prompt cache. Empty = disabled. The RAM cache dies with
+    // the process, so every restart re-prefills prompts it had already computed.
+    std::string cache_disk_dir;
+    int32_t cache_disk_mib      = -1;    // -1 = derive from free disk space
     bool    token_freq_log      = true;  // log real generated-token frequency for FR-Spec-style MTP draft-vocab trimming
 
     std::string hostname      = "127.0.0.1";

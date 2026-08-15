@@ -1499,6 +1499,42 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            // Disk tier. Fingerprint the model so a state is never restored into
+            // a different one - that isn't stale, it's wrong.
+            if (!params_base.cache_disk_dir.empty()) {
+                uint64_t fp = 1469598103934665603ull;
+                for (char c : params_base.model.path) {
+                    fp = (fp ^ (uint8_t) c) * 1099511628211ull;
+                }
+                fp ^= (uint64_t) n_ctx * 1099511628211ull;
+                fp ^= (uint64_t) llama_model_n_params(model_tgt);
+
+                prompt_cache->disk_dir         = params_base.cache_disk_dir;
+                prompt_cache->disk_fingerprint = fp;
+
+                if (params_base.cache_disk_mib >= 0) {
+                    prompt_cache->disk_limit = (size_t) params_base.cache_disk_mib << 20;
+                } else {
+                    // Same principle as the RAM limit: derive it, don't guess.
+                    // An eighth of what's actually free where the cache lives,
+                    // clamped to [1 GiB, 256 GiB]. States are large, so a fixed
+                    // default would either be useless or fill the disk.
+                    std::error_code ec;
+                    std::filesystem::create_directories(params_base.cache_disk_dir, ec);
+                    const auto si = std::filesystem::space(params_base.cache_disk_dir, ec);
+                    const size_t avail = ec ? 0 : (size_t) si.available;
+                    prompt_cache->disk_limit = avail
+                        ? std::min<size_t>(256ull << 30, std::max<size_t>(1ull << 30, avail / 8))
+                        : 0;
+                    SRV_INF("prompt cache: disk limit derived from free space: %.1f GiB (%.1f GiB free in '%s')\n",
+                            prompt_cache->disk_limit / (1024.0 * 1024.0 * 1024.0),
+                            avail / (1024.0 * 1024.0 * 1024.0), params_base.cache_disk_dir.c_str());
+                }
+
+                prompt_cache->disk_scan();
+                prompt_cache->disk_trim();
+            }
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }

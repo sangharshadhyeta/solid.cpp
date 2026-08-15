@@ -1775,6 +1775,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
         }
     }
 
+    if (it_best == states.end()) {
+        // Nothing better in RAM - the disk tier may still hold this prompt from
+        // before a restart, which is the whole point of persisting it.
+        if (disk_load(prompt, tokens_new, ctx_tgt, ctx_dft, id_slot)) {
+            return true;
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
@@ -1821,6 +1829,14 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 }
 
 void server_prompt_cache::update() {
+    // Persist before trimming, so an entry about to be evicted from RAM still
+    // makes it to disk rather than being lost.
+    if (!disk_dir.empty()) {
+        for (const auto & state : states) {
+            disk_save(state);
+        }
+    }
+
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
             SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
@@ -1850,5 +1866,300 @@ void server_prompt_cache::update() {
     for (const auto & state : states) {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+    }
+}
+
+//
+// prompt cache: disk tier
+//
+// Format, little-endian, one file per cached prompt:
+//   u64 magic 'SPCACHE1'
+//   u32 version
+//   u64 fingerprint   - model identity; a state restored into a different model
+//                       is not merely stale but wrong, so entries whose
+//                       fingerprint doesn't match are ignored outright
+//   u64 n_tokens_bytes, tokens blob (server_tokens::serialize)
+//   u64 main_bytes, u64 drft_bytes, then the two state blobs
+//
+// Tokens come first and carry their own length so a scan can build the index by
+// reading a few KiB per file and seeking past the state blob, which is the part
+// measured in gigabytes.
+//
+// Checkpoints are deliberately not persisted in this version: they are an
+// optimisation for context shifting that the server regenerates on demand, and
+// carrying them would roughly double the on-disk size for no correctness gain.
+
+static constexpr uint64_t SERVER_PROMPT_DISK_MAGIC   = 0x3145484341435053ull; // "SPCACHE1"
+static constexpr uint32_t SERVER_PROMPT_DISK_VERSION = 1;
+
+template <typename T> static void spc_write_pod(std::ofstream & f, const T & v) {
+    f.write(reinterpret_cast<const char *>(&v), sizeof(v));
+}
+
+template <typename T> static bool spc_read_pod(std::ifstream & f, T & v) {
+    return (bool) f.read(reinterpret_cast<char *>(&v), sizeof(v));
+}
+
+void server_prompt_cache::disk_scan() {
+    disk_entries.clear();
+
+    if (disk_dir.empty()) {
+        return;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(disk_dir, ec);
+    if (ec) {
+        SRV_WRN("prompt cache: cannot create disk cache dir '%s' (%s), disabling disk tier\n",
+                disk_dir.c_str(), ec.message().c_str());
+        disk_dir.clear();
+        return;
+    }
+
+    size_t total = 0;
+    for (const auto & de : std::filesystem::directory_iterator(disk_dir, ec)) {
+        if (ec || !de.is_regular_file()) {
+            continue;
+        }
+        if (de.path().extension() != ".spc") {
+            continue;
+        }
+
+        std::ifstream f(de.path(), std::ios::binary);
+        uint64_t magic = 0, fingerprint = 0, tokens_bytes = 0, main_bytes = 0, drft_bytes = 0;
+        uint32_t version = 0;
+        if (!f || !spc_read_pod(f, magic) || magic != SERVER_PROMPT_DISK_MAGIC ||
+            !spc_read_pod(f, version) || version != SERVER_PROMPT_DISK_VERSION ||
+            !spc_read_pod(f, fingerprint)) {
+            continue;
+        }
+        if (fingerprint != disk_fingerprint) {
+            continue; // another model - not ours to restore
+        }
+        if (!spc_read_pod(f, tokens_bytes) || tokens_bytes == 0 ||
+            tokens_bytes > (64ull << 20) || tokens_bytes % sizeof(llama_token) != 0) {
+            continue;
+        }
+        llama_tokens packed(tokens_bytes / sizeof(llama_token));
+        if (!f.read(reinterpret_cast<char *>(packed.data()), tokens_bytes)) {
+            continue;
+        }
+        if (!spc_read_pod(f, main_bytes) || !spc_read_pod(f, drft_bytes)) {
+            continue;
+        }
+
+        try {
+            server_prompt_disk_entry entry;
+            entry.path       = de.path().string();
+            entry.tokens     = server_tokens::deserialize(packed, false);
+            entry.size_bytes = main_bytes + drft_bytes;
+            total += entry.size_bytes;
+            disk_entries.push_back(std::move(entry));
+        } catch (const std::exception &) {
+            continue; // corrupt or unsupported - leave it alone, disk_trim will age it out
+        }
+    }
+
+    if (!disk_entries.empty()) {
+        SRV_INF("prompt cache: %zu entr%s on disk (%.3f MiB) in '%s'\n",
+                disk_entries.size(), disk_entries.size() == 1 ? "y" : "ies",
+                total / (1024.0 * 1024.0), disk_dir.c_str());
+    }
+}
+
+void server_prompt_cache::disk_save(const server_prompt_cache_state & state) {
+    if (disk_dir.empty() || state.data.size() == 0) {
+        return;
+    }
+
+    std::vector<char> packed;
+    try {
+        packed = state.prompt.tokens.serialize();
+    } catch (const std::exception & e) {
+        SRV_WRN("prompt cache: cannot serialize tokens for disk (%s)\n", e.what());
+        return;
+    }
+    if (packed.empty()) {
+        return;
+    }
+
+    // Name by content hash of the token blob, so an identical prompt maps to one
+    // file rather than accumulating duplicates across restarts.
+    uint64_t h = 1469598103934665603ull;
+    for (char c : packed) {
+        h = (h ^ (uint8_t) c) * 1099511628211ull;
+    }
+    for (const auto & e : disk_entries) {
+        if (e.path.size() >= 20 && e.path.find(string_format("%016llx", (unsigned long long) h)) != std::string::npos) {
+            return; // already persisted
+        }
+    }
+
+    const std::string path     = disk_dir + "/" + string_format("%016llx", (unsigned long long) h) + ".spc";
+    const std::string path_tmp = path + ".tmp";
+
+    {
+        std::ofstream f(path_tmp, std::ios::binary | std::ios::trunc);
+        if (!f) {
+            SRV_WRN("prompt cache: cannot write '%s'\n", path_tmp.c_str());
+            return;
+        }
+        const uint64_t tokens_bytes = packed.size();
+        const uint64_t main_bytes   = state.data.main.size();
+        const uint64_t drft_bytes   = state.data.drft.size();
+
+        spc_write_pod(f, SERVER_PROMPT_DISK_MAGIC);
+        spc_write_pod(f, SERVER_PROMPT_DISK_VERSION);
+        spc_write_pod(f, disk_fingerprint);
+        spc_write_pod(f, tokens_bytes);
+        f.write(packed.data(), packed.size());
+        spc_write_pod(f, main_bytes);
+        spc_write_pod(f, drft_bytes);
+        if (main_bytes) f.write(reinterpret_cast<const char *>(state.data.main.data()), main_bytes);
+        if (drft_bytes) f.write(reinterpret_cast<const char *>(state.data.drft.data()), drft_bytes);
+        if (!f) {
+            f.close();
+            std::error_code ec;
+            std::filesystem::remove(path_tmp, ec);
+            SRV_WRN("prompt cache: failed writing '%s' (out of disk space?)\n", path_tmp.c_str());
+            return;
+        }
+    }
+
+    // Rename only after a complete write, so a crash mid-save can never leave a
+    // truncated file that a later scan would treat as valid.
+    std::error_code ec;
+    std::filesystem::rename(path_tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path_tmp, ec);
+        return;
+    }
+
+    try {
+        server_prompt_disk_entry entry;
+        entry.path       = path;
+        entry.tokens     = state.prompt.tokens.clone();
+        entry.size_bytes = state.data.size();
+        disk_entries.push_back(std::move(entry));
+    } catch (const std::exception &) {
+        // index update failed - the file is still valid and a later scan finds it
+    }
+
+    SRV_TRC("prompt cache: persisted %d tokens to disk (%.3f MiB)\n",
+            state.prompt.n_tokens(), state.data.size() / (1024.0 * 1024.0));
+
+    disk_trim();
+}
+
+bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens & tokens_new,
+        llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+    if (disk_dir.empty() || disk_entries.empty()) {
+        return false;
+    }
+
+    // Same scoring rule as the RAM tier: prefer the entry that shares the most
+    // of the incoming prompt, and don't bother restoring one that would throw
+    // away most of what it cached.
+    size_t best = disk_entries.size();
+    float  f_sim_best = float(prompt.tokens.get_common_prefix(tokens_new)) / std::max<size_t>(1, tokens_new.size());
+    for (size_t i = 0; i < disk_entries.size(); i++) {
+        const int   lcp   = disk_entries[i].tokens.get_common_prefix(tokens_new);
+        const float f_keep = float(lcp) / std::max<size_t>(1, disk_entries[i].tokens.size());
+        const float f_sim  = float(lcp) / std::max<size_t>(1, tokens_new.size());
+        if (f_keep < 0.25f) {
+            continue;
+        }
+        if (f_sim > f_sim_best) {
+            f_sim_best = f_sim;
+            best = i;
+        }
+    }
+    if (best == disk_entries.size()) {
+        return false;
+    }
+
+    server_prompt_disk_entry & entry = disk_entries[best];
+
+    std::ifstream f(entry.path, std::ios::binary);
+    uint64_t magic = 0, fingerprint = 0, tokens_bytes = 0, main_bytes = 0, drft_bytes = 0;
+    uint32_t version = 0;
+    if (!f || !spc_read_pod(f, magic) || magic != SERVER_PROMPT_DISK_MAGIC ||
+        !spc_read_pod(f, version) || version != SERVER_PROMPT_DISK_VERSION ||
+        !spc_read_pod(f, fingerprint) || fingerprint != disk_fingerprint ||
+        !spc_read_pod(f, tokens_bytes)) {
+        return false;
+    }
+    f.seekg((std::streamoff) tokens_bytes, std::ios::cur);
+    if (!spc_read_pod(f, main_bytes) || !spc_read_pod(f, drft_bytes)) {
+        return false;
+    }
+
+    std::vector<uint8_t> main_data(main_bytes);
+    if (main_bytes && !f.read(reinterpret_cast<char *>(main_data.data()), main_bytes)) {
+        return false;
+    }
+    std::vector<uint8_t> drft_data(drft_bytes);
+    if (drft_bytes && !f.read(reinterpret_cast<char *>(drft_data.data()), drft_bytes)) {
+        return false;
+    }
+
+    const int64_t t_start = ggml_time_us();
+
+    if (main_bytes) {
+        if (llama_state_seq_set_data_ext(ctx_tgt, main_data.data(), main_bytes, id_slot, 0) != main_bytes) {
+            SRV_WRN("prompt cache: failed to restore %llu bytes from disk\n", (unsigned long long) main_bytes);
+            return false;
+        }
+    }
+    if (drft_bytes && ctx_dft) {
+        if (llama_state_seq_set_data_ext(ctx_dft, drft_data.data(), drft_bytes, id_slot, 0) != drft_bytes) {
+            SRV_WRN("%s", "prompt cache: failed to restore draft state from disk\n");
+            return false;
+        }
+    }
+
+    prompt.tokens = entry.tokens.clone();
+    prompt.checkpoints.clear(); // not persisted - regenerated on demand
+
+    SRV_INF("prompt cache: restored %d tokens from disk in %.2f ms (%.3f MiB) - skipped a full prefill\n",
+            prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0,
+            (main_bytes + drft_bytes) / (1024.0 * 1024.0));
+
+    return true;
+}
+
+void server_prompt_cache::disk_trim() {
+    if (disk_dir.empty() || disk_limit == 0) {
+        return;
+    }
+
+    size_t total = 0;
+    for (const auto & e : disk_entries) {
+        total += e.size_bytes;
+    }
+    if (total <= disk_limit) {
+        return;
+    }
+
+    // Oldest first, matching the RAM tier's eviction order.
+    std::sort(disk_entries.begin(), disk_entries.end(),
+            [](const server_prompt_disk_entry & a, const server_prompt_disk_entry & b) {
+                std::error_code ec1, ec2;
+                const auto ta = std::filesystem::last_write_time(a.path, ec1);
+                const auto tb = std::filesystem::last_write_time(b.path, ec2);
+                return ta < tb;
+            });
+
+    size_t removed = 0;
+    while (total > disk_limit && !disk_entries.empty()) {
+        std::error_code ec;
+        std::filesystem::remove(disk_entries.front().path, ec);
+        total -= std::min(total, disk_entries.front().size_bytes);
+        disk_entries.erase(disk_entries.begin());
+        removed++;
+    }
+    if (removed) {
+        SRV_INF("prompt cache: evicted %zu disk entr%s to stay under %.3f MiB\n",
+                removed, removed == 1 ? "y" : "ies", disk_limit / (1024.0 * 1024.0));
     }
 }

@@ -3682,3 +3682,46 @@ the hot set; it is wrong for the 3x shortfall tested here. The honest summary is
 that explicit residency control needs to own most of the working set to beat the
 kernel, which is an argument for DwarfStar's explicit read/write buffer rather
 than for hinting at the page cache from the side.
+
+# Disk-persisted prompt cache: writes and restores, not yet adopted (2026-08-15)
+
+The RAM prompt cache dies with the process, so every restart re-prefills prompts
+it had already computed - the expensive half of a request, and the half most
+likely to repeat. This is the one concrete capability the DwarfStar review found
+that we lacked ("KV cache as a disk citizen").
+
+Built: a disk tier under `--cache-disk DIR`, one file per cached prompt, keyed by
+a content hash of the token blob. Size limit derived from free disk space (an
+eighth, clamped to [1 GiB, 256 GiB]) unless `--cache-disk-size` is given, same
+principle as the RAM limit. Files carry a model fingerprint (path + n_ctx +
+parameter count) and entries that don't match are ignored outright - a state
+restored into a different model isn't stale, it's wrong. Writes go to a `.tmp`
+and are renamed only on completion, so a crash mid-save can't leave a truncated
+file that a later scan would trust. The scan reads only each file's header and
+token list, seeking past the state blob, so building the index costs a few KiB
+per entry rather than gigabytes.
+
+**Status: half working, and shipped opt-in because of it.** Measured end to end
+on a 3623-token prompt:
+
+- cold prefill: 5887 ms
+- state persisted to disk: 271 MiB, written on cache update
+- after a full server restart, the scan found the entry and restored it:
+  `restored 3642 tokens from disk in 26.95 ms` - a 200x saving against
+  re-prefilling, and the number that makes the feature worth finishing
+
+- **but the request still re-prefilled anyway** (5760 ms, `cached_tokens: 0`).
+
+So the persistence layer is correct and fast; the restored state simply isn't
+being adopted by the slot afterwards. The in-RAM path on the same build is fine
+(106 ms, 3622 cached on a repeat), which localises the bug to the disk path's
+hand-off rather than to caching generally: `disk_load()` restores via
+`llama_state_seq_set_data_ext` into `id_slot` and sets `prompt.tokens`, mirroring
+what the RAM path does with a move, yet the slot proceeds to re-process the
+prompt. The likely difference is the RAM path moving the whole `server_prompt`
+(tokens *and* checkpoints) where the disk path clears checkpoints, or a sequence
+-id mismatch between the restore target and the slot's actual sequence. Not yet
+run to ground.
+
+Left default-off (`--cache-disk` is opt-in), so nothing changes for anyone who
+doesn't ask for it, and documented here rather than quietly shipped as done.
