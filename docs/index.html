@@ -220,6 +220,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 <div class="topnav-inner">
 <a class="brand" href="#"><img src="solid.cpp.jpeg" alt=""> solid.cpp</a>
 <nav>
+<a class="nav-link" href="#run-it">Run it</a>
 <a class="nav-link" href="#proof">Proof</a>
 <a class="nav-link" href="#brain-atlas">Brain / Atlas</a>
 <a class="nav-link" href="#docs">Docs</a>
@@ -244,6 +245,47 @@ footer a{color:var(--muted);text-decoration:underline;}
 <span class="pill">CUDA · Metal · Vulkan · CPU</span>
 </div>
 </header>
+
+<section id="run-it">
+<div class="eyebrow">Everything on, one command</div>
+<h2>Run it the way it was measured</h2>
+<p class="section-lede">Every feature on this page, enabled together. This is the exact command the numbers below
+were taken from &mdash; a 26B MoE model at 64k context on a single 12GB RTX 3060.</p>
+
+<pre><code>llama-server \
+  -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
+  -md mtp-gemma-4-26B-A4B-it-Q8_0.gguf \
+  --spec-type draft-mtp -bs --jinja \
+  --moe-cache auto \
+  -c 65536 \
+  -ctk q8_0 -ctv q8_0 \
+  --expert-atlas-file expert-atlas.json \
+  --host 0.0.0.0 --port 8080</code></pre>
+
+<div class="tablewrap">
+<table>
+<colgroup><col style="width:34%"><col style="width:66%"></colgroup>
+<thead><tr><th>Flag</th><th>What it turns on</th></tr></thead>
+<tbody>
+<tr><td><code>-c 65536</code></td><td>The context you want. Expert placement is derived <em>from</em> this &mdash; ask for more and the fork moves experts to CPU RAM to fit it, rather than silently shrinking your context. <strong>No <code>-ncmoe</code> needed:</strong> it resolved to 21 CPU layers on its own.</td></tr>
+<tr><td><code>--moe-cache auto</code></td><td>GPU-resident cache for the CPU-offloaded experts, LFRU eviction. 79% hit rate warm. Also enables router-lookahead prefetch, which predicts the next layer's experts and fetches them during the current layer's compute.</td></tr>
+<tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
+<tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
+<tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
+<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view real measured topic positions (21&times;128 grid) instead of an arbitrary layout. Generate it once with <code>llama-expert-atlas</code>.</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="note">Measured on that command: <strong>~64 tok/s</strong> generation warm (61.8&ndash;66.3 across runs), 4 concurrent slots.
+The first request after startup runs nearer 35 tok/s and climbs as the expert cache fills &mdash; the steady-state
+number is the honest one to plan around, and the cold one is the honest one to expect.</p>
+
+<p class="note">Two optional extras, deliberately not in the line above. <code>--cache-disk DIR</code> persists the
+prompt cache so a restart costs 271ms instead of 5.8s &mdash; but it writes prompt content to disk (owner-only,
+model-fingerprinted), so it is opt-in on purpose. And <code>GGML_CUDA_VMM_KV=1</code> reserves KV lazily,
+committing only what a conversation actually reaches.</p>
+</section>
 
 <section>
 <div class="eyebrow">Why this exists</div>
