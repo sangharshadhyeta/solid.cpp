@@ -278,6 +278,45 @@ check what the pair does to the number the user actually cares about.</p>
 </section>
 
 <section>
+<div class="eyebrow">Measured</div>
+<h2>What this actually buys, on one 12GB card</h2>
+<p>Every number below is from the same machine - an RTX 3060 with 12GB, a 26B MoE model, a SATA SSD -
+measured before and after, and reported whether or not it flattered us.</p>
+
+<div class="stat-row">
+  <div class="stat-card"><div class="num">16&times;</div><div class="label">usable context<br>4,096 &rarr; 65,536 tokens</div></div>
+  <div class="stat-card"><div class="num">4&times;</div><div class="label">concurrent slots<br>1 &rarr; 4</div></div>
+  <div class="stat-card"><div class="num">21&times;</div><div class="label">faster restarts<br>5,775ms &rarr; 271ms prefill</div></div>
+</div>
+<div class="stat-row">
+  <div class="stat-card"><div class="num">1<small>&nbsp;GiB</small></div><div class="label">VRAM freed by q8_0 KV<br>spent on 2 more expert layers</div></div>
+  <div class="stat-card"><div class="num">6/6</div><div class="label">byte-identical outputs<br>quantized vs f16 KV</div></div>
+  <div class="stat-card"><div class="num">3/3</div><div class="label">needle recall at 24.7k tokens<br>10% / 50% / 90% depth</div></div>
+</div>
+
+<p><strong>Context that follows the request, not the flag.</strong> Placement used to be chosen first and
+context shrunk to fit around it; now the requested context is fixed and expert placement gives way to it.
+Same hardware, 16&times; the context and 4&times; the concurrency.</p>
+
+<p><strong>Restarts stop costing a re-read.</strong> The prompt cache now persists to disk keyed by content
+hash, so a 3,600-token document that cost 5.8s to process is restored in 0.27s after a full restart. Files
+are owner-only and model-fingerprinted - they contain your prompts, and the docs say so plainly.</p>
+
+<p><strong>KV cache quantization that pays for itself twice.</strong> Symmetric q8_0 halves the conversation
+cache (2,180 &rarr; 1,158 MiB), and because placement is derived from <em>measured</em> memory rather than a
+fixed flag, the freed gigabyte automatically becomes two more layers of experts on the GPU - no code, no
+tuning. Verified lossless here: 6/6 byte-identical outputs at temperature 0, and full needle recall at 10/50/90%
+depth of a 24,700-token prompt.</p>
+
+<p class="note">And the ones that didn't work, because a fork that only publishes its wins is the thing this
+project exists not to be: pinning hot experts in RAM measured <em>worse</em> than doing nothing and ships
+disabled; page-cache readahead gained 5% on the first request and cost 8% thereafter, so it ships disabled
+too; and a claimed &ldquo;+21% to +50%&rdquo; speedup was retracted outright once measured properly - it was
+a single noisy sample, and the real effect is about 5%. The benchmark harness that caught it is in the
+repository.</p>
+</section>
+
+<section>
 <div class="eyebrow">What this is</div>
 <h2>A fork that measures its own claims</h2>
 <p><code>solid.cpp</code> tracks <a href="https://github.com/ggml-org/llama.cpp">llama.cpp</a> upstream directly and
