@@ -4366,3 +4366,26 @@ survey above says which predictor to port and what recall to expect.
 Recorded rather than built, deliberately. Three mechanisms today failed by
 addressing capacity when the constraint was elsewhere; building a fourth that
 addresses timing while capacity binds would be the same error inverted.
+
+
+## Credit where decisions came from (2026-08-16)
+
+Recorded because several of these changed what we did *not* build, which is
+harder to see later than what we did:
+
+- **antirez/ds4 (DwarfStar)** - the three-tier structure this fork arrived at
+  independently, and the explicit read/write buffer we measured our mmap-based
+  approach against. Reviewing it corrected the premise it was reviewed under
+  (it claims no 8GB support; its published figures are from a 128GB Mac).
+- **vLLM** - PagedAttention, deliberately not ported. Its saving was taken via
+  CUDA's virtual-memory API instead, which keeps addresses contiguous so no
+  attention kernel changes. Its automatic prefix caching already existed here.
+- **JustVugg/colibri issue #200** - the two-step shared-expert router predictor,
+  best recall in this space at 76.7%, and its finding that better prediction
+  bought no throughput when cache capacity bound first. Checked against our own
+  saturated cache before writing a predictor, and that check is why none was
+  written.
+- **Speculating Experts / PILOT / Fate / FineMoE / SP-MoE** - established that
+  the field prefetches by prediction rather than holding experts resident, and
+  that realistic gains are around 14%, not the order of magnitude assumed here.
+  Three residency experiments ship disabled because of that correction.
