@@ -2298,6 +2298,27 @@ bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out
     return true;
 }
 
+bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
+    out = common_moe_cache_summary{};
+    if (!ggml_moe_cache.get_summary) {
+        return false; // no CUDA backend registered, or built without it
+    }
+    ggml_moe_cache_summary raw{};
+    ggml_moe_cache.get_summary(&raw);
+    out.hits             = raw.hits;
+    out.misses           = raw.misses;
+    out.evictions        = raw.evictions;
+    out.fill_failures    = raw.fill_failures;
+    out.admission_skips  = raw.admission_skips;
+    out.slots_used       = raw.slots_used;
+    out.slots_total      = raw.slots_total;
+    out.protected_slots  = raw.protected_slots;
+    out.avg_heat         = raw.avg_heat;
+    out.allocated_bytes  = raw.allocated_bytes;
+    out.budget_bytes     = raw.budget_bytes;
+    return raw.slots_total > 0;
+}
+
 // moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults
 // from a live hint set by llama_context (real n_seq_max, floored at 8,
 // ceilinged at 64 - see moe-cache.cu's MOE_CACHE_MAX_BATCH_CEILING) - but
@@ -2414,6 +2435,12 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     }
 
     common_maybe_autoplace_moe_cpu(params.model.path.c_str(), params, mparams, cparams);
+
+    // mparams.n_gpu_layers is otherwise a local copy that gets discarded once the real model/context
+    // are built below - write the resolved value back so callers (e.g. the server's /props endpoint)
+    // can report what --fit actually decided, not just the -1/"auto" the user passed in. Mirrors the
+    // same write-back already done for tensor_buft_overrides above.
+    params.n_gpu_layers = mparams.n_gpu_layers;
 
     // Both run after autoplace, not before: the calibration-cache lookup
     // inside it can override params.speculative.draft.n_max to the real

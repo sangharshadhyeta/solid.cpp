@@ -51,6 +51,7 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+    int32_t model_n_expert; // 0 for a dense (non-MoE) model
 };
 
 enum server_state {

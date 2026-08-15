@@ -174,6 +174,25 @@
 								</Table.Row>
 							{/if}
 
+							<!-- Experts (MoE) -->
+							{#if serverProps.solid_cpp?.n_expert}
+								<Table.Row>
+									<Table.Cell class="h-10 align-middle font-medium">Experts</Table.Cell>
+
+									<Table.Cell>
+										{formatNumber(serverProps.solid_cpp.n_expert)} per layer
+										{#if serverProps.solid_cpp.n_cpu_moe}
+											<span class="text-muted-foreground"
+												>&middot; {serverProps.solid_cpp.n_cpu_moe} layer{serverProps.solid_cpp
+													.n_cpu_moe === 1
+													? ''
+													: 's'} CPU-offloaded (moe-cache)</span
+											>
+										{/if}
+									</Table.Cell>
+								</Table.Row>
+							{/if}
+
 							<!-- Model Size -->
 							{#if modelMeta?.size}
 								<Table.Row>
