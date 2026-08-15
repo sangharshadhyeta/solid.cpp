@@ -1598,6 +1598,56 @@ static void moe_cache_prewarm_from_history(
         MOE_CACHE_LOG("[moe-cache] CUDA%d pre-warmed %zu expert(s) from previous runs' usage history\n",
                 device.physical, warmed);
     }
+
+    // Second tier of the same decision: the experts history says are hot but
+    // that did not fit in VRAM will be served from CPU RAM, and on a
+    // memory-pressured host those pages are faulted in one scattered read at a
+    // time - measured as the actual cost of the 21x collapse, against a disk
+    // that reads 513 MB/s sequentially. MADV_WILLNEED asks the kernel to read
+    // them ahead in bulk instead.
+    //
+    // Deliberately WILLNEED and not mlock. Pinning was tried and measured worse
+    // (see the notes): pinned pages cannot be reclaimed, so they shrink the pool
+    // every other page competes for, and a budget small enough to be safe is too
+    // small to cover the working set. An advisory hint has no such failure mode -
+    // if RAM is short the kernel simply declines, and nothing else is starved.
+#if defined(__linux__)
+    static const bool readahead_enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_READAHEAD");
+        return !env || atoi(env) != 0; // on unless explicitly disabled
+    }();
+    static const long page_size_w = sysconf(_SC_PAGESIZE);
+    if (readahead_enabled && page_size_w > 0) {
+        size_t advised = 0, advised_bytes = 0;
+        for (const warm_candidate & c : ranked) {
+            auto it_base = base_of_layer.find(c.layer);
+            if (it_base == base_of_layer.end()) {
+                continue;
+            }
+            auto it_seen = device.seen_tensors.find(it_base->second);
+            if (it_seen == device.seen_tensors.end()) {
+                continue;
+            }
+            const size_t expert_size = it_seen->second.expert_size;
+            const uintptr_t begin = (uintptr_t) it_base->second + (uintptr_t) c.expert * expert_size;
+            const uintptr_t end   = begin + expert_size;
+            const uintptr_t first = (begin + page_size_w - 1) & ~((uintptr_t) page_size_w - 1);
+            const uintptr_t last  = end & ~((uintptr_t) page_size_w - 1);
+            if (last <= first) {
+                continue;
+            }
+            if (posix_madvise((void *) first, (size_t) (last - first), POSIX_MADV_WILLNEED) != 0) {
+                break; // not supported here - stop asking
+            }
+            advised++;
+            advised_bytes += (size_t) (last - first);
+        }
+        if (advised) {
+            MOE_CACHE_LOG("[moe-cache] CUDA%d asked the kernel to read ahead %zu historically-hot CPU expert(s) (%zu MiB)\n",
+                    device.physical, advised, advised_bytes >> 20);
+        }
+    }
+#endif
 }
 
 static void moe_cache_build_pending(
