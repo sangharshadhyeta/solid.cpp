@@ -284,7 +284,13 @@ llama_kv_cache::llama_kv_cache(
                 t->buffer = buf; // set dummy buffer for KV cache so that the backend scheduler won't try to allocate it
             }
         } else {
+#ifdef GGML_USE_CUDA
+            ggml_backend_cuda_vmm_next_alloc(true);
+#endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
+#ifdef GGML_USE_CUDA
+            ggml_backend_cuda_vmm_next_alloc(false);
+#endif
         }
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");

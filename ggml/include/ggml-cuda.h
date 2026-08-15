@@ -54,3 +54,7 @@ GGML_BACKEND_API bool   ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t bu
 // physical memory. Returns false if the mapping failed (out of memory).
 GGML_BACKEND_API bool   ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffer_t buffer);
+// Mark the next buffer allocation on this thread as eligible for lazy commit.
+// Only meaningful for allocations whose use lags their reservation (the KV
+// cache); weights are read in full at load and must never be lazy.
+GGML_BACKEND_API void ggml_backend_cuda_vmm_next_alloc(bool enable);

@@ -4090,8 +4090,19 @@ the buffer), tensor slices recorded at `init_tensor`, commit-on-access for every
 buffer API path, and a growth hook in `llama_kv_cache::apply_ubatch` that backs
 cells before kernels reach them. Behind `GGML_CUDA_VMM_KV=1`, default off.
 
-**Status: reserves correctly, crashes on use, and the cause is a one-line gating
-error rather than the design.** The buffer type applied VMM to any allocation
+**Status: fixed and working.** The gating error below was corrected by having
+the caller declare the allocation rather than the buffer type infer it from
+size: `ggml_backend_cuda_vmm_next_alloc(true)` is set around the KV cache's own
+allocation and nowhere else. Only the two KV buffers (680 and 478 MiB) are now
+lazy; the 6618 MiB weights buffer is untouched. Server loads and serves with
+zero CUDA errors.
+
+Worth noting what the freed memory does: total VRAM use went *up* (11703 vs 8639
+MiB eager), because moe-cache derives its budget from free VRAM and immediately
+spends the saving on a larger expert cache. That is the system behaving as
+designed - the KV saving is real, it just does not show up as a lower total.
+
+The original diagnosis, kept for the record: The buffer type applied VMM to any allocation
 over 64 MiB, so it captured the *model weights* buffer (6618 MiB) as well as the
 KV buffers (680 and 478 MiB). Weights are read in full immediately, so lazy
 commit is guaranteed to fault - the comment in the code says "deliberately not
