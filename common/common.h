@@ -658,6 +658,11 @@ struct common_params {
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    // When the user didn't pass --cache-ram, the value above is a placeholder:
+    // the real limit is derived from the host's actual free RAM at startup (see
+    // server-context.cpp). A fixed 8 GiB default is wrong in both directions -
+    // it's most of a 16 GiB laptop and a rounding error on a 512 GiB server.
+    bool    cache_ram_auto      = true;
     bool    token_freq_log      = true;  // log real generated-token frequency for FR-Spec-style MTP draft-vocab trimming
 
     std::string hostname      = "127.0.0.1";
