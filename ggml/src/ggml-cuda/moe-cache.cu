@@ -3734,6 +3734,29 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     break; // no eviction for speculation - see above
                 }
                 const moe_cache_key key{host_base, expert};
+
+                // Feed the same prediction to the host buffer. Its promotion
+                // signal was per-expert heat - backward-looking, and it tried to
+                // hold the whole hot set, which is the capacity approach that
+                // measured worse three times. A prediction says what is about to
+                // be needed, which turns the buffer into a small staging area
+                // for imminent work rather than a cache of what was recently
+                // popular: the same capacity-to-timing shift, one tier down.
+                //
+                // Queued for the worker rather than copied here - this runs on
+                // the decode path and a 1.4 MiB memcpy inline is exactly what
+                // made the buffer slow before.
+                if (moe_cache_host_budget_bytes() > 0) {
+                    auto res_it = device.residency.find(host_base);
+                    if (res_it != device.residency.end() &&
+                        (size_t) expert < res_it->second.host_slot.size() &&
+                        res_it->second.host_slot[expert].load(std::memory_order_relaxed) == nullptr &&
+                        device.host_promote_queue.size() < 64) {
+                        device.host_promote_queue.emplace_back(host_base, expert);
+                        woke = true;
+                    }
+                }
+
                 if (pool.map.find(key) != pool.map.end()) {
                     continue; // already resident or already in flight
                 }

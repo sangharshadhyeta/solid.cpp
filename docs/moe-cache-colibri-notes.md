@@ -4501,3 +4501,33 @@ buffer would make it forward-looking and much smaller: a staging area for what i
 imminently required rather than a cache of what was recently popular. That is the
 same shift from capacity to timing the literature made, applied one tier down,
 and it is the natural next step for the buffer rather than another sizing attempt.
+
+### Feeding the buffer from the prediction, not from heat (2026-08-16)
+
+The prediction says which experts are *about to* be used. The host buffer was
+promoting on historical heat - backward-looking, and aimed at holding the whole
+hot set, which is the capacity approach that lost three times. Wiring the
+prediction into the buffer's promotion queue makes it forward-looking and small:
+a staging area for imminent work rather than a cache of what was recently
+popular. Queued for the worker, never copied inline, since a 1.4 MiB memcpy on
+the decode path is what made the earlier version slow.
+
+Measured under the same 5 GiB cap:
+
+| generation tok/s | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| no buffer | 2.36 | 8.97 | 11.31 |
+| buffer fed by prediction | 1.63 | 5.26 | 5.49 |
+| buffer fed by heat (previous) | 1.08 | 3.74 | 5.03 |
+
+**The signal change is a real improvement: +51%, +41% and +9% over the heat-fed
+version on the three runs.** Forward-looking promotion beats backward-looking
+promotion, which is the point worth keeping.
+
+It is still below no buffer at all, and that has not changed for the reason it
+never did: at 2x oversubscription every byte the buffer holds is a byte the page
+cache loses, and no promotion signal fixes a zero-sum budget. What the prediction
+does is make the buffer *less wrong* - it holds fewer, better-chosen experts.
+Where the ratio is not zero-sum (RAM close to sufficient, the case this targets
+and which cannot be reproduced here) that is exactly the difference that should
+decide it.

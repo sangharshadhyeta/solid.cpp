@@ -364,6 +364,9 @@ being measured. Chat-templated and content-verified, not a synthetic benchmark.<
 <tr><td>Host hot-expert buffer <span class="note">(3 variants, 5 GiB cap &mdash; ships disabled)</span></td><td class="num">11.31 tok/s</td><td class="num">5.03 tok/s</td><td class="num delta-neg">-56%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td><code>mlock</code> pinning hot experts <span class="note">(ships disabled)</span></td><td class="num">11.74 tok/s</td><td class="num">10.30 tok/s</td><td class="num delta-neg">-12%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after 5-round harness)</span></td><td class="num">2.34 tok/s</td><td class="num">2.47 tok/s</td><td class="num delta-pos">+5.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Router-lookahead prefetch <span class="note">(next layer's experts predicted, filled early)</span></td><td class="num">88.3% hit rate</td><td class="num">89.4% hit rate</td><td class="num delta-pos">+1.1pp</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>&hellip; same, on throughput <span class="note">(88% hit rate &mdash; not transfer-bound here)</span></td><td class="num">57.7 tok/s</td><td class="num">57.9 tok/s</td><td class="num">&plusmn;0</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Buffer fed by prediction <span class="note">(vs fed by historical heat, 5 GiB cap)</span></td><td class="num">3.74 tok/s</td><td class="num">5.26 tok/s</td><td class="num delta-pos">+41%</td><td><span class="tag tag-solid">solid</span></td></tr>
 </tbody>
 </table>
 </div>
