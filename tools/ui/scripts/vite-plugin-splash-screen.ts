@@ -1,10 +1,5 @@
-import {
-	APPLE_DEVICES,
-	BUILD_CONFIG,
-	REGEX_PATTERNS,
-	SPLASH_LINK
-} from '../src/lib/constants/pwa.constants';
-import { NEWLINE, TAB } from '../src/lib/constants/special-characters.constants';
+import { NEWLINE, TAB } from '../src/lib/constants/code';
+import { APPLE_DEVICES, BUILD_CONFIG, REGEX_PATTERNS, SPLASH_LINK } from '../src/lib/constants/pwa';
 import { SplashOrientation } from '../src/lib/enums/splash.enums';
 import type { SplashDimensions } from '../src/lib/types';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';

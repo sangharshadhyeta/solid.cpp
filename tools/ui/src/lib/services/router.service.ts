@@ -1,4 +1,4 @@
-import { ROUTES } from '$lib/constants';
+import { ROUTES } from '$lib/constants/routes';
 
 export class RouterService {
 	static chat(id: string): string {

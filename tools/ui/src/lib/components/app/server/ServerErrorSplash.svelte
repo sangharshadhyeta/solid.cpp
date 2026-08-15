@@ -5,7 +5,9 @@
 	import { Button } from '$lib/components/ui/button';
 	import { Input } from '$lib/components/ui/input';
 	import Label from '$lib/components/ui/label/label.svelte';
-	import { HEADERS, ICON_CLASS_DEFAULT, ROUTES, SETTINGS_KEYS } from '$lib/constants';
+	import { AUTHORIZATION_HEADER, BEARER_PREFIX, SETTINGS_KEYS } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
+	import { ROUTES } from '$lib/constants/routes';
 	import { KeyboardKey } from '$lib/enums';
 	import { serverLoading, serverStore } from '$lib/stores/server.svelte';
 	import { config, settingsStore } from '$lib/stores/settings.svelte';
@@ -70,8 +72,8 @@
 			// Test the API key by making a real request to the server
 			const response = await fetch(`${base}/props`, {
 				headers: {
-					'Content-Type': 'application/json',
-					[HEADERS.AUTHORIZATION]: `${HEADERS.BEARER}${apiKeyInput.trim()}`
+					[AUTHORIZATION_HEADER]: `${BEARER_PREFIX}${apiKeyInput.trim()}`,
+					'Content-Type': 'application/json'
 				}
 			});
 

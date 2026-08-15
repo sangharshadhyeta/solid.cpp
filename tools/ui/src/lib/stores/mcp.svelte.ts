@@ -26,11 +26,14 @@ import type { ListChangedHandlers } from '@modelcontextprotocol/sdk/types.js';
 import { browser } from '$app/environment';
 import { SETTINGS_KEYS } from '$lib/constants';
 import {
-	CACHE,
+	DEFAULT_CACHE_TTL_MS,
 	DEFAULT_MCP_CONFIG,
 	EXPECTED_THEMED_ICON_PAIR_COUNT,
 	MCP_ALLOWED_ICON_MIME_TYPES,
-	MCP_RECONNECT,
+	MCP_RECONNECT_ATTEMPT_TIMEOUT_MS,
+	MCP_RECONNECT_BACKOFF_MULTIPLIER,
+	MCP_RECONNECT_INITIAL_DELAY,
+	MCP_RECONNECT_MAX_DELAY,
 	MCP_SERVER_ID_PREFIX
 } from '$lib/constants';
 import {
@@ -914,7 +917,7 @@ class MCPStore {
 		}
 
 		this.reconnectingServers.add(serverName);
-		let backoff = MCP_RECONNECT.INITIAL_DELAY;
+		let backoff = MCP_RECONNECT_INITIAL_DELAY;
 		// Flag set by the phase callback when a DISCONNECTED event fires while
 		// reconnectingServers still holds this server (see JSDoc above).
 		let needsReconnect = false;
@@ -933,10 +936,10 @@ class MCPStore {
 							() =>
 								reject(
 									new Error(
-										`Reconnect attempt timed out after ${MCP_RECONNECT.ATTEMPT_TIMEOUT_MS}ms`
+										`Reconnect attempt timed out after ${MCP_RECONNECT_ATTEMPT_TIMEOUT_MS}ms`
 									)
 								),
-							MCP_RECONNECT.ATTEMPT_TIMEOUT_MS
+							MCP_RECONNECT_ATTEMPT_TIMEOUT_MS
 						)
 					);
 
@@ -977,7 +980,7 @@ class MCPStore {
 					break;
 				} catch (error) {
 					console.warn(`[MCPStore][${serverName}] Reconnection failed:`, error);
-					backoff = Math.min(backoff * MCP_RECONNECT.BACKOFF_MULTIPLIER, MCP_RECONNECT.MAX_DELAY);
+					backoff = Math.min(backoff * MCP_RECONNECT_BACKOFF_MULTIPLIER, MCP_RECONNECT_MAX_DELAY);
 				}
 			}
 		} finally {
@@ -1734,7 +1737,7 @@ class MCPStore {
 				// Cache is valid for 5 minutes
 				const age = Date.now() - serverRes.lastFetched.getTime();
 
-				return age < CACHE.DEFAULT_TTL_MS;
+				return age < DEFAULT_CACHE_TTL_MS;
 			});
 
 			if (allServersCached) {

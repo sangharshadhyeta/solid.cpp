@@ -1,5 +1,5 @@
 import { createPreTransform } from './pre-transform';
-import { SVG } from '$lib/constants';
+import { SVG_BLOCK_CLASS, SVG_LANGUAGE, SVG_TAG_PREFIX, XML_LANGUAGE } from '$lib/constants';
 
 /**
  * Converts svg code blocks to <pre class="svg-block"> for client-side rendering.
@@ -7,7 +7,7 @@ import { SVG } from '$lib/constants';
  * svg inside an xml fence.
  */
 export const rehypeSvgPre = createPreTransform(
-	[SVG.LANGUAGE, SVG.XML_LANGUAGE],
-	SVG.BLOCK_CLASS,
-	(text) => text.startsWith(SVG.TAG_PREFIX)
+	[SVG_LANGUAGE, XML_LANGUAGE],
+	SVG_BLOCK_CLASS,
+	(text) => text.startsWith(SVG_TAG_PREFIX)
 );

@@ -1,5 +1,5 @@
 <script lang="ts">
-	import { PanelLeftClose, PanelLeftOpen, X } from '@lucide/svelte';
+	import { PanelLeftClose, PanelLeftOpen } from '@lucide/svelte';
 	import { goto } from '$app/navigation';
 	import { page } from '$app/state';
 	import {
@@ -22,7 +22,7 @@
 	} from '$lib/stores/conversations.svelte';
 	import { device } from '$lib/stores/device.svelte';
 	import { config } from '$lib/stores/settings.svelte';
-	import { isMobile } from '$lib/stores/viewport.svelte';
+	import { isMobile, sidebarState } from '$lib/stores/viewport.svelte';
 	import { circIn } from 'svelte/easing';
 	import { SvelteSet } from 'svelte/reactivity';
 	import { fade } from 'svelte/transition';
@@ -45,6 +45,10 @@
 	const isStripExpanded = $derived(isExpandedMode || hoveredTooltip !== null);
 	const isOnMobile = $derived(isMobile.current);
 	const alwaysShowOnDesktop = $derived(config().alwaysShowSidebarOnDesktop as boolean);
+
+	$effect(() => {
+		sidebarState.expanded = isExpandedMode;
+	});
 
 	$effect(() => {
 		if (alwaysShowOnDesktop && !isOnMobile) {
@@ -316,7 +320,7 @@
 
 <svelte:window onkeydown={handleKeydown} bind:innerWidth />
 
-{#if innerWidth > 768 || (!page.url.hash.includes(ROUTES.SETTINGS) && !page.url.hash.includes(ROUTES.MCP_SERVERS) && !page.url.hash.includes(ROUTES.SEARCH))}
+{#if innerWidth > 768 || (!page.url.hash.includes(ROUTES.SETTINGS) && !page.url.hash.includes(ROUTES.MCP_SERVERS) && !page.url.hash.includes(ROUTES.SEARCH) && !page.url.hash.includes(ROUTES.BRAIN))}
 	<aside
 		class={[
 			'fixed md:sticky top-2 left-2 md:left-0 md:ml-2 md:mt-2 pt-2 z-10 w-[calc(100dvw-1rem)]',
@@ -344,41 +348,22 @@
 				onmouseleave={() => (logoHovered = false)}
 			>
 				<ActionIcon
-					icon={!isExpandedMode && logoHovered && innerWidth > 768 ? PanelLeftOpen : Logo}
+					icon={logoHovered && innerWidth > 768
+						? isExpandedMode
+							? PanelLeftClose
+							: PanelLeftOpen
+						: Logo}
 					size="lg"
 					iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
 					class="{isExpandedMode
 						? 'bg-muted! md:bg-foreground/5!'
 						: 'bg-transparent!'} md:h-9 md:w-9 h-10 w-10 rounded-full md:hover:bg-foreground/10! pointer-events-auto"
-					href={isExpandedMode ? ROUTES.START : undefined}
-					onclick={isExpandedMode ? undefined : toggleExpandedMode}
-					tooltip={isExpandedMode ? undefined : 'Open Sidebar'}
+					onclick={toggleExpandedMode}
+					tooltip={isExpandedMode ? 'Close Sidebar' : 'Open Sidebar'}
 					tooltipSide={TooltipSide.RIGHT}
-					ariaLabel={isExpandedMode ? 'Go to start' : 'Expand navigation'}
+					ariaLabel={isExpandedMode ? 'Collapse navigation' : 'Expand navigation'}
 				/>
 			</div>
-
-			{#if isOnMobile || (isExpandedMode && !alwaysShowOnDesktop)}
-				<div
-					class="flex items-center transition-all duration-150 ease-out {isMobile.current &&
-					!isExpandedMode
-						? 'opacity-0 h-0!'
-						: ''}"
-					in:fade={{ delay: 50, duration: 150, easing: circIn }}
-					out:fade={{ duration: 100 }}
-				>
-					<ActionIcon
-						icon={isMobile.current ? X : PanelLeftClose}
-						size="lg"
-						iconSize="h-4.5 w-4.5 md:h-4 md:w-4"
-						class="backdrop-blur-none md:h-9 md:w-9 h-10 w-10 rounded-full mr-1 hover:bg-accent!"
-						onclick={toggleExpandedMode}
-						tooltip="Close Sidebar"
-						tooltipSide={TooltipSide.LEFT}
-						ariaLabel="Collapse navigation"
-					/>
-				</div>
-			{/if}
 		</div>
 
 		<div

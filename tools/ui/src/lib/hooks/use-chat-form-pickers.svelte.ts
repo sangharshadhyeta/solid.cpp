@@ -1,7 +1,6 @@
-import { PROMPT_TRIGGER_PREFIX } from '$lib/constants';
+import { getChatCommands, PROMPT_TRIGGER_PREFIX } from '$lib/constants';
 import { ChatFormCommandAction, KeyboardKey } from '$lib/enums';
 import type { ChatFormCommand } from '$lib/types';
-import { getChatCommands } from '$lib/utils';
 import {
 	type CommandDismissSnapshot,
 	findCommandToken,

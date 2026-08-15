@@ -7,7 +7,8 @@
 	import * as RadioGroup from '$lib/components/ui/radio-group';
 	import * as Select from '$lib/components/ui/select';
 	import { Textarea } from '$lib/components/ui/textarea';
-	import { ICON_CLASS_DEFAULT, SETTING_CONFIG_INFO, SETTINGS_KEYS } from '$lib/constants';
+	import { SETTING_CONFIG_INFO, SETTINGS_KEYS } from '$lib/constants';
+	import { ICON_CLASS_DEFAULT } from '$lib/constants/css-classes';
 	import { SettingsFieldType } from '$lib/enums/settings.enums';
 	import { modelsStore, propsCacheVersion, selectedModelName } from '$lib/stores/models.svelte';
 	import { serverStore } from '$lib/stores/server.svelte';

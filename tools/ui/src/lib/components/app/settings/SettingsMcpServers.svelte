@@ -1,14 +1,12 @@
 <script lang="ts">
 	import McpLogo from '../mcp/McpLogo.svelte';
-	import { Plus, X } from '@lucide/svelte';
-	import { browser } from '$app/environment';
-	import { goto, replaceState } from '$app/navigation';
+	import { Plus } from '@lucide/svelte';
 	import { page } from '$app/state';
-	import { ActionIcon, McpServerCard, McpServerCardSkeleton } from '$lib/components/app';
+	import { replaceState } from '$app/navigation';
+	import { McpServerCard, McpServerCardSkeleton } from '$lib/components/app';
 	import { DialogMcpServerAddNew } from '$lib/components/app/dialogs';
 	import { Button } from '$lib/components/ui/button';
 	import * as Empty from '$lib/components/ui/empty';
-	import { ROUTES } from '$lib/constants';
 	import { HealthCheckStatus } from '$lib/enums';
 	import { conversationsStore } from '$lib/stores/conversations.svelte';
 	import { mcpStore } from '$lib/stores/mcp.svelte';
@@ -25,26 +23,6 @@
 	let servers = $derived(mcpStore.getServers());
 
 	let isAddingServer = $state(false);
-
-	let previousRouteId = $state<string | null>(null);
-
-	$effect(() => {
-		const currentId = page.route.id;
-
-		return () => {
-			previousRouteId = currentId;
-		};
-	});
-
-	function handleClose() {
-		const prevIsMcpServers = previousRouteId === '/mcp-servers';
-
-		if (browser && window.history.length > 1 && !prevIsMcpServers) {
-			history.back();
-		} else {
-			goto(ROUTES.START);
-		}
-	}
 
 	onMount(() => {
 		if (page.url.searchParams.has('add')) {
@@ -74,10 +52,6 @@
 </script>
 
 <div in:fade={{ duration: 150 }} class="flex min-h-[calc(100dvh-4rem)] flex-col">
-	<div class="fixed top-4.5 right-4 z-50 md:hidden">
-		<ActionIcon icon={X} tooltip="Close" onclick={handleClose} />
-	</div>
-
 	<div
 		class="sticky top-0 z-10 mt-4 mb-2 flex items-start gap-4 md:p-4 p-0 px-4 md:justify-between md:px-8"
 	>

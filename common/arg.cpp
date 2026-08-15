@@ -2814,6 +2814,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_env("LLAMA_ARG_MOE_CACHE"));
+    add_opt(common_arg(
+        {"--expert-atlas-file"}, "FNAME",
+        "path to a topic-affinity atlas produced by llama-expert-atlas; "
+        "when set, /experts includes measured per-(layer,expert) positions for the Brain view",
+        [](common_params & params, const std::string & value) {
+            params.expert_atlas_file = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_ATLAS_FILE"));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

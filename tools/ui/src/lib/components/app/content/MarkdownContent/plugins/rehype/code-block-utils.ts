@@ -4,11 +4,17 @@
  */
 
 import {
-	CODE_BLOCK_CLASS,
+	CODE_BLOCK_ACTIONS_CLASS,
+	CODE_BLOCK_HEADER_CLASS,
+	CODE_BLOCK_SCROLL_CONTAINER_CLASS,
 	CODE_ICON_SVG,
+	CODE_LANGUAGE_CLASS,
+	COPY_CODE_BTN_CLASS,
 	COPY_ICON_SVG,
 	DIAGRAM_SOURCE_CLASS,
+	PREVIEW_CODE_BTN_CLASS,
 	PREVIEW_ICON_SVG,
+	RELATIVE_CLASS,
 	TOGGLE_SOURCE_BTN_CLASS
 } from '$lib/constants';
 import type { Element, ElementContent } from 'hast';
@@ -59,7 +65,7 @@ export function createButton(
  * Creates a copy button element.
  */
 export function createCopyButton(id: string, idAttribute: string, title: string = 'Copy'): Element {
-	return createButton(CODE_BLOCK_CLASS.COPY_BTN, title, COPY_ICON_SVG, id, idAttribute);
+	return createButton(COPY_CODE_BTN_CLASS, title, COPY_ICON_SVG, id, idAttribute);
 }
 
 /**
@@ -70,7 +76,7 @@ export function createPreviewButton(
 	idAttribute: string,
 	title: string = 'Preview'
 ): Element {
-	return createButton(CODE_BLOCK_CLASS.PREVIEW_BTN, title, PREVIEW_ICON_SVG, id, idAttribute);
+	return createButton(PREVIEW_CODE_BTN_CLASS, title, PREVIEW_ICON_SVG, id, idAttribute);
 }
 
 /**
@@ -114,7 +120,7 @@ export function createSourceView(
 				type: 'element'
 			}
 		],
-		properties: { className: [DIAGRAM_SOURCE_CLASS, CODE_BLOCK_CLASS.SCROLL_CONTAINER] },
+		properties: { className: [DIAGRAM_SOURCE_CLASS, CODE_BLOCK_SCROLL_CONTAINER_CLASS] },
 		tagName: 'div',
 		type: 'element'
 	};
@@ -128,7 +134,7 @@ export function createBlockHeader(
 	id: string,
 	idAttribute: string,
 	actions: Element[],
-	languageClassName: string = CODE_BLOCK_CLASS.LANGUAGE
+	languageClassName: string = CODE_LANGUAGE_CLASS
 ): Element {
 	return {
 		children: [
@@ -140,12 +146,12 @@ export function createBlockHeader(
 			},
 			{
 				children: actions,
-				properties: { className: [CODE_BLOCK_CLASS.ACTIONS] },
+				properties: { className: [CODE_BLOCK_ACTIONS_CLASS] },
 				tagName: 'div',
 				type: 'element'
 			}
 		],
-		properties: { className: [CODE_BLOCK_CLASS.HEADER] },
+		properties: { className: [CODE_BLOCK_HEADER_CLASS] },
 		tagName: 'div',
 		type: 'element'
 	};
@@ -179,7 +185,7 @@ export function createWrapper(
 	return {
 		children: [header, createScrollContainer(preElement, scrollContainerClass), ...extraChildren],
 		properties: {
-			className: [wrapperClass, CODE_BLOCK_CLASS.RELATIVE],
+			className: [wrapperClass, RELATIVE_CLASS],
 			...additionalAttributes
 		} as Element['properties'],
 		tagName: 'div',
