@@ -4002,3 +4002,41 @@ buffer would be weeks of work, validated only against a synthetic cap, for
 hardware not in use here. The mechanism is implemented, measured, documented and
 one flag away; that is the right place to leave it until a model that needs it
 actually lands.
+
+# KV cache quantization: q8_0 frees a gigabyte, and the placement search spends it (2026-08-15)
+
+The KV cache is independent of the model's own quantization - a Q4_K_M model
+still keeps its conversation state in f16 by default. At 65536 context x 4 slots
+that is 2180 MiB of VRAM sitting beside the weights.
+
+**Check the build before trusting any KV-quant result.** This build has
+`GGML_CUDA_FA_ALL_QUANTS=OFF`, which compiles only symmetric Flash Attention
+kernels: `f16-f16`, `bf16-bf16`, `q8_0-q8_0`, `q4_0-q4_0`. Upstream issue #24485
+documents 25-45x prefill slowdowns on combinations without a compiled kernel, and
+discussion #22411 makes the same point for HIP. So the *commonly recommended*
+setting - quantize K, keep V at f16 for quality - would have fallen off the fused
+path here and produced a catastrophic number that looked like an indictment of KV
+quantization generally. Symmetric `q8_0/q8_0` was used for exactly this reason.
+
+Measured, same Unsloth Q4_K_M model, 65536 ctx, 4 slots:
+
+| | f16 | q8_0 |
+| --- | --- | --- |
+| KV cache | 1280 + 900 = 2180 MiB | 680 + 478 = 1158 MiB |
+| n_cpu_moe resolved by --fit | 23 layers on CPU | **21** |
+| expert layers on GPU | 7 | **9** |
+| generation tok/s | 72.7 / 77.2 / 81.9 | 71.3 / 84.7 / 81.5 |
+| coherence | fine | fine |
+
+Throughput is unchanged within noise (medians 77.2 vs 81.5; the spread here is
+wider than the difference). The real result is the 1022 MiB and what happens to
+it: **no code was needed for the freed memory to become experts on the GPU.** The
+placement search probes with the actual `cparams`, cache types included, so a
+smaller KV measures as a smaller footprint and `--fit` resolves a lower `-ncmoe`
+by itself. That composition is a direct dividend of deciding placement from
+measured memory rather than from a fixed flag.
+
+Not changed as a default. It is a strict improvement on this card with this
+model, but KV precision is a quality knob, one coherence check is not a quality
+evaluation, and defaults should not be set from a single model on a single 12GB
+GPU. Recommended for this deployment, documented for others.
