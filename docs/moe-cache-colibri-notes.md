@@ -4242,3 +4242,36 @@ Edge cases exercised, all clean and crash-free:
 - **Buffer disabled** (unset / 0) - the default, unchanged behaviour.
 - **Mixed expert sizes** - a pool is sliced for one expert size; differently
   shaped tensors are left to mmap rather than wasting or corrupting a slot.
+
+### Measured under pressure: negative, and why (2026-08-16)
+
+| 5 GiB cap, generation tok/s | run 1 | run 2 | run 3 |
+| --- | ---: | ---: | ---: |
+| buffer off | 2.36 | 8.97 | 11.31 |
+| buffer on (2 GiB) | 1.61 | 6.07 | 7.87 |
+
+About 30% slower throughout. The cause is not the policy but the allocation
+shape: `malloc` takes the whole 2 GiB pool up front, from inside the same 5 GiB
+budget the page cache is using to hold experts. Early on almost nothing has been
+promoted, so the buffer is 2 GiB of loss against nearly no gain, and
+`MADV_DONTNEED` only offsets it once the buffer is actually full. That is the
+same failure mode as mlock: memory we hold is memory the page cache does not
+get, and holding it eagerly makes the shortfall worse before it makes it better.
+
+Two things follow, and neither is "the idea is wrong":
+
+- **Allocate lazily.** The pool should grow as experts are promoted, never
+  holding more than it has filled. Then the buffer is at worst neutral - every
+  byte it takes is a byte `MADV_DONTNEED` has just released - instead of a
+  fixed up-front debt.
+- **The test environment charges it twice.** Under a cgroup cap the buffer and
+  the page cache draw on one budget, so owning memory is zero-sum by
+  construction. The case this was built for - a 500GB model on a machine with
+  RAM measured in hundreds of gigabytes - is not zero-sum in the same way, but
+  it also cannot be tested here, which is exactly the limitation recorded
+  throughout this document.
+
+Left opt-in and off by default. The correctness work stands (the control run
+showed the nondeterminism was pre-existing, and every edge case was clean); it
+is the eager allocation that must change before the performance claim can be
+revisited.
