@@ -3569,3 +3569,63 @@ with the process. Persisting it keyed by prompt hash is a well-scoped feature,
 it is exactly the "cold things belong on SSD" principle applied to the tier we
 had not applied it to, and unlike weight streaming it needs no new tier - just
 durability for a cache that already exists.
+
+# A testbed for "RAM can't hold the experts", and what it costs today (2026-08-15)
+
+Point 1 of the DwarfStar review - explicit read/write I/O with a hard RAM
+budget, instead of mmap plus the kernel's page cache - was flagged as the one
+case we had never tested, because every model to hand fits in RAM. Two attempts
+to get a model that doesn't fit failed for reasons worth recording:
+
+- **No model that large fits this disk.** GLM-5.2's smallest published quant is
+  217 GB (UD-IQ1_S) and Kimi-K2-Thinking's is 247 GB, against 96 GB free. These
+  are 750B- and 1T-class MoEs; no quantization brings them into range. GLM-4.5
+  -Air at UD-Q4_K_XL (67.7 GB) does fit, and is the right size to force
+  streaming against 30 GB of RAM.
+- **The network wouldn't cooperate.** HuggingFace pulled at ~1 KB/s and GitHub
+  at 0 B/s, so outbound bandwidth was the blocker, not the disk. Download
+  stopped, partial kept (hf resumes from `.incomplete`).
+
+**A better testbed, no download required.** The user's suggestion - run a second
+instance - doesn't work directly: weights are mmap'd `MAP_SHARED`, so two
+instances of the *same file* map the *same physical pages*. Page cache is shared
+and RAM use doesn't double; only KV cache and compute buffers do. The same trap
+applies to cgroup accounting: pages faulted in by the first instance are charged
+to *its* cgroup, so a limit on the second instance never bites on weights.
+
+Two fixes make it valid, and both were used:
+1. Give the second instance its **own copy** of the GGUF, so its pages are its
+   own. On XFS with reflink this is free - `cp` of the 16 GB model took 1 ms and
+   consumed no additional disk, while producing a distinct inode (402660884 vs
+   268782843), which is what page-cache separation actually keys on.
+2. Run it under a **cgroup v2 memory cap** (`systemd-run --scope
+   -p MemoryMax=8G -p MemorySwapMax=0`), CPU-only (`-ngl 0`) since the GPU is
+   already committed to the primary instance. Swap disabled so paging to swap
+   can't be mistaken for streaming from the model file.
+
+This reproduces the condition exactly: `memory.events` showed `max 13225`
+reclaim events at load and **71172** after a single 40-token generation, with
+`oom_kill 0` - it survived by continuously evicting and re-faulting weights,
+which is precisely "streaming from disk because RAM is insufficient".
+
+**Measured cost, same model, same CPU-only settings, 40 tokens:**
+
+| | prompt tok/s | generation tok/s |
+| --- | --- | --- |
+| unlimited RAM | 22.11 | 10.80 |
+| 8 GiB cap (streaming) | 0.34 | 0.51 |
+
+**A 21x collapse in generation.** Worth being precise about the cause: this is
+not the SSD being slow in aggregate (it reads 513 MB/s sequentially). It is that
+the kernel's LRU has no idea which experts matter. Each token routes to 8 of 128
+experts per layer; the page cache evicts on recency alone, so a hot expert is as
+likely to be dropped as one that has never been selected, and the resulting
+access pattern is small and scattered rather than sequential.
+
+That is the entire argument for point 1, now with a number attached: the gap
+isn't bandwidth, it's *knowing what to keep*. moe-cache already tracks exactly
+that (per-expert heat, admission counts), and the MADV_COLD sweep already feeds
+a weak version of it to the kernel - weak because an advisory hint can only
+lower a page's priority, never pin the hot ones. An explicit residency budget
+would decide directly. Note the sweep does not apply to the measurement above:
+it lives on the CUDA moe-cache path, and this test ran `-ngl 0`.
