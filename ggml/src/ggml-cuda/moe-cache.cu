@@ -1401,6 +1401,35 @@ static bool moe_cache_prepare_budget(
     // responds to real pressure; only shrink-below-committed is refused.
     const size_t previous_limit = device.budget_limit;
     const size_t committed = device.allocated_bytes + moe_cache_scratch_total(device.scratch_reserve);
+
+    // Pressure response. `available < committed` means something outside this
+    // cache took memory - another process, or this context's own KV cache
+    // growing - and the clamp below is about to hide that by refusing to lower
+    // the budget. Refusing is still right (a budget under what is already
+    // allocated makes the cache inert; that bug is documented above), but doing
+    // *only* that means the cache notices pressure and never yields to it.
+    //
+    // Pool slabs cannot be partially freed - one allocation per pool - so the
+    // memory that can actually be returned is the dispatch scratch. It is
+    // regrown on demand by moe_cache_grow_device() before the next dispatch, so
+    // releasing it costs one reallocation rather than any cached expert. Only
+    // done when nothing is in flight and the queue is drained, since a dispatch
+    // in progress is reading these very buffers.
+    if (available < committed && !device.inflight && device.queue.empty()) {
+        const size_t released =
+            device.d_ids_cap + device.d_act_cap + device.act_q8_cap + device.d_out_cap;
+        if (released > 0) {
+            ggml_cuda_set_device(device.physical);
+            cudaFree(device.d_ids);   device.d_ids   = nullptr; device.d_ids_cap   = 0;
+            cudaFree(device.d_act);   device.d_act   = nullptr; device.d_act_cap   = 0;
+            cudaFree(device.d_act_q8);device.d_act_q8= nullptr; device.act_q8_cap  = 0;
+            cudaFree(device.d_out);   device.d_out   = nullptr; device.d_out_cap   = 0;
+            MOE_CACHE_LOG("[moe-cache] CUDA%d under memory pressure (%zu MiB available vs %zu MiB held) - "
+                    "released %zu MiB of dispatch scratch\n",
+                    device.physical, available >> 20, committed >> 20, released >> 20);
+        }
+    }
+
     device.budget_limit = std::max(available, committed);
 
     if (!first_check && available != previous_limit) {
