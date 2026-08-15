@@ -4074,3 +4074,40 @@ ends of the range tested, for 1022 MiB of VRAM and two extra expert layers on th
 GPU. Still not made a default - one model on one card is not the basis for a
 global default, and the K-vs-V sensitivity asymmetry could not be explored here
 because `FA_ALL_QUANTS=OFF` compiles only symmetric kernels.
+
+# Block-level KV allocation via CUDA VMM: mechanism works, gating does not (2026-08-15)
+
+PagedAttention's actual saving - do not pay for context nobody uses - reached
+without PagedAttention's cost. vLLM needs a block table and gather kernels, which
+is why the port was rejected: llama.cpp would need new attention kernels per
+backend. CUDA's virtual memory API gets there differently: reserve contiguous
+*virtual* addresses for the full n_ctx, map physical pages only as cells fill.
+Addresses stay linear, so every existing attention kernel works unmodified.
+
+Implemented: a VMM-backed CUDA buffer type (granule-level commit tracking, since
+"cells 0..N in use" is a strided set of per-tensor prefixes, not one prefix of
+the buffer), tensor slices recorded at `init_tensor`, commit-on-access for every
+buffer API path, and a growth hook in `llama_kv_cache::apply_ubatch` that backs
+cells before kernels reach them. Behind `GGML_CUDA_VMM_KV=1`, default off.
+
+**Status: reserves correctly, crashes on use, and the cause is a one-line gating
+error rather than the design.** The buffer type applied VMM to any allocation
+over 64 MiB, so it captured the *model weights* buffer (6618 MiB) as well as the
+KV buffers (680 and 478 MiB). Weights are read in full immediately, so lazy
+commit is guaranteed to fault - the comment in the code says "deliberately not
+applied to weights" and then does not enforce it. The KV buffers themselves
+reserved and committed as intended (`commit_fraction 0.0100 over 10 slices`).
+
+Two further things to verify once that is fixed, both known unknowns rather than
+speculation:
+
+- `llama_kv_cache_context`'s full-cache constructor sets `n_kv = kv->get_size()`
+  for worst-case graph building. If any executed graph uses it, kernels address
+  the entire reservation and commit everything on the first decode, leaving the
+  feature working but pointless. Whether that path only reserves or also executes
+  needs checking.
+- Expected saving on this model is modest - only 5 of 30 layers are
+  full-attention at 65536 cells (680 MiB at q8_0); the other 25 are sliding
+  window and already bounded at 4608 cells. On a non-SWA model, or on an H200
+  running a large model at full context, the proportion is far more favourable,
+  which is the case this was built for.
