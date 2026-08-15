@@ -12,6 +12,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // llama_model_n_expert - not part of the public API surface
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -26,6 +27,7 @@
 #include <filesystem>
 #include <utility>
 #include <fstream>
+#include <mutex>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -4133,6 +4135,7 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* model_n_expert         */ llama_model_n_expert(impl->model_tgt),
     };
 }
 
@@ -4486,10 +4489,54 @@ void server_routes::init_routes() {
         static std::vector<uint8_t> prev_bytes;
         static uint64_t seq = 0;
 
+        // topic-affinity atlas is static once produced by llama-expert-atlas,
+        // so load it lazily on first request rather than at server startup
+        static std::once_flag atlas_once;
+        static json atlas_json;
+        static bool atlas_loaded = false;
+        std::call_once(atlas_once, [this]() {
+            if (params.expert_atlas_file.empty()) {
+                return;
+            }
+            std::ifstream f(params.expert_atlas_file);
+            if (!f) {
+                SRV_WRN("failed to open --expert-atlas-file '%s'\n", params.expert_atlas_file.c_str());
+                return;
+            }
+            try {
+                atlas_json   = json::parse(f);
+                atlas_loaded = true;
+            } catch (const std::exception & e) {
+                SRV_WRN("failed to parse --expert-atlas-file '%s': %s\n", params.expert_atlas_file.c_str(), e.what());
+            }
+        });
+
+        common_moe_cache_summary cs;
+        const bool have_summary = common_moe_cache_get_summary(cs);
+        const long long cs_total = cs.hits + cs.misses;
+        json stats = have_summary ? json{
+            {"hit_rate",        cs_total > 0 ? (double) cs.hits / (double) cs_total : 0.0},
+            {"hits",            cs.hits},
+            {"misses",          cs.misses},
+            {"evictions",       cs.evictions},
+            {"fill_failures",   cs.fill_failures},
+            {"admission_skips", cs.admission_skips},
+            {"slots_used",      cs.slots_used},
+            {"slots_total",     cs.slots_total},
+            {"protected_slots", cs.protected_slots},
+            {"avg_heat",        cs.avg_heat},
+            {"allocated_mib",   cs.allocated_bytes >> 20},
+            {"budget_mib",      cs.budget_bytes >> 20},
+        } : json::object();
+
         std::vector<uint8_t> bytes;
         int rows = 0, cols = 0;
         if (!common_moe_cache_get_expert_map(bytes, rows, cols)) {
-            res->ok({{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"seq", seq}});
+            json body = {{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"seq", seq}, {"stats", stats}};
+            if (atlas_loaded) {
+                body["atlas"] = atlas_json;
+            }
+            res->ok(body);
             return res;
         }
 
@@ -4525,7 +4572,11 @@ void server_routes::init_routes() {
             hits_hex.push_back(hex_digits[b & 0xf]);
         }
 
-        res->ok({{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"seq", seq}});
+        json body = {{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"seq", seq}, {"stats", stats}};
+        if (atlas_loaded) {
+            body["atlas"] = atlas_json;
+        }
+        res->ok(body);
         return res;
     };
 
@@ -4751,7 +4802,25 @@ void server_routes::init_routes() {
         std::string tmpl_default = common_chat_templates_source(meta->chat_params.tmpls.get(), "");
         std::string tmpl_tools   = common_chat_templates_source(meta->chat_params.tmpls.get(), "tool_use");
 
+        // What this deployment's own placement logic actually decided, surfaced for the WebUI's
+        // model-info dialog - not just what the user asked for on the command line, since -ncmoe is
+        // frequently left on 'auto' and resolved by --moe-cache at startup. Static/configuration
+        // facts only, not live cache performance - hit rate, VRAM used, etc. change every request
+        // and already live-update in the Brain view (GET /experts); duplicating a stale snapshot of
+        // the same numbers here would just be two different-looking answers to the same question.
+        json solid_cpp = {
+            { "n_expert", meta->model_n_expert },
+        };
+        {
+            std::vector<uint8_t> map_bytes;
+            int map_rows = 0, map_cols = 0;
+            if (common_moe_cache_get_expert_map(map_bytes, map_rows, map_cols)) {
+                solid_cpp["n_cpu_moe"] = map_rows; // one moe-cache-tracked row per CPU-offloaded MoE layer
+            }
+        }
+
         json props = {
+            { "solid_cpp",                   solid_cpp },
             { "default_generation_settings", default_generation_settings_for_props },
             { "total_slots",                 params.n_parallel },
             { "model_alias",                 meta->model_name },

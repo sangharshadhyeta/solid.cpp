@@ -180,6 +180,57 @@ export interface ApiModelListResponse {
 	models?: ApiModelDetails[];
 }
 
+/** Live per-(layer,expert) moe-cache tier/heat snapshot for the Brain view.
+ * `map`/`hits` are hex-packed byte strings - see
+ * docs/moe-cache-colibri-notes.md for the exact wire format (ported from
+ * Colibri). rows/cols are 0 when nothing has been cached yet. */
+/** Aggregate moe-cache health, summed across every live cache device.
+ * Empty object when no cache pool has been allocated yet. */
+export interface ApiExpertMapStats {
+	hit_rate?: number;
+	hits?: number;
+	misses?: number;
+	evictions?: number;
+	fill_failures?: number;
+	admission_skips?: number;
+	slots_used?: number;
+	slots_total?: number;
+	protected_slots?: number;
+	avg_heat?: number;
+	allocated_mib?: number;
+	budget_mib?: number;
+}
+
+/** One measured (layer,expert) topic-affinity cell from llama-expert-atlas.
+ * x/y are a weighted centroid over category anchors on a unit circle - see
+ * tools/expert-atlas/expert-atlas.cpp - so magnitude reflects how specialized
+ * the expert is (near 0,0 = generalist, near the rim = a topic specialist). */
+export interface ApiExpertAtlasCell {
+	layer: number;
+	expert: number;
+	n: number;
+	spec: number;
+	x: number;
+	y: number;
+}
+
+export interface ApiExpertAtlas {
+	categories: string[];
+	n_layer: number;
+	n_probes: number;
+	cells: ApiExpertAtlasCell[];
+}
+
+export interface ApiExpertMapResponse {
+	rows: number;
+	cols: number;
+	map: string;
+	hits: string;
+	seq: number;
+	stats: ApiExpertMapStats;
+	atlas?: ApiExpertAtlas;
+}
+
 export interface ApiLlamaCppServerProps {
 	default_generation_settings: {
 		id: number;
@@ -263,6 +314,15 @@ export interface ApiLlamaCppServerProps {
 	webui_settings?: Record<string, string | number | boolean>;
 	ui_settings?: Record<string, string | number | boolean>;
 	cors_proxy_enabled?: boolean;
+	/** What this deployment's own placement logic actually decided (e.g. via --moe-cache), not just
+	 * what was requested on the command line. Live cache performance (hit rate, VRAM used, etc.)
+	 * belongs in the Brain view instead - this is deployment configuration, not a live metric. */
+	solid_cpp?: {
+		/** Experts per MoE layer; absent/0 for a dense (non-MoE) model. */
+		n_expert?: number;
+		/** Number of layers whose MoE experts are offloaded to CPU (moe-cache tracked). */
+		n_cpu_moe?: number;
+	};
 }
 
 export interface ApiChatCompletionRequest {
