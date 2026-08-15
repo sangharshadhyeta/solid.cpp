@@ -3299,3 +3299,144 @@ the real number instead of crashing or silently guessing wrong. Restarted
 the persistent 8099 deployment on the fixed binary with `-c 262144`
 (letting `--fit` decide the rest) - landed on the same 8192/slot x 4,
 confirmed via a real chat completion.
+
+# `--fit` priority order was backwards: context should be fixed, `--parallel` should flex (2026-08-15)
+
+Found by direct user correction, not testing: "the parallel 4 and OOM should
+be decided by the program right? this is the thing we built it for" and
+later, explicitly, "the first step for the program will to choose the
+maximum context possible from what the user has given. then maximizing the
+thruput in that." The design above got this backwards. `server.cpp` resolves
+`--parallel` to a hardcoded default of 4 *before* `--fit` ever runs
+(`tools/server/server.cpp:151-156`), so the previous doubling search
+effectively searched "what context fits at 4 slots" - a context request the
+user explicitly typed on the command line was silently shrinking to
+accommodate a slot count nobody asked for.
+
+**Redesign**: the doubling search in `common/fit.cpp` now always probes at
+`n_seq_max=1` first - the most permissive case for fitting the *full*
+requested context. Only if the request doesn't fit even at one slot does
+context itself get reduced (last resort, same as before). If it *does* fit
+at one slot, a second small bounded search (`requested_n_seq_max` down to 2,
+each step reusing the already-proven-safe context size) grows concurrency
+back up afterwards - recovering as much throughput as the confirmed-safe
+context leaves room for, not the other way around.
+
+**Real bug found while verifying this, not designed in from the start**:
+`common_init_result` (`common/common.cpp`) wasn't writing the (possibly
+fit-reduced) `n_seq_max` back to `params.n_parallel`. The server creates one
+slot object per `params.n_parallel` (`tools/server/server-context.cpp`)
+*independent* of the `llama_context` actually built - confirmed live: before
+the fix, the log showed `n_slots = 4` even though fit had decided
+`n_seq_max = 1` for the actual context, a real slot-count/context-capacity
+mismatch under concurrency, not just a stale number in a dialog. Fixed with
+a straightforward write-back; verified `/props` correctly reports
+`total_slots` matching the real context afterward.
+
+**Second real bug, found by deliberately reproducing VRAM contention**: the
+"doesn't fit even at the minimum context, with 1 slot" branch only set
+`n_seq_max = 1` and left `cparams->n_ctx` at the raw, already-proven-unsafe
+requested value - the assumption was "step 1/2 below will handle it," but
+that reduction logic only actively shrinks context for the `n_ctx==0` (auto)
+path; for an explicit `-c` request it just no-ops ("context size set by user
+-> no change") and carries the dangerous raw value all the way to real model
+loading. Went unnoticed in every earlier test because there's normally
+enough VRAM for the tiny minimum-context probe to succeed, routing into the
+(correct) doubling search instead - only surfaced by deliberately starting a
+second full model instance on the same 12GB card to simulate real
+contention (the scenario the user asked about directly: "I think it is not
+considering another embedding model being hosted on the device. is our
+program taking that in consideration?"). Fixed by clamping to `n_ctx_min`
+in that branch too, matching every other unsafe-value path in the function.
+
+**Third, larger real bug - the whole reason this took multiple rounds**:
+even after both fixes above, `-c 262144` (single instance, no contention)
+still hard-crashed the *entire process* - not at load time, but ~1 minute
+in, on the CUDA graph capture of a real (differently-shaped) user prompt
+(`ggml_cuda_graph_evaluate_and_capture` -> `cudaGraphInstantiate` -> OOM ->
+`ggml_abort`, uncatchable). Root cause: `--fit`'s measurement probe
+(`common_get_device_memory_data_impl`) only ever constructs a `llama_context`
+- it never calls `llama_decode`, so it can't see two real costs that only
+show up once actual inference starts: (1) real model loading (weights
+actually read from disk) measured ~400 MiB more in-use at steady state than
+the `no_alloc` probe predicted, and (2) CUDA graph capture allocates
+driver-side graph state lazily on the first real decode of *each new batch
+shape* - a cost with no fixed size, since it depends on the graph's node
+count (model/backend/speculative config), and that never showed up in any
+measurement fit ever took.
+
+Tried `GGML_CUDA_DISABLE_GRAPHS=1` first (an existing env-gated escape hatch
+in `ggml/src/ggml-cuda/common.cuh`) - confirmed by testing that it
+*sometimes* worked (a short, low-token completion succeeded) but was not
+reliable: a longer completion on the identical config crashed at the exact
+same line even with the env var set via `setenv()` early in
+`common_init_result`. Root cause of that failure: `is_enabled()`'s check is
+cached behind a function-local `static const bool`, evaluated once on the
+first call anywhere in the process's life - something inside `--fit`'s own
+probing (well before the `setenv()` call could run) already triggered that
+first evaluation, latching "enabled" before the env var was ever set.
+Reverted that approach entirely rather than fight the ordering.
+
+**Actual fix**: widen the margin the doubling search in `fit.cpp` requires,
+specifically for that search (`step0_margin = 3 * margins_s[0]`, i.e. 3 GiB
+at the 1 GiB default instead of 1). Not a precisely-calibrated number - the
+two gaps above don't have a fixed size - but a well-justified, generously
+conservative one for the one search whose answer gets used to load the
+*real* model with real weights, where a wrong answer means a hard crash
+instead of a merely suboptimal one. Cost: context on this specific
+12GB-card + 26B-MoE-model combination dropped from 16384 (1 GiB margin,
+still crashes) to 4096 (3 GiB margin, held). Validated with a repeated
+stress test - 4+ back-to-back full-length (700 token) generations, ~13
+minutes of continuous real load, no crash - after the 1 GiB margin
+reliably crashed within 1-3 requests under the same test.
+
+# `moe_cache_prepare_budget()` was a one-time latch, not a live value (2026-08-15)
+
+Found by direct user question, not testing: "the almost OOM signal and
+thruput should be continuously seen by the program and values should be
+dynamically adjusted. the level 1 which has chosen the edges stays the same
+on the first run, and level 2 I think is not functioning as we envisioned
+right?" Confirmed by reading the code, not by reproducing a failure:
+`moe_cache_prepare_budget()` (`ggml/src/ggml-cuda/moe-cache.cu`) queries
+`cudaMemGetInfo` exactly once per device, gated by a `device.budget_ready`
+bool that never resets - every call after the first just returns the
+already-cached `budget_limit`, forever, for the life of the process. The
+function's own comment claimed the opposite: "this reflects what's free
+right now, not a stale snapshot."
+
+**Why not just remove the latch entirely**: this function runs on the hot
+per-tensor dispatch path (`moe_cache_begin()`, called for every MoE layer
+access during every decode step, not just once per new shape). Re-issuing
+`cudaMemGetInfo` - a synchronous CUDA API call - on every single call would
+add real per-token overhead. Added a time-gated re-check instead
+(`MOE_CACHE_BUDGET_RECHECK_INTERVAL` = 2 seconds): frequent enough that real
+pressure changes (another process starting, the KV cache growing as a
+conversation lengthens) get noticed within a couple of seconds, infrequent
+enough that the sync call rate stays well under 1/s under any real decode
+throughput.
+
+**Real correctness subtlety, not obvious until reasoned through**: once the
+cache has allocated its own pools, they're real resident CUDA buffers -
+`cudaMemGetInfo`'s `free` naturally drops by however much the cache itself
+already claimed. A naive re-check (`budget = free - reserve`) would see the
+cache's *own prior growth* as shrinking headroom and throttle further growth
+in response to nothing external at all - a self-inflicted ratchet down to
+whatever the budget happened to be on the very first call, silently
+defeating the entire point of re-checking. Fixed by reconstructing "total
+room available to the cache" as `free_memory + device.allocated_bytes`
+before subtracting the reserve - on the first call `allocated_bytes` is
+still 0, so this is identical to the old behavior; on every later re-check,
+it correctly isolates the budget from the cache's own footprint, so it only
+actually moves in response to something *other* than the cache itself.
+
+**Validated live**: with `MOE_CACHE_LOG` at info level, watched the budget
+re-evaluate over real requests -
+`CUDA0 cache budget re-evaluated: 1442 -> 926 MiB (1054 MiB free, 0 MiB
+already cached)`, then after the cache allocated ~921 MiB of its own pools
+two seconds later -
+`CUDA0 cache budget re-evaluated: 926 -> 919 MiB (126 MiB free, 921 MiB
+already cached)`. Raw free memory dropped from 1054 MiB to 126 MiB (the
+cache's own pools), but the reconstructed budget held nearly flat (926 to
+919 MiB) - exactly the "notice real external pressure, ignore your own
+footprint" behavior this was meant to produce, not a coincidence of the
+specific numbers involved.

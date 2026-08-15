@@ -23,6 +23,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
@@ -201,6 +202,10 @@ struct moe_cache_device {
     bool saw_repeat = false;
     bool budget_ready = false;
     size_t budget_limit = 0;
+    // Set to the epoch (never a real re-check) so the very first call in
+    // moe_cache_prepare_budget() always re-evaluates regardless of clock
+    // start time.
+    std::chrono::steady_clock::time_point budget_checked_at{};
     size_t allocated_bytes = 0;
     moe_cache_scratch scratch_reserve;
 
@@ -984,12 +989,27 @@ static int moe_cache_find_pool(
     return -1;
 }
 
+// How often moe_cache_prepare_budget() re-queries live VRAM instead of
+// trusting its last answer. This function runs on the hot per-tensor
+// dispatch path (moe_cache_begin(), called for every MoE layer access, not
+// just once per new shape), so it can't re-issue cudaMemGetInfo - a
+// synchronous CUDA API call - on every single call without adding real
+// per-token overhead. 2 seconds is frequent enough that a real change in
+// device pressure (another process starting, the KV cache growing as a
+// conversation gets longer) gets noticed within a couple of seconds, while
+// keeping the sync call rate low enough (well under 1/s under any real
+// decode throughput) to not show up as measurable overhead.
+static constexpr std::chrono::milliseconds MOE_CACHE_BUDGET_RECHECK_INTERVAL{2000};
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
-    if (device.budget_ready) {
+    const auto now = std::chrono::steady_clock::now();
+    if (device.budget_ready && now - device.budget_checked_at < MOE_CACHE_BUDGET_RECHECK_INTERVAL) {
         return device.budget_limit > 0;
     }
+    const bool first_check = !device.budget_ready;
     device.budget_ready = true;
+    device.budget_checked_at = now;
 
     ggml_cuda_set_device(device.physical);
     size_t free_memory = 0;
@@ -1009,17 +1029,38 @@ static bool moe_cache_prepare_budget(
     // cudaMemGetInfo above is the actual live resource query - this reflects
     // what's free right now, not a stale snapshot from an earlier planning
     // step on a shared multi-tenant machine where availability can shift.
+    //
+    // free_memory alone already excludes the cache's own pools once any have
+    // been allocated (they're real, resident CUDA buffers), so re-deriving
+    // the budget straight from free_memory on every re-check would make the
+    // cache see its own prior growth as shrinking headroom and throttle
+    // itself in response to nothing - a self-inflicted ratchet down to
+    // whatever the budget happened to be on the first call, silently
+    // defeating the point of re-checking at all. Adding device.allocated_bytes
+    // back reconstructs "how much room exists for the cache in total",
+    // matching what free_memory already meant on the very first call, when
+    // allocated_bytes was still 0 - so the budget only actually moves in
+    // response to something *other* than the cache itself: another process,
+    // or this device's own KV cache/compute buffers growing or shrinking.
+    const size_t free_for_budget = free_memory + device.allocated_bytes;
     size_t reserve_mb = session.config.reserve_mb;
     if (reserve_mb == 0) {
-        const size_t free_mb = free_memory >> 20;
+        const size_t free_mb = free_for_budget >> 20;
         reserve_mb = std::min<size_t>(1024, std::max<size_t>(128, free_mb / 20));
     }
     const size_t reserve = reserve_mb << 20;
-    size_t available = free_memory > reserve ? free_memory - reserve : 0;
+    size_t available = free_for_budget > reserve ? free_for_budget - reserve : 0;
     if (session.config.budget_mb > 0) {
         available = std::min(available, session.config.budget_mb << 20);
     }
+    const size_t previous_limit = device.budget_limit;
     device.budget_limit = available;
+
+    if (!first_check && available != previous_limit) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d cache budget re-evaluated: %zu -> %zu MiB (%zu MiB free, %zu MiB already cached)\n",
+                device.physical, previous_limit >> 20, available >> 20,
+                free_memory >> 20, device.allocated_bytes >> 20);
+    }
 
     if (available == 0) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d has no cache budget after %zu MiB reserve (%zu MiB free)\n",
