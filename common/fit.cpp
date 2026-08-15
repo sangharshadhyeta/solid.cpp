@@ -475,11 +475,38 @@ static void common_params_fit_impl(
     // not a guess extrapolated from a distant sample. Scoped to the common single-device (or host-only)
     // case, where the free-memory budget is unambiguous; multi-device setups fall back to the one size
     // that's unconditionally safe everywhere.
+    //
+    // The requested context size is the priority, not n_seq_max (concurrent slots): the doubling search
+    // below always runs at n_seq_max=1 first, since a single slot is the most permissive case for fitting
+    // the full requested context. Only if the request doesn't fit even at one slot does context itself
+    // get reduced (as a last resort); if it *does* fit at one slot, n_seq_max is grown back up afterwards
+    // (see the block below this one) to recover as much concurrency as the now-confirmed-safe context
+    // size leaves room for - not the other way around, where a fixed slot count silently eats into
+    // context the user explicitly asked for.
     const uint32_t requested_n_ctx = cparams->n_ctx;
+    const uint32_t requested_n_seq_max = cparams->n_seq_max;
     bool ctx_clamped_by_fit = false;
+    bool ctx_kept_full_by_fit = false; // true: only n_seq_max was reduced, context itself is untouched
+    // This whole search deliberately probes right up to the edge of what margins_s[0] allows, which is
+    // fine everywhere else in this file (those paths only ever *reduce* usage below a value that already
+    // measured safe). Here it is not fine: this is the one search whose final answer gets used to load
+    // the *real* model with real weights, and two gaps confirmed by direct testing both eat into that
+    // same margin. First, the probe measures a no_alloc model with weights never actually read from
+    // disk - real loading measured ~400 MiB more in-use at steady state than the probe predicted, on top
+    // of margins_s[0] already being fully spent by construction. Second, CUDA graph capture allocates
+    // driver-side graph state lazily on the first real decode of each new batch *shape*, entirely outside
+    // of what this probe measures (it only ever constructs a context, never decodes) - confirmed by
+    // testing: a context --fit measured as safe at load time still hard-aborted the whole process
+    // (uncatchable CUDA OOM, not a request that can be retried) the first time a real prompt of a new
+    // shape triggered a fresh graph capture, well after startup. Neither gap has a precise size - it
+    // depends on the graph's node count, which depends on the model/backend/speculative config - so
+    // rather than guess a number, this search targets extra headroom on top of the configured margin
+    // specifically here, where a wrong answer means a hard crash instead of a merely suboptimal one.
+    const int64_t step0_margin = 3 * (int64_t) margins_s[0];
     if (requested_n_ctx > 4 * n_ctx_min) {
         llama_context_params cparams_probe = *cparams;
         cparams_probe.n_ctx = n_ctx_min;
+        cparams_probe.n_seq_max = 1;
 
         std::vector<ggml_backend_dev_t> probe_devs;
         uint32_t probe_hp_ngl = 0, probe_hp_nct = 0, probe_hp_nex = 0;
@@ -492,10 +519,19 @@ static void common_params_fit_impl(
                         "probing at the minimum context size of %" PRIu32 " first instead of risking a hard "
                         "crash on the raw request\n", __func__, requested_n_ctx, n_ctx_min);
                 cparams->n_ctx = n_ctx_min;
+                cparams->n_seq_max = 1;
                 ctx_clamped_by_fit = true;
-            } else if (probe_hp_nct > 0 && (int64_t) dmds_first[0].mb.total() + (int64_t) margins_s[0] > (int64_t) dmds_first[0].free) {
-                // does not even fit at the minimum context size - nothing more this step can do,
-                // step 1 below will report the same shortfall through the normal (safe, small-ctx) path
+            } else if (probe_hp_nct > 0 && (int64_t) dmds_first[0].mb.total() + step0_margin > (int64_t) dmds_first[0].free) {
+                // does not even fit at the minimum context size with a single slot (e.g. another process -
+                // an embedding server, another llama.cpp instance, anything else sharing the device - is
+                // already holding most of the device's memory). Step 1/2 below only actively reduces
+                // context for the n_ctx==0 (auto) path; for an *explicit* request like this one it just
+                // leaves cparams->n_ctx untouched (fit.cpp's "context size set by user -> no change"
+                // branch), which would carry the full, already-proven-unsafe raw request all the way to
+                // real model loading. Clamp here instead of relying on that fallthrough.
+                cparams->n_ctx = n_ctx_min;
+                cparams->n_seq_max = 1;
+                ctx_clamped_by_fit = true;
             } else {
                 const uint32_t ceiling = std::min(requested_n_ctx, probe_hp_nct);
                 uint32_t safe_n_ctx = n_ctx_min;
@@ -503,9 +539,10 @@ static void common_params_fit_impl(
                 while (true) {
                     llama_context_params cparams_step = *cparams;
                     cparams_step.n_ctx = next_probe;
+                    cparams_step.n_seq_max = 1;
                     const dmds_t dmds_step = common_get_device_memory_data_impl(
                         path_model, mparams, &cparams_step, probe_devs, probe_hp_ngl, probe_hp_nct, probe_hp_nex, log_level);
-                    const bool fits = (int64_t) dmds_step[0].mb.total() + (int64_t) margins_s[0] <= (int64_t) dmds_step[0].free;
+                    const bool fits = (int64_t) dmds_step[0].mb.total() + step0_margin <= (int64_t) dmds_step[0].free;
                     if (!fits) {
                         break;
                     }
@@ -516,11 +553,41 @@ static void common_params_fit_impl(
                     next_probe = std::min(2 * safe_n_ctx, ceiling);
                 }
                 if (safe_n_ctx < requested_n_ctx) {
-                    LOG_WRN("%s: requested context of %" PRIu32 " does not fit (model's trained context is %"
-                            PRIu32 ") - probed and confirmed %" PRIu32 " fits instead of risking a hard crash "
-                            "on the raw request\n", __func__, requested_n_ctx, probe_hp_nct, safe_n_ctx);
+                    LOG_WRN("%s: requested context of %" PRIu32 " does not fit even with a single slot "
+                            "(model's trained context is %" PRIu32 ") - probed and confirmed %" PRIu32
+                            " fits instead of risking a hard crash on the raw request\n",
+                            __func__, requested_n_ctx, probe_hp_nct, safe_n_ctx);
                     cparams->n_ctx = safe_n_ctx;
+                    cparams->n_seq_max = 1;
                     ctx_clamped_by_fit = true;
+                } else if (requested_n_seq_max > 1) {
+                    // the full requested context fits at one slot, and this size has already been
+                    // measured safe by the doubling search above - now recover as much concurrency as
+                    // actually fits at that *fixed* context size, largest first. Each remaining probe is
+                    // a small, bounded increment (one more slot at an already-proven-safe context), not
+                    // a second unbounded search, so it doesn't reintroduce the original crash risk.
+                    uint32_t best_n_seq_max = 1;
+                    for (uint32_t candidate = requested_n_seq_max; candidate >= 2; candidate--) {
+                        llama_context_params cparams_slots = *cparams;
+                        cparams_slots.n_ctx = requested_n_ctx;
+                        cparams_slots.n_seq_max = candidate;
+                        const dmds_t dmds_slots = common_get_device_memory_data_impl(
+                            path_model, mparams, &cparams_slots, probe_devs, probe_hp_ngl, probe_hp_nct, probe_hp_nex, log_level);
+                        const bool fits = (int64_t) dmds_slots[0].mb.total() + step0_margin <= (int64_t) dmds_slots[0].free;
+                        if (fits) {
+                            best_n_seq_max = candidate;
+                            break;
+                        }
+                    }
+                    cparams->n_ctx = requested_n_ctx;
+                    cparams->n_seq_max = best_n_seq_max;
+                    if (best_n_seq_max < requested_n_seq_max) {
+                        LOG_WRN("%s: kept the full requested context of %" PRIu32 " and reduced concurrent "
+                                "slots from %" PRIu32 " to %" PRIu32 " instead - not the other way around\n",
+                                __func__, requested_n_ctx, requested_n_seq_max, best_n_seq_max);
+                    }
+                    ctx_clamped_by_fit = true; // skip the (context-shrinking) reduction search below - this path already fits
+                    ctx_kept_full_by_fit = true; // ...and if remeasurement still disagrees, degrade slots first, not context
                 }
             }
         } catch (const std::runtime_error &) {
@@ -646,18 +713,30 @@ static void common_params_fit_impl(
                     __func__, -global_surplus/MiB);
             }
             if (ctx_clamped_by_fit) {
-                // step 0 already searched for and validated the largest context that fits, with the
-                // same margin required here - reaching this point despite that means the real
-                // measurement below came out slightly different from the last probe (e.g. driver-level
-                // allocator variance right at the boundary step 0 deliberately searched right up to).
-                // The interpolation math below assumes dmds_full was measured at hp_nct, which is no
-                // longer true once step 0 has clamped things, so reusing it here would produce a bogus
-                // (likely far too large) result rather than a merely-suboptimal one - fall back to the
-                // one size every other path in this function already trusts unconditionally instead.
+                // step 0 already searched for and validated a configuration that fits, with the same
+                // margin required here - reaching this point despite that means the real measurement
+                // below came out slightly different from the last probe (e.g. driver-level allocator
+                // variance right at the boundary step 0 deliberately searched right up to). The
+                // interpolation math below assumes dmds_full was measured at hp_nct, which is no longer
+                // true once step 0 has touched things, so reusing it here would produce a bogus (likely
+                // far too large) result rather than a merely-suboptimal one.
+                if (ctx_kept_full_by_fit && cparams->n_seq_max > 1) {
+                    // context itself is the priority and was already kept at the full request - degrade
+                    // slots first, all the way to one if needed, before ever touching context.
+                    LOG_WRN("%s: %" PRIu32 " concurrent slots at the full requested context of %" PRIu32
+                            " did not leave the required margin on remeasurement - falling back to a "
+                            "single slot at the same (unreduced) context instead\n",
+                            __func__, cparams->n_seq_max, cparams->n_ctx);
+                    cparams->n_seq_max = 1;
+                    return;
+                }
+                // context needs to shrink - fall back to the one size every other path in this function
+                // already trusts unconditionally.
                 LOG_WRN("%s: context size of %" PRIu32 " (found safe by step 0) did not leave the required "
                         "margin on remeasurement - falling back to the minimum context size of %" PRIu32 "\n",
                         __func__, cparams->n_ctx, n_ctx_min);
                 cparams->n_ctx = n_ctx_min;
+                cparams->n_seq_max = 1;
                 if (nd <= 1) {
                     return;
                 }

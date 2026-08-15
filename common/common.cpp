@@ -2442,6 +2442,19 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // same write-back already done for tensor_buft_overrides above.
     params.n_gpu_layers = mparams.n_gpu_layers;
 
+    // cparams.n_seq_max can also be reduced by --fit (see the context-vs-concurrency priority logic
+    // in fit.cpp: the requested context size is kept fixed and concurrent slots give way to it, not
+    // the other way around). Writing it back to params.n_parallel is not just for reporting purposes
+    // this time - the server creates one slot object per params.n_parallel (server-context.cpp) after
+    // this constructor returns, independent of the llama_context that was actually built. Without this
+    // write-back the server would create more slots than the context's real n_seq_max supports, a real
+    // mismatch under concurrent requests, not just a stale number in a dialog.
+    if (cparams.n_seq_max != (uint32_t) params.n_parallel && params.n_parallel > 0) {
+        LOG_WRN("%s: --fit reduced concurrent slots from %d to %u to keep the requested context size\n",
+                __func__, params.n_parallel, cparams.n_seq_max);
+    }
+    params.n_parallel = (int32_t) cparams.n_seq_max;
+
     // Both run after autoplace, not before: the calibration-cache lookup
     // inside it can override params.speculative.draft.n_max to the real
     // calibrated value, and both of these need to see that final value, not
