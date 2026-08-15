@@ -1062,6 +1062,18 @@ struct llm_graph_context {
                      int   il) const;
 
     // build MoE FFN without bias tensors
+    // see llama-graph.cpp - delivers a router-lookahead prediction to moe-cache
+    static void moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
+    // Predict the next layer's experts from the current hidden state and hand
+    // the result to moe-cache, so its fills overlap this layer's compute.
+    void build_moe_lookahead(
+            ggml_tensor * cur,
+            ggml_tensor * next_gate_inp,
+            ggml_tensor * next_exps,
+                int64_t   n_expert_used,
+                    int   il) const;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

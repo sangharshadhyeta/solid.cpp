@@ -4626,6 +4626,7 @@ void server_routes::init_routes() {
             {"evictions",       cs.evictions},
             {"fill_failures",   cs.fill_failures},
             {"admission_skips", cs.admission_skips},
+            {"prefetches",      cs.prefetches},
             {"slots_used",      cs.slots_used},
             {"slots_total",     cs.slots_total},
             {"protected_slots", cs.protected_slots},

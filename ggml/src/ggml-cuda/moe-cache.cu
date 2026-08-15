@@ -286,6 +286,7 @@ struct moe_cache_device {
     float * h_out = nullptr;
     size_t h_out_cap = 0;
 
+    long long prefetches = 0;
     long long hits = 0;
     long long misses = 0;
     long long inserts = 0;
@@ -3474,6 +3475,7 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
                 sum.evictions       += device.evictions;
                 sum.fill_failures   += device.fill_failures;
                 sum.admission_skips += device.admission_skips;
+                sum.prefetches      += device.prefetches;
                 sum.allocated_bytes += device.allocated_bytes;
                 sum.budget_bytes    += device.budget_limit;
 
@@ -3672,6 +3674,100 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
     return nullptr;
 }
 
+
+// Speculative prefetch, from a router run one layer ahead of execution.
+//
+// The fill machinery is the same one misses already use; the difference is
+// timing. A reactive fill is issued after the miss that needed it, too late for
+// the token that caused it. This is issued before, so the transfer overlaps the
+// current layer's compute - which is the entire point, and why the literature
+// treats prefetch as a pipeline stage rather than a bigger cache.
+//
+// Two rules keep speculation honest:
+//  - it only ever takes free slots, never evicting a resident expert. At ~77%
+//    accuracy a wrong guess that displaced a known-hot expert would cost more
+//    than a right one saves.
+//  - it respects the same queue bounds as demand fills, so a bad prediction
+//    cannot starve real work.
+static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int n_ids) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_PREFETCH");
+        return !env || atoi(env) != 0; // on unless explicitly disabled
+    }();
+    if (!enabled || !host_base || !ids || n_ids <= 0 ||
+        g_session_count.load(std::memory_order_acquire) <= 0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::unique_lock<std::mutex> lock(session->mu, std::try_to_lock);
+        if (!lock.owns_lock() || session->stopping) {
+            continue; // never block decode for a guess
+        }
+        for (const auto & device_ptr : session->devices) {
+            moe_cache_device & device = *device_ptr;
+            if (device.dead.load()) {
+                continue;
+            }
+            auto seen = device.seen_tensors.find(host_base);
+            if (seen == device.seen_tensors.end()) {
+                continue;
+            }
+            const size_t expert_size = seen->second.expert_size;
+            const int    pool_index  = moe_cache_find_pool(device, expert_size, seen->second.wtype);
+            if (pool_index < 0) {
+                continue;
+            }
+            moe_cache_pool & pool = *device.pools[pool_index];
+
+            bool woke = false;
+            for (int i = 0; i < n_ids; i++) {
+                const int32_t expert = ids[i];
+                if (expert < 0) {
+                    continue;
+                }
+                if ((int) device.queue.size() >= session->config.queue_max) {
+                    break;
+                }
+                if (pool.free_slots.empty()) {
+                    break; // no eviction for speculation - see above
+                }
+                const moe_cache_key key{host_base, expert};
+                if (pool.map.find(key) != pool.map.end()) {
+                    continue; // already resident or already in flight
+                }
+
+                const int slot_index = pool.free_slots.back();
+                pool.free_slots.pop_back();
+                moe_cache_slot & slot = pool.slots[slot_index];
+                slot.key = key;
+                slot.generation++;
+                slot.readers = 0;
+                slot.state = moe_cache_slot_state::copying;
+                try {
+                    if (!pool.map.emplace(key, slot_index).second) {
+                        moe_cache_slot_reset(pool, slot_index, true);
+                        continue;
+                    }
+                    device.queue.push_back({
+                            pool_index, slot_index, slot.generation, key,
+                            (const char *) host_base + (size_t) expert * expert_size,
+                            expert_size});
+                    device.queued_bytes += expert_size;
+                    device.prefetches++;
+                    woke = true;
+                } catch (...) {
+                    moe_cache_slot_reset(pool, slot_index, true);
+                }
+            }
+            if (woke) {
+                session->cv.notify_all();
+            }
+        }
+    }
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -3692,6 +3788,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.host_ptr = moe_cache_host_ptr;
+    ggml_moe_cache.prefetch = moe_cache_prefetch;
 }
 
 #endif
