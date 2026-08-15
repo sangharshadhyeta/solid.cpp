@@ -4040,3 +4040,37 @@ Not changed as a default. It is a strict improvement on this card with this
 model, but KV precision is a quality knob, one coherence check is not a quality
 evaluation, and defaults should not be set from a single model on a single 12GB
 GPU. Recommended for this deployment, documented for others.
+
+## KV quantization quality: validated short and long (2026-08-15)
+
+The throughput and VRAM numbers above say nothing about quality, and a single
+coherence check is not an evaluation - KV error accumulates over *stored* tokens,
+so short prompts test the case least likely to fail.
+
+`llama-perplexity`, the obvious tool, **segfaults on this model**: Gemma-4 with
+MTP/iSWA requires `ctx_other` to be set (the same constraint that appears as a
+warning during memory fitting), which that tool does not construct. So quality
+was measured two other ways.
+
+**Short prompts, deterministic.** Six prompts spanning arithmetic, list recall,
+translation, factual lookup, completion and free composition, at temperature 0
+with a fixed seed: **6/6 byte-identical** between f16 and q8_0.
+
+**Long context, needle-in-a-haystack** (`scripts/kv-needle-test.py`). A fact
+planted at 10%, 50% and 90% depth of a ~24700-token prompt, then asked for back:
+**3/3 recalled under both f16 and q8_0.** Each run uses a unique nonce in the
+filler so the prompt cache cannot serve a previous run - without it the second
+configuration answered from cached KV with `prompt_n = 5`, which would have
+proved nothing.
+
+Two test artefacts worth recording, since both initially looked like real
+failures: a 40-token reply limit truncated the model mid-reasoning so it never
+reached its answer (read as 0/3 until the limit was raised), and the filler was
+~32 tokens per sentence rather than the 14 estimated, building a 42904-token
+prompt against a 32768 context. Neither was a property of the model.
+
+Conclusion: on this model, symmetric `q8_0` KV is effectively lossless at both
+ends of the range tested, for 1022 MiB of VRAM and two extra expert layers on the
+GPU. Still not made a default - one model on one card is not the basis for a
+global default, and the K-vs-V sensitivity asymmetry could not be explored here
+because `FA_ALL_QUANTS=OFF` compiles only symmetric kernels.
