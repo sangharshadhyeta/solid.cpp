@@ -4258,12 +4258,17 @@ promoted, so the buffer is 2 GiB of loss against nearly no gain, and
 same failure mode as mlock: memory we hold is memory the page cache does not
 get, and holding it eagerly makes the shortfall worse before it makes it better.
 
-Two things follow, and neither is "the idea is wrong":
+Lazy allocation was implemented and **measured worse still** - 1.15/5.02/3.33
+against eager's 1.61/6.07/7.87 - which rules out the allocation shape as the
+cause and identifies the real one:
 
-- **Allocate lazily.** The pool should grow as experts are promoted, never
-  holding more than it has filled. Then the buffer is at worst neutral - every
-  byte it takes is a byte `MADV_DONTNEED` has just released - instead of a
-  fixed up-front debt.
+- **Promotion runs inline on the decode path.** Each promotion is a `malloc`, a
+  1.4 MiB `memcpy` and a `madvise` syscall, performed while holding the session
+  lock, on a machine already thrashing. Making allocation lazy simply did that
+  work more often in smaller pieces. The fix is to move promotion onto the fill
+  worker thread that already exists for VRAM fills: decode marks an expert as
+  worth promoting, the worker performs the copy. That is a design correction
+  rather than another parameter, and it is the next thing to build.
 - **The test environment charges it twice.** Under a cgroup cap the buffer and
   the page cache draw on one budget, so owning memory is zero-sum by
   construction. The case this was built for - a 500GB model on a machine with
