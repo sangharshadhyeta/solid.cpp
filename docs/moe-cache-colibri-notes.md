@@ -3938,3 +3938,41 @@ hundred tokens) rather than wall clock, sweeping every few seconds, and using
 information. If that still yields single-digit percentages, the conclusion is
 that the interface cannot express what this access pattern needs, and owning the
 buffer is the only remaining answer.
+
+# One policy, three tiers: unifying VRAM and RAM residency (2026-08-15)
+
+Arrived at in discussion rather than from a measurement, and it simplifies the
+design rather than adding to it.
+
+Today the two tiers run different decision functions for no principled reason.
+VRAM uses LFRU - frequency, recency, and protection segments - and holds ~70% hit
+rate. RAM uses "not routed to in N decisions", a binary threshold, which exists
+only because it was the easiest thing to express through `madvise`. The tier with
+the *more expensive* misses is running the *cruder* policy.
+
+The unified form is one ranking with capacity-determined cut points:
+
+    rank every expert by score = frequency (+) recency
+      top slice        -> VRAM       (evicted directly; we own the memory)
+      next slice       -> keep in RAM (demote everything below it)
+      remainder        -> leave on disk
+
+Same scoring function throughout; only the cut points differ, and they come from
+each tier's capacity rather than from separate hand-tuned rules. All the inputs
+already exist: per-slot heat (VRAM), `selections` and `last_epoch` (RAM), and the
+cross-run history file.
+
+**Where the tiers genuinely cannot be identical is enforcement, not policy.** In
+VRAM we choose the victim slot outright. In RAM we can only advise, and the
+kernel is free to disregard it - and as established above, the advisory interface
+is demotion-only, since no hint expresses "protect this" and `mlock` (the only
+mechanism that does) is a command that measured worse by starving everything
+else. So we compute the same answer for both tiers and can only *ask* for it in
+one of them. Whether asking suffices is exactly what the demote-soft/demote-hard
+benchmark measures.
+
+One consequence worth keeping in view: a RAM miss costs a disk read (~500 MB/s
+here) while a VRAM miss costs a RAM read. The tier with the costlier miss should
+if anything be *more* conservative about what it lets go, not less - which the
+unified design expresses naturally as a different cut point on the same ranking,
+rather than as a second policy to maintain.

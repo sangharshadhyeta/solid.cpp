@@ -214,8 +214,16 @@ struct moe_cache_device {
         std::vector<bool> is_cold;       // already advised, don't re-advise every sweep
         std::vector<uint32_t> selections; // saturating per-expert selection count
         std::vector<bool> is_pinned;      // held resident with mlock
+        // Routing-relative recency: the value of device.plan_epoch when this
+        // expert was last selected. Wall-clock idleness turned out to be the
+        // wrong unit - at 120s idle swept every 30s, a 40-second benchmark run
+        // classified almost nothing, so the kernel was choosing evictions with
+        // no information from us at all. What matters is how many routing
+        // decisions ago an expert was last wanted, not how many seconds.
+        std::vector<uint64_t> last_epoch;
     };
     std::unordered_map<const void *, cpu_residency> residency;
+    uint64_t plan_epoch = 0; // one tick per MoE node planned
     std::chrono::steady_clock::time_point residency_epoch{};
     std::chrono::steady_clock::time_point last_cold_sweep{};
     size_t pinned_bytes = 0;
@@ -851,7 +859,26 @@ static bool moe_cache_grow_host(
     return true;
 }
 
-static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{30};
+// Sweep often enough that the classification is still true when the kernel acts
+// on it. 30s was chosen when the threshold was wall-clock minutes; with a
+// routing-relative threshold the useful signal changes on the order of seconds.
+static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{3};
+
+// How many routing decisions an expert may go unselected before it is declared
+// dormant. One tick per MoE node planned, so with ~46 CPU-resident MoE tensors
+// this is roughly (value / 46) tokens. Default ~100 tokens' worth: long enough
+// that a briefly-unlucky expert is not evicted, short enough that the cold tail
+// is identified while it still matters.
+static uint64_t moe_cache_cold_after_epochs() {
+    static const uint64_t value = [] () -> uint64_t {
+        if (const char * env = getenv("GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS")) {
+            const long long parsed = atoll(env);
+            return parsed <= 0 ? 0 : (uint64_t) parsed;
+        }
+        return 4600;
+    }();
+    return value;
+}
 static constexpr std::chrono::seconds MOE_CACHE_HISTORY_SAVE_INTERVAL{60};
 static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_clock::time_point now);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
@@ -2397,7 +2424,12 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
     const uint32_t cold_after = moe_cache_cold_after_s();
     const uint32_t age_now = (uint32_t) std::chrono::duration_cast<std::chrono::seconds>(
             now - device.residency_epoch).count();
-    const bool do_cold = cold_after > 0 && age_now >= cold_after;
+    const uint64_t cold_epochs = moe_cache_cold_after_epochs();
+    // Routing-relative when available (the useful signal), wall-clock only as a
+    // fallback if epoch classification is disabled.
+    const bool do_cold = cold_epochs > 0
+        ? device.plan_epoch > cold_epochs
+        : (cold_after > 0 && age_now >= cold_after);
 
     size_t advised_experts = 0;
     size_t advised_bytes = 0;
@@ -2407,9 +2439,15 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
             if (res.is_cold[expert]) {
                 continue; // already advised; a later hit clears this
             }
-            // last_seen == 0 means never selected since load - dormant by
-            // definition, and the strongest candidate of all.
-            if (res.last_seen[expert] != 0 && age_now - res.last_seen[expert] < cold_after) {
+            // Dormant if it has not been routed to for cold_epochs routing
+            // decisions. last_epoch == 0 means never selected since load -
+            // dormant by definition, and the strongest candidate of all.
+            if (cold_epochs > 0) {
+                if (expert < res.last_epoch.size() && res.last_epoch[expert] != 0 &&
+                    device.plan_epoch - res.last_epoch[expert] < cold_epochs) {
+                    continue;
+                }
+            } else if (res.last_seen[expert] != 0 && age_now - res.last_seen[expert] < cold_after) {
                 continue;
             }
             // Skip anything currently held in VRAM: its host pages back a live
@@ -2436,7 +2474,36 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
             if (last <= first) {
                 continue; // expert smaller than a page, or straddling one
             }
-            if (madvise((void *) first, (size_t) (last - first), MADV_COLD) != 0) {
+            // MADV_COLD only moves pages to the inactive list and hopes the
+            // kernel gets round to them; MADV_PAGEOUT reclaims immediately,
+            // which is what actually frees room for the hot set under pressure.
+            // Prefer it, falling back when the kernel is too old to support it.
+            // Hard eviction versus soft preference is a real choice, not an
+            // optimisation detail. MADV_PAGEOUT reclaims the page immediately -
+            // decisive, but if the classification is wrong the re-read is paid
+            // unconditionally. MADV_COLD only moves the page to the front of the
+            // eviction queue: it survives when there is no pressure and goes
+            // first when there is, so a misclassification costs nothing unless
+            // memory is actually short. Default is the soft form; set
+            // GGML_CUDA_MOE_CACHE_DEMOTE=pageout for the hard one.
+            static const bool hard_demote = [] {
+                const char * env = getenv("GGML_CUDA_MOE_CACHE_DEMOTE");
+                return env && strcmp(env, "pageout") == 0;
+            }();
+            int adv_rc = -1;
+#ifdef MADV_PAGEOUT
+            static bool pageout_ok = true;
+            if (hard_demote && pageout_ok) {
+                adv_rc = madvise((void *) first, (size_t) (last - first), MADV_PAGEOUT);
+                if (adv_rc != 0 && errno == EINVAL) {
+                    pageout_ok = false; // not supported here - use MADV_COLD from now on
+                }
+            }
+#endif
+            if (adv_rc != 0) {
+                adv_rc = madvise((void *) first, (size_t) (last - first), MADV_COLD);
+            }
+            if (adv_rc != 0) {
                 if (errno == EINVAL) {
                     // kernel without MADV_COLD - stop trying for this process
                     MOE_CACHE_LOG("%s", "[moe-cache] MADV_COLD unsupported on this kernel, cold-page hinting disabled\n");
@@ -2589,6 +2656,7 @@ static int moe_cache_plan(
     // is found once here rather than per expert.
     moe_cache_device::cpu_residency * residency = nullptr;
     uint32_t age_now = 0;
+    device.plan_epoch++;
     if (moe_cache_cold_after_s() > 0 && node->n_expert > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (device.residency_epoch.time_since_epoch().count() == 0) {
@@ -2606,6 +2674,7 @@ static int moe_cache_plan(
                 entry.is_cold.assign((size_t) node->n_expert, false);
                 entry.selections.assign((size_t) node->n_expert, 0);
                 entry.is_pinned.assign((size_t) node->n_expert, false);
+                entry.last_epoch.assign((size_t) node->n_expert, 0);
             }
             residency = &entry;
         } catch (...) {
@@ -2622,6 +2691,7 @@ static int moe_cache_plan(
 
         if (residency && (size_t) expert < residency->last_seen.size()) {
             residency->last_seen[expert] = age_now;
+            residency->last_epoch[expert] = device.plan_epoch;
             // Saturating, so a long-running server ranks by sustained use
             // rather than letting an early burst dominate forever.
             if (residency->selections[expert] < UINT32_MAX) {

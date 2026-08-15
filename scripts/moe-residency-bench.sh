@@ -38,12 +38,13 @@ PROMPT='{"messages":[{"role":"user","content":"Write three sentences about the o
 
 mkdir -p "$OUT"; rm -f "$OUT"/*.samples
 
-CONFIGS=("baseline" "history" "history+readahead")
+CONFIGS=("baseline" "demote-soft" "demote-hard")
 env_for() {
     case "$1" in
-        baseline)           echo "GGML_CUDA_MOE_CACHE_HISTORY=/nonexistent GGML_CUDA_MOE_CACHE_READAHEAD=0" ;;
-        history)            echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_READAHEAD=0" ;;
-        history+readahead)  echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_READAHEAD=1" ;;
+        baseline)           echo "GGML_CUDA_MOE_CACHE_HISTORY=/nonexistent GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS=0" ;;
+        history)            echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS=0" ;;
+        demote-soft)        echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS=4600 GGML_CUDA_MOE_CACHE_DEMOTE=cold" ;;
+        demote-hard)        echo "GGML_CUDA_MOE_CACHE_HISTORY=$HIST GGML_CUDA_MOE_CACHE_COLD_AFTER_EPOCHS=4600 GGML_CUDA_MOE_CACHE_DEMOTE=pageout" ;;
     esac
 }
 
@@ -56,7 +57,11 @@ stop_server() {
 measure() { # $1 label, $2 rep
     local label=$1 rep=$2
     stop_server
-    sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    # Evict only the model's pages, not the whole page cache. Global
+    # drop_caches also flushes libraries and the CUDA runtime, which is most of
+    # the startup cost and none of what the test needs cold.
+    sync
+    /root/.claude/jobs/a804561e/tmp/dropfile "$MODEL" 2>/dev/null
 
     # shellcheck disable=SC2046
     systemd-run --scope --quiet -p MemoryMax="$CAP" -p MemorySwapMax=0 \
