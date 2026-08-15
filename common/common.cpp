@@ -1294,13 +1294,18 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
-static bool common_device_memory_data_fits(const common_device_memory_data_vec & data) {
+// margin: bytes that must remain free per device on top of what's needed.
+// Defaults to 0 (bare fit) for callers that only ask "would this load at all".
+// A caller whose answer will be re-judged by common_fit_params() must pass the
+// same margin that check will demand - otherwise placement approves a config
+// that fit then rejects, and the two silently disagree.
+static bool common_device_memory_data_fits(const common_device_memory_data_vec & data, int64_t margin = 0) {
     for (const auto & d : data) {
         if (d.total <= 0) {
             continue; // not a real device (host aggregate, or a device with unknown budget)
         }
         const int64_t needed = (int64_t) d.model + (int64_t) d.context + (int64_t) d.compute;
-        if (needed > d.free) {
+        if (needed + margin > d.free) {
             return false;
         }
     }
@@ -1325,14 +1330,15 @@ static std::vector<llama_model_tensor_buft_override> common_moe_build_cpu_overri
 static bool common_moe_fits_with_n(
         const char * path_model, const llama_model_params & mparams_base,
         const llama_context_params & cparams, uint32_t n,
-        std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert) {
+        std::vector<ggml_backend_dev_t> & devs, uint32_t & hp_ngl, uint32_t & hp_n_ctx_train, uint32_t & hp_n_expert,
+        int64_t margin = 0) {
     std::vector<llama_model_tensor_buft_override> trial = common_moe_build_cpu_overrides(n);
     llama_model_params mparams_trial = mparams_base;
     mparams_trial.tensor_buft_overrides = trial.data();
     try {
         common_device_memory_data_vec trial_data = common_get_device_memory_data(
                 path_model, &mparams_trial, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
-        return common_device_memory_data_fits(trial_data);
+        return common_device_memory_data_fits(trial_data, margin);
     } catch (const std::exception &) {
         return false;
     }
@@ -1352,7 +1358,8 @@ struct common_moe_fit_probe_result {
 // probes, not O(n_layer). A live, per-launch computation: the answer
 // depends on -c/--parallel/free VRAM at that moment, not a cached constant.
 static common_moe_fit_probe_result common_moe_find_safe_layers(
-        const char * path_model, const llama_model_params & mparams_base, const llama_context_params & cparams) {
+        const char * path_model, const llama_model_params & mparams_base, const llama_context_params & cparams,
+        int64_t margin = 0) {
     common_moe_fit_probe_result result;
 
     std::vector<ggml_backend_dev_t> devs;
@@ -1373,21 +1380,21 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
     result.n_layer = hp_ngl;
     result.is_moe  = hp_n_expert > 0;
 
-    if (common_device_memory_data_fits(data)) {
+    if (common_device_memory_data_fits(data, margin)) {
         result.already_fits = true;
         return result;
     }
     if (!result.is_moe) {
         return result;
     }
-    if (!common_moe_fits_with_n(path_model, mparams_base, cparams, hp_ngl, devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
+    if (!common_moe_fits_with_n(path_model, mparams_base, cparams, hp_ngl, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, margin)) {
         return result; // nothing fits even with everything offloaded
     }
 
     uint32_t lo = 1, hi = hp_ngl;
     while (lo < hi) {
         const uint32_t mid = lo + (hi - lo) / 2;
-        if (common_moe_fits_with_n(path_model, mparams_base, cparams, mid, devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
+        if (common_moe_fits_with_n(path_model, mparams_base, cparams, mid, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, margin)) {
             hi = mid;
         } else {
             lo = mid + 1;
@@ -2418,12 +2425,94 @@ static bool common_maybe_autoplace_moe_cpu(
     return true;
 }
 
+// Raise MoE CPU offload until the *requested* context fits, before --fit ever
+// considers shrinking that context.
+//
+// Order of operations is the whole point here. common_fit_params() runs first
+// and, finding the model doesn't fit, shrinks n_ctx until it does - at whatever
+// MoE placement it was handed. common_maybe_autoplace_moe_cpu() then runs and
+// asks only "does the model fit?", which is now trivially true (at the reduced
+// context), so it does nothing. Each step locally succeeds while together they
+// silently trade away context the user explicitly asked for, to preserve a
+// placement nobody deliberately chose. Measured on a 12GB card with a 26B MoE:
+// `-ncmoe 15 -c 65536` collapsed to 4096 ctx / 1 slot, while `-ncmoe 30` (the
+// same model, more experts in CPU RAM) served the full 65536 at 4 slots and
+// ~90% of the throughput - the context was never the thing that had to give.
+//
+// So placement is chosen here, against the requested context, and only if no
+// placement can host it does --fit fall back to reducing context as before
+// (a genuine hardware limit rather than a self-inflicted one).
+//
+// -ncmoe acts as a floor rather than an off-switch: an explicit value is never
+// lowered, but it is raised when the requested context demands it. This
+// deliberately differs from common_maybe_autoplace_moe_cpu()'s "bail if any
+// override is set" rule - that early-out means passing -ncmoe silently disables
+// the very logic meant to make this decision (the same trap as -ngl disabling
+// --fit entirely), which is exactly how the collapse above went unnoticed.
+static bool common_maybe_raise_moe_for_ctx(
+        const char * path_model, common_params & params,
+        llama_model_params & mparams, const llama_context_params & cparams) {
+    // Only meaningful for an explicit request. n_ctx == 0 ("auto") means the
+    // user expressed no preference, so there is no context to protect and the
+    // existing post-fit autoplace path already handles it.
+    if (params.n_ctx == 0) {
+        return false;
+    }
+
+    // Any non-MoE-block override pattern means the user hand-placed tensors
+    // with -ot; rebuilding the override list from a layer count would discard
+    // that. Only the uniform "first N layers" shape -ncmoe produces is safe to
+    // extend, so bail on anything else.
+    uint32_t current_n = 0;
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (o.pattern == nullptr) {
+            continue;
+        }
+        if (o.pattern != llm_ffn_exps_block_regex((int) current_n)) {
+            return false;
+        }
+        current_n++;
+    }
+
+    // Must match what common_fit_params() will demand of this same config, or
+    // placement approves a layout fit then rejects - see fit.cpp's step0_margin,
+    // which requires 3x the configured per-device target to cover costs its
+    // no-alloc probe can't see (real weight loading, lazy CUDA graph capture).
+    // Judging placement by a bare fit here is what let a 65536-token request
+    // get "fixed" by a single extra offloaded layer and still collapse to 4096.
+    const int64_t margin = 3 * (int64_t) params.fit_params_target[0];
+
+    const common_moe_fit_probe_result probe =
+        common_moe_find_safe_layers(path_model, mparams, cparams, margin);
+    if (!probe.is_moe || probe.already_fits) {
+        return false; // dense model, or the requested context already fits as configured
+    }
+    if (!probe.found_safe_n || probe.safe_n <= current_n) {
+        // Nothing fits even with every expert offloaded, or more offload than
+        // already configured wouldn't help - a real hardware ceiling. Leave it
+        // to --fit to reduce context, which is the correct last resort.
+        return false;
+    }
+
+    LOG_WRN("%s: requested context of %d does not fit with the MoE experts of %u layer(s) on CPU - "
+            "raised to %u layer(s) so the requested context fits, instead of reducing the context to fit "
+            "the placement (pass -fit off to disable this)\n",
+            __func__, params.n_ctx, current_n, probe.safe_n);
+
+    params.tensor_buft_overrides  = common_moe_build_cpu_overrides(probe.safe_n);
+    mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+    return true;
+}
+
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
     if (params.fit_params) {
+        // must run before common_fit_params() - see the function's own comment
+        common_maybe_raise_moe_for_ctx(params.model.path.c_str(), params, mparams, cparams);
+
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
