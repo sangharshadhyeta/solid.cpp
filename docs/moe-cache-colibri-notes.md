@@ -4632,3 +4632,22 @@ auto-placement simply does not consult it. Making the fit search continue past
 "fits" toward a throughput optimum - or defaulting to the calibrated value where
 one exists - is the natural next step, and unlike most of this document's
 suggestions it has a measured gain attached before being built.
+
+
+### `-ncmoe 99` and a reporting bug it exposed (2026-08-22)
+
+`-ncmoe 99` on a 53-layer model is a legitimate "offload everything" idiom - the
+extra 46 override patterns simply match layers that do not exist - and it
+measures identically to `-ncmoe 53`: 53 layers offloaded, 2307 slots, 34%
+coverage, 68.5% hit rate against 68.3%.
+
+It did surface something small and real, though. `/props` reported
+`n_cpu_moe_final: 99` on a model with 53 layers, and that field feeds the
+model-info dialog and the Brain placement view - so the UI was stating something
+untrue about the model. The count came straight from the number of override
+entries rather than from the layers those entries actually match. Now clamped to
+the model's real layer count in `common_maybe_raise_moe_for_ctx`.
+
+Worth noting because it is the same failure mode as `du` reporting 21 GB for
+files that freed 4 GB: a number that was easy to compute standing in for the
+number that was true.
