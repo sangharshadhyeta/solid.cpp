@@ -4892,3 +4892,49 @@ should prefer evicting RAM-backed experts and protect NVMe-only ones. This is
 textbook cost-aware caching (GreedyDual-Size, Cao & Irani 1997), and it is the
 clearest thing the OS literature has to offer us that we are currently getting
 wrong.
+
+## Reading the fill path properly: two claimed defects were not defects
+
+Implementing the "obvious" wins from the transfer/compute analysis meant reading
+the fill path closely, and two of the three claimed defects dissolved on contact.
+
+**"Every fill blocks on `cudaStreamSynchronize`."** It does, but that
+synchronize runs on the *fill worker thread*, on the worker's own low-priority
+stream - not on the decode path. Decode never waits for a fill: on a miss it
+records demand, enqueues a job, and computes that expert on the CPU for this
+token, so the promoted copy only benefits later tokens. Transfer is already
+fully overlapped with compute. There was no serialization to remove.
+
+**The cache-size knee is not where transfer/compute balance predicted.** The
+prediction was C* ≈ 7.7 GB from `t_xfer(C) = t_cmp`. Measured by sweeping
+`--moe-cache`:
+
+| cache | 1 GB | 2 GB | 4 GB | 6 GB | 8 GB |
+|-------|------|------|------|------|------|
+| tok/s | 29.8 | 32.4 | **37.3** | 37.6 | 37.2 |
+
+The knee is at **4 GB**, and everything past it is flat inside noise. The model
+was wrong in structure, not arithmetic: it priced a miss as a PCIe transfer, but
+a miss is *computed on the CPU* and no transfer happens on the critical path at
+all. The correct objective is a placement problem,
+
+    T(C) = sum_{e in VRAM(C)} f_e * t_gpu  +  sum_{e not in VRAM(C)} f_e * t_cpu  +  T_other
+
+with f_e the measured access frequency. Marginal value is f_e * (t_cpu - t_gpu),
+strictly decreasing as C admits colder experts, so greedy-by-frequency is exactly
+optimal and flattens where f_e does. The trace predicts where: the top 512
+experts serve 46.4% of accesses and the next 512 only 19.7%.
+
+**Consequence: ~3.5 GB of VRAM is free.** We ship a cache around 7.4-8 GB for
+throughput that 4 GB already delivers. On this model that reclaims enough VRAM
+for a large multiple of the current KV allocation.
+
+The third defect was real: the fill path does `memcpy` into a pinned staging
+buffer and then DMAs from it, which costs an extra RAM->RAM copy (203 us per
+7.43 MB expert) purely to make the following copy pinned - cancelling most of
+what pinning is worth. `GGML_CUDA_MOE_CACHE_HOSTREG_MB` now page-locks expert
+tensor regions lazily, budget-capped, and DMAs straight from the model mapping.
+It is opt-in (default 0) because pinned pages are unreclaimable. Since fills are
+off the decode path, the win is fill *throughput*, not per-token latency: the
+worker's ceiling moves from ~1,976 to ~3,300 experts/s against a measured demand
+near 1,428/s.
