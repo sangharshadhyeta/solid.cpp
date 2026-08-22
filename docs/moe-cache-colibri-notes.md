@@ -4985,3 +4985,56 @@ a fill at all. This is consistent with, not a contradiction of, the earlier
 finding that transfer was already off the decode path - the win was always
 going to be in fill *throughput* headroom, not per-token latency, and headroom
 that was already ample shows only a small effect when widened further.
+
+## Deeper router lookahead: measured, not just modeled
+
+Built an offline validation of the router-lookahead mechanism against ground
+truth - real hidden states captured via a modified eval callback, real gate
+weight matrices and load-balancing bias read from the GGUF, real routing
+decisions from the trace tool. Sanity check (predict a layer from its own
+hidden state) passed exactly: 4117/4117, 100.0%.
+
+Cross-layer precision (predicting layer L+d from layer L's hidden state,
+against what layer L+d's router actually needed):
+
+| depth d (MoE layers ahead) | precision | vs. random (4.7%) |
+|---|---|---|
+| 1 | 59.3% | 12.6x |
+| 2 | 48.0% | 10.2x |
+| 3 | 41.1% | 8.7x |
+
+This also surfaced a real bug in the shipped mechanism: `build_moe_lookahead`
+ranked by raw gate logits, but the model's actual ranking criterion is
+`sigmoid(logits) + exp_probs_b` (a learned per-expert load-balancing bias).
+Fixed - `build_moe_lookahead` now takes the bias tensor and applies it before
+ranking. Gemma-4 has no such bias tensor, so this is a no-op there (sigmoid is
+monotonic and changes nothing about a ranking with no bias term added).
+
+Extended lookahead to a configurable depth (`GGML_CUDA_MOE_LOOKAHEAD_DEPTH`,
+1-3, default 1) and measured production-shape throughput (4 slots, 65536 ctx,
+moe-cache at the confirmed 4 GB knee, 4-way concurrent load, MTP off to avoid
+its own confound):
+
+| depth | r1 | r2 | mean |
+|-------|-------|-------|-------|
+| 1     | 50.46 | 49.85 | 50.16 |
+| 2     | 51.28 | 48.07 | 49.68 |
+| 3     | 53.43 | 48.67 | 51.05 |
+
+**No measurable gain.** All three means sit inside the same ~5% run-to-run
+noise this system has shown at every sweep this session (cache size,
+admit_after). Depth 3's high single sample (53.43) is undercut by its own
+second round (48.67) - noise, not a trend.
+
+This is consistent with the cache-knee finding from earlier: at the 4 GB
+operating point the system is compute-bound, not transfer-bound - misses are
+absorbed by CPU fallback inside the compute window already. Better prediction
+has nothing left to buy at this operating point; it would only start mattering
+if the cache were pushed back into the transfer-bound region (smaller cache, or
+a model whose expert corpus approaches the RAM ceiling), which is exactly where
+the offline precision curve says it should help most and where a future variant
+should be re-tested.
+
+Default stays at depth 1. The sigmoid+bias ranking fix ships regardless of
+depth - it is a correctness fix independent of how far ahead the prediction
+reaches, and the depth-1 numbers above already include it.

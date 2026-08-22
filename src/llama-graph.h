@@ -1071,8 +1071,10 @@ struct llm_graph_context {
             ggml_tensor * cur,
             ggml_tensor * next_gate_inp,
             ggml_tensor * next_exps,
+            ggml_tensor * next_exp_probs_b,   // may be null: models without a load-balancing bias
                 int64_t   n_expert_used,
-                    int   il) const;
+                    int   il,
+                    int   depth = 1) const;   // layers ahead being predicted; only affects the debug tensor name
 
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
