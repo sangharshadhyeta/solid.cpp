@@ -1412,6 +1412,7 @@ struct common_moe_calibration_entry {
     int         spec_n_max      = -1; // -1 = no MTP calibration recorded
     int         concurrency     = 1;  // > 1: tok_per_sec is aggregate throughput at this many concurrent requests, not solo
     double      tok_per_sec     = 0.0;
+    int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
     std::string calibrated_at;
 };
 
@@ -1468,6 +1469,7 @@ static bool common_moe_calibration_lookup(
         out.spec_n_max      = e.value("spec_n_max", -1);
         out.concurrency     = e.value("concurrency", 1);
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
+        out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.calibrated_at   = e.value("calibrated_at", std::string());
         return true;
     } catch (const std::exception &) {
@@ -1497,6 +1499,7 @@ static void common_moe_calibration_save(
         {"spec_n_max",      entry.spec_n_max},
         {"concurrency",     entry.concurrency},
         {"tok_per_sec",     entry.tok_per_sec},
+        {"moe_cache_mb",    entry.moe_cache_mb},
         {"calibrated_at",   entry.calibrated_at},
     };
     fs_create_directory_with_parents(fs_get_cache_directory());
@@ -1658,7 +1661,7 @@ static std::pair<double, double> common_moe_bench_one_request(int port, const ch
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
-        int n_concurrency = 1) {
+        int n_concurrency = 1, int moe_cache_mb = -1) {
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -1700,11 +1703,13 @@ static double common_moe_bench_candidate_server(
     // real deployment usage - would badly skew a histogram meant to guide
     // FR-Spec vocab trimming toward this benchmark's own prompt pool
     // instead of real traffic.
+    char cache_arg[32];
+    snprintf(cache_arg, sizeof(cache_arg), moe_cache_mb > 0 ? "%d" : "auto", moe_cache_mb);
     snprintf(cmd, sizeof(cmd),
-        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache auto -c %u %s%s%s"
+        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache %s -c %u %s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
-        self_exe.c_str(), path_model.c_str(), n_cpu_moe, ctx_for_launch,
+        self_exe.c_str(), path_model.c_str(), n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
@@ -2116,6 +2121,56 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Expert-cache size: same question as -ncmoe, same answer - measure this
+    // model's own knee rather than assume one. Our own sweep found the
+    // relationship is not "more is better": Nemotron flattened at 4 GiB (of a
+    // 7-8 GiB default) with no loss, while a too-small request starved the
+    // fit search's VRAM margin and collapsed concurrent slots entirely. Start
+    // small and grow only while it still pays; stop and take the smallest
+    // point once growth stops paying, mirroring the n_max envelope-doubling
+    // approach below rather than a full sweep of every candidate.
+    LOG_INF("%s: finding expert-cache size knee (growing while it still helps) at ncmoe=%u ...\n",
+            __func__, best_n);
+    static const int cache_candidates_mb[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
+    // Test every candidate rather than stopping at the first non-improving
+    // step: the curve is not guaranteed monotonic below the knee - our own
+    // sweep found a placement cliff at small cache sizes (too little VRAM
+    // margin starves the fit search of concurrent slots, e.g. 4 -> 1, a
+    // collapse unrelated to cache-hit-rate that a local stop rule would
+    // mistake for "smaller is fine"). Picking the smallest point within 3%
+    // of the *global* max, after seeing the whole curve, is robust to that
+    // dip in a way a running best-so-far comparison is not.
+    std::vector<std::pair<int, double>> cache_results;
+    for (size_t i = 0; i < sizeof(cache_candidates_mb) / sizeof(cache_candidates_mb[0]); i++) {
+        const int mb = cache_candidates_mb[i];
+        double tps = common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, n_predict, concurrency, mb);
+        if (tps < 0) {
+            tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, mb);
+        }
+        LOG_INF("%s:   moe-cache=%dMiB -> %s\n", __func__, mb,
+                tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        if (tps > 0) {
+            cache_results.emplace_back(mb, tps);
+        }
+    }
+    int    best_cache_mb  = -1; // -1 stays "auto" if the sweep found nothing usable
+    double best_cache_tps = -1.0;
+    for (const auto & r : cache_results) {
+        best_cache_tps = std::max(best_cache_tps, r.second);
+    }
+    if (best_cache_tps > 0) {
+        for (const auto & r : cache_results) {
+            if (r.second >= best_cache_tps * 0.97) {
+                best_cache_mb = r.first; // smallest candidate within 3% of the global max
+                break;
+            }
+        }
+    }
+
     time_t now = time(nullptr);
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -2127,6 +2182,7 @@ void common_moe_calibrate(common_params & params) {
     entry.spec_n_max      = best_n_max;
     entry.concurrency     = concurrency;
     entry.tok_per_sec     = best_threads_tps;
+    entry.moe_cache_mb    = best_cache_mb;
     entry.calibrated_at   = timebuf;
     common_moe_calibration_save(path_model, params, entry);
 
@@ -2425,10 +2481,30 @@ static bool common_maybe_autoplace_moe_cpu(
                 params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
                 params.speculative.draft.n_max = cached.spec_n_max;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s, measured %.2f %s on %s) "
+            // Same rule as spec_n_max above: only refine --moe-cache's own
+            // "auto" intent, never override a size the user explicitly
+            // requested. GGML_CUDA_MOE_CACHE_MODE=auto is the marker for
+            // that - "off" or an explicit numeric budget means the user
+            // already decided and calibration should not second-guess it.
+            const char * cache_mode_env = getenv("GGML_CUDA_MOE_CACHE_MODE");
+            const bool cache_mode_is_auto = !cache_mode_env || std::string(cache_mode_env) == "auto";
+            if (cached.moe_cache_mb > 0 && cache_mode_is_auto) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE", "1");
+                _putenv_s("GGML_CUDA_MOE_CACHE_MODE", "on");
+                _putenv_s("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(cached.moe_cache_mb).c_str());
+#else
+                setenv("GGML_CUDA_MOE_CACHE", "1", 1);
+                setenv("GGML_CUDA_MOE_CACHE_MODE", "on", 1);
+                setenv("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(cached.moe_cache_mb).c_str(), 1);
+#endif
+                params.moe_cache_force = true;
+            }
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
                     cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
+                    cached.moe_cache_mb > 0 && cache_mode_is_auto ? string_format(", moe-cache=%dMiB", cached.moe_cache_mb).c_str() : "",
                     cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
                     cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;
@@ -2552,6 +2628,28 @@ static bool common_maybe_raise_moe_for_ctx(
                         "rather than the %s that merely fits\n",
                         __func__, cal.n_cpu_moe, cal.tok_per_sec, cal.calibrated_at.c_str(),
                         "minimum");
+                // Same expert-cache-size consultation as common_maybe_autoplace_moe_cpu -
+                // this is the placement path that actually runs when the user asks
+                // for a context and lets -ncmoe auto-raise to fit it (--moe-cache
+                // auto, no explicit -ncmoe), which is most real launches. Only
+                // refines --moe-cache's own "auto" intent, same guard as there.
+                {
+                    const char * cache_mode_env = getenv("GGML_CUDA_MOE_CACHE_MODE");
+                    const bool cache_mode_is_auto = !cache_mode_env || std::string(cache_mode_env) == "auto";
+                    if (cal.moe_cache_mb > 0 && cache_mode_is_auto) {
+#if defined(_WIN32)
+                        _putenv_s("GGML_CUDA_MOE_CACHE", "1");
+                        _putenv_s("GGML_CUDA_MOE_CACHE_MODE", "on");
+                        _putenv_s("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(cal.moe_cache_mb).c_str());
+#else
+                        setenv("GGML_CUDA_MOE_CACHE", "1", 1);
+                        setenv("GGML_CUDA_MOE_CACHE_MODE", "on", 1);
+                        setenv("GGML_CUDA_MOE_CACHE_BUDGET_MB", std::to_string(cal.moe_cache_mb).c_str(), 1);
+#endif
+                        params.moe_cache_force = true;
+                        LOG_WRN("%s: using calibrated expert-cache size of %d MiB\n", __func__, cal.moe_cache_mb);
+                    }
+                }
                 params.tensor_buft_overrides  = common_moe_build_cpu_overrides((uint32_t) cal.n_cpu_moe);
                 mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
                 // c_ngl was filled by the fit probe above with the model's real

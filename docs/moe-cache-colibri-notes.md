@@ -5172,3 +5172,38 @@ eviction experiments above (reconciliation, uncapped, rate-limited) all
 independently converged on the same negative result: asking one signal to do
 both jobs is the actual mistake, not a bug in any particular implementation of
 it.
+
+## Silent failure: moe-cache never engaged for Ornith (or GLM-5.2) - fixed
+
+Ornith-1.5-35B-A3B's Brain page showed the atlas but the live expert-activity
+overlay was empty. Traced to `moe_cache_begin()`'s admission guard:
+`expert_size < session->config.min_expert_bytes`, with `min_expert_bytes`
+defaulting to 1 MiB. Ornith's per-expert tensors (256 experts, Qwen3.5-MoE
+style - more, smaller experts than Nemotron's 128) are 840 KiB - below the
+floor. Every candidate tensor was rejected before `session->tensor_layer` ever
+got a single entry.
+
+The dangerous part was not the threshold - it was that this failure was
+**completely silent**. The session initialized normally, logged "explicit MoE
+cache mode disables weight repacking" (success), and then did nothing for the
+server's entire lifetime: 0 hits, 0 misses, empty expert-map, no warning
+anywhere. From the outside this was indistinguishable from a correctly
+configured, simply-idle cache.
+
+`GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB` already existed as an override, but
+nothing told an operator they needed it. **GLM-5.2 has 256 experts/layer too**
+and would have hit the identical silent failure - moe-cache dead on arrival
+for the exact model this session has been building toward, with no signal
+anything was wrong.
+
+Fixed two ways:
+- Default `min_expert_bytes` lowered 1 MiB -> 256 KiB, based on Ornith's
+  measured 840 KiB/expert, with margin for genuinely-too-small slabs the
+  floor exists to exclude.
+- A one-time warning added at the exact rejection point, independent of what
+  the threshold is set to, so this specific silent-failure shape cannot recur
+  even if a future model's experts fall below whatever floor is chosen later.
+
+Verified end to end on Ornith after the fix: `rows=29, cols=256` (real CPU-
+offloaded layer count x real expert count), 61.0% hit rate, 22,732 hits,
+5,736/5,986 slots used, 3,597 MiB allocated - all previously reporting zero.
