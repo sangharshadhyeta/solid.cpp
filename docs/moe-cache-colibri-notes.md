@@ -5117,3 +5117,28 @@ worse bet when capacity is already tight.
 `GGML_CUDA_MOE_CACHE_SPEC_EVICT` defaults to off. Left in, gated, rather than
 removed - a measured dead end is worth keeping on record over deleting the
 evidence.
+
+## Was it volume? Throttled to 4 evictions/token, tested - no
+
+Direct follow-up: is the regression proportional to how often speculative
+eviction fires? Added a per-token cap (`GGML_CUDA_MOE_CACHE_SPEC_EVICT_CAP`,
+default 4, reset once per real decode step via `device.collect_calls`) so at
+most 4 speculative evictions can happen per token, down from a theoretical
+ceiling of `n_expert_used x n_layers` (up to ~240 for Gemma-4 uncapped).
+
+Same >RAM pressure test (10 GiB cgroup cap, 16.9 GiB model):
+
+| | mean tok/s |
+|---|---|
+| no speculative eviction | 44.08 |
+| speculative eviction, uncapped | 37.42 |
+| speculative eviction, capped to 4/token | 37.0 |
+
+No difference. Volume was not the cause - even 4 wrong swaps per token,
+repeated across a generation, cost the same as letting it fire unbounded. Each
+individual speculative eviction is, on average, a losing trade regardless of
+how often it happens: discarding an unconfirmed probation item for a
+41-59%-confidence guess costs more than it gains, every time it happens, not
+just in aggregate. This closes the speculative-eviction line of investigation -
+neither reconciliation-based reinforcement, nor rate-limiting, rescues it.
+`GGML_CUDA_MOE_CACHE_SPEC_EVICT` stays off by default.

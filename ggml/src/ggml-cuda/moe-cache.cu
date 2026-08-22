@@ -310,6 +310,8 @@ struct moe_cache_device {
     long long collect_failures = 0;
     long long nodes = 0;
     long long collect_calls = 0;
+    long long spec_evictions_this_cycle = 0;   // rate limit for speculative eviction
+    long long spec_evict_reset_at_calls = 0;   // collect_calls value at last reset
     std::atomic<int> error_logs{0};
 };
 
@@ -3852,6 +3854,25 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                             // this on to re-test once demand genuinely exceeds
                             // capacity, where the calculus may differ.
                 } else {
+                    // Rate-limited: uncapped, this fires up to n_expert_used
+                    // times per layer per token (measured harmful - see above).
+                    // Reset once per real decode step (device.collect_calls),
+                    // capped small so eviction is reserved for genuinely
+                    // confident, infrequent swaps rather than every layer's
+                    // every speculative candidate.
+                    if (device.spec_evict_reset_at_calls != device.collect_calls) {
+                        device.spec_evict_reset_at_calls = device.collect_calls;
+                        device.spec_evictions_this_cycle = 0;
+                    }
+                    static const long long spec_evict_cap = [] {
+                        const char * env = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT_CAP");
+                        const long long v = env ? atoll(env) : 4;
+                        return v < 0 ? 0 : v;
+                    }();
+                    if (device.spec_evictions_this_cycle >= spec_evict_cap) {
+                        break; // budget spent for this token - fall back to free-only
+                    }
+                    device.spec_evictions_this_cycle++;
                     // No free slot: evict the least-preferred probation-tier
                     // occupant, by the same heat criterion that decides who
                     // gets to STAY (moe_cache_pick_coldest_unpinned - shared
