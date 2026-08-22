@@ -732,6 +732,28 @@ static bool moe_cache_colder_enough(uint32_t a_heat, uint32_t b_heat) {
 // candidates gets picked when several are in contention.
 static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
 
+// Coldest-first, bounded-window pick from a segment, skipping anything with
+// active readers. Shared by real-miss eviction and, now, speculative-fill
+// eviction: same criterion used to choose what to keep should decide what to
+// let go, rather than a separate, unprincipled policy for each path.
+static int moe_cache_pick_coldest_unpinned(moe_cache_pool & pool, int head) {
+    int best = -1;
+    uint32_t best_heat = 0;
+    int candidate = head;
+    for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
+        if (pool.slots[candidate].readers > 0) {
+            continue;
+        }
+        seen++;
+        const uint32_t heat = pool.slots[candidate].heat;
+        if (best < 0 || moe_cache_colder_enough(best_heat, heat)) {
+            best = candidate;
+            best_heat = heat;
+        }
+    }
+    return best;
+}
+
 static void moe_cache_promote_to_protected(moe_cache_pool & pool, int index) {
     moe_cache_segment_remove(pool, index);
     const int cap = std::max(1, pool.n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100);
@@ -2996,26 +3018,9 @@ static int moe_cache_plan(
             // pick among a bounded recency window is by heat (coldest
             // wins, with hysteresis) rather than plain oldest-first - the
             // heat half of the hybrid.
-            auto pick_coldest_unpinned = [&](int head) -> int {
-                int best = -1;
-                uint32_t best_heat = 0;
-                int candidate = head;
-                for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
-                    if (pool.slots[candidate].readers > 0) {
-                        continue;
-                    }
-                    seen++;
-                    const uint32_t heat = pool.slots[candidate].heat;
-                    if (best < 0 || moe_cache_colder_enough(best_heat, heat)) {
-                        best = candidate;
-                        best_heat = heat;
-                    }
-                }
-                return best;
-            };
-            int candidate = pick_coldest_unpinned(pool.lru_head);
+            int candidate = moe_cache_pick_coldest_unpinned(pool, pool.lru_head);
             if (candidate < 0) {
-                candidate = pick_coldest_unpinned(pool.protected_head);
+                candidate = moe_cache_pick_coldest_unpinned(pool, pool.protected_head);
             }
             if (candidate < 0) {
                 device.insert_skips++;
@@ -3833,8 +3838,38 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                 if ((int) device.queue.size() >= session->config.queue_max) {
                     break;
                 }
-                if (pool.free_slots.empty()) {
-                    break; // no eviction for speculation - see above
+                static const bool spec_evict = [] {
+                    const char * env = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT");
+                    return env && atoi(env) != 0; // default off - see the note below
+                }();
+                int slot_index = -1;
+                if (!pool.free_slots.empty()) {
+                    slot_index = pool.free_slots.back();
+                    pool.free_slots.pop_back();
+                } else if (!spec_evict) {
+                    break; // default: no eviction for speculation - measured harmful
+                            // under no real memory pressure (probation churn); gate
+                            // this on to re-test once demand genuinely exceeds
+                            // capacity, where the calculus may differ.
+                } else {
+                    // No free slot: evict the least-preferred probation-tier
+                    // occupant, by the same heat criterion that decides who
+                    // gets to STAY (moe_cache_pick_coldest_unpinned - shared
+                    // with the real-miss path). Protected is never touched
+                    // here, on purpose: an item earns protected status via a
+                    // real hit or a cross-depth-confirmed prediction (see the
+                    // promote_to_protected call above, on repeated prefetch
+                    // agreement) - exactly the "keep many loaded" half of the
+                    // design. Speculative admission may only rotate the
+                    // unconfirmed probation tier, never something already
+                    // proven wanted.
+                    const int candidate = moe_cache_pick_coldest_unpinned(pool, pool.lru_head);
+                    if (candidate < 0) {
+                        break; // probation has nothing left to sacrifice
+                    }
+                    moe_cache_slot_reset(pool, candidate, false);
+                    slot_index = candidate;
+                    device.evictions++;
                 }
                 const moe_cache_key key{host_base, expert};
 
@@ -3860,12 +3895,30 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     }
                 }
 
-                if (pool.map.find(key) != pool.map.end()) {
-                    continue; // already resident or already in flight
+                {
+                    auto existing = pool.map.find(key);
+                    if (existing != pool.map.end()) {
+                        // A closer, fresher-depth prediction re-targeting what a
+                        // farther, weaker-depth guess already brought in (or
+                        // queued) is real evidence, not a duplicate to discard.
+                        // Every layer re-predicts on its own turn (build_moe_
+                        // lookahead fires at every layer), so by the time we are
+                        // one layer out a candidate may have been suggested by
+                        // depth 3, then depth 2, then depth 1 - each strictly
+                        // more accurate (measured: 41.1% / 48.0% / 59.3%
+                        // precision) than the last. Treat repeated agreement the
+                        // same way a real re-request already does: promote it,
+                        // so it survives the probation churn other one-off
+                        // speculative admissions are exposed to, rather than
+                        // silently doing nothing with the stronger signal.
+                        moe_cache_slot & existing_slot = pool.slots[existing->second];
+                        if (existing_slot.state == moe_cache_slot_state::valid) {
+                            moe_cache_promote_to_protected(pool, existing->second);
+                        }
+                        continue; // already resident or already in flight
+                    }
                 }
 
-                const int slot_index = pool.free_slots.back();
-                pool.free_slots.pop_back();
                 moe_cache_slot & slot = pool.slots[slot_index];
                 slot.key = key;
                 slot.generation++;
