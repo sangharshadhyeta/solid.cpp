@@ -5038,3 +5038,37 @@ should be re-tested.
 Default stays at depth 1. The sigmoid+bias ranking fix ships regardless of
 depth - it is a correctness fix independent of how far ahead the prediction
 reaches, and the depth-1 numbers above already include it.
+
+## The expert-corpus tail is model-specific, not universal - corrected
+
+Earlier reasoning applied Nemotron's measured skew tail (99.6% hit rate needs
+99.97% of the corpus resident) to argue that a 744B model like GLM-5.2 would
+need essentially its entire expert corpus resident to clear the hit rate a
+20 tok/s target requires. That was an unjustified generalization from a single
+model. Traced Gemma-4-26B-A4B (30 MoE layers, 128 experts/layer, top-8; 21,594
+real tokens, same methodology as the Nemotron trace) to check:
+
+| resident fraction of corpus | Nemotron hit rate | Gemma-4 hit rate |
+|---|---|---|
+| 17.5% | 46.4% | **69.4%** |
+| 35%   | 66.1% | **89.3%** |
+| 70%   | 93.0% | **99.2%** |
+| ~90-99.9% | 99.6% (needed 99.97% resident) | **99.8% (at 90% resident)** |
+
+Gemma-4's tail is dramatically more compressible. At identical resident
+fractions it clears far higher hit rates, and it crosses 99.8% at 90% of its
+corpus rather than needing essentially all of it. Two real models, two
+meaningfully different tail shapes - this is a property of each model's
+training (routing entropy, load-balancing regime), not a property of MoE
+architectures as a class.
+
+Consequence: the bandwidth-derived requirement (>=98.7% hit rate to keep a
+744B model's NVMe miss traffic inside a 20 tok/s / 50ms budget, from
+13.4 GB/token active weight against 3.55 GB/s NVMe) still holds - that's pure
+arithmetic, architecture-independent. What is no longer justified is assuming
+GLM-5.2's *tail shape* resembles Nemotron's specifically. Whether a resident
+fraction well under "the whole model" can clear that bar depends on GLM's own
+routing concentration, which is genuinely unmeasured. This is now an open
+question, not a settled negative - the honest next step is tracing GLM's own
+routing once the download completes, not further extrapolation from either of
+the two models measured so far.
