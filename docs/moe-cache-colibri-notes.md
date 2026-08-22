@@ -4574,3 +4574,61 @@ has a router and checks the gate dimensions match before predicting.
 
 Throughput is flat within noise, the same result as on Gemma: prefetch moves hit
 rate, and only converts to speed where the workload is transfer-bound.
+
+## Why Nemotron's hit rate is lower than Gemma's, and what it exposed (2026-08-22)
+
+Nemotron ran at 57.1% cache hit rate against Gemma's 79%. The cause is
+arithmetic, not a defect:
+
+| | Gemma-4 | Nemotron |
+| --- | ---: | ---: |
+| offloaded layers | 21 | 46 |
+| expert size | 2178 / 1452 KiB | 3349 / 3654 KiB |
+| cache slots | 1316 | 1239 |
+| coverage per layer | 62.7 (49%) | 26.9 (21%) |
+| hit rate | 79% | 57% |
+
+A similar slot count spread over 2.2x the layers, with experts about twice the
+size, gives each layer 21% coverage instead of 49%. Hit rate tracks coverage
+closely.
+
+**Scanning further ahead would not fix it.** The cache is 100% full (1239/1239)
+with 79057 admission skips, and prefetch deliberately takes only free slots so
+speculation never evicts certainty. More predictions would have nowhere to land,
+and accuracy degrades with distance anyway.
+
+**Reducing context made it worse, which was the useful surprise.** At 16384
+instead of 65536: 44 layers offloaded (not 46), 1014 slots (not 1239), 18%
+coverage, 53.3% hit rate, 30-34 tok/s. Less context let the placement search
+offload *fewer* layers, so more weights stayed resident on the GPU - consuming
+exactly the VRAM the expert cache wanted.
+
+**So the lever runs the other way.** Forcing `-ncmoe 53` (every layer offloaded)
+at the same 65536 context:
+
+| -ncmoe | layers | slots | coverage | hit rate | tok/s |
+| --- | ---: | ---: | ---: | ---: | --- |
+| auto (46) | 46 | 1239 | 21% | 57.1% | 36-38 |
+| 53 | 53 | 2307 | 34% | 68.3% | 39.8-41.2 |
+
+Nearly double the cache, +11pp hit rate, ~8% throughput, same hardware and
+context.
+
+**What this exposes is a limitation in our own placement logic, one level up
+from the bug fixed this morning.** That fix made context lead and placement
+follow. But the search still answers only *"what is the minimum offload that
+makes this context fit?"* - it stops at 46 because 46 suffices. Every layer left
+resident holds weights competing with the expert cache for the same VRAM, and
+since cached experts serve the offloaded layers, trading resident weights for
+cache capacity stays net-positive well past the point where the context merely
+fits. Sufficient is not optimal.
+
+Caveats stated plainly: one model, one context, n=3, and 41 vs 37 tok/s sits near
+this rig's noise band. The hit-rate gap (68.3% vs 57.1%) is the solid part, being
+a far lower-variance metric than throughput.
+
+`--moe-calibrate` already performs an empirical throughput search over `-ncmoe`;
+auto-placement simply does not consult it. Making the fit search continue past
+"fits" toward a throughput optimum - or defaulting to the calibrated value where
+one exists - is the natural next step, and unlike most of this document's
+suggestions it has a measured gain attached before being built.
