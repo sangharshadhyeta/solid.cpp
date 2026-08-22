@@ -4737,3 +4737,60 @@ converts back into hit rate. Whether that hit rate becomes throughput is
 unmeasured - a direct ncmoe 40 vs 46 vs 52 benchmark was started and timed out
 before finishing. Until that is measured, widening the default range would be
 shipping a guess.
+
+## Placement between ncmoe 40 and 52 does not affect throughput
+
+The open question above - whether the expert-cache hit rate gained at high CPU
+offload turns into tokens/sec - is now measured. Same flags as the live deploy,
+on 8099, concurrency 4, varying only `-ncmoe`, two measured rounds each after a
+warm-up round that fills the expert cache:
+
+| placement | r1    | r2    | mean  |
+|-----------|-------|-------|-------|
+| ncmoe=40  | 29.46 | 30.70 | 30.08 |
+| ncmoe=46  | 30.85 | 29.19 | 30.02 |
+| ncmoe=52  | 29.41 | 30.83 | 30.12 |
+
+All six samples fall in 29.19-30.85 tok/s (+/-2.7%), and the three means agree
+to within 0.1 tok/s. The 68.3% vs 57.1% hit-rate advantage measured at
+`-ncmoe 99` does **not** become throughput: offloading more layers adds CPU
+compute at very close to the rate the improved hit rate removes GPU stalls, and
+the two cancel.
+
+Consequences:
+
+- Do **not** widen the calibration search range. There is nothing above the old
+  bound to find, so the boundary-extension change is a correctness fix for a
+  heuristic that was wrong in principle, not a throughput win. It stays because
+  a peak on the boundary is still the wrong thing to report as an optimum.
+- The `-ncmoe` arm of `--moe-calibrate` is measuring a flat objective on this
+  model class. That fully explains the +/-8% run-to-run disagreement documented
+  above: there is no peak to find, so the "winner" is whichever candidate drew
+  the luckiest sample.
+- It also retroactively justifies treating calibration as a floor rather than
+  an override. The fit search's conservative answer (46) is worth exactly as
+  much as the calibrated one (40), so deferring to the safer number costs
+  nothing measurable.
+
+Note the absolute numbers here (~30 tok/s) are below calibration's ~38 tok/s for
+the same placement because this harness lets the reasoning model run ~760 tokens
+per request rather than the calibrator's short generations. Only the comparison
+between arms is meaningful.
+
+## The UI build silently stopped compiling our own source
+
+The brain/atlas view reverted to the stock square. Nothing of ours was lost or
+reverted - `tools/ui/src/lib/components/app/brain/Brain.svelte` still had every
+atlas reference. Upstream #22937 ("Move static build output from repo code to HF
+Bucket") changed the build to download a prebuilt UI bundle from
+`ggml-org/llama-ui` and embed that, with `LLAMA_USE_PREBUILT_UI` defaulting ON.
+
+The failure mode is the nasty kind: the build stays green, no warning is
+printed, the source stays on disk untouched, and every rebuild quietly ships
+upstream's UI. `LLAMA_USE_PREBUILT_UI=OFF` alone is not enough either - it then
+embeds `tools/ui/dist`, which still held the *downloaded* assets, so `npm run
+build` has to regenerate `dist/` from source first. The embedded `ui.cpp` was
+byte-identical in size until that happened, which is what gave it away.
+
+`LLAMA_USE_PREBUILT_UI` now defaults OFF in this fork. A fork that modifies the
+UI cannot correctly default to someone else's prebuilt copy of it.

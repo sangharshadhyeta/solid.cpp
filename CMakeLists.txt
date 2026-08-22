@@ -135,7 +135,14 @@ option(LLAMA_BUILD_EXAMPLES  "llama: build examples"                            
 option(LLAMA_BUILD_SERVER    "llama: build server example"                                                       ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
-option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
+# solid.cpp: default OFF, not ON as upstream.
+# Upstream #22937 moved the built UI out of the repo and into a HuggingFace
+# bucket, so an ON default silently embeds *their* prebuilt bundle and never
+# compiles tools/ui/src. This fork carries its own UI (the brain/atlas view),
+# which that default erased from every rebuild while leaving the source intact
+# and the build green - a regression with no error message anywhere. Building
+# from source is the only correct default for a fork that modifies the UI.
+option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" OFF)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
