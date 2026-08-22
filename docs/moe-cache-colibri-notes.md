@@ -4531,3 +4531,46 @@ does is make the buffer *less wrong* - it holds fewer, better-chosen experts.
 Where the ratio is not zero-sum (RAM close to sufficient, the case this targets
 and which cannot be reproduced here) that is exactly the difference that should
 decide it.
+
+# Second model, no new machinery: Nemotron 3.5 Lightning 30B-A3B (2026-08-22)
+
+Everything built for Gemma-4 transferred to a structurally different model with
+one exception. Nemotron 3.5 Lightning is `nemotron_h_moe`: 53 blocks interleaving
+Mamba-2, dense and MoE, 128 routed experts plus 1 shared expert per MoE layer,
+MTP layers embedded in the GGUF, 1M trained context.
+
+Verified working on first run, unchanged:
+
+- **Placement from context.** `-ncmoe` omitted entirely; the search derived
+  **0 -> 46 of 53 layers** on CPU purely from the requested 65536 context, on a
+  model it had never seen.
+- **MTP without a drafter.** `nextn_predict_layers = 1` satisfies
+  `nemotron-h-moe.cpp`'s single-block assert, `blk.52.nextn.*` tensors load, and
+  `common/speculative.cpp` takes its `else if (spec_mtp)` branch to build the
+  draft context against the target model itself. No `-md`, one file instead of
+  two - unlike Gemma-4, whose draft is a separate `gemma4-assistant` model
+  because its MTP layers are genuinely not in the main GGUF (the `nextn` string
+  found there is `nextNode`, from the tokenizer).
+- **moe-cache on a hybrid layout.** Engages after the first request: two pools
+  (q5_0 and q5_1 expert shapes), 1158 slots, ~3.6 GB VRAM, 46x128 Brain grid.
+- **Shared experts stay on GPU by construction.** They run on *every* token, so
+  offloading them would be exactly backwards. The offload regex is
+  `\.ffn_(up|down|gate|gate_up)_(ch|)exps`, which matches `ffn_down_exps` and not
+  `ffn_down_shexp` - correct already, and worth recording since it is the kind of
+  thing that is right by accident until someone checks.
+
+**The one thing that did need code: router-lookahead prefetch.** It was wired
+only into `gemma4.cpp`, so Nemotron ran with `prefetches: 0`. Wiring it required
+a real difference rather than a copy: Gemma predicts against layer `il+1`, but
+here `il+1` is usually a Mamba-2 or dense block with no router at all. Predicting
+against an absent or differently-shaped gate would crash or produce confident
+nonsense, so `nemotron-h.cpp` scans forward for the nearest block that actually
+has a router and checks the gate dimensions match before predicting.
+
+| | prefetches | hit rate | generation tok/s |
+| --- | ---: | ---: | --- |
+| before wiring | 0 | 55.2% | 39.3 / 38.7 / 35.4 |
+| after | **379** | **57.1%** | 37.1 / 38.1 / 38.5 / 36.1 |
+
+Throughput is flat within noise, the same result as on Gemma: prefetch moves hit
+rate, and only converts to speed where the workload is transfer-bound.
