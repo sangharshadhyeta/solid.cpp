@@ -342,6 +342,7 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                 build_moe_lookahead(tmp,
                         model.layers[il + 1].ffn_gate_inp,
                         model.layers[il + 1].ffn_down_exps,
+                        nullptr, // gemma4 has no load-balancing bias tensor
                         n_expert_used, il);
             }
 

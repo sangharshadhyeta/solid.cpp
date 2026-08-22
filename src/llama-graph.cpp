@@ -1905,15 +1905,26 @@ void llm_graph_context::build_moe_lookahead(
         ggml_tensor * cur,
         ggml_tensor * next_gate_inp,
         ggml_tensor * next_exps,
+        ggml_tensor * next_exp_probs_b,
             int64_t   n_expert_used,
-                int   il) const {
+                int   il,
+                int   depth) const {
     if (!ggml_moe_cache.prefetch || !cur || !next_gate_inp || !next_exps || !next_exps->data) {
         return;
     }
 
     ggml_tensor * next_logits = build_lora_mm(next_gate_inp, cur);
-    ggml_tensor * next_top    = ggml_argsort_top_k(ctx0, next_logits, n_expert_used);
-    cb(next_top, "ffn_moe_lookahead", il);
+    // Rank by what the target layer's router actually ranks by, not raw
+    // logits: measured offline against ground truth (depth-0 sanity check,
+    // 4117/4117 exact), the real criterion is sigmoid(logits) + a learned
+    // per-expert load-balancing bias. Skipping the bias here was silently
+    // ranking by a different criterion than the one being predicted.
+    ggml_tensor * next_probs = ggml_sigmoid(ctx0, next_logits);
+    if (next_exp_probs_b) {
+        next_probs = ggml_add(ctx0, next_probs, next_exp_probs_b);
+    }
+    ggml_tensor * next_top = ggml_argsort_top_k(ctx0, next_probs, n_expert_used);
+    cb(next_top, depth == 1 ? "ffn_moe_lookahead" : "ffn_moe_lookahead2", il);
 
     // Fires in graph order - while this layer is still computing and before the
     // next layer's expert matmul is reached, which is the whole point.
