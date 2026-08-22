@@ -338,12 +338,24 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
             // hand it to moe-cache, so its fills overlap the expert compute just
             // queued above rather than blocking the next layer. `tmp` is the
             // normalised router input, which is what the next gate would see.
-            if (il + 1 < (int) model.layers.size() && model.layers[il + 1].ffn_gate_inp) {
+            // See src/models/nemotron-h.cpp for the rationale: depth is measured,
+            // not assumed - configurable via the same env var, default 1.
+            static const int lookahead_depth = [] {
+                const char * env = getenv("GGML_CUDA_MOE_LOOKAHEAD_DEPTH");
+                const int v = env ? atoi(env) : 1;
+                return v < 1 ? 1 : (v > 3 ? 3 : v);
+            }();
+            int found = 0;
+            for (int nx = il + 1; nx < (int) model.layers.size() && found < lookahead_depth; ++nx) {
+                if (!model.layers[nx].ffn_gate_inp) {
+                    continue;
+                }
+                found++;
                 build_moe_lookahead(tmp,
-                        model.layers[il + 1].ffn_gate_inp,
-                        model.layers[il + 1].ffn_down_exps,
+                        model.layers[nx].ffn_gate_inp,
+                        model.layers[nx].ffn_down_exps,
                         nullptr, // gemma4 has no load-balancing bias tensor
-                        n_expert_used, il);
+                        n_expert_used, il, found);
             }
 
             cur_moe = build_norm(cur_moe,

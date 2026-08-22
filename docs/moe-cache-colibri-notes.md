@@ -5072,3 +5072,48 @@ routing concentration, which is genuinely unmeasured. This is now an open
 question, not a settled negative - the honest next step is tracing GLM's own
 routing once the download completes, not further extrapolation from either of
 the two models measured so far.
+
+## Speculative eviction: tested and refuted in both regimes
+
+Direct response to a specific proposal: use cross-depth agreement to reconcile
+predictions (implemented - repeated confirmation across lookahead depths
+promotes to protected, same as a real hit), and let speculative admission
+evict the coldest probation-tier occupant when free, using the identical
+heat-based criterion that decides who stays (`moe_cache_pick_coldest_unpinned`,
+extracted as a shared helper and reused by both the real-miss and speculative
+paths). Both built; both tested; both real results kept below rather than
+argued from theory.
+
+**Reconciliation (promote on repeated cross-depth agreement): no measurable
+effect.** Gemma-4, depth 1/2/3, before vs after: 100.94/100.94, 98.78/98.91,
+96.72/96.26 - identical within noise. Cross-depth agreement events are
+apparently too rare to matter: most wrong deep guesses never get confirmed by
+a later, closer prediction anyway.
+
+**Speculative eviction (evict probation to admit a speculative guess): a real,
+reproducible regression, in both regimes tested.**
+
+| regime | no eviction (default) | eviction enabled | delta |
+|--------|----------------------|-------------------|-------|
+| abundant RAM (42 GB fast memory, 16.9 GB model) | ~100.9 tok/s (depth 1) | ~65.9 tok/s | **-35%** |
+| genuine >RAM pressure (10 GB cgroup cap, 16.9 GB model) | 44.75 tok/s | 37.42 tok/s | **-16%** |
+
+Three independent samples at each point, all consistent, no overlap between
+conditions. The hypothesis that memory pressure would flip the calculus in
+favor of eviction-enabled speculation is refuted, not confirmed - the
+regression shrinks under pressure but does not reverse.
+
+Mechanism: probation exists specifically to give a newly-admitted item one
+chance to be touched again before it earns protection. Lookahead fires at
+every layer, every token - far more admission attempts than the natural
+token-to-token reuse interval. Letting every one of those evict on a miss
+means "coldest available" collapses to "most recently admitted," because
+nothing survives long enough for heat to separate genuinely useless items from
+genuinely useful-but-not-yet-reused ones. Under pressure this gets slightly
+*worse* to trade away, not better: every slot is more expensive to refill, so
+discarding an unconfirmed probation item for a 48-59%-confidence guess is a
+worse bet when capacity is already tight.
+
+`GGML_CUDA_MOE_CACHE_SPEC_EVICT` defaults to off. Left in, gated, rather than
+removed - a measured dead end is worth keeping on record over deleting the
+evidence.
