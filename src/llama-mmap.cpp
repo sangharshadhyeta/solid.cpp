@@ -454,7 +454,27 @@ struct llama_mmap::impl {
         }
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
-        addr = mmap(NULL, file->size(), PROT_READ, flags, fd, 0);
+        // PROT_WRITE is opt-in and does not make the mapping writable in any
+        // meaningful sense: MAP_PRIVATE means copy-on-write, so nothing reaches
+        // the file and pages stay shared with the page cache until written -
+        // and weights are never written. It exists because cuMemHostRegister
+        // rejects a PROT_READ file mapping outright (CUDA_ERROR_INVALID_VALUE),
+        // and the cudaHostRegisterReadOnly flag is unsupported on this driver
+        // (CUDA_ERROR_NOT_SUPPORTED), so a writable mapping is the only way to
+        // page-lock model weights for direct DMA. See moe-cache HOSTREG_MB.
+        int prot = PROT_READ;
+        if (const char * env = getenv("LLAMA_MMAP_WRITABLE")) {
+            if (env[0] && env[0] != '0') {
+                // MAP_SHARED|PROT_WRITE on an O_RDONLY fd is EACCES, so the
+                // mapping has to become MAP_PRIVATE as well. That is the safe
+                // direction anyway: private means copy-on-write, so a stray
+                // write can never reach the model file on disk.
+                prot  |= PROT_WRITE;
+                flags &= ~MAP_SHARED;
+                flags |= MAP_PRIVATE;
+            }
+        }
+        addr = mmap(NULL, file->size(), prot, flags, fd, 0);
         if (addr == MAP_FAILED) {
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }

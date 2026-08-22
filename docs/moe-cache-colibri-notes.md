@@ -4938,3 +4938,50 @@ It is opt-in (default 0) because pinned pages are unreclaimable. Since fills are
 off the decode path, the win is fill *throughput*, not per-token latency: the
 worker's ceiling moves from ~1,976 to ~3,300 experts/s against a measured demand
 near 1,428/s.
+
+## The direct-DMA fill: why it took four attempts, and the real number
+
+`GGML_CUDA_MOE_CACHE_HOSTREG_MB` initially failed silently at every fill -
+`cudaHostRegister` returned `invalid argument` on every attempt, and the
+original log line used the filterable `MOE_CACHE_LOG` macro, which (like the
+`--moe-cache` stats path tested earlier) emitted nothing. That combination
+would have let a completely dead code path report "no measurable gain" with
+total confidence. Switched to unfilterable `fprintf(stderr)` before trusting
+any A/B result again.
+
+Diagnosed with `cuMemHostRegister` called directly via ctypes against a real
+mmap of the model file, isolating llama.cpp entirely:
+
+| mapping | flags=0 | READ_ONLY |
+|---|---|---|
+| `PROT_READ` (what llama.cpp uses) | `INVALID_VALUE` | `NOT_SUPPORTED` |
+| `PROT_READ\|PROT_WRITE` | **OK** | `NOT_SUPPORTED` |
+
+Two separate driver limitations, not one: this driver cannot register a
+read-only file mapping at all, and `cudaHostRegisterReadOnly` is unsupported
+regardless. The only registrable mapping is writable. `LLAMA_MMAP_WRITABLE=1`
+now maps the model `PROT_READ|PROT_WRITE` - which also had to become
+`MAP_PRIVATE` instead of `MAP_SHARED`, since `MAP_SHARED|PROT_WRITE` on an
+`O_RDONLY` fd is `EACCES`. `MAP_PRIVATE` is copy-on-write, so this is safe by
+construction: nothing our process writes can ever reach the file on disk, and
+weight tensors are never written regardless.
+
+With that fixed, direct DMA genuinely runs - 7,840 MiB paged-locked, correctly
+capped under an 8,192 MiB budget. Three-arm A/B, three rounds each:
+
+| arm | mean tok/s |
+|-----|-----------|
+| baseline (read-only mmap, staging copy) | 37.4 |
+| writable mmap only, no DMA change | 37.0 |
+| **writable mmap + direct DMA** | **37.9** |
+
+**+1.3%, and every direct-DMA sample beats every baseline sample - real, not
+noise, but far short of the 1.67x the per-expert microbenchmark (506 -> 303 us)
+predicted.** The gap is explained by where fills sit in the pipeline: a miss is
+computed on the CPU for the *current* token regardless, and the promoted copy
+only benefits later tokens, so shaving 203 us off a background copy barely
+touches the measured critical path. At ~72% hit rate most tokens do not wait on
+a fill at all. This is consistent with, not a contradiction of, the earlier
+finding that transfer was already off the decode path - the win was always
+going to be in fill *throughput* headroom, not per-token latency, and headroom
+that was already ample shows only a small effect when widened further.

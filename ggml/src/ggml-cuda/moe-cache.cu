@@ -44,6 +44,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <unordered_map>
 #include <fstream>
 #include <unordered_set>
+#include <unistd.h>
 #include <utility>
 #include <vector>
 
@@ -315,7 +316,10 @@ struct moe_cache_device {
 struct moe_cache_session {
     moe_cache_config config;
     std::mutex hostreg_mu;
-    std::unordered_set<const void *> hostreg;   // tensor regions page-locked for DMA
+    // region base -> the page-aligned [begin,end) actually registered. Stored as
+    // an interval because GGUF packs tensors on 32-byte boundaries, so the raw
+    // base is not page-aligned and cudaHostRegister rejects it outright.
+    std::unordered_map<const void *, std::pair<uintptr_t, uintptr_t>> hostreg;
     size_t hostreg_bytes = 0;
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
@@ -1184,30 +1188,60 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // which cancels most of what pinning is worth. Registering the tensor
             // once removes the copy: 506 us -> 303 us per expert.
             bool direct = false;
+            {
+                static std::atomic<int> once{0};
+                if (once.fetch_add(1) == 0) {
+                    fprintf(stderr, "[moe-cache] first fill: hostreg_mb=%zu region_base=%p region_bytes=%zu\n",
+                            session->config.hostreg_mb, job.region_base, job.region_bytes); fflush(stderr);
+                }
+            }
             if (error == cudaSuccess && session->config.hostreg_mb > 0 &&
                 job.region_base && job.region_bytes > 0) {
+                static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
                 std::lock_guard<std::mutex> reg_lock(session->hostreg_mu);
                 auto it_reg = session->hostreg.find(job.region_base);
-                if (it_reg != session->hostreg.end()) {
-                    direct = true;
-                } else if (session->hostreg_bytes + job.region_bytes <=
-                           session->config.hostreg_mb << 20) {
-                    const cudaError_t reg = cudaHostRegister(
-                            const_cast<void *>(job.region_base), job.region_bytes,
-                            cudaHostRegisterDefault);
-                    if (reg == cudaSuccess) {
-                        session->hostreg.insert(job.region_base);
-                        session->hostreg_bytes += job.region_bytes;
-                        direct = true;
-                        MOE_CACHE_LOG("[moe-cache] page-locked %zu MiB expert region for direct DMA (%zu MiB total)\n",
-                                job.region_bytes >> 20, session->hostreg_bytes >> 20);
-                    } else {
-                        MOE_CACHE_LOG("[moe-cache] cudaHostRegister of %zu MiB failed (%s) - staying on the staging path\n",
-                                job.region_bytes >> 20, cudaGetErrorString(reg));
+                if (it_reg == session->hostreg.end()) {
+                    // Register the page-aligned *interior*: rounding outward would
+                    // overlap the neighbouring tensor's pages and CUDA refuses a
+                    // range that is already partly registered. Losing at most one
+                    // page at each end costs nothing - those experts simply keep
+                    // using the staging path via the range check below.
+                    const uintptr_t raw   = (uintptr_t) job.region_base;
+                    const uintptr_t begin = (raw + page - 1) & ~(page - 1);
+                    const uintptr_t end   = (raw + job.region_bytes) & ~(page - 1);
+                    if (end > begin &&
+                        session->hostreg_bytes + (end - begin) <= session->config.hostreg_mb << 20) {
+                        // The model is mmap'd PROT_READ, and cudaHostRegisterDefault
+                        // demands writable pages - it fails "invalid argument" on a
+                        // read-only mapping no matter how well aligned. ReadOnly is
+                        // the flag for exactly this: device reads only, which is all
+                        // an expert weight fill ever does.
+                        cudaError_t reg = cudaHostRegister(
+                                (void *) begin, (size_t) (end - begin), cudaHostRegisterReadOnly);
+                        if (reg != cudaSuccess) {
+                            (void) cudaGetLastError();
+                            reg = cudaHostRegister(
+                                    (void *) begin, (size_t) (end - begin), cudaHostRegisterDefault);
+                        }
+                        if (reg == cudaSuccess) {
+                            session->hostreg.emplace(job.region_base, std::make_pair(begin, end));
+                            session->hostreg_bytes += (size_t) (end - begin);
+                            it_reg = session->hostreg.find(job.region_base);
+                            fprintf(stderr, "[moe-cache] page-locked %zu MiB expert region for direct DMA (%zu MiB total)\n",
+                                    (size_t) (end - begin) >> 20, session->hostreg_bytes >> 20); fflush(stderr);
+                        } else {
+                            fprintf(stderr, "[moe-cache] cudaHostRegister of %zu MiB failed (%s) - staging path\n",
+                                    (size_t) (end - begin) >> 20, cudaGetErrorString(reg)); fflush(stderr);
                         // Not fatal - an unregistered region simply keeps using
                         // the staging path. Clear the sticky error either way.
-                        (void) cudaGetLastError();
+                            (void) cudaGetLastError();
+                        }
                     }
+                }
+                if (it_reg != session->hostreg.end()) {
+                    const uintptr_t src = (uintptr_t) job.source;
+                    direct = src >= it_reg->second.first &&
+                             src + job.bytes <= it_reg->second.second;
                 }
             }
             if (error == cudaSuccess && direct) {
@@ -2162,8 +2196,8 @@ static void moe_cache_session_destroy(void * opaque) {
     // so leaking them would shrink usable RAM for the rest of the process's life.
     {
         std::lock_guard<std::mutex> reg_lock(session->hostreg_mu);
-        for (const void * base : session->hostreg) {
-            if (cudaHostUnregister(const_cast<void *>(base)) != cudaSuccess) {
+        for (const auto & entry : session->hostreg) {
+            if (cudaHostUnregister((void *) entry.second.first) != cudaSuccess) {
                 (void) cudaGetLastError();
             }
         }
