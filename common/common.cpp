@@ -2489,8 +2489,14 @@ static bool common_maybe_raise_moe_for_ctx(
     // Record what was asked for regardless of the outcome below, so the Brain
     // view can distinguish "23 layers because you asked for it" from "23 layers
     // because 65536 context demanded it".
-    params.placed_n_cpu_moe_req   = (int32_t) current_n;
-    params.placed_n_cpu_moe_final = (int32_t) current_n;
+    // Clamp what gets reported to the layers that actually exist. `-ncmoe 99`
+    // on a 53-layer model is a legitimate "offload everything" idiom - the extra
+    // patterns simply match nothing - but reporting 99 CPU layers to /props (and
+    // from there to the model-info dialog and the Brain placement view) states
+    // something untrue about the model.
+    const int32_t n_layer_real = probe.n_layer > 0 ? (int32_t) probe.n_layer : (int32_t) current_n;
+    params.placed_n_cpu_moe_req   = std::min((int32_t) current_n, n_layer_real);
+    params.placed_n_cpu_moe_final = std::min((int32_t) current_n, n_layer_real);
     params.placed_n_ctx_req       = params.n_ctx;
     if (probe.n_layer > 0) {
         params.placed_n_layer = (int32_t) probe.n_layer;
@@ -2513,7 +2519,7 @@ static bool common_maybe_raise_moe_for_ctx(
 
     params.tensor_buft_overrides  = common_moe_build_cpu_overrides(probe.safe_n);
     mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
-    params.placed_n_cpu_moe_final = (int32_t) probe.safe_n;
+    params.placed_n_cpu_moe_final = std::min((int32_t) probe.safe_n, n_layer_real);
     return true;
 }
 
