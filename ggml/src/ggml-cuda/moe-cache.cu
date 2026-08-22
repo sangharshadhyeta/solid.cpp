@@ -168,7 +168,18 @@ struct moe_cache_config {
     // 141GB one. GGML_CUDA_MOE_CACHE_RESERVE_MB still overrides this exactly
     // as before when explicitly set.
     size_t reserve_mb = 0;
-    size_t min_expert_bytes = 1u << 20;
+    // Measured, not a round-number guess: Ornith-1.5-35B-A3B (256 experts,
+    // Qwen3.5-MoE-style) has 840 KiB per expert - below a naive 1 MiB floor,
+    // which silently rejected every expert tensor at moe_cache_begin() with
+    // zero log output anywhere. The cache session initialized, reported
+    // "explicit MoE cache mode" success, and then did nothing for the entire
+    // server lifetime - no hits, no misses, no expert-map data, and no signal
+    // to the operator that anything was wrong. GLM-5.2 (256 experts/layer) is
+    // in the same size class and would hit the identical silent failure.
+    // 256 KiB stays well clear of real many-small-expert architectures while
+    // still excluding genuinely too-small slabs (the reason this floor exists
+    // at all - per-slot bookkeeping/fragmentation overhead dominating).
+    size_t min_expert_bytes = 256u << 10;
     // Default is derived live from g_max_batch_hint (the real n_seq_max of
     // the context, set before session_create() runs) - see
     // moe_cache_read_config(). Floor of 8 so ordinary prefill/decode batches
@@ -2314,8 +2325,26 @@ static void * moe_cache_begin(
         return nullptr;
     }
     moe_cache_session * session = g_session_stack.back().active;
-    if (!session || session->stopping || session->dormant || !name || !host_base ||
-        !strstr(name, "_exps") || n_tokens < 1 ||
+    if (!session || session->stopping || session->dormant || !name || !host_base) {
+        return nullptr;
+    }
+    // Logged once, loudly, rather than silently: this specific rejection
+    // used to be indistinguishable from "cache working as intended" from the
+    // outside - the session still logs a successful "explicit MoE cache
+    // mode" line and never registers a single expert. Found on a real model
+    // (Ornith-1.5-35B-A3B, 840 KiB/expert against a then-1 MiB floor) where
+    // it cost a long diagnosis with zero pointer from the logs.
+    if (name && host_base && strstr(name, "_exps") && n_expert > 0 &&
+        expert_size > 0 && expert_size < session->config.min_expert_bytes) {
+        static std::atomic<bool> warned{false};
+        if (!warned.exchange(true)) {
+            MOE_CACHE_LOG("[moe-cache] expert tensor '%s' is %zu KiB/expert, below the "
+                    "%zu KiB minimum (GGML_CUDA_MOE_CACHE_MIN_EXPERT_KB) - this model's "
+                    "experts will never be cached; lower the minimum if this is expected\n",
+                    name, expert_size >> 10, session->config.min_expert_bytes >> 10);
+        }
+    }
+    if (!strstr(name, "_exps") || n_tokens < 1 ||
         n_tokens > session->config.max_batch ||
         expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
