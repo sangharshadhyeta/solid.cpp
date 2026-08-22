@@ -5142,3 +5142,33 @@ how often it happens: discarding an unconfirmed probation item for a
 just in aggregate. This closes the speculative-eviction line of investigation -
 neither reconciliation-based reinforcement, nor rate-limiting, rescues it.
 `GGML_CUDA_MOE_CACHE_SPEC_EVICT` stays off by default.
+
+## Literature check: why prediction-driven eviction fails, independent of our own tests
+
+Zandieh et al.-style investigation aside, a dedicated study asked exactly the
+question this session tested: "When Does Trace-Driven Evaluation Mislead MoE
+Expert Caching?" (arXiv 2608.07911). They trained a proper ML predictor for
+eviction specifically - not a heuristic, a model using log recency, frequency,
+gate mass, concurrent routing multiplicity, layer, and popularity rate as
+features - to predict how long a cached expert would stay unused. Result:
+3.39% optimal-victim selection rate vs 22.11% for plain LFRU, with *negative*
+rank correlation (-0.207) against true next-use distances. Worse than random,
+despite far richer features than our heat-based signal.
+
+Their stated reason matches our result exactly: "Expert prefetching predicts
+which experts a future step will route to; [an eviction predictor] estimates
+how long a cached block will remain unused. These are different targets."
+Being a good prefetch-timing signal (our lookahead: 41-59% precision,
+genuinely useful, shipped) does not make a signal good at the eviction
+question, which is a different prediction problem. A model built specifically
+for the eviction question still failed at it, worse than a frequency counter.
+
+Consistent across SpecPrefetch, FineMoE, and MoE-Infinity in the wider
+literature: prediction owns prefetch/admission timing; LFU/LFRU (frequency-
+and recency-based, not prediction-based) owns eviction. That division of
+labor is exactly what this project already ships - lookahead for admission
+timing, LFRU heat/protection for eviction - and it is why the speculative-
+eviction experiments above (reconciliation, uncapped, rate-limited) all
+independently converged on the same negative result: asking one signal to do
+both jobs is the actual mistake, not a bug in any particular implementation of
+it.
