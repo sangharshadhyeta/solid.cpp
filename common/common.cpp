@@ -1946,7 +1946,7 @@ void common_moe_calibrate(common_params & params) {
     // found the peak more than ~15% of n_layer above the floor) - wide
     // enough to contain the peak, narrow enough that golden-section search
     // stays cheap.
-    const uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
+    uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
 
     LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
             "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
@@ -1954,6 +1954,12 @@ void common_moe_calibrate(common_params & params) {
 
     std::map<int, double> ncmoe_trace;
     auto measure_ncmoe = [&](int n) -> double {
+        // Memoized: the boundary-extension search below re-probes points the
+        // first search already measured, and a sample costs a full server spawn.
+        auto it = ncmoe_trace.find(n);
+        if (it != ncmoe_trace.end()) {
+            return it->second;
+        }
         const double tps = bench_with_retry((uint32_t) n, 0, "", n_threads_default);
         LOG_INF("%s:   ncmoe=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
         return tps; // failed candidates measure as -1, golden-section still works (just avoids them)
@@ -1981,6 +1987,29 @@ void common_moe_calibrate(common_params & params) {
     if (best_tps < 0) {
         LOG_ERR("%s: every placement candidate failed to benchmark; not writing a cache entry\n", __func__);
         return;
+    }
+
+    // The initial hi bound is a heuristic ("the peak is never more than ~15%
+    // of n_layer above the safe floor"), and a heuristic that is wrong shows
+    // itself in exactly one way: the winner sits *on* the boundary, meaning
+    // throughput was still climbing when the search ran out of room. Measured
+    // on Nemotron 3.5 Lightning, where [37,43] returned 43 with the trace
+    // rising monotonically to it - because on this model extra CPU offload
+    // frees VRAM that the expert cache converts straight back into hit rate.
+    // Extend to the hard ceiling and keep going rather than shipping a bound
+    // artifact as an optimum.
+    if (best_n == ncmoe_hi && ncmoe_hi < (uint32_t) probe.n_layer) {
+        const uint32_t prev_hi = ncmoe_hi;
+        ncmoe_hi = (uint32_t) probe.n_layer;   // the hard ceiling: one extension is all there is
+        LOG_INF("%s: peak landed on the search boundary (%u) - throughput was still rising, "
+                "extending the range to [%u, %u]\n", __func__, prev_hi, prev_hi, ncmoe_hi);
+        common_golden_section_search_max((int) prev_hi, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
+        for (const auto & kv : ncmoe_trace) {
+            if (kv.second > best_tps) {
+                best_tps = kv.second;
+                best_n   = (uint32_t) kv.first;
+            }
+        }
     }
 
     int best_n_max = -1;
@@ -2482,6 +2511,65 @@ static bool common_maybe_raise_moe_for_ctx(
     // Judging placement by a bare fit here is what let a 65536-token request
     // get "fixed" by a single extra offloaded layer and still collapse to 4096.
     const int64_t margin = 3 * (int64_t) params.fit_params_target[0];
+
+    // Prefer a calibrated placement when one exists. The search below answers
+    // "what is the least offload that makes this context fit?", which is a
+    // sufficiency question, not a throughput one - and the two have different
+    // answers. Every layer left resident holds weights competing with the expert
+    // cache for the same VRAM, and cached experts serve the offloaded layers, so
+    // trading resident weights for cache capacity keeps paying well past the
+    // point where the context merely fits. Measured on Nemotron 3.5 (53 layers):
+    // the fit search stopped at 46 for 1239 cache slots and a 57.1% hit rate,
+    // while offloading all 53 gave 2307 slots and 68.3%.
+    //
+    // --moe-calibrate already measures the throughput optimum empirically. This
+    // only consults what it recorded; it does not guess past "fits" on its own,
+    // because the right number is hardware- and model-specific and the honest
+    // way to find it is to measure it.
+    {
+        common_moe_calibration_entry cal;
+        if (common_moe_calibration_lookup(path_model, params, cal) && cal.n_cpu_moe > 0) {
+            std::vector<ggml_backend_dev_t> cdevs;
+            uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
+            // Keep the full fit margin here. Dropping it to 0 -- on the
+            // reasoning that a calibrated entry is a measurement rather than a
+            // prediction, so it only needs to still fit -- was tried and
+            // reproduced the 4k collapse outright: ncmoe=40 passed a zero-margin
+            // probe, then real weight loading plus lazy CUDA graph capture
+            // overran VRAM and the downstream search clamped the server to
+            // n_ctx=4096 with a single slot. The margin covers allocation that
+            // happens *after* the probe, so a measurement taken elsewhere does
+            // not excuse skipping it.
+            //
+            // That makes calibration a floor, never a licence to undershoot: it
+            // can only move placement to be *more* CPU-offloaded than the safe
+            // minimum (which is where it pays -- freed VRAM turns into expert
+            // cache hit rate). When it recommends less, the fit search's more
+            // conservative answer wins.
+            if (common_moe_fits_with_n(path_model, mparams, cparams, (uint32_t) cal.n_cpu_moe,
+                                       cdevs, c_ngl, c_nct, c_nex, margin)) {
+                LOG_WRN("%s: using calibrated placement of %d CPU layer(s) (measured %.2f tok/s on %s) "
+                        "rather than the %s that merely fits\n",
+                        __func__, cal.n_cpu_moe, cal.tok_per_sec, cal.calibrated_at.c_str(),
+                        "minimum");
+                params.tensor_buft_overrides  = common_moe_build_cpu_overrides((uint32_t) cal.n_cpu_moe);
+                mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+                // c_ngl was filled by the fit probe above with the model's real
+                // layer count - report against that, not the override count.
+                if (c_ngl > 0) {
+                    params.placed_n_layer = (int32_t) c_ngl;
+                }
+                const int32_t n_layer_cal = c_ngl > 0 ? (int32_t) c_ngl : cal.n_cpu_moe;
+                params.placed_n_cpu_moe_req   = std::min((int32_t) current_n, n_layer_cal);
+                params.placed_n_cpu_moe_final = std::min(cal.n_cpu_moe, n_layer_cal);
+                params.placed_n_ctx_req       = params.n_ctx;
+                return true;
+            }
+            LOG_WRN("%s: calibrated placement of %d CPU layer(s) is below the safe minimum for this "
+                    "context - keeping the fit search's more conservative answer\n",
+                    __func__, cal.n_cpu_moe);
+        }
+    }
 
     const common_moe_fit_probe_result probe =
         common_moe_find_safe_layers(path_model, mparams, cparams, margin);
