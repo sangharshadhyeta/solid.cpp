@@ -145,6 +145,11 @@ struct moe_cache_job {
     moe_cache_key key;
     const void * source = nullptr;
     size_t bytes = 0;
+    // The whole expert tensor this expert lives in. cudaHostRegister has to be
+    // handed a page-aligned range, and adjacent experts share boundary pages,
+    // so registration is done per tensor rather than per expert.
+    const void * region_base = nullptr;
+    size_t region_bytes = 0;
 };
 
 struct moe_cache_demand {
@@ -177,6 +182,11 @@ struct moe_cache_config {
     int queue_max = 128;
     size_t queue_mb = 512;
     int stats_every = 0;
+    // Page-lock up to this many MiB of expert weights so the fill DMA can read
+    // them directly. 0 = off (default): pinning is unreclaimable, so opting in
+    // is the caller's decision. Measured: staged copy 506 us/expert vs direct
+    // pinned DMA 303 us, on a 24.5 GB/s PCIe 4.0 x16 link.
+    size_t hostreg_mb = 0;
     int max_devices = INT_MAX;
     int min_compute_capability = 700;
     bool serial_fill = true;
@@ -304,6 +314,9 @@ struct moe_cache_device {
 
 struct moe_cache_session {
     moe_cache_config config;
+    std::mutex hostreg_mu;
+    std::unordered_set<const void *> hostreg;   // tensor regions page-locked for DMA
+    size_t hostreg_bytes = 0;
     std::vector<std::unique_ptr<moe_cache_device>> devices;
     std::unordered_map<int, int> layer_devices;
     std::unordered_map<const void *, int> tensor_devices;
@@ -478,6 +491,9 @@ static moe_cache_config moe_cache_read_config() {
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_STATS", 0, INT_MAX, value)) {
         config.stats_every = (int)value;
+    }
+    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_HOSTREG_MB", 0, 1024 * 1024, value)) {
+        config.hostreg_mb = (size_t)value;
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_NDEV", 1, INT_MAX, value)) {
         config.max_devices = (int)value;
@@ -1162,7 +1178,45 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (session->config.serial_fill) {
                 fill_lock.lock();
             }
-            if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
+            // Direct DMA out of the model mapping when the region is page-locked.
+            // The staging path costs an extra RAM->RAM memcpy (203 us on a 7.43 MB
+            // expert) purely so the following copy can start from pinned memory -
+            // which cancels most of what pinning is worth. Registering the tensor
+            // once removes the copy: 506 us -> 303 us per expert.
+            bool direct = false;
+            if (error == cudaSuccess && session->config.hostreg_mb > 0 &&
+                job.region_base && job.region_bytes > 0) {
+                std::lock_guard<std::mutex> reg_lock(session->hostreg_mu);
+                auto it_reg = session->hostreg.find(job.region_base);
+                if (it_reg != session->hostreg.end()) {
+                    direct = true;
+                } else if (session->hostreg_bytes + job.region_bytes <=
+                           session->config.hostreg_mb << 20) {
+                    const cudaError_t reg = cudaHostRegister(
+                            const_cast<void *>(job.region_base), job.region_bytes,
+                            cudaHostRegisterDefault);
+                    if (reg == cudaSuccess) {
+                        session->hostreg.insert(job.region_base);
+                        session->hostreg_bytes += job.region_bytes;
+                        direct = true;
+                        MOE_CACHE_LOG("[moe-cache] page-locked %zu MiB expert region for direct DMA (%zu MiB total)\n",
+                                job.region_bytes >> 20, session->hostreg_bytes >> 20);
+                    } else {
+                        MOE_CACHE_LOG("[moe-cache] cudaHostRegister of %zu MiB failed (%s) - staying on the staging path\n",
+                                job.region_bytes >> 20, cudaGetErrorString(reg));
+                        // Not fatal - an unregistered region simply keeps using
+                        // the staging path. Clear the sticky error either way.
+                        (void) cudaGetLastError();
+                    }
+                }
+            }
+            if (error == cudaSuccess && direct) {
+                error = cudaMemcpyAsync(
+                        destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+                if (error == cudaSuccess) {
+                    error = cudaStreamSynchronize(stream);
+                }
+            } else if (error == cudaSuccess && stage && stage_capacity >= job.bytes) {
                 memcpy(stage, job.source, job.bytes);
                 error = cudaMemcpyAsync(
                         destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
@@ -1703,7 +1757,8 @@ static void moe_cache_prewarm_from_history(
             device.queue.push_back({
                     pool_index, slot_index, slot.generation, key,
                     (const char *) host_base + (size_t) c.expert * expert_size,
-                    expert_size});
+                    expert_size,
+                    host_base, it_seen->second.bytes});
             device.queued_bytes += expert_size;
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
@@ -2101,6 +2156,19 @@ static void moe_cache_session_destroy(void * opaque) {
     for (auto & device_ptr : session->devices) {
         std::unique_lock<std::mutex> dispatch_lock(device_ptr->dispatch_mu);
         moe_cache_free_device(*device_ptr);
+    }
+
+    // Give back every page-locked expert region. Pinned pages are unreclaimable,
+    // so leaking them would shrink usable RAM for the rest of the process's life.
+    {
+        std::lock_guard<std::mutex> reg_lock(session->hostreg_mu);
+        for (const void * base : session->hostreg) {
+            if (cudaHostUnregister(const_cast<void *>(base)) != cudaSuccess) {
+                (void) cudaGetLastError();
+            }
+        }
+        session->hostreg.clear();
+        session->hostreg_bytes = 0;
     }
 
     delete session;
@@ -2941,7 +3009,8 @@ static int moe_cache_plan(
                 (const char *)node->host_base + (size_t)expert * node->expert_size;
             device.queue.push_back({
                     node->pool_index, slot_index, slot.generation,
-                    key, source, node->expert_size});
+                    key, source, node->expert_size,
+                    node->host_base, (size_t) node->n_expert * node->expert_size});
             device.queued_bytes += node->expert_size;
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
