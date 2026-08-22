@@ -309,6 +309,30 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur, 
 
         cur = ggml_add(ctx0, moe_out, ffn_shexp);
         cb(cur, "ffn_out", il);
+
+        // Router lookahead: predict the next MoE layer's experts now, so
+        // moe-cache can fetch them while this layer's expert compute runs.
+        //
+        // Unlike a uniformly-MoE model, this architecture interleaves Mamba-2,
+        // dense and MoE blocks, so the next layer with a router is not il+1 -
+        // it has to be searched for. Predicting against the wrong layer's gate
+        // would produce confident nonsense, so scan forward for the next block
+        // that actually has one.
+        for (int nx = il + 1; nx < (int) model.layers.size(); ++nx) {
+            const auto & next = model.layers[nx];
+            if (!next.ffn_gate_inp) {
+                continue; // Mamba or dense block - no experts to prefetch
+            }
+            // Only predict where the gate has the same shape, so the matmul is
+            // valid and the resulting ids index the same expert space.
+            if (next.ffn_gate_inp->ne[0] == model.layers[il].ffn_gate_inp->ne[0] &&
+                next.ffn_gate_inp->ne[1] == model.layers[il].ffn_gate_inp->ne[1] &&
+                next.ffn_down_exps) {
+                build_moe_lookahead(inp_emb, next.ffn_gate_inp, next.ffn_down_exps,
+                        n_expert_used, il);
+            }
+            break; // nearest MoE layer only - anything further is too stale to trust
+        }
     }
 
     cur = build_cvec(cur, il);
