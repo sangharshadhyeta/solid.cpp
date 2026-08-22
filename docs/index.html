@@ -389,6 +389,9 @@ being measured. Chat-templated and content-verified, not a synthetic benchmark.<
 <colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
 <thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
+<tr><td>Cross-depth agreement promotion <span class="note">(reconciling repeated lookahead predictions)</span></td><td class="num">100.94 tok/s</td><td class="num">100.94 tok/s</td><td class="num">&plusmn;0</td><td><span class="tag tag-solid">measured</span></td></tr>
+<tr><td>Speculative eviction <span class="note">(let a lookahead guess evict probation; abundant RAM)</span></td><td class="num">100.9 tok/s</td><td class="num">65.9 tok/s</td><td class="num delta-neg">-35%</td><td><span class="tag tag-solid">refuted</span></td></tr>
+<tr><td>&hellip; same, under genuine &gt;RAM pressure <span class="note">(10 GiB cgroup cap vs 16.9 GiB model &mdash; where it should help most)</span></td><td class="num">44.75 tok/s</td><td class="num">37.42 tok/s</td><td class="num delta-neg">-16%</td><td><span class="tag tag-solid">refuted</span></td></tr>
 <tr><td>NVMe migration <span class="note">(model reads, SATA &rarr; PCIe NVMe)</span></td><td class="num">0.50 GB/s</td><td class="num">2.9 GB/s</td><td class="num delta-pos">5.8&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Expert-cache size knee <span class="note">(sweep 1/2/4/6/8 GiB, production shape)</span></td><td class="num">7.4&ndash;8 GiB</td><td class="num">4 GiB, same tok/s</td><td class="num delta-pos">3.5 GiB freed</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>&hellip; that freed VRAM</td><td class="num">&mdash;</td><td class="num">&rarr; KV / context</td><td class="num">&mdash;</td><td><span class="tag tag-solid">measured</span></td></tr>
