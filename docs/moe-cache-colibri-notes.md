@@ -4651,3 +4651,89 @@ the model's real layer count in `common_maybe_raise_moe_for_ctx`.
 Worth noting because it is the same failure mode as `du` reporting 21 GB for
 files that freed 4 GB: a number that was easy to compute standing in for the
 number that was true.
+
+## TurboQuant for the V cache: measured, then dropped
+
+Asked to implement TurboQuant (Zandieh et al., ICLR 2026 - WHT + Lloyd-Max,
+claimed 72-78% KV reduction) for the V cache. Built the codec on CPU first,
+because that answers the go/no-go question before any kernel work.
+
+The codec is self-contained: the Hadamard rotation is applied at encode and
+undone at decode, so it can be an ordinary `GGML_TYPE_*` with attention math
+untouched. Implementation is in `tools/tbq-dump/tbq-eval.c`; it reproduces
+Lloyd-Max's theoretical 3-bit bound exactly (NRMSE 0.180 vs theory 0.186), so
+the numbers below are not an artifact of a broken implementation.
+
+Evaluated against real V vectors captured from running models with the new
+`llama-tbq-dump` tool (ggml eval callback on `Vcur`), not synthetic data. The
+metric is error in `softmax(scores) @ V` - inner-product distortion, which is
+what TurboQuant's theorem is actually stated for - not per-element NRMSE.
+
+Nemotron 3.5 Lightning, real V, head_dim=256, 20k rows:
+
+| scheme      | bpw   | elem-NRMSE | attn-out NRMSE |
+|-------------|-------|------------|----------------|
+| q8_0        | 8.5   | 0.00570    | 0.00296        |
+| q4_0        | 4.5   | 0.09129    | **0.04752**    |
+| tbq4 b=32   | 4.5   | 0.09438    | **0.05001**    |
+| tbq3 b=32   | 3.5   | 0.17991    | 0.09766        |
+| tbq3 b=128  | 3.125 | 0.18432    | 0.10271        |
+
+At matched bitrate TurboQuant is *slightly worse* than the q4_0 llama.cpp
+already has. Qwen2.5 agrees (0.03387 vs 0.03345).
+
+The reason is measurable rather than mysterious. The Hadamard rotation exists
+to destroy per-channel outliers ("massive activations") that wreck a per-block
+absmax scale. The captured V tensors barely have any: channel-outlier ratio
+(max channel sd / mean channel sd) is **1.5x on Nemotron, 1.9x on Qwen2.5**.
+That pathology lives in K and in the residual stream, not in V - so on V the
+rotation has nothing to repair, and all that is left is Lloyd-Max vs absmax at
+equal bits, which absmax wins because its per-32 scale is itself adaptive.
+
+TurboQuant's one unique offering is a bitrate llama.cpp cannot currently reach
+for KV at all (3.125 bpw), but at 2.2x the error of q4_0.
+
+Payoff on this model is small regardless: Nemotron is a linear-attention hybrid
+with only 7 attention layers of 53, so the whole KV cache is ~268 MiB (1 layer
+f16 = 64 MiB + 6 layers q8_0 = 204 MiB). The V half is ~134 MiB; going q8_0 ->
+3.125 bpw saves ~85 MiB out of ~12 GiB of VRAM.
+
+Cost side: a new ggml type plus a *fused* FA kernel for the (q8_0 K, tbq3 V)
+pairing, or the pair falls off the fused path onto the 25-45x slow path (this
+build has `GGML_CUDA_FA_ALL_QUANTS=OFF`; only f16-f16, bf16-bf16, q8_0-q8_0 and
+q4_0-q4_0 exist). Not built. The measurement, not an opinion, is the reason.
+
+## Calibration is noise-limited in the range it searches
+
+Two consecutive `--moe-calibrate` runs on Nemotron, same machine, same flags:
+
+| ncmoe | run 1  | run 2  |
+|-------|--------|--------|
+| 37    | -      | 35.26  |
+| 38    | -      | 38.16  |
+| 39    | 37.61  | 37.02  |
+| 40    | 38.05  | **38.21** |
+| 41    | 38.01  | 35.41  |
+| 42    | 38.17  | -      |
+| 43    | **38.61** | -   |
+
+The two runs disagree on the argmax (43 vs 40) while their winning throughputs
+differ by ~1%. The whole band spans 35.3-38.2 tok/s - about +/-8% - so the
+search is resolving noise, not signal, at `n_samples_per_candidate = 2`.
+
+Two consequences, one fixed and one open:
+
+*Fixed:* run 1's peak landed exactly on the search's upper bound (43), which is
+`safe_n + max(4, n_layer/8)` - a heuristic from our own Gemma-4 sweeps ("the
+peak is never more than ~15% of n_layer above the floor"). A peak sitting on the
+boundary means throughput was still climbing when the search ran out of room, so
+the bound is now extended to the hard ceiling and the search continues.
+`measure_ncmoe` is memoized so the extension never re-pays for a measured point.
+
+*Open:* the region that actually looked promising was never sampled. `-ncmoe 99`
+was separately measured at 2307 expert-cache slots / 68.3% hit rate against the
+fit search's 1239 / 57.1%, because CPU offload frees VRAM that the expert cache
+converts back into hit rate. Whether that hit rate becomes throughput is
+unmeasured - a direct ncmoe 40 vs 46 vs 52 benchmark was started and timed out
+before finishing. Until that is measured, widening the default range would be
+shipping a guess.
