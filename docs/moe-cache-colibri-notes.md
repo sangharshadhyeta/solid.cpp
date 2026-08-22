@@ -4794,3 +4794,101 @@ byte-identical in size until that happened, which is what gave it away.
 
 `LLAMA_USE_PREBUILT_UI` now defaults OFF in this fork. A fork that modifies the
 UI cannot correctly default to someone else's prebuilt copy of it.
+
+## The memory hierarchy, measured end to end (Aug 2026, after the NVMe)
+
+Every number below is measured on this box, not derived. They settle several
+design questions that had been argued from arithmetic.
+
+| tier | capacity | measured bandwidth |
+|------|----------|--------------------|
+| VRAM (RTX 3060) | 12 GB | ~360 GB/s spec, **254 GB/s** effective in the MoE op |
+| RAM -> VRAM (pinned PCIe 4.0 x16) | - | **24.5 GB/s** (pageable: 12-17) |
+| RAM local (DDR4-2666, 6 threads) | 30 GB | **36.6 GB/s** |
+| NVMe (WD Blue SN5000) | 500 GB | **3.55 GB/s**, QD-independent (3.43 at QD1) |
+| SATA SSD (previous model store) | 224 GB | **0.50 GB/s** |
+
+`nvidia-smi` reports PCIe Gen1 at idle; the link trains up to Gen4 x16 only
+under real transfers. Measure under load or the number is 6x too low.
+
+Queue depth barely matters on this NVMe - 3.43 GB/s at QD1 vs 3.56 at QD32 - so
+io_uring depth is not the win it would be on a faster drive. That saved building
+an async fetch path that would have bought nothing.
+
+### Transfer vs compute: the balance point
+
+One MoE layer step (`MUL_MAT_ID`, q4_K, 128 experts, top-8, batch 1, 7.08 MB of
+expert weights), via `test-backend-ops perf`:
+
+| operation | time | ratio to compute |
+|-----------|------|------------------|
+| compute, weights resident in VRAM | **27.8 us** | 1x |
+| fetch from RAM over PCIe | **289 us** | **10.4x** |
+| fetch from NVMe | **1,994 us** | **72x** |
+
+To hide a RAM fetch behind compute you must prefetch ~10 layers ahead; to hide
+an NVMe fetch, ~72 layers ahead. Nemotron has **24 MoE layers in total**, and
+the router can only predict one layer ahead because layer L+2's routing depends
+on a hidden state that does not exist yet.
+
+So: **NVMe-backed experts can never arrive in time.** NVMe is capacity for
+experts that are rarely used at all, never a tier on the steady-state path.
+Residency is mandatory; streaming is strictly a fallback. This kills the
+otherwise attractive idea of shrinking the VRAM cache to a small landing zone
+and streaming everything just-in-time.
+
+### Batching does not amortize weight reads in MoE
+
+Same op, scaling tokens per pass:
+
+| tokens | MoE (MUL_MAT_ID) | dense (MUL_MAT, q5_1 4096x14336) |
+|--------|------------------|----------------------------------|
+| 1      | 27.8 us          | - |
+| 3      | -                | 136 us |
+| 8      | 177 us (6.4x)    | 213 us (1.56x for 2.7x work) |
+| 128    | 1,491 us         | - |
+| 512    | 1,654 us (1.11x for 4x work) | - |
+
+A dense matmul reads its weights once and amortizes across the batch. An MoE
+layer does not: each extra token routes to *more distinct experts*, so time
+grows nearly linearly until the expert count saturates (~n=128 here, after which
+all 128 experts have been touched and further batching really is free).
+
+### Which is why MTP *hurts* under memory pressure
+
+Measured, Nemotron on NVMe, cgroup `memory.max`, single stream:
+
+| RAM cap | model : RAM+VRAM | no MTP | with MTP | delta |
+|---------|------------------|--------|----------|-------|
+| 26G | 0.68x | **38.0** | 32.4 | -15% |
+| 16G | 0.94x | **26.6** | 16.2 | **-39%** |
+| 12G | 1.10x | **8.75** | 6.15 | **-30%** |
+| 8G  | 1.33x | **4.5**  | -    | - |
+
+Draft acceptance was healthy throughout (0.74-0.90, mean accepted length
+3.2-3.7), so the drafting itself works. The loss is memory behaviour: verifying
+~3.3 tokens in one pass activates the *union* of those tokens' experts - at
+top-6 per layer that is ~15-20 distinct experts instead of 6. Speculative
+decoding trades more expert traffic for fewer passes, and when expert traffic is
+the bottleneck that trade is a loss. The prediction here was that MTP would help
+*more* under pressure; it does the opposite, at every cap.
+
+### The fitting cliff
+
+The same table read as a curve: throughput is flat while the model fits and
+collapses the moment it does not. 0.94x -> 1.10x (a 17% increase in pressure)
+costs 70% of throughput. Storage speed sets how far you fall, not where the edge
+is - all of these runs already had the model on the 3.55 GB/s NVMe.
+
+Practical ceiling on this box (30 GB RAM + 12 GB VRAM, ~36 GB usable): a model
+of about **34-35 GB**. Spend the budget on quantization quality inside that
+boundary rather than on parameter count past it.
+
+### What this says about eviction policy (not yet implemented)
+
+A miss refilled from RAM costs 289 us; from NVMe, 1,994 us - a **7x difference**
+that LFRU currently ignores, since it treats every miss as equal cost. The cache
+should prefer evicting RAM-backed experts and protect NVMe-only ones. This is
+textbook cost-aware caching (GreedyDual-Size, Cao & Irani 1997), and it is the
+clearest thing the OS literature has to offer us that we are currently getting
+wrong.
