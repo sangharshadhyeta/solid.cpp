@@ -288,6 +288,19 @@ struct moe_cache_device {
     // Rate limit for the warming scan below - same clock spec_evict already
     // uses (device.collect_calls), so this doesn't need its own timer.
     long long atlas_warm_last_calls = -1;
+
+    // Track 1 step 4a (docs/plan.md): within-layer co-activation - which
+    // experts get selected *together* in the same real routing decision,
+    // independent of topic label. Deliberately scoped to within one plan()
+    // call's own ids[] (same tensor, same decision) rather than across
+    // layers/tokens: a true cross-layer pathway signal needs a token-
+    // boundary signal this cache doesn't have yet (nothing currently tells
+    // it "a new token's forward pass just started" vs. "still the same
+    // token, next layer") - inventing a heuristic for that risked the same
+    // class of bug the bounds-check fix above just caught for real, so it's
+    // left as an explicit prerequisite rather than guessed at. Observational
+    // only, same as req_dir_* - nothing reads this yet.
+    std::unordered_map<uint64_t, uint32_t> co_activation;
     // Decay rate for the centroid EMA - deliberately the same shape as the
     // heat step/decay already tuned elsewhere in this file (a fast-reacting
     // but not noise-chasing signal), not yet independently measured. Revisit
@@ -3870,6 +3883,23 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 #endif
 }
 
+// Track 1 step 4a (docs/plan.md): unordered-pair key for co-activation
+// counting, mixing the tensor identity with both expert indices (order-
+// independent - (a,b) and (b,a) are the same real co-activation event).
+static uint64_t moe_cache_pair_key(const void * host_base, int32_t a, int32_t b) {
+    if (a > b) {
+        std::swap(a, b);
+    }
+    uint64_t h = (uint64_t)(uintptr_t) host_base;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= ((uint64_t)(uint32_t) a << 32) | (uint32_t) b;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+    return h;
+}
+
 // Track 1 step 3 (docs/plan.md): Atlas-driven cache warming's actual
 // warming action. Off by default - this is the first thing in the Atlas
 // track that touches real cache state, and it hasn't been A/B'd yet, so it
@@ -4211,6 +4241,22 @@ static int moe_cache_plan(
         device.inserts++;
         inserts_left--;
         wake_worker = true;
+    }
+
+    // Track 1 step 4a: within-layer co-activation tracking. Capped to
+    // small ids[] batches (decode-scale, not a large prefill chunk) since
+    // this is an O(n^2) pass over the batch's own selected experts - a
+    // real prefill batch can carry thousands of ids, and n^2 on that would
+    // be a genuine cost, not a rounding error. n_ids <= 32 covers ordinary
+    // decode (n_expert_used is a handful) with real margin.
+    if (n_ids >= 2 && n_ids <= 32) {
+        for (int a = 0; a < n_ids; a++) {
+            if (ids[a] < 0) continue;
+            for (int b = a + 1; b < n_ids; b++) {
+                if (ids[b] < 0 || ids[b] == ids[a]) continue;
+                device.co_activation[moe_cache_pair_key(node->host_base, ids[a], ids[b])]++;
+            }
+        }
     }
 
     // Track 1 step 3: Atlas-driven warming, rate-limited to once every 64

@@ -38,12 +38,23 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    n_expert` guard every other caller already had. Verified clean afterward
    across two real generations (800 tokens total), no crash, hit rate
    climbing to 94%.
-4. **[not started]** Pairwise co-activation ("fire together") signal — track
-   live `(expert_i, expert_j)` co-selection frequency across real traffic,
-   independent of topic label. This is the more direct answer to "why can't
-   the atlas be dynamic" than nudging static positions from a live-classified
-   topic would be, and it's a genuinely different, complementary signal to
-   step 3, not a replacement.
+4. **[step 4a done, 4b blocked]** Pairwise co-activation ("fire together")
+   signal. Split in two once actually scoped:
+   - **4a, done**: within-layer co-activation - which experts get selected
+     *together* in the same real routing decision (`device.co_activation`,
+     an unordered-pair count keyed by tensor + both expert indices). Capped
+     to `n_ids <= 32` so a large prefill batch's O(n²) pass over its own ids
+     never runs - verified no slowdown on a ~2000-token prefill (1.8s, no
+     crash) and no crash across normal decode traffic either. Observational
+     only, same as req_dir - nothing reads it yet.
+   - **4b, blocked, not started**: true *cross-layer* pathway tracking (the
+     actual "fire together" signal the brain-folding discussion was about)
+     needs a token-boundary signal this cache doesn't have - nothing
+     currently tells it "a new token's forward pass just started" vs. "same
+     token, next layer." Inventing a heuristic for that risked the same bug
+     class caught below; left as an explicit prerequisite instead of guessed
+     at. This is the more direct answer to "why can't the atlas be dynamic"
+     than nudging static positions from a live-classified topic would be.
 5. **[not started]** Pathway/connectome visualization — add Z = layer depth
    to the Atlas view; plot real per-token trajectories through the resulting
    3D volume using step 4's co-activation data. Recurring pathways should
