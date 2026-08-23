@@ -1233,6 +1233,28 @@ static bool moe_cache_cuda_ok(
 // feed garbage into a GEMM. Disable the cache instead - the offload path
 // still works without it, just slower. Logged once, loudly, because the
 // symptom otherwise (fluent-looking nonsense) points nowhere near the cause.
+// TEST ONLY. Makes every Nth prefill copy report failure, so the recovery
+// path can be exercised deterministically instead of hoping to recreate the
+// original race. That race (a copy failing under VRAM pressure, the slot
+// being published anyway, and the stale buffer then read as expert weights)
+// produced fluent-looking garbage and took a long diagnosis precisely
+// because it could not be reproduced on demand - 7 configurations came back
+// clean before the chat-templated prompt turned out to be the trigger. A
+// defensive fix that cannot be tested is not a fix, it is a hope.
+// Off unless GGML_CUDA_MOE_CACHE_FAULT_INJECT is set to a positive N.
+static bool moe_cache_inject_copy_fault() {
+    static const int every = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_FAULT_INJECT");
+        const int v = env ? atoi(env) : 0;
+        return v < 0 ? 0 : v;
+    }();
+    if (every <= 0) {
+        return false;
+    }
+    static std::atomic<long long> n{0};
+    return (n.fetch_add(1) + 1) % every == 0;
+}
+
 static void moe_cache_note_copy_failure(moe_cache_device & device) {
     static const int limit = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_MAX_COPY_FAILURES");
@@ -1775,6 +1797,13 @@ static bool moe_cache_prefill_copy_split(
         moe_cache_device & device, moe_cache_session * session,
         moe_cache_prefill_slab & slab, int slot,
         const void * next_host_base, size_t next_tensor_bytes, int64_t next_n_expert) {
+    // See moe_cache_inject_copy_fault - test-only, no effect unless the
+    // env var is set. Placed before any copy so both the whole-tensor
+    // fast path and the hit/miss split path are covered by one check.
+    if (moe_cache_inject_copy_fault()) {
+        return false;
+    }
+
     if (!session || next_n_expert <= 0 || next_tensor_bytes % (size_t) next_n_expert != 0) {
         return moe_cache_cuda_ok(device,
                 cudaMemcpyAsync(slab.dev[slot], next_host_base, next_tensor_bytes,

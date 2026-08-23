@@ -425,6 +425,53 @@ failure/VRAM pressure after init and fail loudly (or fall back to
 today: run one model instance per GPU and check `nvidia-smi` for
 competing processes before blaming the model.
 
+## MTP speculative decoding: works, but NOT on Ornith (2026-08-24)
+
+Prompted by the Codacus video's claim that the expert cache is worth ~5%
+alone and that its real value is the interaction with speculative decoding.
+Tested that premise on our stack; it does not transfer, and turned up a
+separate real finding.
+
+**Ornith-1.5-35B (`qwen35moe`, 41 blocks, 256 experts,
+`nextn_predict_layers=1`) with its built-in MTP head is a large
+regression**, reproduced across two rounds:
+
+| config | tok/s | draft acceptance |
+|---|---|---|
+| cache off, MTP off | 47.28 / 46.91 | - |
+| cache auto, MTP off | 65.33 / 65.87 | - |
+| cache off, MTP on | 24.54 | 0.203 |
+| cache auto, MTP on | 22.21 | 0.187 |
+
+Control on the same build, Gemma-4-26B with its SEPARATE MTP draft model
+(`mtp-gemma-4-26B-A4B-it-Q8_0.gguf`): acceptance **0.718 / 0.738**. So the
+`--spec-type draft-mtp` path is fine - MTP wires up correctly (zero
+"unused tensor blk.*nextn" lines once the flag is passed, versus 4
+without). **Ornith's built-in head simply produces bad drafts**: ~0.19
+acceptance at mean draft length 1.6 means paying a draft pass plus a
+verify pass and discarding 4 of every 5 tokens, which is exactly the ~2x
+slowdown observed. Most plausible cause: Ornith-1.5 is a finetune whose
+`nextn` head was not retrained alongside the modified backbone, so it
+predicts for a model that no longer exists. Not fixable in llama.cpp - a
+property of the checkpoint.
+
+**Actionable**: do not use `--spec-type draft-mtp` with Ornith. Nothing in
+the output warns you; the failure is silent and expensive. A diagnostic
+that fires when acceptance stays very low would be worth adding.
+
+**The Codacus premise does not transfer.** They report cache alone at
++5% (42 -> 44 tok/s). On our stack the cache alone is worth **+38%**
+(47.28 -> 65.33 on Ornith), so we are not leaving the cache x spec
+interaction unexploited - we already get most of that value from the
+cache by itself. That also explains why every cache-POLICY tweak measured
+flat today: the cache is already doing its job here, and the remaining
+headroom inside it is small.
+
+**Not established**: whether Gemma+MTP is a throughput win on this rig.
+Round 1 showed +43%, round 2 showed +1.5%, at essentially identical
+acceptance - so the acceptance gap is solid but the throughput claim needs
+more rounds before it means anything.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:
