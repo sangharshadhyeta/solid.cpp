@@ -204,6 +204,41 @@ condition under which it won. Still gated behind
 been re-validated with more rounds the way the steady-state tests were -
 worth doing before considering a default flip.
 
+## Step 6 — measured: is the co-activation signal actually predictive?
+
+Built opt-in scoring (`GGML_CUDA_MOE_CACHE_MEASURE_PRED=1`, commit
+`95456179c`) rather than building a policy on an unmeasured signal - this
+session had already produced three mechanisms that were built, A/B'd, and
+found flat or reverted.
+
+**Result (Ornith-1.5-35B, 22000 scored predictions, 9475 tracked edges):**
+
+| predictor | depth-1 precision | cost per layer |
+|---|---|---|
+| router-lookahead (existing) | **59.3%** | real `n_embd x n_expert` matmul |
+| cross-layer co-activation | **33.8%** | hash lookup |
+
+Stable as the table grew (33.8 / 33.7 / 33.0 / 33.8 over 16k-22k samples),
+so converged, not undertrained. Worse than router-lookahead at depth 1, and
+worse even than its depth-3 precision (41.1%).
+
+Structural reason: the router predicts from the **actual hidden state of
+the current token**; the co-activation table is a static frequency prior
+with no token-specific information, and routing is data-dependent. A prior
+cannot compete with a computation that sees the input.
+
+**Consequence: step 7b (co-activation as a cheaper/deeper prefetch
+predictor) is DROPPED, not built.** Measuring cost ~15 lines; building it
+would have cost far more and ended flat.
+
+**Still open - step 7a, group-aware admission.** A different signal:
+*within*-layer co-occurrence, not cross-layer prediction. The question is
+"given the first expert selected in a routing decision, how well does the
+table predict the OTHERS selected in that same decision?" If that is high,
+admitting correlated experts as a unit is worth building, because admitting
+A alone when A and B always co-fire guarantees a miss on B. Cheaply
+measurable with the same instrumentation pattern; not yet measured.
+
 ## Track 1.6 — Discovered topics from co-activation (not started)
 
 The atlas's 9 categories are human guesses hardcoded in `k_probes[]`, and a
