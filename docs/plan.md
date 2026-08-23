@@ -293,6 +293,39 @@ a real plan exists, because two very different projects both fit the name:
   within the current architecture — no architecture change, a different lens
   on data we're already collecting.
 
+## UNRESOLVED — degenerate output incident (2026-08-24)
+
+A live `llama-server` on Ornith-1.5-35B (`--moe-cache auto -c 65536 -ngl 99
+--expert-atlas-file`, atlas v2) returned **pure `////////` for every token**
+on a raw `/completion` request. Real corruption, not a rendering artifact:
+`stop_type: limit`, 40 tokens, all slashes.
+
+**Could not be reproduced.** Every variable isolated, all coherent:
+
+| cache | ctx | atlas | result |
+|---|---|---|---|
+| off | 4096 | none | coherent |
+| auto | 4096 | none | coherent |
+| off | 65536 | none | coherent |
+| auto | 65536 | none | coherent |
+| auto | 65536 | v1 | coherent (×2) |
+| auto | 65536 | v2 | coherent |
+| auto | 65536 | v2 | coherent replaying the exact prime-then-query sequence |
+
+The failing instance logged **no** CUDA error, fill failure, dispatch
+failure, or assert. The one genuinely anomalous thing about it: **the same
+process also hung on shutdown** — stopped listening, then ignored SIGTERM
+for ~12 minutes and needed `SIGKILL`. Degenerate output *and* a wedged
+shutdown in one process, with clean logs, reads as a single transient fault
+in that instance rather than a deterministic config bug.
+
+Not fixed, not explained, and explicitly **not** claimed fixed — it may
+recur. If it does, the things worth capturing before killing the process:
+`/experts` stats (fill/dispatch failure counters), whether shutdown also
+hangs, and `nvidia-smi -q` for ECC/Xid errors. A GPU-level transient fault
+would explain both symptoms at once and would not be a moe-cache bug at all;
+that hypothesis is untested.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:
