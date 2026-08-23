@@ -929,6 +929,14 @@ public:
 
     server_state_callback_t callback_state = [](server_state, json) -> void {};
 
+    // Populated alongside the moe-cache atlas registration in init(), so
+    // get_experts (a member of the separate server_routes class, reached
+    // via its ctx_server reference to *this) can translate co-activation
+    // edges' raw tensor pointers back into layer numbers for the frontend -
+    // moe-cache itself only ever sees/reports tensor identity, never layer
+    // numbers, on purpose (see ggml_moe_cache.set_atlas's doc comment).
+    std::unordered_map<const void *, int> atlas_tensor_layer;
+
     server_context_impl() {
         mtmd_helper_log_set(common_log_default_callback, nullptr);
     }
@@ -1746,6 +1754,7 @@ private:
                             const ggml_tensor * t = llama_model_get_tensor(model_tgt, name);
                             if (t && t->data && common_moe_cache_set_atlas(t->data, expert, x, y, spec)) {
                                 tensors_registered++;
+                                atlas_tensor_layer[t->data] = layer;
                             }
                         }
                     }
@@ -4696,6 +4705,39 @@ void server_routes::init_routes() {
         // atlas-covered expert has been selected - nothing to show yet.
         if (have_summary && cs.req_dir_valid) {
             stats["req_dir"] = json{{"x", cs.req_dir_x}, {"y", cs.req_dir_y}};
+        }
+
+        // Track 1 step 5 prerequisite: co-activation edges (steps 4a/4b),
+        // tensor pointers translated to layer numbers via the map built
+        // during atlas registration above - moe-cache itself never learns
+        // layer numbers, only tensor identity, so this translation has to
+        // happen here, not in common_moe_cache_get_co_activation. A layer
+        // this map has no entry for (atlas didn't cover it, or none was
+        // loaded) is omitted from the edge rather than guessed at.
+        if (!ctx_server.atlas_tensor_layer.empty()) {
+            auto layer_of = [this](const void * tensor) -> int {
+                auto it = ctx_server.atlas_tensor_layer.find(tensor);
+                return it == ctx_server.atlas_tensor_layer.end() ? -1 : it->second;
+            };
+            auto to_json = [&](bool cross_layer) {
+                json arr = json::array();
+                for (const auto & e : common_moe_cache_get_co_activation(cross_layer, 64)) {
+                    const int lf = layer_of(e.tensor_from);
+                    const int lt = layer_of(e.tensor_to);
+                    if (lf < 0 || lt < 0) {
+                        continue;
+                    }
+                    arr.push_back(json{
+                            {"layer_from", lf}, {"expert_from", e.expert_from},
+                            {"layer_to", lt}, {"expert_to", e.expert_to},
+                            {"count", e.count}});
+                }
+                return arr;
+            };
+            json within = to_json(false);
+            json cross  = to_json(true);
+            if (!within.empty()) stats["co_activation_within_layer"] = within;
+            if (!cross.empty())  stats["co_activation_cross_layer"]  = cross;
         }
 
         std::vector<uint8_t> bytes;

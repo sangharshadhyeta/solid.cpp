@@ -24,6 +24,17 @@ extern "C" {
 // devices - the same numbers moe-cache.cu already logs per device
 // (MOE_CACHE_LOG), exposed for a UI/monitoring caller instead of only the
 // log. All-zero when no session has recorded anything yet.
+// One co-activation edge, real (tensor, expert) identity on both ends -
+// see ggml_moe_cache_api::get_co_activation's doc comment for what
+// cross_layer means and why this replaced an earlier, opaque-hash version.
+struct ggml_moe_cache_co_activation_entry {
+	const void * tensor_from;
+	int32_t      expert_from;
+	const void * tensor_to;
+	int32_t      expert_to;
+	uint32_t     count;
+};
+
 struct ggml_moe_cache_summary {
 	long long hits;
 	long long misses;
@@ -287,6 +298,20 @@ struct ggml_moe_cache_api {
     void (*set_atlas)(
             const void * host_base, const int32_t * expert,
             const float * x, const float * y, const float * spec, int n_cells);
+
+    // Track 1 steps 4a/4b's co-activation data, exported as real (tensor,
+    // expert) identity - not the opaque hash the first version of this
+    // mistakenly stored, which turned out to have thrown away the one
+    // thing worth keeping (see moe_cache_edge's doc comment in moe-cache.cu
+    // for the full story). cross_layer selects which counter: 0 = 4a
+    // (within one routing decision, undirected), 1 = 4b (layer L's top
+    // pick -> layer L+1's, directed). Writes up to max_entries of the
+    // highest-count edges into out (already sorted, highest count first)
+    // and returns how many were written - a top-K query, not a full dump,
+    // since a caller like a visualization only ever wants the significant
+    // edges. NULL-safe; returns 0 if no CUDA moe-cache session exists yet.
+    int (*get_co_activation)(
+            int cross_layer, struct ggml_moe_cache_co_activation_entry * out, int max_entries);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;

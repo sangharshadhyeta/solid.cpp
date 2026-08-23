@@ -2476,6 +2476,22 @@ bool common_moe_cache_set_atlas(
     return true;
 }
 
+std::vector<common_moe_cache_co_activation_entry> common_moe_cache_get_co_activation(
+        bool cross_layer, int max_entries) {
+    std::vector<common_moe_cache_co_activation_entry> out;
+    if (!ggml_moe_cache.get_co_activation || max_entries <= 0) {
+        return out;
+    }
+    std::vector<ggml_moe_cache_co_activation_entry> raw(max_entries);
+    const int n = ggml_moe_cache.get_co_activation(cross_layer ? 1 : 0, raw.data(), max_entries);
+    out.reserve((size_t) std::max(n, 0));
+    for (int i = 0; i < n; i++) {
+        out.push_back({raw[i].tensor_from, raw[i].expert_from,
+                        raw[i].tensor_to,   raw[i].expert_to, raw[i].count});
+    }
+    return out;
+}
+
 // moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults
 // from a live hint set by llama_context (real n_seq_max, floored at 8,
 // ceilinged at 64 - see moe-cache.cu's MOE_CACHE_MAX_BATCH_CEILING) - but
