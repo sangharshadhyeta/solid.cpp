@@ -396,6 +396,10 @@ struct moe_cache_device {
     // it into P(partner | anchor fired), which is what a confidence
     // threshold actually needs.
     std::unordered_map<moe_cache_key, uint32_t, moe_cache_key_hash> expert_fire_count;
+    // Consecutive copy failures. A cache that cannot copy is not a slow
+    // cache, it is a source of wrong weights, so past a small threshold it
+    // disables itself rather than continuing to half-work.
+    std::atomic<int> copy_failures{0};
     long long group_admits = 0;
     long long partner_pred_total = 0;
     long long partner_pred_hit   = 0;
@@ -1210,10 +1214,41 @@ static bool moe_cache_cuda_ok(
                     device.physical, operation, cudaGetErrorString(error));
         }
     }
-    if (fatal && error != cudaErrorMemoryAllocation) {
+    if (fatal) {
+        // cudaErrorMemoryAllocation used to be exempt here, on the reasoning
+        // that allocation failures are recoverable (the caller retries with a
+        // smaller size). But that exemption also covered OOM on the COPY
+        // paths, where there is nothing to retry and the buffer is left
+        // holding someone else's bytes - so an out-of-memory device kept
+        // serving wrong weights indefinitely. Allocation sites that genuinely
+        // want to retry pass fatal=false and are unaffected.
         device.dead.store(true);
     }
     return false;
+}
+
+// A failed copy means some buffer now holds the wrong bytes. One can be a
+// transient; a run of them means the device is out of memory or otherwise
+// unable to serve this cache, and every subsequent "hit" is a chance to
+// feed garbage into a GEMM. Disable the cache instead - the offload path
+// still works without it, just slower. Logged once, loudly, because the
+// symptom otherwise (fluent-looking nonsense) points nowhere near the cause.
+static void moe_cache_note_copy_failure(moe_cache_device & device) {
+    static const int limit = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_MAX_COPY_FAILURES");
+        const int v = env ? atoi(env) : 8;
+        return v < 1 ? 1 : v;
+    }();
+    if (device.copy_failures.fetch_add(1) + 1 >= limit && !device.dead.exchange(true)) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d DISABLED after %d copy failures - "
+                "continuing would risk serving wrong expert weights. "
+                "Most likely cause: another process is using this GPU's memory. "
+                "Inference continues on the uncached offload path.\n",
+                device.physical, limit);
+        fprintf(stderr, "[moe-cache] CUDA%d DISABLED after %d copy failures "
+                "(likely VRAM exhaustion) - falling back to uncached offload\n",
+                device.physical, limit);
+    }
 }
 
 static bool moe_cache_grow_device(
@@ -1731,18 +1766,23 @@ static int moe_cache_moe_lfru_copy_experts(
 // that - dispatch_mu is always acquired before session->mu in this file
 // (see e.g. the teardown path around device.dead.store(true) above), never
 // the reverse, so this ordering can't deadlock against it.
-static void moe_cache_prefill_copy_split(
+// Returns false if ANY copy in the split failed. The caller must then
+// refuse to publish the slot: a partially-written prefill buffer still
+// holds whatever the previous tenant left behind, and the consumer
+// (ggml_cuda_mul_mat_id) reads it as weights - which is silent corruption,
+// not a degraded cache. See the incident note in docs/plan.md.
+static bool moe_cache_prefill_copy_split(
         moe_cache_device & device, moe_cache_session * session,
         moe_cache_prefill_slab & slab, int slot,
         const void * next_host_base, size_t next_tensor_bytes, int64_t next_n_expert) {
     if (!session || next_n_expert <= 0 || next_tensor_bytes % (size_t) next_n_expert != 0) {
-        moe_cache_cuda_ok(device,
+        return moe_cache_cuda_ok(device,
                 cudaMemcpyAsync(slab.dev[slot], next_host_base, next_tensor_bytes,
                         cudaMemcpyHostToDevice, device.prefill_stream),
                 "prefill copy", false);
-        return;
     }
     const size_t expert_size = next_tensor_bytes / (size_t) next_n_expert;
+    bool all_ok = true;
     char * dst_base = (char *) slab.dev[slot];
     const char * src_base = (const char *) next_host_base;
 
@@ -1798,10 +1838,10 @@ static void moe_cache_prefill_copy_split(
 
     for (int64_t e = 0; e < next_n_expert; e++) {
         if (hit_src[(size_t) e]) {
-            moe_cache_cuda_ok(device,
+            all_ok = moe_cache_cuda_ok(device,
                     cudaMemcpyAsync(dst_base + (size_t) e * expert_size, hit_src[(size_t) e], expert_size,
                             cudaMemcpyDeviceToDevice, device.prefill_stream),
-                    "prefill hit copy", false);
+                    "prefill hit copy", false) && all_ok;
         }
     }
     if (!release_ctx->pins.empty()) {
@@ -1834,12 +1874,13 @@ static void moe_cache_prefill_copy_split(
         }
         const size_t off = (size_t) run_start * expert_size;
         const size_t len = (size_t) (e - run_start) * expert_size;
-        moe_cache_cuda_ok(device,
+        all_ok = moe_cache_cuda_ok(device,
                 cudaMemcpyAsync(dst_base + off, src_base + off, len,
                         cudaMemcpyHostToDevice, device.prefill_stream),
-                "prefill miss copy", false);
+                "prefill miss copy", false) && all_ok;
         run_start = -1;
     }
+    return all_ok;
 }
 
 // Called from ggml_cuda_mul_mat_id while it dispatches host_base's own node,
@@ -1906,9 +1947,24 @@ static void moe_cache_prefill_advance(const void * host_base, void * origin_stre
         }
     }
 
-    moe_cache_prefill_copy_split(device, session, slab, slot, next_host_base, next_tensor_bytes, next_n_expert);
-    moe_cache_cuda_ok(device, cudaEventRecord(slab.ready[slot], device.prefill_stream),
+    const bool copied = moe_cache_prefill_copy_split(
+            device, session, slab, slot, next_host_base, next_tensor_bytes, next_n_expert);
+    const bool recorded = moe_cache_cuda_ok(device,
+            cudaEventRecord(slab.ready[slot], device.prefill_stream),
             "prefill event record", false);
+
+    if (!copied || !recorded) {
+        // Do NOT publish this slot. inflight_host is what prefill_wait uses
+        // to decide the buffer holds live data for this tensor; setting it
+        // after a failed copy is exactly how a stale buffer gets consumed as
+        // weights, which surfaces as fluent-looking garbage rather than an
+        // error. Leaving it clear makes wait() return NULL and the caller
+        // fall back to its normal H2D path - slower, correct.
+        slab.inflight_host[slot] = nullptr;
+        slab.inflight_bytes[slot] = 0;
+        moe_cache_note_copy_failure(device);
+        return;
+    }
 
     slab.inflight_host[slot] = next_host_base;
     slab.inflight_bytes[slot] = next_tensor_bytes;
