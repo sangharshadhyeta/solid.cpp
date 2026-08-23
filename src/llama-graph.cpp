@@ -1933,6 +1933,34 @@ void llm_graph_context::build_moe_lookahead(
     ggml_build_forward_expand(gf, hint);
 }
 
+void llm_graph_context::build_moe_prefill_prefetch(
+        ggml_tensor * this_gate_up_exps,
+        ggml_tensor * this_down_exps,
+        ggml_tensor * next_gate_up_exps,
+        ggml_tensor * next_down_exps) const {
+    if (!ggml_moe_cache.prefill_register_successor) {
+        return;
+    }
+    // A plain function call, not a graph node - see the header comment for
+    // why this has to happen now, at build time, rather than deferred into
+    // the graph the way moe_prefetch_cb/build_moe_lookahead above defer
+    // their work (that one predicts data that doesn't exist until the
+    // router actually runs; this one only needs static tensor metadata that
+    // is already known here).
+    if (this_gate_up_exps && this_gate_up_exps->data &&
+        next_gate_up_exps && next_gate_up_exps->data) {
+        ggml_moe_cache.prefill_register_successor(
+                this_gate_up_exps->data, next_gate_up_exps->data, ggml_nbytes(next_gate_up_exps),
+                next_gate_up_exps->ne[2]);
+    }
+    if (this_down_exps && this_down_exps->data &&
+        next_down_exps && next_down_exps->data) {
+        ggml_moe_cache.prefill_register_successor(
+                this_down_exps->data, next_down_exps->data, ggml_nbytes(next_down_exps),
+                next_down_exps->ne[2]);
+    }
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,

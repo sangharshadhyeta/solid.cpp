@@ -1038,9 +1038,27 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
             if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                 int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
                 // check if a backend with higher prio wants to offload the op
+                if (getenv("MOE_CACHE_DEBUG_GATE") && tensor->op == GGML_OP_MUL_MAT_ID) {
+                    static int n = 0;
+                    if (n++ < 3000) {
+                        fprintf(stderr, "[sched-dbg] src=%s src_backend_id=%d last=%d is_host=%d op_offload=%d buft=%s\n",
+                                src->name, src_backend_id, sched->n_backends - 1,
+                                (int) ggml_backend_buffer_is_host(src->buffer), (int) sched->op_offload,
+                                ggml_backend_buft_name(src->buffer->buft));
+                    }
+                }
                 if (sched->op_offload && src_backend_id == sched->n_backends - 1 && ggml_backend_buffer_is_host(src->buffer)) {
                     for (int b = 0; b < src_backend_id; b++) {
-                        if (ggml_backend_supports_op(sched->backends[b], tensor) && ggml_backend_offload_op(sched->backends[b], tensor)) {
+                        bool sup = ggml_backend_supports_op(sched->backends[b], tensor);
+                        bool off = sup && ggml_backend_offload_op(sched->backends[b], tensor);
+                        if (getenv("MOE_CACHE_DEBUG_GATE") && tensor->op == GGML_OP_MUL_MAT_ID) {
+                            static int n2 = 0;
+                            if (n2++ < 3000) {
+                                fprintf(stderr, "[sched-dbg]   b=%d supports_op=%d offload_op=%d ne2=%lld\n",
+                                        b, (int)sup, (int)off, (long long) tensor->ne[2]);
+                            }
+                        }
+                        if (sup && off) {
                             SET_CAUSE(tensor, "1.off");
                             return b;
                         }
@@ -1789,6 +1807,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
+    // Whether used_ids has any bit left after the LFRU pass below cleared the
+    // rows it served device-to-device - persists across inputs/splits that
+    // reuse the same ids_tensor, same as used_ids itself (only recomputed
+    // when the ids_tensor actually changes). Starts true so the very first
+    // use, before ids_tensor is ever set, doesn't wrongly skip.
+    bool any_h2d_needed = true;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1901,8 +1925,50 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+
+                        // LFRU upgrade: an expert already resident in the decode-time
+                        // GPU cache for this same weight tensor doesn't need this H2D
+                        // at all - skip it here (device-to-device instead, no PCIe
+                        // cost) so the contiguous-run grouping below only ever builds
+                        // runs out of genuinely missing rows. Recomputed alongside
+                        // used_ids (only when the ids tensor actually changed, same
+                        // as that computation) since LFRU residency, like used_ids
+                        // itself, is only meaningful per-ids-tensor, not per-copy.
+                        if (ggml_moe_cache.moe_lfru_copy_expert) {
+                            for (int64_t e = 0; e < n_expert; e++) {
+                                if (!ggml_bitset_get(used_ids.data(), e)) {
+                                    continue;
+                                }
+                                void * dst = (uint8_t *) input_cpy->data + e * expert_size;
+                                if (ggml_moe_cache.moe_lfru_copy_expert(
+                                        input->data, (int32_t) e, expert_size, dst, split_backend)) {
+                                    ggml_bitset_clear(used_ids.data(), e);
+                                }
+                            }
+                        }
+                        // Every used row may have been served D2D above - remember
+                        // that for this ids_tensor so a later copy of the SAME split
+                        // input (another node/input reusing it - see the != check
+                        // above) doesn't have to redo the LFRU scan, and so the
+                        // run-finder below (which assumes at least one set bit) can
+                        // be skipped cleanly instead of scanning past the end.
+                        any_h2d_needed = false;
+                        for (int64_t e = 0; e < n_expert && !any_h2d_needed; e++) {
+                            any_h2d_needed = ggml_bitset_get(used_ids.data(), e);
+                        }
                     }
 
+                    if (!any_h2d_needed) {
+                        continue; // this input is fully served from the LFRU cache
+                    }
+
+                    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                        static int n = 0;
+                        if (n++ < 40) {
+                            fprintf(stderr, "[split-copy-dbg] node=%s input=%s n_expert=%lld expert_size=%zu\n",
+                                    node->name, input->name, (long long) n_expert, expert_size);
+                        }
+                    }
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;

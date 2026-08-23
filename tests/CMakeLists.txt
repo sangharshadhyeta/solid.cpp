@@ -270,6 +270,20 @@ endif()
 llama_build_and_test(test-backend-ops.cpp)
 llama_build(test-moe-cache.cpp)
 target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
+if (GGML_CUDA)
+    # The prefill-double-buffer test drives cudaStream_t/cudaMemcpyAsync
+    # directly (it's testing a CUDA-specific mechanism), unlike the rest of
+    # this file which stays backend-agnostic via ggml-backend.h. Only safe to
+    # include cuda_runtime.h/link cudart when CUDA is actually part of the
+    # build, hence the compile definition gating it in the source file.
+    # find_package(CUDAToolkit) was already run inside ggml/src/ggml-cuda, but
+    # its imported targets are only visible from that call site downward, not
+    # to this sibling directory - re-running it here is a no-op cache lookup,
+    # not a second toolkit search.
+    find_package(CUDAToolkit REQUIRED)
+    target_link_libraries(test-moe-cache PRIVATE CUDA::cudart)
+    target_compile_definitions(test-moe-cache PRIVATE MOE_CACHE_TEST_HAS_CUDA)
+endif()
 llama_test(test-moe-cache LABEL "backend")
 set_tests_properties(test-moe-cache PROPERTIES TIMEOUT 20)
 

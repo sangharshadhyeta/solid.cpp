@@ -1312,6 +1312,47 @@ static bool common_device_memory_data_fits(const common_device_memory_data_vec &
     return true;
 }
 
+// The buffer type -ncmoe places its overridden experts in. Plain
+// ggml_backend_cpu_buffer_type() is host memory the CPU backend can compute
+// on, but it's invisible to op_offload: op_offload's backend-assignment path
+// (ggml_backend_sched_backend_id_from_cur) only considers diverting a node to
+// GPU for buffers a GPU device's own get_host_buffer_type() produced (the
+// same buffer type llama-model.cpp's make_cpu_buft_list already uses for
+// tensors that overflow VRAM naturally, for exactly this reason - see its
+// own comment: "useful when processing of large batches is offloaded to a
+// GPU device, since it reduces the time spent on data transfers"). Plain CPU
+// buft tensors stay CPU-computed forever, at any batch size - verified
+// empirically: -ncmoe layers never engaged op_offload even at n_tokens on
+// the order of thousands. Resolving the same host buffer type here (falling
+// back to plain CPU buft if no device offers one, e.g. CPU-only builds)
+// makes explicit -ncmoe placements op_offload-eligible during prefill the
+// same way naturally-overflowing tensors already are, without touching
+// ggml_moe_cache at all - its CPU-dispatch gate checks buffer *usage*
+// (WEIGHTS), not buffer *type*, so decode-time behavior is unaffected.
+static ggml_backend_buffer_type_t common_moe_cpu_override_buft() {
+    static ggml_backend_buffer_type_t buft = [] () -> ggml_backend_buffer_type_t {
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+                continue;
+            }
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(dev);
+            if (host_buft) {
+                if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                    fprintf(stderr, "[ncmoe-buft-dbg] resolved HOST buft=%p (name=%s) from dev=%s\n",
+                            (void*)host_buft, ggml_backend_buft_name(host_buft), ggml_backend_dev_name(dev));
+                }
+                return host_buft;
+            }
+        }
+        if (getenv("MOE_CACHE_DEBUG_GATE")) {
+            fprintf(stderr, "[ncmoe-buft-dbg] no GPU host buft found, falling back to plain CPU buft\n");
+        }
+        return ggml_backend_cpu_buffer_type();
+    }();
+    return buft;
+}
+
 // Shared by Layer 1 (use the safe floor as-is) and Layer 2/--moe-calibrate
 // (use the safe floor as the starting point for empirical throughput
 // candidates above it). Keeps its own C-string storage alive for the
@@ -1319,9 +1360,10 @@ static bool common_device_memory_data_fits(const common_device_memory_data_vec &
 static std::vector<llama_model_tensor_buft_override> common_moe_build_cpu_overrides(uint32_t n) {
     static std::list<std::string> pattern_storage;
     std::vector<llama_model_tensor_buft_override> ov;
+    ggml_backend_buffer_type_t buft = common_moe_cpu_override_buft();
     for (uint32_t i = 0; i < n; i++) {
         pattern_storage.push_back(llm_ffn_exps_block_regex((int) i));
-        ov.push_back({pattern_storage.back().c_str(), ggml_backend_cpu_buffer_type()});
+        ov.push_back({pattern_storage.back().c_str(), buft});
     }
     ov.push_back({nullptr, nullptr});
     return ov;

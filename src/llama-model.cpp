@@ -1013,7 +1013,11 @@ static buft_list_t make_gpu_buft_list(ggml_backend_dev_t dev, llama_split_mode s
 
 struct llama_model::impl {
     impl() = default;
-    ~impl() = default;
+    ~impl() {
+        for (auto & [base, unreg_fn] : pinned_host_buffers) {
+            unreg_fn(base);
+        }
+    }
 
     uint64_t n_elements = 0;
 
@@ -1032,6 +1036,12 @@ struct llama_model::impl {
 
     // contexts where the model tensors metadata is stored as well as the corresponding buffers:
     std::vector<std::pair<ggml_context_ptr, std::vector<ggml_backend_buffer_ptr>>> ctxs_bufs;
+
+    // CPU-resident weight buffers (tensor-override / -ncmoe) pinned so the CUDA
+    // scheduler's op_offload path can read them directly instead of through
+    // unregistered/demand-paged host memory - see the pinning pass in
+    // load_tensors below. Unregistered on model teardown.
+    std::vector<std::pair<void *, void (*)(void *)>> pinned_host_buffers;
 
     buft_list_t cpu_buft_list;
     std::map<ggml_backend_dev_t, buft_list_t> gpu_buft_list;
@@ -1687,6 +1697,59 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // -ncmoe/--override-tensor CPU-resident expert weights are read directly by
+    // the CUDA scheduler's op_offload path (ggml_cuda_mul_mat_q reading
+    // src0->data with no explicit H2D copy) once a MUL_MAT_ID batch reaches
+    // op_offload_min_batch_size (32) - i.e. essentially every real prefill
+    // batch. That buffer is plain ggml_backend_cpu_buffer_type(), never
+    // registered as pinned host memory by the existing load path (the
+    // mmap-fragment pinning above only covers ranges used as GPU-upload
+    // sources, not the final resting place of CPU-target tensors). Measured
+    // +53% prefill throughput from pinning it (RTX 3060, Gemma-4-26B-A4B,
+    // -ncmoe 15); decode is unaffected since it stays under moe-cache's own
+    // batch-size gate and never reaches this path.
+    {
+        // The CPU buffer type reports a NULL device (see the FIXME workaround
+        // above, in this same function) - ggml_backend_register_host_buffer is
+        // implemented by CUDA, not CPU, so it has to be found by scanning
+        // devices, same as the existing mmap-fragment pinning code below does,
+        // not by asking the (CPU) buffer's own device.
+        bool (*reg_fn)(void *, size_t) = nullptr;
+        void (*unreg_fn)(void *) = nullptr;
+        for (size_t i = 0; i < ggml_backend_dev_count() && !reg_fn; i++) {
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_dev_get(i));
+            // rw falls back to cudaHostRegisterDefault when ReadOnly registration
+            // is rejected outright by the driver - see ggml_backend_cuda_register_host_buffer_rw.
+            reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer_rw");
+            if (!reg_fn) {
+                reg_fn = (bool (*)(void *, size_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_register_host_buffer");
+            }
+            if (reg_fn) {
+                unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
+            }
+        }
+        if (reg_fn && unreg_fn) {
+            for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+                for (auto & buf : bufs) {
+                    if (ggml_backend_buffer_get_usage(buf.get()) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+                        !ggml_backend_buffer_is_host(buf.get())) {
+                        continue;
+                    }
+                    void * base = ggml_backend_buffer_get_base(buf.get());
+                    size_t size = ggml_backend_buffer_get_size(buf.get());
+                    if (reg_fn(base, size)) {
+                        pimpl->pinned_host_buffers.emplace_back(base, unreg_fn);
+                        LLAMA_LOG_INFO("%s: pinned %.2f MiB CPU weight buffer (%s) for direct CUDA reads\n",
+                                __func__, size / 1024.0 / 1024.0, ggml_backend_buffer_name(buf.get()));
+                    } else {
+                        LLAMA_LOG_DEBUG("%s: failed to pin CPU weight buffer (%s), %.2f MiB\n",
+                                __func__, ggml_backend_buffer_name(buf.get()), size / 1024.0 / 1024.0);
+                    }
+                }
+            }
         }
     }
 

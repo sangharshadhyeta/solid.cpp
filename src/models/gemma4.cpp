@@ -358,6 +358,23 @@ llama_model_gemma4::graph::graph(const llama_model & model, const llm_graph_para
                         n_expert_used, il, found);
             }
 
+            // Full-layer prefill double buffer: unlike the router lookahead
+            // above, this doesn't need a prediction - a real prefill batch
+            // touches close to every expert regardless of routing, so just
+            // register the next MoE layer's whole expert tensors as this
+            // layer's successor now (the actual copy is issued later, at
+            // compute time, from ggml_cuda_mul_mat_id). Only ever the
+            // immediate next layer: the double buffer holds 2 slots.
+            for (int nx = il + 1; nx < (int) model.layers.size(); ++nx) {
+                if (!model.layers[nx].ffn_gate_inp) {
+                    continue;
+                }
+                build_moe_prefill_prefetch(
+                        model.layers[il].ffn_gate_up_exps, model.layers[il].ffn_down_exps,
+                        model.layers[nx].ffn_gate_up_exps, model.layers[nx].ffn_down_exps);
+                break;
+            }
+
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);
