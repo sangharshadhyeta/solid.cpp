@@ -390,6 +390,12 @@ struct moe_cache_device {
     // partner_best mirrors successor_best but for the undirected
     // within-layer table, updated on both endpoints of each edge.
     std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> partner_best;
+    // How often each expert was selected at all. partner_best holds a raw
+    // co-occurrence COUNT, which says nothing on its own - a partner seen
+    // twice looks identical to one seen 500 times. Dividing by this turns
+    // it into P(partner | anchor fired), which is what a confidence
+    // threshold actually needs.
+    std::unordered_map<moe_cache_key, uint32_t, moe_cache_key_hash> expert_fire_count;
     long long group_admits = 0;
     long long partner_pred_total = 0;
     long long partner_pred_hit   = 0;
@@ -4479,7 +4485,22 @@ static int moe_cache_plan(
                 // slot would hold another tensor's weights - silent
                 // corruption, and the same shape of unchecked assumption
                 // that caused a real segfault earlier in this work.
-                if (pkey.tensor == node->host_base &&
+                // Confidence gate. The first version of this policy admitted
+                // the top partner unconditionally and measured -0.5% tok/s
+                // for +0.39pp hit rate: it was paying a fill and an
+                // eviction for partners whose co-occurrence might be
+                // incidental. P(partner | anchor fired) is the honest
+                // measure; a raw count is not.
+                static const double min_p = [] {
+                    const char * env = getenv("GGML_CUDA_MOE_CACHE_GROUP_ADMIT_MIN_P");
+                    const double v = env ? atof(env) : 0.5;
+                    return v < 0.0 ? 0.0 : v;
+                }();
+                const auto fit = device.expert_fire_count.find(key);
+                const uint32_t fired = fit == device.expert_fire_count.end() ? 0 : fit->second;
+                const double conf = fired > 0 ? (double) pit->second.second / (double) fired : 0.0;
+                if (conf >= min_p &&
+                    pkey.tensor == node->host_base &&
                     pkey.expert >= 0 && pkey.expert < node->n_expert &&
                     pool.map.find(pkey) == pool.map.end()) {
                     int pslot = -1;
@@ -4494,7 +4515,17 @@ static int moe_cache_plan(
                         // inert after warmup - the exact trap the first
                         // version of atlas warming fell into.
                         const int cand = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
-                        if (cand >= 0) {
+                        // Only displace something genuinely cold. The first
+                        // version evicted whatever was coldest even when
+                        // "coldest" was still warm, so a confident partner
+                        // could throw out an expert that was itself being
+                        // used - paying twice (a fill now, a refill later)
+                        // for one speculative admission.
+                        static const uint32_t max_victim_heat = [] {
+                            const char * env = getenv("GGML_CUDA_MOE_CACHE_GROUP_ADMIT_VICTIM_HEAT");
+                            return (uint32_t) (env ? atoi(env) : MOE_CACHE_HEAT_STEP * 2);
+                        }();
+                        if (cand >= 0 && pool.slots[cand].heat <= max_victim_heat) {
                             moe_cache_slot_reset(pool, cand, false);
                             pslot = cand;
                             device.evictions++;
@@ -4565,6 +4596,9 @@ static int moe_cache_plan(
         }
         for (int a = 0; a < n_ids; a++) {
             if (ids[a] < 0) continue;
+            if (moe_cache_partner_index_enabled()) {
+                device.expert_fire_count[{node->host_base, ids[a]}]++;
+            }
             for (int b = a + 1; b < n_ids; b++) {
                 if (ids[b] < 0 || ids[b] == ids[a]) continue;
                 const moe_cache_key ka{node->host_base, ids[a]};
