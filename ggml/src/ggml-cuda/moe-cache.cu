@@ -4789,7 +4789,17 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     if (!env) {
                         // back-compat with the older on/off-only flag
                         const char * legacy = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT");
-                        return (legacy && atoi(legacy) != 0) ? spec_evict_mode::any : spec_evict_mode::off;
+                        if (legacy) {
+                            return atoi(legacy) != 0 ? spec_evict_mode::any : spec_evict_mode::off;
+                        }
+                        // Default: agree, not off. Safe even though it's now
+                        // the default - agree can only ever fire when a
+                        // farther depth exists to confirm against
+                        // (GGML_CUDA_MOE_LOOKAHEAD_DEPTH>=2), and that itself
+                        // still defaults to 1, so this is a no-op until the
+                        // caller opts into deeper lookahead. any is never
+                        // defaulted - measured harmful in every regime tested.
+                        return spec_evict_mode::agree;
                     }
                     if (!strcmp(env, "any")) return spec_evict_mode::any;
                     if (!strcmp(env, "agree")) return spec_evict_mode::agree;
