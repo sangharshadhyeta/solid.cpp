@@ -378,10 +378,12 @@ actually <em>see</em> what any of it is doing while it runs.</p>
 about as constrained as it gets for a 26B-parameter MoE model), same prompt, same config except the one thing
 being measured. Chat-templated and content-verified, not a synthetic benchmark.</p>
 
-<div class="stat-row">
+<div class="stat-row" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
 <div class="stat-card"><div class="num">+65<small>%</small></div><div class="label">Biggest single fix <span class="note">(frozen expert-cache bug, found live)</span></div></div>
+<div class="stat-card"><div class="num">+41<small>%</small></div><div class="label">Buffer fed by prediction <span class="note">(vs historical heat)</span></div></div>
 <div class="stat-card"><div class="num">+36.0<small>%</small></div><div class="label">Expert-prefetch, prefill <span class="note">(via thecodacus)</span></div></div>
 <div class="stat-card"><div class="num">+31.3<small>%</small></div><div class="label">MoE expert-cache vs naive CPU offload</div></div>
+<div class="stat-card"><div class="num">+28.1<small>%</small></div><div class="label">MTP speculative decoding</div></div>
 </div>
 
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">The throughput pipeline</h3>
