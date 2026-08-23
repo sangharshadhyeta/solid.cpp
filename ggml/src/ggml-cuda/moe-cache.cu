@@ -22,6 +22,7 @@ void ggml_moe_cache_register(const void * owner) {
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cerrno>
 #include <chrono>
 #if defined(__linux__)
@@ -277,9 +278,16 @@ struct moe_cache_device {
     // yet read to make a promotion or eviction decision.
     struct atlas_cell { float x = 0.0f, y = 0.0f, spec = 0.0f; };
     std::unordered_map<moe_cache_key, atlas_cell, moe_cache_key_hash> atlas;
+    // Secondary index for the warming scan (Track 1 step 3): "every expert
+    // atlas covers for this tensor", so ranking candidates for one layer
+    // doesn't mean scanning the whole model's atlas data on every attempt.
+    std::unordered_map<const void *, std::vector<std::pair<int32_t, atlas_cell>>> atlas_by_tensor;
     float req_dir_x = 0.0f;
     float req_dir_y = 0.0f;
     bool  req_dir_valid = false;
+    // Rate limit for the warming scan below - same clock spec_evict already
+    // uses (device.collect_calls), so this doesn't need its own timer.
+    long long atlas_warm_last_calls = -1;
     // Decay rate for the centroid EMA - deliberately the same shape as the
     // heat step/decay already tuned elsewhere in this file (a fast-reacting
     // but not noise-chasing signal), not yet independently measured. Revisit
@@ -3862,6 +3870,119 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 #endif
 }
 
+// Track 1 step 3 (docs/plan.md): Atlas-driven cache warming's actual
+// warming action. Off by default - this is the first thing in the Atlas
+// track that touches real cache state, and it hasn't been A/B'd yet, so it
+// follows the same rule every other predictive mechanism here was held to
+// before earning trust: prefetch-only, free-slot-only, NEVER evicts. A
+// wrong topic read costs one wasted free-slot fill, same ceiling a wrong
+// router-lookahead guess already has - never a displaced, already-earned
+// resident expert.
+static bool moe_cache_atlas_warm_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool moe_cache_atlas_warm(
+        moe_cache_device & device, moe_cache_pool & pool, int pool_index,
+        const void * host_base, size_t expert_size, int64_t n_expert) {
+    if (!device.req_dir_valid || n_expert <= 0) {
+        return false;
+    }
+    const auto it = device.atlas_by_tensor.find(host_base);
+    if (it == device.atlas_by_tensor.end() || it->second.empty()) {
+        return false;
+    }
+    const float rx = device.req_dir_x, ry = device.req_dir_y;
+    const float rmag = std::sqrt(rx * rx + ry * ry);
+    if (rmag < 1e-6f) {
+        return false; // decaying centroid hasn't moved off the origin yet - nothing to rank against
+    }
+
+    // Rank by cosine similarity to the live request direction, discounted
+    // by each candidate's own specialization confidence (a high-cosine
+    // match to a barely-specialized expert is a much weaker signal than
+    // the same cosine to a sharply-specialized one). Bounded top-K, no
+    // allocation - this runs on a rate-limited decode-path call, not off it.
+    constexpr int K = 2;
+    struct cand { int32_t expert; float score; };
+    cand best[K];
+    int n_best = 0;
+    for (const auto & [expert, cell] : it->second) {
+        // Atlas data can be stale (a different model/shape than what's
+        // actually loaded, or an architecture change since the offline
+        // probe ran) or, in this session's own testing, was deliberately
+        // registered from a different model's atlas to exercise this path -
+        // in both cases an out-of-range expert index here is a real,
+        // previously-unguarded out-of-bounds read: host_base + expert *
+        // expert_size would point past this tensor's real allocation, and
+        // the fill worker's copy from that address segfaults. Every other
+        // caller (moe_cache_plan, moe_cache_prefetch) bounds-checks against
+        // n_expert before trusting an index; this one has to too, since its
+        // indices come from an external file, not the model's own router.
+        if (expert < 0 || expert >= n_expert) {
+            continue;
+        }
+        const moe_cache_key key{host_base, expert};
+        if (pool.map.find(key) != pool.map.end()) {
+            continue; // already resident or already in flight
+        }
+        const float cmag = std::sqrt(cell.x * cell.x + cell.y * cell.y);
+        if (cmag < 1e-6f) {
+            continue; // this expert never showed real affinity to any probed category
+        }
+        const float score = ((cell.x * rx + cell.y * ry) / (cmag * rmag)) * cell.spec;
+        if (score <= 0.0f) {
+            continue; // only warm candidates genuinely aligned with the live direction
+        }
+        if (n_best < K) {
+            best[n_best++] = {expert, score};
+            std::sort(best, best + n_best, [](const cand & a, const cand & b) { return a.score > b.score; });
+        } else if (score > best[K - 1].score) {
+            best[K - 1] = {expert, score};
+            std::sort(best, best + K, [](const cand & a, const cand & b) { return a.score > b.score; });
+        }
+    }
+
+    bool woke = false;
+    for (int i = 0; i < n_best; i++) {
+        if (pool.free_slots.empty()) {
+            break; // free-slot-only - see the function comment, this never evicts
+        }
+        const int32_t expert = best[i].expert;
+        const moe_cache_key key{host_base, expert};
+        if (pool.map.find(key) != pool.map.end()) {
+            continue; // resolved by something else since ranking above
+        }
+        const int slot_index = pool.free_slots.back();
+        pool.free_slots.pop_back();
+        moe_cache_slot & slot = pool.slots[slot_index];
+        slot.key = key;
+        slot.generation++;
+        slot.readers = 0;
+        slot.state = moe_cache_slot_state::copying;
+        try {
+            if (!pool.map.emplace(key, slot_index).second) {
+                moe_cache_slot_reset(pool, slot_index, true);
+                continue;
+            }
+            device.queue.push_back({
+                    pool_index, slot_index, slot.generation, key,
+                    (const char *) host_base + (size_t) expert * expert_size,
+                    expert_size});
+            device.queued_bytes += expert_size;
+            device.prefetches++;
+            woke = true;
+        } catch (...) {
+            moe_cache_slot_reset(pool, slot_index, true);
+        }
+    }
+    return woke; // caller (moe_cache_plan) folds this into its own wake_worker/notify
+}
+
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -4091,6 +4212,22 @@ static int moe_cache_plan(
         inserts_left--;
         wake_worker = true;
     }
+
+    // Track 1 step 3: Atlas-driven warming, rate-limited to once every 64
+    // plan() calls (device.nodes, unconditionally incremented once per call
+    // just below - deliberately not plan_epoch, whose own increment above
+    // is conditional on cold-sweep being enabled) so ranking a tensor's
+    // whole atlas-covered candidate set never runs on every single token -
+    // see moe_cache_atlas_warm's own comment for why this is prefetch-only
+    // and off by default.
+    if (moe_cache_atlas_warm_enabled() &&
+        (long long) device.nodes - device.atlas_warm_last_calls >= 64) {
+        device.atlas_warm_last_calls = (long long) device.nodes;
+        if (moe_cache_atlas_warm(device, pool, node->pool_index, node->host_base, node->expert_size, node->n_expert)) {
+            wake_worker = true;
+        }
+    }
+
     device.nodes++;
     lock.unlock();
     if (wake_worker) {
@@ -5222,12 +5359,17 @@ static void moe_cache_set_atlas(
         std::lock_guard<std::mutex> lock(session->mu);
         for (const auto & device_ptr : session->devices) {
             moe_cache_device & device = *device_ptr;
+            auto & by_tensor = device.atlas_by_tensor[host_base];
+            by_tensor.clear(); // a second registration for this host_base replaces its entries, both indices
+            by_tensor.reserve((size_t) n_cells);
             for (int i = 0; i < n_cells; i++) {
                 if (expert[i] < 0) {
                     continue;
                 }
+                const moe_cache_device::atlas_cell cell{x[i], y[i], spec[i]};
                 const moe_cache_key key{host_base, expert[i]};
-                device.atlas[key] = moe_cache_device::atlas_cell{x[i], y[i], spec[i]};
+                device.atlas[key] = cell;
+                by_tensor.emplace_back(expert[i], cell);
             }
         }
     }
