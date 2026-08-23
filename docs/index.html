@@ -521,12 +521,38 @@ agree with at all. Measured (200-token run, depth=2, same prompt as the refutati
 76.5% baseline (evictions 828 vs. 869 — <em>fewer</em>, not more), against <code>any</code>'s 54.2% hit rate and
 4081 evictions under identical conditions. Throughput: statistically indistinguishable from baseline (53.68 vs.
 53.67 tok/s, <code>-r 5</code>) — a real but modest hit-rate gain that this workload doesn't have enough
-memory pressure to turn into a measurable tok/s difference yet. <strong>Does not currently generalize past
-depth=2</strong>: at depth=3, hits actually drop slightly versus off (75.0% vs. 75.8%, evictions 969 vs. 918) —
-this mode only tracks "seen before this step", not which depth pair agreed, so with three active depths it
-also accepts weaker depth-3-confirms-depth-2 corroboration (41%&rarr;48% precision) alongside the strong
-depth-2-confirms-depth-1 case (48%&rarr;59.3%) that made depth=2 work. Use <code>LOOKAHEAD_DEPTH=2</code> with
-this mode until depth is tracked explicitly per candidate, not just presence/absence.</p>
+memory pressure to turn into a measurable tok/s difference yet.</p>
+<p><strong>Update: depth=3 fixed.</strong> The corroboration memory now stores <em>which</em> depth suggested
+each candidate (<code>spec_seen_this_cycle</code> holds <code>(key, depth)</code> pairs, plumbed end to end via
+a new <code>moe_lookahead_userdata</code> passed through <code>ggml_map_custom1</code>, not just tensor
+identity) and only counts a strictly closer depth's prediction as corroboration — a same-or-farther-depth
+repeat is ignored rather than treated as agreement. Re-measured at depth=3: hits 77.0% vs. off's 77.3% and
+evictions <em>828 vs. 846</em> (fewer, not more) — flat with baseline, no longer the regression the untracked
+version showed (75.0% vs. 75.8%, +5.6% more evictions). Swept further out of curiosity (temporarily uncapping
+<code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH</code> past its normal 3 ceiling, same 200-token run, mode=agree):</p>
+<div class="tablewrap"><table><colgroup><col><col><col><col></colgroup>
+<thead><tr><th>depth</th><th>hit rate</th><th>evictions</th><th>gen tok/s</th></tr></thead>
+<tbody>
+<tr><td>2</td><td class="num">77.3%</td><td class="num">811</td><td class="num">51.0</td></tr>
+<tr><td>3</td><td class="num">76.3%</td><td class="num">881</td><td class="num">49.1</td></tr>
+<tr><td>4</td><td class="num">75.4%</td><td class="num">986</td><td class="num">47.1</td></tr>
+<tr><td>5</td><td class="num">68.8%</td><td class="num">1432</td><td class="num">44.2</td></tr>
+<tr><td>6</td><td class="num">66.3%</td><td class="num">1573</td><td class="num">42.3</td></tr>
+<tr><td>8</td><td class="num">68.8%</td><td class="num">1411</td><td class="num">41.0</td></tr>
+</tbody></table></div>
+<p>Monotonic decline, with a real cliff between depth 4 and 5. Checked whether that cliff was the
+cross-depth-agreement mechanism itself (a debug histogram of confirming depths - fewer than 20 real
+corroborated evictions fired in the whole 200-token run) and re-ran the same sweep with
+<code>SPEC_EVICT_MODE</code> unset (off) entirely: the identical cliff appears there too (depth 4: 74.2%
+hits/1080 evictions &rarr; depth 5: 66.4%/1608 &rarr; depth 6: 63.5%/1741). So the cliff has nothing to do with
+eviction policy - it's the always-on speculative-fill admission path (<code>moe_cache_prefetch</code>'s
+free-slot branch, which runs in every mode including off, with zero precision gating). At depth 5-6 the sheer
+volume of low-precision (&sim;30-35%) far-depth guesses is enough to fill real cache capacity with speculative
+content that's usually wrong, displacing what accurate demand-driven admissions would have kept. Depth=2
+remains the sweet spot; the sweep confirms going deeper is a real net loss, not something eviction-side tuning
+would fix - a real fix would mean precision-gating the free-slot admission itself, a separate change to the
+always-on prefetch path, out of scope here since production never exceeds the model builders' hard depth cap
+of 3 anyway (unaffected by any of this).</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
