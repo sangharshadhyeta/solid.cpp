@@ -397,13 +397,19 @@ struct moe_cache_device {
     long long spec_evict_reset_at_calls = 0;   // collect_calls value at last reset
     // Cross-depth agreement gate for GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=agree
     // (see moe_cache_prefetch): a candidate a farther, less-accurate depth
-    // wanted but could not get a free slot for is remembered here for the
-    // rest of this decode step. If a closer, more-accurate depth's own
-    // prediction for the same target tensor lands on the same expert, that
-    // is real corroboration - two independent router-state samples agreeing,
-    // not one guess - and only then is an eviction permitted. Bounded and
-    // reset on the same collect_calls clock spec_evictions_this_cycle uses.
-    std::vector<moe_cache_key> spec_seen_this_cycle;
+    // wanted but could not get a free slot for is remembered here, along
+    // with the depth that suggested it, for the rest of this decode step.
+    // Eviction is only permitted when a *strictly closer* (smaller-depth,
+    // more accurate) prediction later lands on the same expert - not merely
+    // "seen again regardless of which depth". Depth is tracked explicitly
+    // because, measured, treating any repeat sighting as corroboration
+    // works at depth=2 (only one possible pairing: depth-2 confirmed by
+    // depth-1) but measurably hurts at depth=3, where it also accepts a
+    // depth-3-confirmed-by-depth-2 pairing - both still under 50% precision
+    // - diluting the depth-1-confirms-depth-2 signal that actually works
+    // (see docs/index.html). Bounded and reset on the same collect_calls
+    // clock spec_evictions_this_cycle uses.
+    std::vector<std::pair<moe_cache_key, int>> spec_seen_this_cycle;
     std::atomic<int> error_logs{0};
 };
 
@@ -4719,7 +4725,7 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
 //    than a right one saves.
 //  - it respects the same queue bounds as demand fills, so a bad prediction
 //    cannot starve real work.
-static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int n_ids) {
+static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int n_ids, int depth) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_PREFETCH");
         return !env || atoi(env) != 0; // on unless explicitly disabled
@@ -4810,17 +4816,32 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                         device.spec_seen_this_cycle.clear();
                     }
                     if (mode == spec_evict_mode::agree) {
-                        const auto & seen = device.spec_seen_this_cycle;
-                        const bool corroborated = std::find(seen.begin(), seen.end(), key) != seen.end();
+                        auto & seen = device.spec_seen_this_cycle;
+                        auto it = std::find_if(seen.begin(), seen.end(),
+                                [&](const std::pair<moe_cache_key, int> & p) { return p.first == key; });
+                        // Corroborated only if a *strictly closer* (smaller,
+                        // more accurate) depth than whatever suggested it
+                        // before now confirms it - not merely seen twice. A
+                        // same-or-farther-depth repeat is not new evidence
+                        // (see the struct comment on spec_seen_this_cycle for
+                        // why this distinction is the depth=3 fix).
+                        const bool corroborated = it != seen.end() && depth < it->second;
                         if (!corroborated) {
-                            // Remember this guess in case a later, closer-depth
-                            // call this same step lands on the same expert -
-                            // real corroboration, not an eviction yet.
-                            if (device.spec_seen_this_cycle.size() < 64) {
-                                device.spec_seen_this_cycle.push_back(key);
+                            if (it == seen.end()) {
+                                // First sighting this step: remember it (and
+                                // its depth) in case a later, closer call
+                                // lands on the same expert.
+                                if (seen.size() < 64) {
+                                    seen.emplace_back(key, depth);
+                                }
                             }
+                            // else: a same-or-farther-depth repeat of an
+                            // already-seen, still-unconfirmed candidate - no
+                            // new information, leave the closer depth already
+                            // on record as the one that still needs confirming.
                             break; // uncorroborated: behave exactly like mode=off
                         }
+                        seen.erase(it); // confirmed - remove so it can't double-fire this step
                     }
                     // Rate-limited regardless of mode: uncapped, this fires up
                     // to n_expert_used times per layer per token (measured

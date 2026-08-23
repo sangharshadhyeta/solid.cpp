@@ -127,7 +127,17 @@ struct ggml_moe_cache_api {
     // (Speculating Experts, PILOT, Fate, FineMoE): prediction is only ~77%
     // accurate, so these fills must never displace an expert the cache is
     // confident about. Speculation loses ties to certainty.
-    void (*prefetch)(const void * host_base, const int32_t * ids, int n_ids);
+    //
+    // `depth` is how many MoE layers ahead this prediction targets (1 =
+    // immediate next layer, using the freshest, most accurate router
+    // state; higher = farther and measurably less accurate - 59.3% / 48.0%
+    // / 41.1% precision at depth 1/2/3). Needed so cross-depth-agreement
+    // speculative eviction (GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=agree) can
+    // require a *closer* depth to confirm a farther one specifically,
+    // rather than merely "seen twice regardless of which depths agreed" -
+    // the latter also accepts weak depth-3-confirms-depth-2 corroboration
+    // and measurably dilutes the effect (see docs/index.html).
+    void (*prefetch)(const void * host_base, const int32_t * ids, int n_ids, int depth);
 
     // Full-layer prefill double buffer, split into a build-time and a
     // compute-time half - CUDA graph capture can only ever be active during

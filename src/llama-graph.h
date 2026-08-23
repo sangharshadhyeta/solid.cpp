@@ -1061,6 +1061,17 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // Userdata for moe_prefetch_cb below - bundles the target tensor pointer
+    // (how moe-cache identifies what's being prefetched) with the depth of
+    // this specific prediction (how many MoE layers ahead it targets, 1 =
+    // closest/most accurate), so moe-cache's cross-depth-agreement eviction
+    // can require a genuinely closer confirmation rather than merely "seen
+    // twice" - see the comment on ggml_moe_cache.prefetch.
+    struct moe_lookahead_userdata {
+        void * host_base;
+        int    depth;
+    };
+
     // build MoE FFN without bias tensors
     // see llama-graph.cpp - delivers a router-lookahead prediction to moe-cache
     static void moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
@@ -1074,7 +1085,7 @@ struct llm_graph_context {
             ggml_tensor * next_exp_probs_b,   // may be null: models without a load-balancing bias
                 int64_t   n_expert_used,
                     int   il,
-                    int   depth = 1) const;   // layers ahead being predicted; only affects the debug tensor name
+                    int   depth = 1) const;   // layers ahead being predicted; also gates cross-depth-agreement eviction
 
     // Full-layer prefill double buffer: unlike router lookahead above (which
     // predicts which *experts* the next layer needs, since decode only ever

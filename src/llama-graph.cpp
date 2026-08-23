@@ -1872,18 +1872,22 @@ ggml_tensor * llm_graph_context::build_ffn(
 
 // Hands a lookahead prediction to moe-cache. Runs on the CPU backend as a
 // custom op, so it executes in graph order rather than at build time.
-// `userdata` is the next layer's expert-weight base pointer, which is how
-// moe-cache identifies the tensor being prefetched.
+// `userdata` points to a moe_lookahead_userdata (see build_moe_lookahead)
+// carrying both the next layer's expert-weight base pointer (how moe-cache
+// identifies the tensor being prefetched) and the prediction's depth (how
+// moe-cache's cross-depth-agreement eviction tells a closer, more accurate
+// confirmation apart from a farther, weaker one).
 void llm_graph_context::moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
     GGML_UNUSED(dst);
     GGML_UNUSED(nth);
     if (ith != 0 || !ggml_moe_cache.prefetch || !userdata || a->type != GGML_TYPE_I32) {
         return;
     }
+    const auto * ud = (const llm_graph_context::moe_lookahead_userdata *) userdata;
     // Only the first token's row is used: prefetching is per-layer, and the
     // experts the first token routes to are as good a sample as any for what
     // the layer is about to touch.
-    ggml_moe_cache.prefetch(userdata, (const int32_t *) a->data, (int) a->ne[0]);
+    ggml_moe_cache.prefetch(ud->host_base, (const int32_t *) a->data, (int) a->ne[0], ud->depth);
 }
 
 
@@ -1926,10 +1930,17 @@ void llm_graph_context::build_moe_lookahead(
     ggml_tensor * next_top = ggml_argsort_top_k(ctx0, next_probs, n_expert_used);
     cb(next_top, depth == 1 ? "ffn_moe_lookahead" : "ffn_moe_lookahead2", il);
 
+    // Bundles the target tensor pointer with this call's depth for
+    // moe_prefetch_cb - see the struct comment. Allocated once per (layer,
+    // depth) pair at graph build time (bounded: at most n_layers * 3) and
+    // deliberately never freed, the same lifetime the raw tensor-pointer
+    // userdata this replaces already had implicitly.
+    auto * ud = new llm_graph_context::moe_lookahead_userdata{next_exps->data, depth};
+
     // Fires in graph order - while this layer is still computing and before the
     // next layer's expert matmul is reached, which is the whole point.
     ggml_tensor * hint = ggml_map_custom1(ctx0, next_top,
-            llm_graph_context::moe_prefetch_cb, 1, next_exps->data);
+            llm_graph_context::moe_prefetch_cb, 1, ud);
     ggml_build_forward_expand(gf, hint);
 }
 
