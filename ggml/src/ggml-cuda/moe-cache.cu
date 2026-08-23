@@ -4619,6 +4619,12 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
                 sum.allocated_bytes += device.allocated_bytes;
                 sum.budget_bytes    += device.budget_limit;
 
+                if (device.req_dir_valid) {
+                    sum.req_dir_x     = device.req_dir_x;
+                    sum.req_dir_y     = device.req_dir_y;
+                    sum.req_dir_valid = 1;
+                }
+
                 for (const auto & pool_ptr : device.pools) {
                     const moe_cache_pool & pool = *pool_ptr;
                     sum.slots_total += (size_t) pool.n_slots;

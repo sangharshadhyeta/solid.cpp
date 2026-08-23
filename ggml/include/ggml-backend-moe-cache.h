@@ -37,6 +37,18 @@ struct ggml_moe_cache_summary {
 	double avg_heat;
 	size_t allocated_bytes;
 	size_t budget_bytes;
+
+	// Step 0 of Atlas-driven cache warming (see ggml_moe_cache.set_atlas) -
+	// the live, decaying request-direction centroid, in the same (x,y)
+	// affinity space the atlas cells use. req_dir_valid is false until at
+	// least one atlas-covered expert has actually been selected; x/y are
+	// 0 until then. When multiple devices are live, this is simply
+	// whichever device's session was iterated last - fine for the
+	// visualization this feeds, not meant to be a precise cross-device
+	// aggregate the way the counters above are.
+	float req_dir_x;
+	float req_dir_y;
+	int   req_dir_valid;
 };
 
 struct ggml_moe_cache_api {

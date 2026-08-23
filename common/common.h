@@ -981,6 +981,13 @@ struct common_moe_cache_summary {
     double avg_heat           = 0.0;
     size_t allocated_bytes    = 0;
     size_t budget_bytes       = 0;
+
+    // Step 0 of Atlas-driven cache warming - live request-direction
+    // centroid. req_dir_valid false (and x/y left at 0) until at least one
+    // atlas-covered expert has actually been selected.
+    float req_dir_x     = 0.0f;
+    float req_dir_y     = 0.0f;
+    bool  req_dir_valid = false;
 };
 
 // Returns false (out left zeroed) if no CUDA moe-cache session has

@@ -2451,6 +2451,9 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
     out.avg_heat         = raw.avg_heat;
     out.allocated_bytes  = raw.allocated_bytes;
     out.budget_bytes     = raw.budget_bytes;
+    out.req_dir_x        = raw.req_dir_x;
+    out.req_dir_y        = raw.req_dir_y;
+    out.req_dir_valid    = raw.req_dir_valid != 0;
     return raw.slots_total > 0;
 }
 
