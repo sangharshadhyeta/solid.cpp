@@ -367,6 +367,19 @@ struct moe_cache_device {
     moe_cache_key last_top_expert{};
     int  last_top_layer = -1;
     bool last_top_expert_valid = false;
+
+    // Track 1 step 6 (docs/plan.md): does the cross-layer co-activation
+    // table actually PREDICT the next layer's pick? Router-lookahead's own
+    // measured precision is 59.3% / 48.0% / 41.1% at depth 1/2/3, and it
+    // pays a real n_embd x n_expert matmul per layer to get it; a table
+    // lookup is nearly free, so the question is whether it is competitive.
+    // successor_best is an O(1) index (from-expert -> its highest-count
+    // successor so far) maintained alongside the edge counts, so scoring a
+    // prediction never scans the full edge map. All of this is gated - see
+    // moe_cache_measure_pred_enabled - and costs nothing when off.
+    std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> successor_best;
+    long long xlayer_pred_total = 0;
+    long long xlayer_pred_hit   = 0;
     // Keyed by a real, directed moe_cache_edge (from = earlier layer) -
     // same fix as co_activation above, same reason.
     std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation_cross_layer;
@@ -4008,6 +4021,15 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 // wrong topic read costs one wasted free-slot fill, same ceiling a wrong
 // router-lookahead guess already has - never a displaced, already-earned
 // resident expert.
+// Step 6: opt-in measurement only. Off by default, checked once.
+static bool moe_cache_measure_pred_enabled() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_MEASURE_PRED");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
 static bool moe_cache_atlas_warm_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM");
@@ -4431,8 +4453,36 @@ static int moe_cache_plan(
             node->layer >= 0 && device.last_top_layer >= 0 &&
             node->layer != device.last_top_layer;
         if (real_transition) {
-            device.co_activation_cross_layer[
-                    moe_cache_edge_directed(device.last_top_expert, top_key)]++;
+            // Step 6 scoring, BEFORE this observation updates the table -
+            // otherwise the prediction would be graded against evidence it
+            // just supplied, which would inflate it.
+            if (moe_cache_measure_pred_enabled()) {
+                const auto pred = device.successor_best.find(device.last_top_expert);
+                if (pred != device.successor_best.end()) {
+                    device.xlayer_pred_total++;
+                    if (pred->second.first == top_key) {
+                        device.xlayer_pred_hit++;
+                    }
+                    if (device.xlayer_pred_total % 2000 == 0) {
+                        fprintf(stderr,
+                                "[xlayer-pred] depth-1 precision %.1f%% (%lld/%lld) over %zu tracked edges\n",
+                                100.0 * (double) device.xlayer_pred_hit / (double) device.xlayer_pred_total,
+                                device.xlayer_pred_hit, device.xlayer_pred_total,
+                                device.co_activation_cross_layer.size());
+                    }
+                }
+            }
+            const auto edge = moe_cache_edge_directed(device.last_top_expert, top_key);
+            const uint32_t n = ++device.co_activation_cross_layer[edge];
+            if (moe_cache_measure_pred_enabled()) {
+                // O(1) index upkeep: only this edge's count changed, so it
+                // can only have become the new best for its own from-expert.
+                auto & best = device.successor_best[device.last_top_expert];
+                if (n > best.second) {
+                    best.first  = top_key;
+                    best.second = n;
+                }
+            }
         }
         // Advance regardless: the next call's "previous layer" should be
         // this one even when this call itself recorded nothing, otherwise
