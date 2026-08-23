@@ -257,6 +257,73 @@
 			ctx.strokeStyle = 'rgba(226, 232, 240, 0.7)';
 			ctx.stroke();
 		}
+
+		// Track 1 steps 4a/4b/5 (docs/plan.md): co-activation edges, drawn
+		// faint underneath everything else already rendered above (points,
+		// then the req_dir marker below, both stay legible on top). Endpoint
+		// positions come from atlasPointsPx, keyed by (layer,expert) - the
+		// edges themselves only carry layer/expert, not x/y, so this is a
+		// lookup, not a direct plot. An edge whose endpoint isn't in this
+		// atlas (shouldn't happen if server-side translation is correct, but
+		// cheap to guard) is skipped rather than drawn from a wrong origin.
+		const posOf = new Map<string, { px: number; py: number }>();
+		for (const { px, py, cell } of atlasPointsPx) {
+			posOf.set(`${cell.layer}:${cell.expert}`, { px, py });
+		}
+		const drawEdges = (
+			edges: { layer_from: number; expert_from: number; layer_to: number; expert_to: number; count: number }[] | undefined,
+			rgb: string
+		) => {
+			if (!edges?.length) return;
+			const maxCount = Math.max(...edges.map((e) => e.count));
+			for (const e of edges) {
+				const a = posOf.get(`${e.layer_from}:${e.expert_from}`);
+				const b = posOf.get(`${e.layer_to}:${e.expert_to}`);
+				if (!a || !b) continue;
+				const weight = maxCount > 0 ? e.count / maxCount : 0;
+				ctx.beginPath();
+				ctx.moveTo(a.px, a.py);
+				ctx.lineTo(b.px, b.py);
+				ctx.strokeStyle = `rgba(${rgb},${(0.06 + weight * 0.3).toFixed(3)})`;
+				ctx.lineWidth = 0.5 + weight * 1.5;
+				ctx.stroke();
+			}
+		};
+		// Cross-layer first (a known gap - see api.d.ts - some of these are
+		// same-layer artifacts, so they're drawn under, not over, the
+		// within-layer edges) then within-layer on top, in a distinct hue.
+		drawEdges(stats.co_activation_cross_layer, '90,155,216'); // warm blue
+		drawEdges(stats.co_activation_within_layer, '78,214,165'); // hot green
+
+		// Live request-direction marker (Track 1 step 0/1) - same (x,y)
+		// space as every cell above, same projection. Clamped to the disc:
+		// unlike a cell's x/y (bounded by construction, a weighted average
+		// of unit vectors), req_dir is a raw decaying EMA and has no such
+		// guarantee - drawing it outside the ring it's meant to sit in
+		// would look like a bug even when the math is fine.
+		if (stats.req_dir) {
+			let { x: rx, y: ry } = stats.req_dir;
+			const mag = Math.sqrt(rx * rx + ry * ry);
+			if (mag > 1) {
+				rx /= mag;
+				ry /= mag;
+			}
+			const mx = cx + rx * radius;
+			const my = cy + ry * radius;
+			ctx.beginPath();
+			ctx.arc(mx, my, 9, 0, 2 * Math.PI);
+			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
+			ctx.lineWidth = 2;
+			ctx.stroke();
+			ctx.beginPath();
+			ctx.moveTo(mx - 5, my);
+			ctx.lineTo(mx + 5, my);
+			ctx.moveTo(mx, my - 5);
+			ctx.lineTo(mx, my + 5);
+			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
+			ctx.lineWidth = 1.5;
+			ctx.stroke();
+		}
 	}
 
 	function draw() {
