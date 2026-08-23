@@ -395,6 +395,15 @@ struct moe_cache_device {
     long long collect_calls = 0;
     long long spec_evictions_this_cycle = 0;   // rate limit for speculative eviction
     long long spec_evict_reset_at_calls = 0;   // collect_calls value at last reset
+    // Cross-depth agreement gate for GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=agree
+    // (see moe_cache_prefetch): a candidate a farther, less-accurate depth
+    // wanted but could not get a free slot for is remembered here for the
+    // rest of this decode step. If a closer, more-accurate depth's own
+    // prediction for the same target tensor lands on the same expert, that
+    // is real corroboration - two independent router-state samples agreeing,
+    // not one guess - and only then is an eviction permitted. Bounded and
+    // reset on the same collect_calls clock spec_evictions_this_cycle uses.
+    std::vector<moe_cache_key> spec_seen_this_cycle;
     std::atomic<int> error_logs{0};
 };
 
@@ -4756,30 +4765,67 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                 if ((int) device.queue.size() >= session->config.queue_max) {
                     break;
                 }
-                static const bool spec_evict = [] {
-                    const char * env = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT");
-                    return env && atoi(env) != 0; // default off - see the note below
+                // "any": the original policy - evict for any single speculative
+                // guess, rate-limited only by count. Measured harmful (-35% /
+                // -16% / -15% across three regimes, see docs) because the harm
+                // is churn frequency, not eviction-target quality - kept only
+                // for A/B comparison against "agree" below, not recommended.
+                // "agree": only evict when a *closer, more-accurate* depth's
+                // prediction lands on the same expert a farther depth already
+                // wanted but could not get a free slot for this same decode
+                // step - two independent router-state samples agreeing, which
+                // the measured per-depth precision (41.1% / 48.0% / 59.3% for
+                // depth 3/2/1) says should be much rarer and much more often
+                // right than either depth alone. Default off either way.
+                enum class spec_evict_mode { off, any, agree };
+                static const spec_evict_mode mode = [] {
+                    const char * env = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE");
+                    if (!env) {
+                        // back-compat with the older on/off-only flag
+                        const char * legacy = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT");
+                        return (legacy && atoi(legacy) != 0) ? spec_evict_mode::any : spec_evict_mode::off;
+                    }
+                    if (!strcmp(env, "any")) return spec_evict_mode::any;
+                    if (!strcmp(env, "agree")) return spec_evict_mode::agree;
+                    return spec_evict_mode::off;
                 }();
+                const moe_cache_key key{host_base, expert};
                 int slot_index = -1;
                 if (!pool.free_slots.empty()) {
                     slot_index = pool.free_slots.back();
                     pool.free_slots.pop_back();
-                } else if (!spec_evict) {
+                } else if (mode == spec_evict_mode::off) {
                     break; // default: no eviction for speculation - measured harmful
                             // under no real memory pressure (probation churn); gate
                             // this on to re-test once demand genuinely exceeds
                             // capacity, where the calculus may differ.
                 } else {
-                    // Rate-limited: uncapped, this fires up to n_expert_used
-                    // times per layer per token (measured harmful - see above).
-                    // Reset once per real decode step (device.collect_calls),
-                    // capped small so eviction is reserved for genuinely
-                    // confident, infrequent swaps rather than every layer's
-                    // every speculative candidate.
+                    // Reset once per real decode step (device.collect_calls) -
+                    // shared clock for both the rate limit and the agreement
+                    // memory below, so a stale guess from tokens ago can never
+                    // count as "agreement" with a fresh one.
                     if (device.spec_evict_reset_at_calls != device.collect_calls) {
                         device.spec_evict_reset_at_calls = device.collect_calls;
                         device.spec_evictions_this_cycle = 0;
+                        device.spec_seen_this_cycle.clear();
                     }
+                    if (mode == spec_evict_mode::agree) {
+                        const auto & seen = device.spec_seen_this_cycle;
+                        const bool corroborated = std::find(seen.begin(), seen.end(), key) != seen.end();
+                        if (!corroborated) {
+                            // Remember this guess in case a later, closer-depth
+                            // call this same step lands on the same expert -
+                            // real corroboration, not an eviction yet.
+                            if (device.spec_seen_this_cycle.size() < 64) {
+                                device.spec_seen_this_cycle.push_back(key);
+                            }
+                            break; // uncorroborated: behave exactly like mode=off
+                        }
+                    }
+                    // Rate-limited regardless of mode: uncapped, this fires up
+                    // to n_expert_used times per layer per token (measured
+                    // harmful under mode=any - see above). Capped small so
+                    // eviction is reserved for genuinely infrequent swaps.
                     static const long long spec_evict_cap = [] {
                         const char * env = getenv("GGML_CUDA_MOE_CACHE_SPEC_EVICT_CAP");
                         const long long v = env ? atoll(env) : 4;
@@ -4808,7 +4854,6 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     slot_index = candidate;
                     device.evictions++;
                 }
-                const moe_cache_key key{host_base, expert};
 
                 // Feed the same prediction to the host buffer. Its promotion
                 // signal was per-expert heat - backward-looking, and it tried to

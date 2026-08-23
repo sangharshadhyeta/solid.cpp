@@ -392,6 +392,7 @@ being measured. Chat-templated and content-verified, not a synthetic benchmark.<
 <tr><td>Speculative eviction <span class="note">(let a lookahead guess evict probation; abundant RAM)</span></td><td class="num">100.9 tok/s</td><td class="num">65.9 tok/s</td><td class="num delta-neg">-35%</td><td><span class="tag tag-solid">refuted</span></td></tr>
 <tr><td>&hellip; same, under genuine &gt;RAM pressure <span class="note">(10 GiB cgroup cap vs 16.9 GiB model &mdash; where it should help most)</span></td><td class="num">44.75 tok/s</td><td class="num">37.42 tok/s</td><td class="num delta-neg">-16%</td><td><span class="tag tag-solid">refuted</span></td></tr>
 <tr><td>&hellip; re-tested with cost-aware (NVMe-vs-RAM-weighted) eviction target selection <span class="note">(isolated A/B: cost-weighting alone is noise-neutral, 56.5 vs 56.4 tok/s; combined with spec-evict, 47.8 vs 47.7 tok/s)</span></td><td class="num">56.4 tok/s</td><td class="num">47.7&ndash;47.8 tok/s</td><td class="num delta-neg">-15%</td><td><span class="tag tag-solid">refuted</span></td></tr>
+<tr><td>&hellip; re-tested gated on cross-depth agreement <span class="note">(require a closer depth to independently confirm a farther depth's guess before evicting anything; hit rate, 200-tok run)</span></td><td class="num">76.5% hits</td><td class="num">77.3% hits</td><td class="num delta-pos">fewer evictions, higher hits</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>NVMe migration <span class="note">(model reads, SATA &rarr; PCIe NVMe)</span></td><td class="num">0.50 GB/s</td><td class="num">2.9 GB/s</td><td class="num delta-pos">5.8&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Expert-cache size knee <span class="note">(sweep 1/2/4/6/8 GiB, production shape)</span></td><td class="num">7.4&ndash;8 GiB</td><td class="num">4 GiB, same tok/s</td><td class="num delta-pos">3.5 GiB freed</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Low cache-size placement collapse <span class="note">(2,048 MiB request starves the fit search)</span></td><td class="num">4 slots</td><td class="num">1 slot</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">found live</span></td></tr>
@@ -503,9 +504,24 @@ itself cold-swept off the page cache (<code>MADV_DONTNEED</code>) is weighted as
 mlock'd or recently-selected one is not, so a hotter-but-cheap slot can still lose to a colder-but-expensive
 one. Isolated A/B against plain heat: noise-neutral under normal load (56.5 vs. 56.4 tok/s), because
 memory pressure severe enough to trigger real cold-sweeps is rare in that regime — this is a correctness/
-robustness fix for the pressure case, not a throughput win, and does not rescue speculative eviction (see
-table: still refuted, -15% either way). NVMe tier weight reuses this fork's own measured 5.8&times; NVMe
-migration number rather than a fresh guess.</p>
+robustness fix for the pressure case, not a throughput win. Does not by itself rescue the original
+(single-guess) speculative eviction policy — see the cross-depth-agreement fix below for what actually did.
+NVMe tier weight reuses this fork's own measured 5.8&times; NVMe migration number rather than a fresh guess.</p>
+</div>
+<div class="card">
+<h3>Cross-depth-agreement speculative eviction (<code>SPEC_EVICT_MODE=agree</code>)</h3>
+<p>The original speculative-eviction policy (<code>SPEC_EVICT_MODE=any</code>, formerly the only mode) let any
+single router-lookahead guess evict a probation slot — refuted three times over (see table): the harm was
+eviction <em>frequency</em>, not target quality, since a single depth's guess is only 41–59% precise. This mode
+instead remembers a farther, less-accurate depth's candidate for the rest of the decode step, and only permits
+an eviction when a closer, more-accurate depth's own prediction lands on the <em>same</em> expert — two
+independent router-state samples agreeing, gated on the same <code>collect_calls</code> clock the rate limit
+already used. Requires <code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH&gt;=2</code> (default 1) to have a farther depth to
+agree with at all. Measured (200-token run, depth=2, same prompt as the refutation above): hit rate 77.3% vs.
+76.5% baseline (evictions 828 vs. 869 — <em>fewer</em>, not more), against <code>any</code>'s 54.2% hit rate and
+4081 evictions under identical conditions. Throughput: statistically indistinguishable from baseline (53.68 vs.
+53.67 tok/s, <code>-r 5</code>) — a real but modest hit-rate gain that this workload doesn't have enough
+memory pressure to turn into a measurable tok/s difference yet.</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
