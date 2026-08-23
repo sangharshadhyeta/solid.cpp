@@ -521,7 +521,12 @@ agree with at all. Measured (200-token run, depth=2, same prompt as the refutati
 76.5% baseline (evictions 828 vs. 869 — <em>fewer</em>, not more), against <code>any</code>'s 54.2% hit rate and
 4081 evictions under identical conditions. Throughput: statistically indistinguishable from baseline (53.68 vs.
 53.67 tok/s, <code>-r 5</code>) — a real but modest hit-rate gain that this workload doesn't have enough
-memory pressure to turn into a measurable tok/s difference yet.</p>
+memory pressure to turn into a measurable tok/s difference yet. <strong>Does not currently generalize past
+depth=2</strong>: at depth=3, hits actually drop slightly versus off (75.0% vs. 75.8%, evictions 969 vs. 918) —
+this mode only tracks "seen before this step", not which depth pair agreed, so with three active depths it
+also accepts weaker depth-3-confirms-depth-2 corroboration (41%&rarr;48% precision) alongside the strong
+depth-2-confirms-depth-1 case (48%&rarr;59.3%) that made depth=2 work. Use <code>LOOKAHEAD_DEPTH=2</code> with
+this mode until depth is tracked explicitly per candidate, not just presence/absence.</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
