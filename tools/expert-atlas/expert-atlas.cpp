@@ -205,6 +205,23 @@ static json build_atlas_json() {
             }
 
             double x = 0.0, y = 0.0, spec = 0.0;
+            // Per-category probability vector, kept rather than discarded.
+            // x/y below collapse it onto a circle, which is lossy in two
+            // specific ways worth naming: (1) an N-category profile is
+            // squashed to 2 numbers, so two experts with entirely different
+            // topic mixes can land on the same point (a 50/50 code+history
+            // expert and an even generalist both sit near the origin); and
+            // (2) the circle places categories at equal angles in *array
+            // order*, which invents an adjacency that was never measured -
+            // "code" ends up next to "math" and, wrapping around, next to
+            // "history", purely because of where they sit in k_probes[].
+            // Emitting the raw vector lets a consumer project it however it
+            // likes (2D circle, 3D sphere, or a re-projection after the
+            // category set grows) without this tool having to pick one, and
+            // without another schema change later. Sparse: categories an
+            // expert never fired on are omitted, which is most of them for
+            // any genuinely specialized expert.
+            json cats = json::object();
             if (f_sum > 0.0) {
                 const double log_c = std::log((double) categories.size());
                 double entropy = 0.0;
@@ -214,6 +231,7 @@ static json build_atlas_json() {
                     y += p * std::sin(angle_by_category[cat]);
                     if (p > 0.0) {
                         entropy -= p * std::log(p);
+                        cats[cat] = std::round(p * 1000.0) / 1000.0;
                     }
                 }
                 spec = log_c > 0.0 ? 1.0 - entropy / log_c : 0.0;
@@ -224,8 +242,13 @@ static json build_atlas_json() {
             cell["expert"] = expert;
             cell["n"]      = total_n;
             cell["spec"]   = std::round(spec * 1000.0) / 1000.0;
+            // x/y stay exactly as before - the existing 2D atlas view and
+            // moe-cache's own req_dir tracking both read them, and changing
+            // their meaning would silently invalidate every atlas file on
+            // disk. cats is purely additive.
             cell["x"]      = std::round(x * 1000.0) / 1000.0;
             cell["y"]      = std::round(y * 1000.0) / 1000.0;
+            cell["cats"]   = std::move(cats);
             cells.push_back(std::move(cell));
         }
     }

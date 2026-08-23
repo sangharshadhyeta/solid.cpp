@@ -236,6 +236,16 @@ export interface ApiExpertAtlasCell {
 	spec: number;
 	x: number;
 	y: number;
+	/** Per-category probability vector, sparse (categories this expert never
+	 * fired on are omitted). Absent in atlas files generated before this
+	 * field existed - consumers must fall back to the 2D x/y in that case.
+	 * x/y are this same vector collapsed onto a circle, which is lossy: an
+	 * expert firing on exactly two categories lands on a straight chord
+	 * between their anchors (22% of experts on a real Ornith atlas), and
+	 * anything firing on all of them collapses to the origin alongside
+	 * experts that fired on none. Keeping the vector lets a consumer project
+	 * into 3D (or re-project after the category set changes) instead. */
+	cats?: Record<string, number>;
 }
 
 export interface ApiExpertAtlas {
