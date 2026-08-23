@@ -1704,6 +1704,61 @@ private:
             }
         }
 
+        // Step 0 of Atlas-driven cache warming: hand moe-cache the same
+        // measured topic-affinity cells --expert-atlas-file already feeds
+        // the Brain/Atlas UI (get_experts below), keyed by the real tensor
+        // pointer moe-cache itself uses. Best-effort only - a missing file,
+        // a layer whose tensor name doesn't match either MoE tensor naming
+        // scheme, or no CUDA moe-cache registered at all all just skip
+        // silently, same as every other optional integration here.
+        if (!params_base.expert_atlas_file.empty() && model_tgt != nullptr) {
+            std::ifstream f(params_base.expert_atlas_file);
+            if (f) {
+                try {
+                    json atlas_json = json::parse(f);
+                    std::map<int, std::vector<json>> by_layer;
+                    for (const auto & cell : atlas_json.at("cells")) {
+                        by_layer[cell.at("layer").get<int>()].push_back(cell);
+                    }
+                    static const char * const moe_tensor_names[] = {
+                        "blk.%d.ffn_down_exps.weight",
+                        "blk.%d.ffn_gate_up_exps.weight",
+                        "blk.%d.ffn_gate_exps.weight",
+                        "blk.%d.ffn_up_exps.weight",
+                    };
+                    size_t tensors_registered = 0;
+                    for (const auto & [layer, cells] : by_layer) {
+                        std::vector<int32_t> expert;
+                        std::vector<float> x, y, spec;
+                        expert.reserve(cells.size());
+                        x.reserve(cells.size());
+                        y.reserve(cells.size());
+                        spec.reserve(cells.size());
+                        for (const auto & cell : cells) {
+                            expert.push_back(cell.at("expert").get<int32_t>());
+                            x.push_back(cell.at("x").get<float>());
+                            y.push_back(cell.at("y").get<float>());
+                            spec.push_back(cell.at("spec").get<float>());
+                        }
+                        for (const char * name_fmt : moe_tensor_names) {
+                            char name[128];
+                            snprintf(name, sizeof(name), name_fmt, layer);
+                            const ggml_tensor * t = llama_model_get_tensor(model_tgt, name);
+                            if (t && t->data && common_moe_cache_set_atlas(t->data, expert, x, y, spec)) {
+                                tensors_registered++;
+                            }
+                        }
+                    }
+                    if (tensors_registered > 0) {
+                        SRV_INF("registered atlas topic-affinity data with moe-cache for %zu MoE tensor(s)\n",
+                                tensors_registered);
+                    }
+                } catch (const std::exception & e) {
+                    SRV_WRN("failed to register --expert-atlas-file with moe-cache: %s\n", e.what());
+                }
+            }
+        }
+
         return true;
     }
 

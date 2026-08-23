@@ -988,6 +988,12 @@ struct common_moe_cache_summary {
 // support at all.
 bool common_moe_cache_get_summary(common_moe_cache_summary & out);
 
+// See the .cpp for the full doc comment - step 0 of Atlas-driven cache
+// warming, registers one MoE tensor's measured topic-affinity cells.
+bool common_moe_cache_set_atlas(
+        const void * host_base, const std::vector<int32_t> & expert,
+        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec);
+
 //
 // Model utils
 //

@@ -2454,6 +2454,25 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
     return raw.slots_total > 0;
 }
 
+// Registers one MoE tensor's measured topic-affinity cells (from
+// --expert-atlas-file) with moe-cache's step-0 request-direction tracking.
+// host_base identifies the tensor the same way moe_cache_key already does;
+// the caller (server_context::init, which has both the loaded model and the
+// parsed atlas file) is responsible for resolving that pointer and calling
+// this once per MoE tensor found for each atlas-covered layer.
+bool common_moe_cache_set_atlas(
+        const void * host_base, const std::vector<int32_t> & expert,
+        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec) {
+    if (!ggml_moe_cache.set_atlas || !host_base || expert.empty()) {
+        return false;
+    }
+    if (expert.size() != x.size() || expert.size() != y.size() || expert.size() != spec.size()) {
+        return false;
+    }
+    ggml_moe_cache.set_atlas(host_base, expert.data(), x.data(), y.data(), spec.data(), (int) expert.size());
+    return true;
+}
+
 // moe-cache's own admission gate (GGML_CUDA_MOE_CACHE_MAX_BATCH) defaults
 // from a live hint set by llama_context (real n_seq_max, floored at 8,
 // ceilinged at 64 - see moe-cache.cu's MOE_CACHE_MAX_BATCH_CEILING) - but

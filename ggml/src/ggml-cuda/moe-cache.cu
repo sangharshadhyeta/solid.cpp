@@ -269,6 +269,22 @@ struct moe_cache_device {
     std::vector<std::unique_ptr<moe_cache_pool>> pools;
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
+
+    // Step 0 of Atlas-driven cache warming (see ggml_moe_cache.set_atlas) -
+    // each expert's measured topic-affinity position, and a live, decaying
+    // centroid of where the current request is trending in that same space.
+    // Observational only right now: updated on real demand hits, nowhere
+    // yet read to make a promotion or eviction decision.
+    struct atlas_cell { float x = 0.0f, y = 0.0f, spec = 0.0f; };
+    std::unordered_map<moe_cache_key, atlas_cell, moe_cache_key_hash> atlas;
+    float req_dir_x = 0.0f;
+    float req_dir_y = 0.0f;
+    bool  req_dir_valid = false;
+    // Decay rate for the centroid EMA - deliberately the same shape as the
+    // heat step/decay already tuned elsewhere in this file (a fast-reacting
+    // but not noise-chasing signal), not yet independently measured. Revisit
+    // once step 1 (an actual warming action) needs a real tuned value.
+    static constexpr float MOE_CACHE_ATLAS_DECAY = 0.15f;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     // Per-CPU-resident-tensor last-use tracking, for the MADV_COLD sweep. An
     // expert that is neither in the VRAM cache nor recently selected is pure
@@ -3939,6 +3955,36 @@ static int moe_cache_plan(
         }
 
         const moe_cache_key key{node->host_base, expert};
+
+        // Step 0 of Atlas-driven cache warming: fold this real, live routing
+        // decision into the decaying request-direction centroid, regardless
+        // of hit/miss - this is about what the router actually selected,
+        // not about cache state. No-op (and cheap: one hash lookup) for any
+        // expert the atlas has no measured position for, which is expected
+        // and fine - coverage is whatever the offline probes actually hit.
+        // Purely observational: nothing downstream reads req_dir_* yet.
+        {
+            const auto atlas_it = device.atlas.find(key);
+            if (atlas_it != device.atlas.end()) {
+                const auto & cell = atlas_it->second;
+                if (!device.req_dir_valid) {
+                    device.req_dir_x = cell.x;
+                    device.req_dir_y = cell.y;
+                    device.req_dir_valid = true;
+                } else {
+                    device.req_dir_x += moe_cache_device::MOE_CACHE_ATLAS_DECAY * (cell.x - device.req_dir_x);
+                    device.req_dir_y += moe_cache_device::MOE_CACHE_ATLAS_DECAY * (cell.y - device.req_dir_y);
+                }
+                if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                    static std::atomic<long long> n{0};
+                    if (++n % 200 == 0) {
+                        fprintf(stderr, "[atlas-dbg] req_dir=(%.3f,%.3f) last_expert=(%.3f,%.3f) spec=%.3f\n",
+                                device.req_dir_x, device.req_dir_y, cell.x, cell.y, cell.spec);
+                    }
+                }
+            }
+        }
+
         auto found = pool.map.find(key);
         if (found != pool.map.end()) {
             moe_cache_slot & slot = pool.slots[found->second];
@@ -5151,6 +5197,36 @@ static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device) {
             profile.standalone_gbs > 0.0 ? 100.0 * profile.contended_gbs / profile.standalone_gbs : 0.0);
 }
 
+// Step 0 of Atlas-driven cache warming - see the header doc comment on
+// ggml_moe_cache.set_atlas. Registers into every live session's every
+// device, same broadcast pattern moe_cache_get_summary already uses to
+// reach all of them, since a caller here has no session/device handle of
+// its own (the atlas is a model-wide, not a per-session, property).
+static void moe_cache_set_atlas(
+        const void * host_base, const int32_t * expert,
+        const float * x, const float * y, const float * spec, int n_cells) {
+    if (!host_base || n_cells <= 0 || !expert || !x || !y || !spec) {
+        return;
+    }
+    if (g_session_count.load(std::memory_order_acquire) <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            moe_cache_device & device = *device_ptr;
+            for (int i = 0; i < n_cells; i++) {
+                if (expert[i] < 0) {
+                    continue;
+                }
+                const moe_cache_key key{host_base, expert[i]};
+                device.atlas[key] = moe_cache_device::atlas_cell{x[i], y[i], spec[i]};
+            }
+        }
+    }
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -5170,6 +5246,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
+    ggml_moe_cache.set_atlas = moe_cache_set_atlas;
     ggml_moe_cache.host_ptr = moe_cache_host_ptr;
     ggml_moe_cache.prefetch = moe_cache_prefetch;
     ggml_moe_cache.prefill_register_successor = moe_cache_prefill_register_successor;
