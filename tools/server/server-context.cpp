@@ -4689,6 +4689,14 @@ void server_routes::init_routes() {
             {"allocated_mib",   cs.allocated_bytes >> 20},
             {"budget_mib",      cs.budget_bytes >> 20},
         } : json::object();
+        // Step 0 of Atlas-driven cache warming, made visible: the live
+        // request-direction centroid, in the same (x,y) space the atlas
+        // cells below use, so the frontend can plot it as a marker over the
+        // static topic map. Omitted entirely until at least one real,
+        // atlas-covered expert has been selected - nothing to show yet.
+        if (have_summary && cs.req_dir_valid) {
+            stats["req_dir"] = json{{"x", cs.req_dir_x}, {"y", cs.req_dir_y}};
+        }
 
         std::vector<uint8_t> bytes;
         int rows = 0, cols = 0;
