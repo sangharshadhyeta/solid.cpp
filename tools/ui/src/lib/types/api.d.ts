@@ -199,30 +199,6 @@ export interface ApiExpertMapStats {
 	avg_heat?: number;
 	allocated_mib?: number;
 	budget_mib?: number;
-	/** Track 1 step 0/1 (docs/plan.md): live, decaying centroid of where the
-	 * current request is trending in the same (x,y) topic-affinity space
-	 * the atlas cells below use. Absent until at least one atlas-covered
-	 * expert has actually been selected - not present at all rather than
-	 * a stale (0,0) placeholder. */
-	req_dir?: { x: number; y: number };
-	co_activation_within_layer?: ApiCoActivationEdge[];
-	co_activation_cross_layer?: ApiCoActivationEdge[];
-}
-
-/** One co-activation edge - see Track 1 steps 4a/4b in docs/plan.md.
- * within_layer: two experts selected together in one routing decision
- * (undirected). cross_layer: layer_from's top pick -> layer_to's top pick
- * (directed) - note a known gap, not yet fixed server-side: this doesn't
- * distinguish a genuinely later layer from a different tensor of the SAME
- * logical layer (gate_up_exps -> down_exps share one router decision), so
- * some cross-layer edges are same-layer artifacts (layer_from === layer_to
- * is the tell). */
-export interface ApiCoActivationEdge {
-	layer_from: number;
-	expert_from: number;
-	layer_to: number;
-	expert_to: number;
-	count: number;
 }
 
 /** One measured (layer,expert) topic-affinity cell from llama-expert-atlas.
@@ -236,16 +212,6 @@ export interface ApiExpertAtlasCell {
 	spec: number;
 	x: number;
 	y: number;
-	/** Per-category probability vector, sparse (categories this expert never
-	 * fired on are omitted). Absent in atlas files generated before this
-	 * field existed - consumers must fall back to the 2D x/y in that case.
-	 * x/y are this same vector collapsed onto a circle, which is lossy: an
-	 * expert firing on exactly two categories lands on a straight chord
-	 * between their anchors (22% of experts on a real Ornith atlas), and
-	 * anything firing on all of them collapses to the origin alongside
-	 * experts that fired on none. Keeping the vector lets a consumer project
-	 * into 3D (or re-project after the category set changes) instead. */
-	cats?: Record<string, number>;
 }
 
 export interface ApiExpertAtlas {
