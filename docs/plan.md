@@ -20,15 +20,24 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    miss). Purely observational — nothing reads it yet. Verified end to end
    on a live server (60 tensors registered, centroid genuinely tracks real
    traffic across a 200-token generation, no crash). Commit `5fc3f803e`.
-2. **[in progress]** Expose `req_dir_x/y` (and per-expert positions) via
-   `/experts` so the Brain/Atlas UI can render it as a live marker over the
-   existing static topic map.
-3. **[not started]** Warming action — rank each layer's experts by cosine
-   similarity between their Atlas position and `req_dir`, feed the top-K into
-   the existing `host_promote_queue`/prefetch machinery. **Prefetch-only,
-   never evict**, until proven — same discipline every other predictive
-   mechanism in this cache (router-lookahead, speculative eviction,
-   cross-depth agreement) was held to before earning eviction rights.
+2. **[done]** Expose `req_dir_x/y` via `/experts` (`stats.req_dir`, omitted
+   until at least one atlas-covered expert has been selected). Verified live:
+   absent before generation, real coordinates after. Commit `5b739f7dc`.
+   Frontend rendering (an actual marker drawn on the canvas) is not part of
+   this - only the data is available so far.
+3. **[done]** Warming action — `moe_cache_atlas_warm`, rate-limited to once
+   every 64 `plan()` calls, ranks a tensor's atlas-covered candidates by
+   cosine similarity to `req_dir` (discounted by specialization confidence),
+   admits top-K into free slots only - **never evicts**. Off by default
+   (`GGML_CUDA_MOE_CACHE_ATLAS_WARM=1` to enable), not yet A/B'd for a real
+   effect, same discipline as everything else predictive here. Caught and
+   fixed a real bug during first live test: atlas expert indices weren't
+   bounds-checked against the tensor's actual expert count, causing an
+   out-of-bounds read (confirmed segfault, not hypothetical) when tested
+   with a mismatched model/atlas pair - fixed with the same `expert <
+   n_expert` guard every other caller already had. Verified clean afterward
+   across two real generations (800 tokens total), no crash, hit rate
+   climbing to 94%.
 4. **[not started]** Pairwise co-activation ("fire together") signal — track
    live `(expert_i, expert_j)` co-selection frequency across real traffic,
    independent of topic label. This is the more direct answer to "why can't
