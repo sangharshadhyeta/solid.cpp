@@ -119,6 +119,31 @@ reusing the mapping already built for `set_atlas` registration).
   baseline.** Stays off by default. Documented plainly rather than kept as
   the earlier, more optimistic read.
 
+**Real design flaw found, not yet fixed**: `moe_cache_atlas_warm` competes
+for free slots and evicts probation candidates to admit *new* experts - the
+same operation router-lookahead prefetch already does, just with a weaker
+prediction signal (cosine similarity to a decaying centroid vs. the real
+router's own one-layer-ahead logits, 59.3% precision at depth 1). That's
+structural redundancy with an existing, better mechanism, not a distinct
+purpose - explains why the A/B tests kept coming back flat regardless of
+tuning. The right purpose for topic-affinity data is different: not "what to
+fetch" (already router-lookahead's job) but **"what to keep"** - of experts
+already resident and cooling toward eviction, protect the ones topically
+aligned with where the request is heading, even if their raw LFRU heat says
+they're not urgent. That's a genuinely different signal neither LFRU nor
+router-lookahead has access to. The correct integration point is
+`moe_cache_weighted_heat`/`moe_cache_cost_tier_weight` (already built earlier
+today for the NVMe-vs-RAM eviction cost tier) - topic alignment should be
+another factor in eviction-candidate scoring there, not a second competing
+admission path. Real redesign needed, not a tuning fix - not started.
+
+Separately, all A/B testing so far used a single fixed-topic prompt
+generated start to finish - exactly the regime where LFRU's reactive signal
+is already near-optimal (nothing changes, nothing to predict) and where
+atlas warming (in either the current or the corrected design) has no room to
+show a difference. The real test needs a topic-*switching* workload -
+building one now.
+
 ## Track 1.5 — CPU-GPU split gap (from FreeToken, never carried over)
 
 Real gap identified while re-testing step 3, not hypothetical: the atlas
