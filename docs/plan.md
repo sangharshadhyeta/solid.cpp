@@ -347,7 +347,29 @@ a real plan exists, because two very different projects both fit the name:
   within the current architecture — no architecture change, a different lens
   on data we're already collecting.
 
-## Degenerate output under VRAM exhaustion — silent corruption (2026-08-24)
+## Degenerate output under VRAM exhaustion — ROOT-CAUSED AND FIXED (2026-08-24)
+
+**Root cause found and fixed** (`b321b6259`).
+`moe_cache_prefill_advance()` published a prefill slot
+(`inflight_host[slot] = next_host_base`) **unconditionally**, even when the
+copies into that slot had failed. `prefill_wait()` uses `inflight_host` to
+decide the buffer holds live data, so it then handed
+`ggml_cuda_mul_mat_id` a buffer still containing the previous tenant's
+bytes - read as expert weights. Every copy *was* error-checked; the return
+values were discarded. Under VRAM pressure that is exactly how a cache
+turns into a source of fluent-looking nonsense with a clean log.
+
+Fixed by making `copy_split` report whether every copy landed, refusing to
+publish a slot whose copy failed (so `wait()` returns NULL and the caller
+falls back to its normal H2D path), and disabling the cache entirely after
+N consecutive copy failures with a loud one-time log. Also removed the
+`cudaErrorMemoryAllocation` exemption from `moe_cache_cuda_ok`'s fatal
+branch - it was meant for retryable allocation sites but also covered OOM
+on copy paths, where nothing retries and the buffer keeps stale bytes.
+
+Historical detail retained below, including two wrong turns.
+
+
 
 A live server returned **pure `////////` for every token**. Root cause is
 almost certainly **VRAM exhaustion**, not any of this session's changes -
