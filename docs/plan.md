@@ -231,13 +231,30 @@ cannot compete with a computation that sees the input.
 predictor) is DROPPED, not built.** Measuring cost ~15 lines; building it
 would have cost far more and ended flat.
 
-**Still open - step 7a, group-aware admission.** A different signal:
-*within*-layer co-occurrence, not cross-layer prediction. The question is
-"given the first expert selected in a routing decision, how well does the
-table predict the OTHERS selected in that same decision?" If that is high,
-admitting correlated experts as a unit is worth building, because admitting
-A alone when A and B always co-fire guarantees a miss on B. Cheaply
-measurable with the same instrumentation pattern; not yet measured.
+**Step 7a - MEASURED, and it is strong** (commit `ea822e946`). Different
+question from step 6: "given one expert in a routing decision, is its most
+frequent partner also selected in that SAME decision?"
+
+  within-layer partner precision@1:  **67.6%** (54080/80000 scored decisions)
+  chance baseline:                     2.8%  (from real n_ids / n_expert)
+  -> **24x over chance**, stable and rising slightly as the table matures
+  (cross-layer prediction sat at 37.2% in the same run, for contrast)
+
+This differs from step 6 in kind, not degree. Step 6 was *prediction*,
+competing against a router that sees the token's actual hidden state and
+therefore wins. 7a measures co-occurrence *structure*, which the router's
+per-token computation does not help the cache exploit at all - the cache
+still admits **one expert at a time**, so when A is admitted and B co-fires
+67.6% of the time, that is a miss taken structurally, not for want of a
+prediction.
+
+**This is the first result in Track 1 that justifies building on it.**
+Next: group-aware admission - admit/evict correlated experts as a unit
+rather than individually - then A/B it like everything else. Not built yet.
+Worth noting the honest risk before building: a 67.6% partner hit rate does
+not automatically mean group admission wins, because admitting B early also
+costs a slot that something else could have used. The A/B decides it, not
+the precision number.
 
 ## Track 1.6 — Discovered topics from co-activation (not started)
 
