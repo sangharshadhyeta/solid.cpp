@@ -293,38 +293,45 @@ a real plan exists, because two very different projects both fit the name:
   within the current architecture — no architecture change, a different lens
   on data we're already collecting.
 
-## UNRESOLVED — degenerate output incident (2026-08-24)
+## Degenerate output under VRAM exhaustion — silent corruption (2026-08-24)
 
-A live `llama-server` on Ornith-1.5-35B (`--moe-cache auto -c 65536 -ngl 99
---expert-atlas-file`, atlas v2) returned **pure `////////` for every token**
-on a raw `/completion` request. Real corruption, not a rendering artifact:
-`stop_type: limit`, 40 tokens, all slashes.
+A live server returned **pure `////////` for every token**. Root cause is
+almost certainly **VRAM exhaustion**, not any of this session's changes -
+the user reports seeing it before the atlas work existed at all.
 
-**Could not be reproduced.** Every variable isolated, all coherent:
+**Trigger correlates with VRAM pressure from a co-resident GPU process**,
+in every observed case:
+- first sighting: server started immediately after `llama-expert-atlas`
+  had been holding the GPU
+- second sighting: a 64k server running while diagnostic servers were
+  launched alongside it
+- a deliberate contention test: free VRAM already at 152 MiB, dropping to
+  43 MiB once a second instance loaded - the request then hung outright
+- every **single clean instance** test came back coherent, including
+  `--moe-cache auto` *with* the atlas file (3/3 runs)
 
-| cache | ctx | atlas | result |
-|---|---|---|---|
-| off | 4096 | none | coherent |
-| auto | 4096 | none | coherent |
-| off | 65536 | none | coherent |
-| auto | 65536 | none | coherent |
-| auto | 65536 | v1 | coherent (×2) |
-| auto | 65536 | v2 | coherent |
-| auto | 65536 | v2 | coherent replaying the exact prime-then-query sequence |
+**Only reproducible through the chat-templated prompt**, not a raw one:
+`<|im_start|>user\n...<|im_end|>\n<|im_start|>assistant\n<think>\n`.
+A plain `/completion` prompt stays coherent even in a failing instance,
+which is why an early pass at this wrongly concluded "not reproducible" -
+it was testing the wrong endpoint. A later pass wrongly blamed the atlas
+registration; a clean single instance with the atlas is fine.
 
-The failing instance logged **no** CUDA error, fill failure, dispatch
-failure, or assert. The one genuinely anomalous thing about it: **the same
-process also hung on shutdown** — stopped listening, then ignored SIGTERM
-for ~12 minutes and needed `SIGKILL`. Degenerate output *and* a wedged
-shutdown in one process, with clean logs, reads as a single transient fault
-in that instance rather than a deterministic config bug.
+Ruled out: Ornith itself, the chat template, the atlas file (v1 and v2),
+context size alone, and moe-cache alone. Each is fine in isolation.
 
-Not fixed, not explained, and explicitly **not** claimed fixed — it may
-recur. If it does, the things worth capturing before killing the process:
-`/experts` stats (fill/dispatch failure counters), whether shutdown also
-hangs, and `nvidia-smi -q` for ECC/Xid errors. A GPU-level transient fault
-would explain both symptoms at once and would not be a moe-cache bug at all;
-that hypothesis is untested.
+**The real defect is the failure mode, not the OOM**: moe-cache sizes its
+slab from free VRAM at init, and when a co-resident process takes VRAM
+afterward, it degrades into silently producing wrong weights - garbage
+tokens - instead of raising a clean allocation error. The corrupted
+instance logged no CUDA error, no fill failure, no dispatch failure, and
+also hung on shutdown (ignored SIGTERM ~12 min, needed SIGKILL).
+
+**Not fixed.** The worthwhile fix is defensive: detect allocation
+failure/VRAM pressure after init and fail loudly (or fall back to
+`--moe-cache off`) rather than emitting garbage. Practical workaround
+today: run one model instance per GPU and check `nvidia-smi` for
+competing processes before blaming the model.
 
 ## Open, no proposal yet
 
