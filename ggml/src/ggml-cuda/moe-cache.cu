@@ -801,9 +801,77 @@ static void moe_cache_pool_decay(moe_cache_pool & pool) {
 // current best eviction pick `a` if b's heat is *meaningfully* colder,
 // not just marginally - prevents two similarly-hot slots from flip-
 // flopping as the eviction choice from one insertion to the next purely
-// from noise.
-static bool moe_cache_colder_enough(uint32_t a_heat, uint32_t b_heat) {
-    return (uint64_t) b_heat + b_heat / 4 + 4 <= a_heat;
+// from noise. Generalized to the cost-weighted score used below -
+// GreedyDual-Size's priority is a real number, not an integer heat count,
+// so this needs the double-precision form rather than a second, drifting
+// copy of the same 25%-plus-4 margin.
+static bool moe_cache_colder_enough(double a_score, double b_score) {
+    return b_score + b_score / 4.0 + 4.0 <= a_score;
+}
+
+// GreedyDual-Size, cut down to what this cache actually needs: within one
+// pool every slot is the same size (one pool per distinct expert_size), so
+// the classic cost/size term collapses to plain cost, and there is no
+// bin-packing decision left - only "how expensive would it be to bring this
+// expert back if we evict it now". That answer is not uniform across a
+// pool's own residents, though, and this fork already tracks the signal
+// that tells them apart: an expert whose CPU-side backing pages this
+// process itself advised POSIX_MADV_DONTNEED on (device.residency.is_cold -
+// the CPU host-buffer cold sweep, see moe_cache_cold_sweep) is not sitting
+// in the page cache anymore and has to come back from the NVMe device at
+// NVMe latency; one that is mlock'd (is_pinned) or was selected recently
+// enough that the cold sweep has not touched it is still page-cache-warm,
+// RAM-latency to refetch. Weighting the existing heat score by that tier
+// multiplier means eviction prefers to let go of a slot that is merely
+// less-recently-hit but cheap to bring back over one that is only
+// marginally hotter but would cost a real NVMe round trip to restore -
+// the actual GreedyDual-Size idea (evict the least total value, not just
+// the least recent), applied without touching the SLRU/heat machinery
+// itself, which took a lot of separately-measured tuning to land on 65%
+// (see the struct comment above moe_cache_slot).
+//
+// The 5.8x figure is this fork's own measured NVMe-vs-slower-storage
+// migration win (see docs/index.html, "NVMe migration") - not a fresh
+// benchmark, a reuse of an already-validated number as the tier penalty
+// for "this expert's pages are gone, not just idle". Deliberately not
+// wired to the H2D/D2D bandwidth profile above: that measures device-side
+// contention, a different hop in the path than the host-storage tier this
+// weight is about.
+static constexpr double MOE_CACHE_COST_TIER_NVME = 5.8;
+static constexpr double MOE_CACHE_COST_TIER_RAM  = 1.0;
+
+// Off switch for A/B isolation only - lets the cost-weighted and
+// spec-eviction effects be measured independently of each other rather than
+// only ever as a bundle. Not meant as a tuning knob for end users.
+static bool moe_cache_cost_weight_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_COST_WEIGHT");
+        return !env || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static double moe_cache_cost_tier_weight(const moe_cache_device & device, const moe_cache_key & key) {
+    if (key.expert < 0 || !moe_cache_cost_weight_enabled()) {
+        return MOE_CACHE_COST_TIER_RAM;
+    }
+    const auto it = device.residency.find(key.tensor);
+    if (it == device.residency.end()) {
+        return MOE_CACHE_COST_TIER_RAM; // no host-residency tracking for this tensor - neutral, today's behavior
+    }
+    const auto & res = it->second;
+    const size_t e = (size_t) key.expert;
+    if (e < res.is_pinned.size() && res.is_pinned[e]) {
+        return MOE_CACHE_COST_TIER_RAM; // mlock'd: always page-cache-resident, never pays the NVMe tier
+    }
+    if (e < res.is_cold.size() && res.is_cold[e]) {
+        return MOE_CACHE_COST_TIER_NVME; // cold-swept: this process itself asked the kernel to drop these pages
+    }
+    return MOE_CACHE_COST_TIER_RAM;
+}
+
+static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_slot & slot) {
+    return (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
 }
 
 // protected_ is capped at half the pool - the structural fix for the
@@ -822,36 +890,36 @@ static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
 // active readers. Shared by real-miss eviction and, now, speculative-fill
 // eviction: same criterion used to choose what to keep should decide what to
 // let go, rather than a separate, unprincipled policy for each path.
-static int moe_cache_pick_coldest_unpinned(moe_cache_pool & pool, int head) {
+static int moe_cache_pick_coldest_unpinned(const moe_cache_device & device, moe_cache_pool & pool, int head) {
     int best = -1;
-    uint32_t best_heat = 0;
+    double best_score = 0.0;
     int candidate = head;
     for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
         if (pool.slots[candidate].readers > 0) {
             continue;
         }
         seen++;
-        const uint32_t heat = pool.slots[candidate].heat;
-        if (best < 0 || moe_cache_colder_enough(best_heat, heat)) {
+        const double score = moe_cache_weighted_heat(device, pool.slots[candidate]);
+        if (best < 0 || moe_cache_colder_enough(best_score, score)) {
             best = candidate;
-            best_heat = heat;
+            best_score = score;
         }
     }
     return best;
 }
 
-static void moe_cache_promote_to_protected(moe_cache_pool & pool, int index) {
+static void moe_cache_promote_to_protected(const moe_cache_device & device, moe_cache_pool & pool, int index) {
     moe_cache_segment_remove(pool, index);
     const int cap = std::max(1, pool.n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100);
     if (pool.protected_count >= cap && pool.protected_head >= 0) {
         int demote = pool.protected_head;
-        uint32_t demote_heat = pool.slots[demote].heat;
+        double demote_score = moe_cache_weighted_heat(device, pool.slots[demote]);
         int candidate = pool.slots[demote].next;
         for (int seen = 1; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next, seen++) {
-            const uint32_t heat = pool.slots[candidate].heat;
-            if (moe_cache_colder_enough(demote_heat, heat)) {
+            const double score = moe_cache_weighted_heat(device, pool.slots[candidate]);
+            if (moe_cache_colder_enough(demote_score, score)) {
                 demote = candidate;
-                demote_heat = heat;
+                demote_score = score;
             }
         }
         moe_cache_segment_remove(pool, demote);
@@ -3810,7 +3878,7 @@ static int moe_cache_plan(
                 // a one-off admission" signal that earns real protection
                 // from eviction churn. Heat then decides how long that
                 // protection actually lasts, at the next decay sweep.
-                moe_cache_promote_to_protected(pool, found->second);
+                moe_cache_promote_to_protected(device, pool, found->second);
                 node->pins[node->n_pins++] = {found->second};
                 slot_indices[index] = found->second;
                 device.hits++;
@@ -3862,9 +3930,9 @@ static int moe_cache_plan(
             // pick among a bounded recency window is by heat (coldest
             // wins, with hysteresis) rather than plain oldest-first - the
             // heat half of the hybrid.
-            int candidate = moe_cache_pick_coldest_unpinned(pool, pool.lru_head);
+            int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
             if (candidate < 0) {
-                candidate = moe_cache_pick_coldest_unpinned(pool, pool.protected_head);
+                candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.protected_head);
             }
             if (candidate < 0) {
                 device.insert_skips++;
@@ -4732,7 +4800,7 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     // design. Speculative admission may only rotate the
                     // unconfirmed probation tier, never something already
                     // proven wanted.
-                    const int candidate = moe_cache_pick_coldest_unpinned(pool, pool.lru_head);
+                    const int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
                     if (candidate < 0) {
                         break; // probation has nothing left to sacrifice
                     }
@@ -4782,7 +4850,7 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                         // silently doing nothing with the stronger signal.
                         moe_cache_slot & existing_slot = pool.slots[existing->second];
                         if (existing_slot.state == moe_cache_slot_state::valid) {
-                            moe_cache_promote_to_protected(pool, existing->second);
+                            moe_cache_promote_to_protected(device, pool, existing->second);
                         }
                         continue; // already resident or already in flight
                     }
