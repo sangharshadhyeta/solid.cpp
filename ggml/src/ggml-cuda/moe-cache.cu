@@ -866,6 +866,53 @@ static bool moe_cache_cost_weight_enabled() {
     return enabled;
 }
 
+// is_cold is our own advisory record of having called madvise on an expert's
+// pages, not ground truth of whether those pages are actually gone. The
+// default demotion mode is soft (MADV_COLD, not MADV_PAGEOUT - see
+// moe_cache_cold_sweep above): a soft-advised page "survives when there is
+// no pressure and goes first when there is", so an expert we advised cold an
+// hour ago, on a box that never came under real memory pressure since, is
+// almost certainly still page-cache-resident right now - charging it the
+// NVMe tier penalty would be wrong under the *default* demotion mode, which
+// is exactly the case that matters most (GGML_CUDA_MOE_CACHE_DEMOTE=pageout
+// is opt-in). mincore() gives the real answer instead of trusting the
+// advisory flag: it asks the kernel which pages of this exact range are
+// resident right now, no assumption needed. Only called for is_cold-flagged
+// experts (the minority actually advised), so the common case - most
+// experts are never cold-swept at all - never pays this syscall.
+static bool moe_cache_pages_actually_resident(const void * host_base, size_t expert_size, size_t expert) {
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0 || expert_size == 0) {
+        return true; // can't tell - don't over-penalize on a bad read
+    }
+    const uintptr_t begin = (uintptr_t) host_base + expert * expert_size;
+    const uintptr_t start = begin & ~((uintptr_t) page_size - 1);
+    const uintptr_t end   = (begin + expert_size + (uintptr_t) page_size - 1) & ~((uintptr_t) page_size - 1);
+    const size_t n_pages = (size_t) ((end - start) / (uintptr_t) page_size);
+    if (n_pages == 0) {
+        return true;
+    }
+    // Bounded: a typical expert is well under a few hundred pages: no heap
+    // churn for the common case, and a real cap (4096 pages = 16 MiB at 4K
+    // pages) so a pathologically large expert can't blow the stack either.
+    unsigned char stack_vec[4096];
+    std::vector<unsigned char> heap_vec;
+    unsigned char * vec = stack_vec;
+    if (n_pages > sizeof(stack_vec)) {
+        heap_vec.resize(n_pages);
+        vec = heap_vec.data();
+    }
+    if (mincore((void *) start, (size_t) (end - start), vec) != 0) {
+        return true; // ENOMEM (unmapped hole) or similar - don't over-penalize on a syscall failure
+    }
+    for (size_t i = 0; i < n_pages; i++) {
+        if (!(vec[i] & 1)) {
+            return false; // even one missing page means the read touches disk
+        }
+    }
+    return true;
+}
+
 static double moe_cache_cost_tier_weight(const moe_cache_device & device, const moe_cache_key & key) {
     if (key.expert < 0 || !moe_cache_cost_weight_enabled()) {
         return MOE_CACHE_COST_TIER_RAM;
@@ -880,7 +927,18 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
         return MOE_CACHE_COST_TIER_RAM; // mlock'd: always page-cache-resident, never pays the NVMe tier
     }
     if (e < res.is_cold.size() && res.is_cold[e]) {
-        return MOE_CACHE_COST_TIER_NVME; // cold-swept: this process itself asked the kernel to drop these pages
+        // Ground-truth check before trusting our own advisory flag - see the
+        // comment on moe_cache_pages_actually_resident above. Toggle exists
+        // for A/B isolation only (measuring the mincore() syscall's own
+        // overhead against the correctness it buys) - not a tuning knob.
+        static const bool verify = [] {
+            const char * env = getenv("GGML_CUDA_MOE_CACHE_COST_VERIFY");
+            return !env || atoi(env) != 0;
+        }();
+        if (verify && moe_cache_pages_actually_resident(key.tensor, res.expert_size, e)) {
+            return MOE_CACHE_COST_TIER_RAM; // advised cold, but still actually resident - not expensive yet
+        }
+        return MOE_CACHE_COST_TIER_NVME; // verified gone (or verification disabled): assume NVMe cost
     }
     return MOE_CACHE_COST_TIER_RAM;
 }
