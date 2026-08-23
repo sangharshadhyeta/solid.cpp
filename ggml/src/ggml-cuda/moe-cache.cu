@@ -380,6 +380,20 @@ struct moe_cache_device {
     std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> successor_best;
     long long xlayer_pred_total = 0;
     long long xlayer_pred_hit   = 0;
+
+    // Step 7a measurement: a different question from step 6. Not "which
+    // expert comes next across layers" (refuted, 33.8%) but "given one
+    // expert in a routing decision, is its most frequent partner also
+    // selected in that SAME decision". That is what group-aware admission
+    // would rely on: if A and B always co-fire, admitting A alone
+    // guarantees a miss on B, independent of how well anything predicts.
+    // partner_best mirrors successor_best but for the undirected
+    // within-layer table, updated on both endpoints of each edge.
+    std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> partner_best;
+    long long partner_pred_total = 0;
+    long long partner_pred_hit   = 0;
+    long long partner_chance_num = 0; // sum of (n_ids-1), for the chance-level baseline
+    long long partner_chance_den = 0; // sum of n_expert
     // Keyed by a real, directed moe_cache_edge (from = earlier layer) -
     // same fix as co_activation above, same reason.
     std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation_cross_layer;
@@ -4418,12 +4432,46 @@ static int moe_cache_plan(
     // be a genuine cost, not a rounding error. n_ids <= 32 covers ordinary
     // decode (n_expert_used is a handful) with real margin.
     if (n_ids >= 2 && n_ids <= 32) {
+        // Step 7a scoring, BEFORE this decision updates the table - same
+        // discipline as step 6, so a prediction is never graded against
+        // evidence it just supplied.
+        if (moe_cache_measure_pred_enabled() && ids[0] >= 0) {
+            const moe_cache_key anchor{node->host_base, ids[0]};
+            const auto it = device.partner_best.find(anchor);
+            if (it != device.partner_best.end()) {
+                device.partner_pred_total++;
+                device.partner_chance_num += n_ids - 1;
+                device.partner_chance_den += node->n_expert > 0 ? node->n_expert : 1;
+                for (int b = 1; b < n_ids; b++) {
+                    if (ids[b] == it->second.first.expert) {
+                        device.partner_pred_hit++;
+                        break;
+                    }
+                }
+                if (device.partner_pred_total % 2000 == 0) {
+                    const double chance = device.partner_chance_den > 0
+                        ? 100.0 * (double) device.partner_chance_num / (double) device.partner_chance_den : 0.0;
+                    fprintf(stderr,
+                            "[partner-pred] within-layer precision@1 %.1f%% (%lld/%lld) vs %.1f%% chance\n",
+                            100.0 * (double) device.partner_pred_hit / (double) device.partner_pred_total,
+                            device.partner_pred_hit, device.partner_pred_total, chance);
+                }
+            }
+        }
         for (int a = 0; a < n_ids; a++) {
             if (ids[a] < 0) continue;
             for (int b = a + 1; b < n_ids; b++) {
                 if (ids[b] < 0 || ids[b] == ids[a]) continue;
-                device.co_activation[moe_cache_edge_undirected(
-                        {node->host_base, ids[a]}, {node->host_base, ids[b]})]++;
+                const moe_cache_key ka{node->host_base, ids[a]};
+                const moe_cache_key kb{node->host_base, ids[b]};
+                const uint32_t n = ++device.co_activation[moe_cache_edge_undirected(ka, kb)];
+                if (moe_cache_measure_pred_enabled()) {
+                    // Undirected: this count is evidence for BOTH endpoints.
+                    auto & ba = device.partner_best[ka];
+                    if (n > ba.second) { ba.first = kb; ba.second = n; }
+                    auto & bb = device.partner_best[kb];
+                    if (n > bb.second) { bb.first = ka; bb.second = n; }
+                }
             }
         }
     }
