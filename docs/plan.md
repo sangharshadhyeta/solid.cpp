@@ -69,13 +69,13 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    Fibonacci-sphere anchors (near-equidistant, no arbitrary array-order
    adjacency). Drag to orbit, scroll to zoom. Kept cheap: cold experts draw
    as 1px rects and skip the depth sort; drag redraws coalesce onto rAF.
-   Originally built with layer on z — that was the wrong axis, corrected.
-   ~~Pathway/connectome visualization~~ — add Z = layer depth
-   to the Atlas view; plot real per-token trajectories through the resulting
-   3D volume using step 4's co-activation data. Recurring pathways should
-   show up as literal bundles of parallel lines through the volume (the
-   "brain folds toward what's used together" intuition that motivated this,
-   and the direct visual payoff of steps 3-4).
+   Originally built as a pathway view with layer depth on z, plotting
+   per-token trajectories through the layer stack — that was the wrong axis
+   and was corrected: layer is a single scalar the layer × expert grid
+   already shows well, while topic affinity is genuinely N-dimensional and
+   is where the information was actually being lost. Co-activation edges are
+   still drawn, now reading as "these topic regions fire together" rather
+   than as trajectories through depth.
 
 **Known gap found while smoke-testing the export API**: cross-layer edges
 (4b) don't distinguish "the next `plan()` call is a different tensor of the
@@ -89,11 +89,11 @@ artifact, diluting the genuine signal. Not fixed yet - would need
 (e.g. via the shape/pool_index already available) before folding it into
 `last_top_expert`, rather than treating every call as a layer boundary.
 
-**Step 5 prerequisites (in progress)**: storage bug fixed (`moe_cache_edge`
+**Step 5 prerequisites (done)**: storage bug fixed (`moe_cache_edge`
 replaces the original opaque-hash counters for both `co_activation` and
 `co_activation_cross_layer`); export API added
 (`ggml_moe_cache.get_co_activation`, top-K by count, real tensor identity);
-server-side tensor->layer translation in progress (`atlas_tensor_layer` map,
+server-side tensor->layer translation done (`atlas_tensor_layer` map,
 reusing the mapping already built for `set_atlas` registration).
 
 **Step 3's real-world verdict, tested twice, two different data sources**:
