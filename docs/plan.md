@@ -310,27 +310,43 @@ the warming decision itself is good. Not started - needs its own scoped
 design, likely reusing the existing `device.queue`/worker-thread plumbing
 rather than inventing new infrastructure.
 
-## Track 2 — Unified tiered placement
+## Track 2 — Unified tiered placement — RESCOPED (mostly already exists)
 
-Stems from "MoE expert weights — resident also tiered": today's hard
-`-ncmoe` boundary means GPU-resident layers get every expert unconditionally
-loaded, no cache, no eviction; CPU-offloaded layers get the opposite
-treatment entirely. Proposal: replace the boundary with one uniform, global
-LFRU budget spanning every MoE layer.
+Original framing was "remove the hard `-ncmoe` boundary, give every MoE layer
+one global LFRU budget" - loader change, budget-math change, cache-sizing
+change. Investigating the code before building showed most of that is
+already true:
 
-1. **[not started]** Loader change — every MoE layer loads CPU-resident, no
-   exceptions; removes `common_moe_build_cpu_overrides`'s current
-   below-cutoff-only behavior.
-2. **[not started]** Budget/placement redesign — `common_maybe_raise_moe_for_ctx`
-   stops deciding *which* layers are resident; it only sizes the total VRAM
-   budget handed to the cache. Real re-derivation of the placement/fit math,
-   not a flag flip.
-3. **[not started]** Measure the real, already-flagged risk before shipping
-   anything beyond a prototype: early layers are touched by nearly every
-   token structurally, not because of hot/cold dynamics — under a unified
-   cache they compete for eviction instead of having guaranteed residency,
-   a real cold-start regression risk. Build behind a flag, A/B the cold-start
-   cost specifically against the current fixed-cutoff scheme.
+1. **Pools are keyed by `(expert_size, wtype)`, not by layer**
+   (`moe_cache_find_pool`). A single global budget spanning all layers
+   already exists - every layer sharing a tensor shape shares a pool.
+   Nothing to build.
+2. **Offloading every MoE layer is already expressible** as
+   `-ncmoe <n_layer>`; `common_moe_build_cpu_overrides(n)` simply emits an
+   override per layer below `n`. No loader change needed.
+3. What genuinely remains is a **default-policy question**, not an
+   architecture one: `common_maybe_raise_moe_for_ctx` picks the *minimum*
+   offload that makes the requested context fit. Its own comment already
+   flags this as "a sufficiency question, not a throughput one", with a
+   measured counter-example (Nemotron 3.5: fit search stopped at 46 layers
+   -> 1239 slots -> 57.1% hit rate; offloading all 53 -> 2307 slots ->
+   68.3%). `--moe-calibrate` already finds the throughput optimum
+   empirically, but is opt-in.
+
+**So the remaining work is an experiment, not a rewrite**: compare
+(a) auto placement (minimum that fits) against (b) `-ncmoe <n_layer>`
+(maximum offload, larger cache budget) on tok/s and hit rate, on this
+hardware and model. If (b) wins consistently, the change is to the default
+placement policy - a small, well-contained edit - not to the loader or the
+cache. Testable with zero new code.
+
+Caveat worth stating before running it: more offload means more experts
+served from the cache, which is only a win while the cache can hold enough
+of the working set. Past some point it trades resident weights for cache
+capacity that cannot cover the extra demand, and the constrained-regime
+result (33% hit rate at a 512 MiB budget) shows what the far end of that
+looks like. The optimum is empirical, which is exactly why
+`--moe-calibrate` exists.
 
 ## Track 3 — "True MoE" emulation
 
