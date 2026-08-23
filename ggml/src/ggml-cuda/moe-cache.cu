@@ -1049,6 +1049,24 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
     return MOE_CACHE_COST_TIER_RAM;
 }
 
+// Track 1 (docs/plan.md): topic-affinity was also tried here, as an
+// eviction-candidate scoring factor ALONGSIDE moe_cache_atlas_warm's
+// admission mechanism below, on the theory that the two are complementary
+// (admission brings new topically-aligned experts in; this would keep
+// already-resident ones around longer). Tested head to head on a real
+// topic-switch workload against admission-only and eviction-only variants -
+// the combination measured WORSE than either alone (1/4 rounds won, hit
+// rate net *negative* vs. baseline, -0.95pp), worse than the eviction-only
+// redesign it was meant to complement (3/4 rounds, +0.63pp) and far worse
+// than admission-only (4/4 rounds, +2.75pp - the actual best performer of
+// all three, and what's still active below). Root cause, best guess: the
+// two interfere rather than cooperate - this weight makes topically-aligned
+// candidates resist eviction everywhere, including when moe_cache_atlas_
+// warm's OWN admission calls need to evict something to make room for a
+// DIFFERENT atlas-suggested candidate, so admission ends up fighting itself.
+// Removed after the third A/B round settled it - see docs/plan.md for the
+// full three-way comparison and the honest reporting of both reversals.
+
 static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_slot & slot) {
     return (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
 }
