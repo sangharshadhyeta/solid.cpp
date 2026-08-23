@@ -365,6 +365,7 @@ struct moe_cache_device {
     // per-device value in multi-slot serving - not pretending to be more
     // precise than that.
     moe_cache_key last_top_expert{};
+    int  last_top_layer = -1;
     bool last_top_expert_valid = false;
     // Keyed by a real, directed moe_cache_edge (from = earlier layer) -
     // same fix as co_activation above, same reason.
@@ -582,6 +583,14 @@ struct moe_cache_node {
     int64_t n_out = 0;
     int64_t n_expert = 0;
     int wtype = -1;
+    // Logical layer index, parsed from the tensor name in moe_cache_begin
+    // (-1 when the name doesn't follow llama.cpp's "blk.N." convention).
+    // Needed because ONE logical layer dispatches SEVERAL expert tensors
+    // (gate_up_exps then down_exps) that share a single router decision -
+    // without this, cross-layer co-activation treats that pair as a layer
+    // transition and records a self-edge. See the tracking block in
+    // moe_cache_plan.
+    int layer = -1;
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[GGML_MOE_CACHE_MAX_BATCH_ROWS];
     int n_pins = 0;
@@ -3377,6 +3386,7 @@ static void moe_cache_session_enter(void * opaque) {
     // last layer as a false cross-layer edge.
     for (const auto & device_ptr : session->devices) {
         device_ptr->last_top_expert_valid = false;
+        device_ptr->last_top_layer = -1;
     }
 }
 
@@ -3694,6 +3704,16 @@ static void * moe_cache_begin(
     node->n_out = n_out;
     node->n_expert = n_expert;
     node->wtype = wtype;
+    // llama.cpp names every per-layer tensor "blk.<layer>.<what>.weight"
+    // (llm_tn / LLM_TENSOR_NAMES), so the logical layer is already carried
+    // by the name this API is handed - no new parameter needed.
+    node->layer = -1;
+    if (const char * blk = strstr(name, "blk.")) {
+        const char * digits = blk + 4;
+        if (*digits >= '0' && *digits <= '9') {
+            node->layer = atoi(digits);
+        }
+    }
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -4397,11 +4417,29 @@ static int moe_cache_plan(
     // product across two different calls, not a self-pairing within one.
     if (n_ids > 0 && ids[0] >= 0 && ids[0] < node->n_expert) {
         const moe_cache_key top_key{node->host_base, ids[0]};
-        if (device.last_top_expert_valid) {
+        // Only record an edge across a REAL layer boundary. One logical
+        // layer dispatches several expert tensors (gate_up_exps then
+        // down_exps) off a single router decision, so without this check
+        // that pair looks like a transition and lands as a self-edge -
+        // measured at 45 of 64 exported cross-layer edges on Gemma and 55
+        // of 64 on Ornith, i.e. most of the signal was this artifact.
+        // Unknown layer (-1, tensor name off-convention) is treated as
+        // "can't tell" and records nothing rather than guessing, which is
+        // the same choice every other unknown in this file makes.
+        const bool real_transition =
+            device.last_top_expert_valid &&
+            node->layer >= 0 && device.last_top_layer >= 0 &&
+            node->layer != device.last_top_layer;
+        if (real_transition) {
             device.co_activation_cross_layer[
                     moe_cache_edge_directed(device.last_top_expert, top_key)]++;
         }
+        // Advance regardless: the next call's "previous layer" should be
+        // this one even when this call itself recorded nothing, otherwise
+        // a same-layer pair in the middle would also swallow the following
+        // genuine transition.
         device.last_top_expert = top_key;
+        device.last_top_layer = node->layer;
         device.last_top_expert_valid = true;
     }
 
