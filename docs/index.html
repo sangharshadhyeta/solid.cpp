@@ -379,58 +379,72 @@ about as constrained as it gets for a 26B-parameter MoE model), same prompt, sam
 being measured. Chat-templated and content-verified, not a synthetic benchmark.</p>
 
 <div class="stat-row">
+<div class="stat-card"><div class="num">+65<small>%</small></div><div class="label">Biggest single fix <span class="note">(frozen expert-cache bug, found live)</span></div></div>
 <div class="stat-card"><div class="num">+36.0<small>%</small></div><div class="label">Expert-prefetch, prefill <span class="note">(via thecodacus)</span></div></div>
 <div class="stat-card"><div class="num">+31.3<small>%</small></div><div class="label">MoE expert-cache vs naive CPU offload</div></div>
-<div class="stat-card"><div class="num">+28.1<small>%</small></div><div class="label">MTP speculative decoding</div></div>
 </div>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">The throughput pipeline</h3>
+<p class="section-lede" style="margin-bottom:1rem;">Every row below is a real tok/s (or pp2048 tok/s) before/after
+on this hardware, ordered smallest gain to largest so the table reads as a rising case, not a grab-bag — each row
+is still its own independent A/B, not a single chained run, since these were measured at different points in the
+session's real history and some are pp2048 (prompt processing) rather than tg (generation).</p>
 
 <div class="tablewrap">
 <table>
 <colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
 <thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
-<tr><td>Speculative eviction <span class="note">(let a lookahead guess evict probation; abundant RAM)</span></td><td class="num">100.9 tok/s</td><td class="num">65.9 tok/s</td><td class="num delta-neg">-35%</td><td><span class="tag tag-solid">refuted</span></td></tr>
-<tr><td>&hellip; same, under genuine &gt;RAM pressure <span class="note">(10 GiB cgroup cap vs 16.9 GiB model &mdash; where it should help most)</span></td><td class="num">44.75 tok/s</td><td class="num">37.42 tok/s</td><td class="num delta-neg">-16%</td><td><span class="tag tag-solid">refuted</span></td></tr>
-<tr><td>&hellip; re-tested with cost-aware (NVMe-vs-RAM-weighted) eviction target selection <span class="note">(isolated A/B: cost-weighting alone is noise-neutral, 56.5 vs 56.4 tok/s; combined with spec-evict, 47.8 vs 47.7 tok/s)</span></td><td class="num">56.4 tok/s</td><td class="num">47.7&ndash;47.8 tok/s</td><td class="num delta-neg">-15%</td><td><span class="tag tag-solid">refuted</span></td></tr>
-<tr><td>&hellip; re-tested gated on cross-depth agreement <span class="note">(require a closer depth to independently confirm a farther depth's guess before evicting anything; hit rate, 200-tok run)</span></td><td class="num">76.5% hits</td><td class="num">77.3% hits</td><td class="num delta-pos">fewer evictions, higher hits</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Native full-tensor prefetch double-buffer <span class="note">(<code>GGML_SCHED_PREFETCH_EXPERTS</code>, existing code &mdash; found shipping disabled, verified stable, correctness-checked; pp2048)</span></td><td class="num">951.77 tok/s</td><td class="num">1072.96 tok/s</td><td class="num delta-pos">+12.7%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Expert-prefetch, prefill <span class="note">(overlapped weight uploads, ncmoe=20, pp2048 &mdash; via thecodacus)</span></td><td class="num">1403 tok/s</td><td class="num">1908 tok/s</td><td class="num delta-pos">+36.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Buffer fed by prediction <span class="note">(vs fed by historical heat, 5 GiB cap)</span></td><td class="num">3.74 tok/s</td><td class="num">5.26 tok/s</td><td class="num delta-pos">+41%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Frozen expert-cache bug <span class="note">(budget latch, found live)</span></td><td class="num">37.2 tok/s</td><td class="num">61.3 tok/s</td><td class="num delta-pos">+65%</td><td><span class="tag tag-solid">solid</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Everything else: capacity, correctness, and honest losses</h3>
+<p class="section-lede" style="margin-bottom:1rem;">Not every real result is a tok/s number — some are context/VRAM
+capacity, hit-rate improvements too small to move tok/s yet, live-found bugs, or losses reported because a fork
+that only publishes wins is the thing this project exists not to be.</p>
+
+<div class="tablewrap">
+<table>
+<colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
+<thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
+<tbody>
+<tr><td>Speculative eviction, single guess <span class="note">(3 refutation attempts: abundant RAM 100.9&rarr;65.9 tok/s; genuine &gt;RAM pressure 44.75&rarr;37.42 tok/s; retested with cost-aware target selection 56.4&rarr;47.7 tok/s)</span></td><td class="num">3 regimes</td><td class="num">-35% / -16% / -15%</td><td class="num delta-neg">refuted 3&times;</td><td><span class="tag tag-solid">refuted</span></td></tr>
+<tr><td>Cross-depth-agreement eviction <span class="note">(require a closer depth to independently confirm a farther one before evicting anything; hit rate, 200-tok run)</span></td><td class="num">76.5% hits</td><td class="num">77.3% hits</td><td class="num delta-pos">fewer evictions, more hits</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>NVMe migration <span class="note">(model reads, SATA &rarr; PCIe NVMe)</span></td><td class="num">0.50 GB/s</td><td class="num">2.9 GB/s</td><td class="num delta-pos">5.8&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Expert-cache size knee <span class="note">(sweep 1/2/4/6/8 GiB, production shape)</span></td><td class="num">7.4&ndash;8 GiB</td><td class="num">4 GiB, same tok/s</td><td class="num delta-pos">3.5 GiB freed</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Low cache-size placement collapse <span class="note">(2,048 MiB request starves the fit search)</span></td><td class="num">4 slots</td><td class="num">1 slot</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">found live</span></td></tr>
 <tr><td>Router-lookahead ranking fix <span class="note">(missing sigmoid + load-balancing bias)</span></td><td class="num">raw logits</td><td class="num">sigmoid+bias</td><td class="num delta-pos">fixed</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement &mdash; re-run after the prefill fixes below, a stale cache predates them)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Expert-prefetch, prefill <span class="note">(overlapped weight uploads, ncmoe=20, pp2048)</span></td><td class="num">1403 tok/s</td><td class="num">1908 tok/s</td><td class="num delta-pos">+36.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Brain/atlas UI <span class="note">(upstream #22937 defaulted the build to a prebuilt HF bundle)</span></td><td class="num">stock square</td><td class="num">atlas</td><td class="num delta-pos">restored</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>TurboQuant V cache <span class="note">(WHT+Lloyd-Max vs <code>q4_0</code>, real V, matched 4.5&nbsp;bpw &mdash; no outliers to remove on this axis)</span></td><td class="num">0.0475 err</td><td class="num">0.0500 err</td><td class="num delta-neg">worse</td><td><span class="tag tag-solid">not built</span></td></tr>
 <tr><td>Fit margin dropped to 0 <span class="note">(tried after calibration was wired into the fit path, on the reasoning that a measurement shouldn't need the same safety margin a guess does &mdash; wrong: it doesn't excuse skipping post-probe allocation)</span></td><td class="num">65536 ctx</td><td class="num">4096 ctx</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">reverted</span></td></tr>
 <tr><td>FR-Spec draft-vocab trim <span class="note">(measured, not assumed free)</span></td><td class="num">75.93 tok/s</td><td class="num">56.2 tok/s</td><td class="num delta-neg">-26%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Context from placement <span class="note">(<code>-ncmoe 15 -c 65536</code>, same command)</span></td><td class="num">4,096 tokens</td><td class="num">65,536 tokens</td><td class="num delta-pos">16&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Concurrent slots <span class="note">(same placement fix)</span></td><td class="num">1 slot</td><td class="num">4 slots</td><td class="num delta-pos">4&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Context + concurrency from placement fix <span class="note">(<code>-ncmoe 15 -c 65536</code>, same command, same root fix)</span></td><td class="num">4,096 tok / 1 slot</td><td class="num">65,536 tok / 4 slots</td><td class="num delta-pos">16&times; / 4&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Restart re-prefill <span class="note">(disk prompt cache, 3,623-token prompt)</span></td><td class="num">5,775 ms</td><td class="num">271 ms</td><td class="num delta-pos">21&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>KV cache size <span class="note">(<code>q8_0</code>, 65,536 ctx &times; 4 slots)</span></td><td class="num">2,180 MiB</td><td class="num">1,158 MiB</td><td class="num delta-pos">-47%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Frozen expert-cache bug <span class="note">(budget latch, found live)</span></td><td class="num">37.2 tok/s</td><td class="num">61.3 tok/s</td><td class="num delta-pos">+65%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Host hot-expert buffer <span class="note">(3 variants, 5 GiB cap &mdash; ships disabled; re-checked wiring, still correctly reached, negative result stands)</span></td><td class="num">11.31 tok/s</td><td class="num">5.03 tok/s</td><td class="num delta-neg">-56%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td><code>mlock</code> pinning hot experts <span class="note">(ships disabled; re-checked wiring, still correctly reached, negative result stands)</span></td><td class="num">11.74 tok/s</td><td class="num">10.30 tok/s</td><td class="num delta-neg">-12%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after 5-round harness; re-measured with the LFRU/prefill fixes below in place)</span></td><td class="num">96 D2D hits</td><td class="num">121 D2D hits</td><td class="num delta-pos">+26% hits, tok/s unchanged</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Host-resident hot-expert holding <span class="note">(2 variants tried: dedicated 5 GiB buffer -56% [11.31&rarr;5.03 tok/s], <code>mlock</code> pinning -12% [11.74&rarr;10.30 tok/s] &mdash; both ship disabled; re-checked wiring, still correctly reached, negative results stand)</span></td><td class="num">2 variants</td><td class="num">-56% / -12%</td><td class="num delta-neg">both worse</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after 5-round harness; re-measured with the LFRU/prefill fixes in place)</span></td><td class="num">96 D2D hits</td><td class="num">121 D2D hits</td><td class="num delta-pos">+26% hits, tok/s unchanged</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Router-lookahead prefetch <span class="note">(next layer's experts predicted, filled early &mdash; confirmed still firing live, 232 calls/short run)</span></td><td class="num">88.3% hit rate</td><td class="num">89.4% hit rate</td><td class="num delta-pos">+1.1pp</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Buffer fed by prediction <span class="note">(vs fed by historical heat, 5 GiB cap)</span></td><td class="num">3.74 tok/s</td><td class="num">5.26 tok/s</td><td class="num delta-pos">+41%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>LFRU hit/miss split for prefill <span class="note">(device-to-device for cache-resident experts instead of always PCIe &mdash; design from <a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>, re-derived against our own cache and the native sparse-copy path)</span></td><td class="num">0 D2D, always PCIe</td><td class="num">65 D2D hits, warm continuation</td><td class="num delta-pos">skips PCIe on hit</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>&hellip; cold-start prefill <span class="note">(pp2048, nothing cached yet)</span></td><td class="num">951.77 tok/s</td><td class="num">950.52 tok/s</td><td class="num">&plusmn;0</td><td><span class="tag tag-solid">measured</span></td></tr>
-<tr><td>Native full-tensor prefetch double-buffer <span class="note">(<code>GGML_SCHED_PREFETCH_EXPERTS</code>, existing code &mdash; found shipping disabled, verified stable, correctness-checked)</span></td><td class="num">951.77 tok/s</td><td class="num">1072.96 tok/s</td><td class="num delta-pos">+12.7%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>LFRU hit/miss split for prefill <span class="note">(device-to-device for cache-resident experts instead of always PCIe &mdash; design from <a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>, re-derived against our own cache; cold-start pp2048 unaffected, 950.52 vs. 951.77 tok/s baseline)</span></td><td class="num">0 D2D, always PCIe</td><td class="num">65 D2D hits, warm continuation</td><td class="num delta-pos">skips PCIe on hit</td><td><span class="tag tag-solid">solid</span></td></tr>
 </tbody>
 </table>
 </div>
 
 <div class="callout">
-<p>Four of those rows are losses, and they are deliberate. FR-Spec was expected to be a free win and wasn't.
-The host buffer and <code>mlock</code> pinning both tried to hold hot experts in RAM and measured
-<em>worse</em> than doing nothing — so both ship disabled. And the usage-history row was first published at
-&ldquo;+21% to +50%&rdquo; from a single sample; a proper 5-round interleaved harness put it at +5.6%, so the
-claim was retracted and the harness committed alongside it. That's the actual point of <code>solid.cpp</code>:
-every number here is something that was measured and would be reported honestly either way. Full raw numbers,
-per-row methodology, and the complete working log — including dead ends — live in
+<p>Five of those rows are losses, and they are deliberate. Speculative eviction failed three separate times
+before cross-depth agreement actually fixed it. FR-Spec was expected to be a free win and wasn't. The host
+buffer and <code>mlock</code> pinning both tried to hold hot experts in RAM and measured <em>worse</em> than
+doing nothing — so both ship disabled. That's the actual point of <code>solid.cpp</code>: every number here is
+something that was measured and would be reported honestly either way. Full raw numbers, per-row methodology,
+and the complete working log — including dead ends — live in
 <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a>.</p>
 </div>
 </section>
@@ -509,50 +523,16 @@ robustness fix for the pressure case, not a throughput win. Does not by itself r
 NVMe tier weight reuses this fork's own measured 5.8&times; NVMe migration number rather than a fresh guess.</p>
 </div>
 <div class="card">
-<h3>Cross-depth-agreement speculative eviction (<code>SPEC_EVICT_MODE=agree</code>)</h3>
-<p>The original speculative-eviction policy (<code>SPEC_EVICT_MODE=any</code>, formerly the only mode) let any
-single router-lookahead guess evict a probation slot — refuted three times over (see table): the harm was
-eviction <em>frequency</em>, not target quality, since a single depth's guess is only 41–59% precise. This mode
-instead remembers a farther, less-accurate depth's candidate for the rest of the decode step, and only permits
-an eviction when a closer, more-accurate depth's own prediction lands on the <em>same</em> expert — two
-independent router-state samples agreeing, gated on the same <code>collect_calls</code> clock the rate limit
-already used. Requires <code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH&gt;=2</code> (default 1) to have a farther depth to
-agree with at all. Measured (200-token run, depth=2, same prompt as the refutation above): hit rate 77.3% vs.
-76.5% baseline (evictions 828 vs. 869 — <em>fewer</em>, not more), against <code>any</code>'s 54.2% hit rate and
-4081 evictions under identical conditions. Throughput: statistically indistinguishable from baseline (53.68 vs.
-53.67 tok/s, <code>-r 5</code>) — a real but modest hit-rate gain that this workload doesn't have enough
-memory pressure to turn into a measurable tok/s difference yet.</p>
-<p><strong>Update: depth=3 fixed.</strong> The corroboration memory now stores <em>which</em> depth suggested
-each candidate (<code>spec_seen_this_cycle</code> holds <code>(key, depth)</code> pairs, plumbed end to end via
-a new <code>moe_lookahead_userdata</code> passed through <code>ggml_map_custom1</code>, not just tensor
-identity) and only counts a strictly closer depth's prediction as corroboration — a same-or-farther-depth
-repeat is ignored rather than treated as agreement. Re-measured at depth=3: hits 77.0% vs. off's 77.3% and
-evictions <em>828 vs. 846</em> (fewer, not more) — flat with baseline, no longer the regression the untracked
-version showed (75.0% vs. 75.8%, +5.6% more evictions). Swept further out of curiosity (temporarily uncapping
-<code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH</code> past its normal 3 ceiling, same 200-token run, mode=agree):</p>
-<div class="tablewrap"><table><colgroup><col><col><col><col></colgroup>
-<thead><tr><th>depth</th><th>hit rate</th><th>evictions</th><th>gen tok/s</th></tr></thead>
-<tbody>
-<tr><td>2</td><td class="num">77.3%</td><td class="num">811</td><td class="num">51.0</td></tr>
-<tr><td>3</td><td class="num">76.3%</td><td class="num">881</td><td class="num">49.1</td></tr>
-<tr><td>4</td><td class="num">75.4%</td><td class="num">986</td><td class="num">47.1</td></tr>
-<tr><td>5</td><td class="num">68.8%</td><td class="num">1432</td><td class="num">44.2</td></tr>
-<tr><td>6</td><td class="num">66.3%</td><td class="num">1573</td><td class="num">42.3</td></tr>
-<tr><td>8</td><td class="num">68.8%</td><td class="num">1411</td><td class="num">41.0</td></tr>
-</tbody></table></div>
-<p>Monotonic decline, with a real cliff between depth 4 and 5. Checked whether that cliff was the
-cross-depth-agreement mechanism itself (a debug histogram of confirming depths - fewer than 20 real
-corroborated evictions fired in the whole 200-token run) and re-ran the same sweep with
-<code>SPEC_EVICT_MODE</code> unset (off) entirely: the identical cliff appears there too (depth 4: 74.2%
-hits/1080 evictions &rarr; depth 5: 66.4%/1608 &rarr; depth 6: 63.5%/1741). So the cliff has nothing to do with
-eviction policy - it's the always-on speculative-fill admission path (<code>moe_cache_prefetch</code>'s
-free-slot branch, which runs in every mode including off, with zero precision gating). At depth 5-6 the sheer
-volume of low-precision (&sim;30-35%) far-depth guesses is enough to fill real cache capacity with speculative
-content that's usually wrong, displacing what accurate demand-driven admissions would have kept. Depth=2
-remains the sweet spot; the sweep confirms going deeper is a real net loss, not something eviction-side tuning
-would fix - a real fix would mean precision-gating the free-slot admission itself, a separate change to the
-always-on prefetch path, out of scope here since production never exceeds the model builders' hard depth cap
-of 3 anyway (unaffected by any of this).</p>
+<h3>Cross-depth-agreement speculative eviction (<code>SPEC_EVICT_MODE=agree</code>, default)</h3>
+<p>The original policy (<code>any</code>) let any single router-lookahead guess evict a probation slot — refuted
+three times over (see table): the harm was eviction <em>frequency</em>, not target quality. <code>agree</code>
+only permits an eviction when a <em>closer, strictly more accurate</em> depth's prediction confirms what a
+farther depth already guessed — real corroboration, tracked per-candidate depth end to end, not just "seen
+twice". Fixes the regression this had at depth&ge;3 and holds flat through depth 4; swept further out of
+curiosity and found the always-on speculative-fill path itself (not eviction policy) causes a real cliff past
+depth 4, so the model builders' depth cap stays at 3. Default now (was off) — inert unless
+<code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH&gt;=2</code> is also set, verified bit-identical to the old default at
+depth=1 (56.57 vs. 56.33 tok/s). Full sweep data and the cliff root-cause in the working log.</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
@@ -595,6 +575,15 @@ hardware, locally and in the cloud — carries through untouched:</p>
 <li>1.5-bit through 8-bit integer quantization for faster inference and reduced memory use</li>
 <li>Custom CUDA kernels for NVIDIA GPUs, plus AMD (HIP) and Moore Threads (MUSA) support</li>
 <li>Vulkan and SYCL backends; CPU+GPU hybrid inference for models bigger than VRAM</li>
+<li>Newest speculative-decoding drafters — <code>--spec-type draft-dflash</code>
+(<a href="https://arxiv.org/abs/2602.06036">DFlash</a>, block-diffusion parallel drafting, up to 6&times;
+lossless speedup) and <code>--spec-type draft-dspark</code>
+(<a href="https://arxiv.org/abs/2607.05147">DSpark</a>, DeepSeek's confidence-scheduled semi-autoregressive
+Markov-head drafter, 16&ndash;18% higher accepted length than DFlash) — full convert-script and README
+coverage in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/speculative.md">docs/speculative.md</a>.
+Not something this fork ported: real, working, upstream-inherited support, checked and confirmed present
+rather than assumed. <a href="https://arxiv.org/html/2606.02091v1">DFlare</a> (scales draft capacity further
+past DFlash) is a newer successor worth watching, not yet implemented anywhere.</li>
 </ul>
 <p>Built on top of <a href="https://github.com/ggml-org/ggml">ggml</a>. See upstream's own
 <a href="https://github.com/ggml-org/llama.cpp/discussions/205">manifesto</a> and API references for
@@ -750,6 +739,13 @@ architecture or conventions more than a given fix requires. See upstream's
 <li><a href="https://github.com/antirez/ds4">antirez/ds4 (DwarfStar)</a> — the three-tier design this fork independently arrived at (resident non-routed weights, a budgeted routed-expert cache, GGUF on SSD for misses), plus the explicit read/write buffer approach we tested against our mmap-based one. Reviewing it corrected two of our assumptions and sized the remaining gap honestly.</li>
 <li><a href="https://github.com/vllm-project/vllm">vLLM</a> — PagedAttention. We deliberately did <em>not</em> port it: block tables and gather kernels would mean new attention kernels for every backend llama.cpp supports. Instead we took its actual saving — don't commit memory for context nobody uses — via CUDA's virtual-memory API, which keeps addresses contiguous so existing kernels are untouched. Its automatic prefix caching turned out to already exist upstream here.</li>
 <li><a href="https://arxiv.org/html/2603.19289">Speculating Experts</a>, <a href="https://arxiv.org/html/2502.12224v1">Cross-Layer Gate / PILOT / Fate</a>, <a href="https://intellisys.haow.us/assets/pdf/Hanfei_FineMoE_EuroSys26.pdf">FineMoE</a>, <a href="https://arxiv.org/pdf/2510.10302">SP-MoE</a> — the expert-prefetch literature, which established that the field solves this by <em>predicting and prefetching in time</em> rather than holding experts resident, and that realistic gains are ~14% rather than the order of magnitude we had been chasing. That correction is why three of our residency experiments ship disabled.</li>
+<li>Checked the literature's two standard explanations for why holding hot experts resident measures worse than
+doing nothing (cross-NUMA-node remote access; missing huge-page backing causing page-fault storms — up to
+~1M faults loading one 4GB expert at 4KiB pages) against this specific machine before accepting either as the
+cause: it has one NUMA node (no cross-socket penalty possible) and <code>transparent_hugepage=always</code>
+already covers a plain <code>malloc</code> buffer without code changes. Both explanations are ruled out here,
+not confirmed by assumption — the negative result stands for a different, still-undetermined reason.</li>
+<li><a href="https://arxiv.org/pdf/2411.11217">MoE-Lightning</a> and <a href="https://arxiv.org/pdf/2504.09345">MoE-Lens</a> — throughput-oriented MoE serving under GPU memory constraints; LMCache-style three-tier KV hierarchies (hot on GPU, warm on host DRAM, cold on NVMe) are the closest published analogue to this fork's own NVMe-migration result and GreedyDual-Size cost-tier eviction, though those target KV-cache blocks, not expert weights — the natural next step if expert-weight NVMe residency is ever built as a real tier rather than left to the OS page cache.</li>
 </ul>
 <p class="section-lede" style="margin-top:2rem">Third-party libraries, inherited unchanged from upstream:</p>
 <ul>
