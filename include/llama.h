@@ -625,6 +625,16 @@ extern "C" {
     // Get the number of metadata key/value pairs
     LLAMA_API int32_t llama_model_meta_count(const struct llama_model * model);
 
+    // Look up a loaded tensor by its exact GGUF name (e.g.
+    // "blk.3.ffn_down_exps.weight"). Returns NULL if no such tensor exists
+    // in this model. The returned tensor's ->data is the same stable
+    // pointer moe-cache and the graph builders already key expert-cache
+    // entries off (host_base) - added so a caller like the server, which
+    // has no access to the model's internal per-layer tensor structs, can
+    // still hand moe-cache real tensor identity for something it measured
+    // offline against this same model (e.g. --expert-atlas-file).
+    LLAMA_API const struct ggml_tensor * llama_model_get_tensor(const struct llama_model * model, const char * name);
+
     // Get sampling metadata key name. Returns nullptr if the key is invalid
     LLAMA_API const char * llama_model_meta_key_str(enum llama_model_meta_key key);
 

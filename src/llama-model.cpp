@@ -2829,6 +2829,10 @@ int32_t llama_model_meta_count(const llama_model * model) {
     return (int)model->gguf_kv.size();
 }
 
+const ggml_tensor * llama_model_get_tensor(const llama_model * model, const char * name) {
+    return model->get_tensor(name);
+}
+
 const char * llama_model_meta_key_str(llama_model_meta_key key) {
     switch (key) {
         case LLAMA_MODEL_META_KEY_SAMPLING_SEQUENCE:        return "general.sampling.sequence";

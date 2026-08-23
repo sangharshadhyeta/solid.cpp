@@ -247,6 +247,34 @@ struct ggml_moe_cache_api {
     // writes *out (zeroed on failure). NULL-safe like the other optional
     // entries here.
     void (*get_summary)(struct ggml_moe_cache_summary * out);
+
+    // Step 0 of Atlas-driven cache warming: registers each expert's measured
+    // topic-affinity position (see llama-expert-atlas / docs/index.html's
+    // Brain-Atlas section) so moe-cache can track, live, which direction in
+    // that same space the current request is trending toward - a decaying
+    // centroid of already-selected experts' positions, updated on real
+    // demand hits. Purely observational for now: this only maintains and
+    // logs the signal, nothing reads it to promote or evict anything yet.
+    // That's deliberate - the same "prove the signal is real before acting
+    // on it" discipline every other predictive mechanism in this cache
+    // followed (router-lookahead, speculative eviction).
+    //
+    // Category names/angles are NOT passed here on purpose: the warming
+    // score this will eventually feed is a plain cosine similarity in (x,y)
+    // space between a candidate expert and the live request centroid -
+    // never needs to name which category that direction corresponds to.
+    // Keeping labels out of this low-level, dependency-light module also
+    // avoids pulling a JSON parser into ggml-cuda; the atlas file itself is
+    // parsed once at the common/ layer, which already has one.
+    //
+    // host_base identifies which tensor's experts these entries belong to,
+    // matching moe_cache_key's own convention. Safe to call once per
+    // (host_base) with that tensor's full set of measured cells; a second
+    // call for a host_base already registered replaces its entries. NULL-
+    // safe. n_cells may be 0 (registers nothing, still valid).
+    void (*set_atlas)(
+            const void * host_base, const int32_t * expert,
+            const float * x, const float * y, const float * spec, int n_cells);
 };
 
 extern struct ggml_moe_cache_api ggml_moe_cache;
