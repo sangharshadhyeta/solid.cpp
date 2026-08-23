@@ -38,7 +38,7 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    n_expert` guard every other caller already had. Verified clean afterward
    across two real generations (800 tokens total), no crash, hit rate
    climbing to 94%.
-4. **[step 4a done, 4b blocked]** Pairwise co-activation ("fire together")
+4. **[done]** Pairwise co-activation ("fire together")
    signal. Split in two once actually scoped:
    - **4a, done**: within-layer co-activation - which experts get selected
      *together* in the same real routing decision (`device.co_activation`,
@@ -63,31 +63,33 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
      ~2000-token prefill, no crash in either. This is the more direct answer
      to "why can't the atlas be dynamic" than nudging static positions from
      a live-classified topic would be.
-5. **[done]** 3D topic-space visualization (commit `ec1354bc1`) — third axis is
-   TOPIC, not layer: `llama-expert-atlas` now keeps the per-category vector
-   (`cats{}`) instead of discarding it, and the Brain view projects it onto
-   Fibonacci-sphere anchors (near-equidistant, no arbitrary array-order
-   adjacency). Drag to orbit, scroll to zoom. Kept cheap: cold experts draw
-   as 1px rects and skip the depth sort; drag redraws coalesce onto rAF.
-   Originally built as a pathway view with layer depth on z, plotting
-   per-token trajectories through the layer stack — that was the wrong axis
-   and was corrected: layer is a single scalar the layer × expert grid
-   already shows well, while topic affinity is genuinely N-dimensional and
-   is where the information was actually being lost. Co-activation edges are
-   still drawn, now reading as "these topic regions fire together" rather
-   than as trajectories through depth.
+5. **[built, then REVERTED]** 3D topic-space visualization (`ec1354bc1`,
+   reverted in `de08f87b2`). Built as a real 3D sphere with topic (not layer)
+   on the third axis, Fibonacci-sphere anchors, orbit/zoom. Reverted at the
+   user's request: too taxing on a machine that is usually also serving the
+   model. The cost I had underweighted - the full atlas ships in the
+   `/experts` response on **every 1.5s poll**, so adding the per-category
+   `cats{}` vector inflated that payload from 1.2MB to 2.0MB per poll per
+   open tab, on top of the per-frame draw cost. The active atlas file was
+   reverted to the pre-`cats` v1 for the same reason.
+   Kept (data-side, no per-frame or per-poll cost): the generator still
+   emits `cats{}` (opt-in by regenerating), the co-activation export API,
+   and the server-side tensor->layer translation. Those are what Track 1.6
+   would build on. If revisited, WebGL would suit an interactive connectome
+   better than the 2D-canvas projection used here.
 
-**Known gap found while smoke-testing the export API**: cross-layer edges
-(4b) don't distinguish "the next `plan()` call is a different tensor of the
-*same* logical layer" (gate_up_exps -> down_exps, which share one router
-decision and very often the same selected expert) from "the next call is
-genuinely the following layer." A live sample showed exactly this: `layer
-6 expert 6 -> layer 6 expert 6`, a same-layer artifact, not a real
-cross-layer hop. Roughly half of tracked edges are probably this kind of
-artifact, diluting the genuine signal. Not fixed yet - would need
-`moe_cache_plan` to know it's looking at a same-logical-layer tensor pair
-(e.g. via the shape/pool_index already available) before folding it into
-`last_top_expert`, rather than treating every call as a layer boundary.
+**Same-layer artifact in cross-layer edges — FIXED** (`9f68d2f64`). One
+logical layer dispatches several expert tensors (gate_up_exps then
+down_exps) off a single router decision, so consecutive `plan()` calls were
+frequently the same layer and got recorded as self-edges - measured at 55 of
+64 exported edges on Ornith and 45 of 64 on Gemma, i.e. ~86% of the signal
+was artifact. Fixed by parsing the logical layer from the tensor name
+`begin()` already receives (llama.cpp names every per-layer tensor
+`blk.<layer>.<what>.weight`, so no new API parameter was needed) and only
+recording an edge when the layer actually changes; an unparseable name
+yields -1 and records nothing rather than guessing. Verified live on
+Ornith: **64 of 64 exported cross-layer edges are now genuine transitions,
+0 self-edges** (was 9 of 64 genuine) - a 7x increase in usable signal.
 
 **Step 5 prerequisites (done)**: storage bug fixed (`moe_cache_edge`
 replaces the original opaque-hash counters for both `co_activation` and
