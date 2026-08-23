@@ -70,6 +70,56 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    "brain folds toward what's used together" intuition that motivated this,
    and the direct visual payoff of steps 3-4).
 
+**Step 5 prerequisites (in progress)**: storage bug fixed (`moe_cache_edge`
+replaces the original opaque-hash counters for both `co_activation` and
+`co_activation_cross_layer`); export API added
+(`ggml_moe_cache.get_co_activation`, top-K by count, real tensor identity);
+server-side tensor->layer translation in progress (`atlas_tensor_layer` map,
+reusing the mapping already built for `set_atlas` registration).
+
+**Step 3's real-world verdict, tested twice, two different data sources**:
+- *Mismatched data* (Ornith's atlas on Gemma - arbitrary topic labels, no
+  real relationship to what Gemma's experts do): flat-to-noise on both
+  tok/s and hit rate, both the conservative and looser "speculative" eviction
+  variants, across 2 interleaved rounds. See the git log for the full numbers.
+- *Matched data* (Gemma's own atlas, `/mnt/nvme/models/moe-test/expert-atlas.json`,
+  n_layer=30, on Gemma): a materially different picture. The conservative
+  variant (`GGML_CUDA_MOE_CACHE_ATLAS_WARM=1`, defaults `EVICT_MIN=0.6
+  EVICT_CAP=1`) beat baseline tok/s in **both** interleaved rounds (58.44 vs
+  58.28, 58.49 vs 58.33 - consistently, not a coin flip like the mismatched
+  test), a small but real +0.29% average. The looser "speculative" variant
+  (`EVICT_MIN=0.0 EVICT_CAP=2`) won hit rate consistently (~93% vs ~91%
+  baseline in both rounds) but showed real instability on tok/s - a 54.8
+  tok/s outlier in round 1 (a genuine ~6% drop, not noise), suggesting more
+  frequent eviction sometimes costs more than the hit-rate gain returns.
+  Only 2 rounds so far - real, consistent direction, not yet enough samples
+  to call fully proven. Needs a longer run (more rounds, larger/richer atlas)
+  before treating this as validated - in progress.
+
+## Track 1.5 — CPU-GPU split gap (from FreeToken, never carried over)
+
+Real gap identified while re-testing step 3, not hypothetical: the atlas
+warming ranking pass (`moe_cache_atlas_warm`'s cosine-similarity scan over a
+tensor's whole atlas-covered candidate set) runs **inline, synchronously, on
+the critical GPU-dispatch path** (`moe_cache_plan`, which must complete
+before the GPU op for that layer can be issued) - not offloaded to the
+existing background fill-worker thread the way the actual expert-weight
+*copies* already are. FreeToken's reference architecture keeps this kind of
+CPU-side prediction/ranking work off the hot dispatch path, running on spare
+CPU cycles while the GPU is busy with the previous layer's compute, instead
+of blocking the thread that has to issue the next GPU op. We didn't carry
+that split over when building Track 1 - everything CPU-side (the ranking
+loop, not just the fill worker's actual copies) has been synchronous so far.
+
+**Hypothesis, not yet measured**: moving the ranking computation itself onto
+the background worker (leaving only "read the precomputed result and admit a
+slot" on the critical path, the same shape moe_cache_plan already uses for
+real demand fills queued to the worker) could reduce the per-call latency
+atlas warming currently adds every 64 plan() calls, independent of whether
+the warming decision itself is good. Not started - needs its own scoped
+design, likely reusing the existing `device.queue`/worker-thread plumbing
+rather than inventing new infrastructure.
+
 ## Track 2 — Unified tiered placement
 
 Stems from "MoE expert weights — resident also tiered": today's hard
