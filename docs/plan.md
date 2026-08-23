@@ -70,6 +70,18 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
    "brain folds toward what's used together" intuition that motivated this,
    and the direct visual payoff of steps 3-4).
 
+**Known gap found while smoke-testing the export API**: cross-layer edges
+(4b) don't distinguish "the next `plan()` call is a different tensor of the
+*same* logical layer" (gate_up_exps -> down_exps, which share one router
+decision and very often the same selected expert) from "the next call is
+genuinely the following layer." A live sample showed exactly this: `layer
+6 expert 6 -> layer 6 expert 6`, a same-layer artifact, not a real
+cross-layer hop. Roughly half of tracked edges are probably this kind of
+artifact, diluting the genuine signal. Not fixed yet - would need
+`moe_cache_plan` to know it's looking at a same-logical-layer tensor pair
+(e.g. via the shape/pool_index already available) before folding it into
+`last_top_expert`, rather than treating every call as a layer boundary.
+
 **Step 5 prerequisites (in progress)**: storage bug fixed (`moe_cache_edge`
 replaces the original opaque-hash counters for both `co_activation` and
 `co_activation_cross_layer`); export API added
@@ -95,6 +107,17 @@ reusing the mapping already built for `set_atlas` registration).
   Only 2 rounds so far - real, consistent direction, not yet enough samples
   to call fully proven. Needs a longer run (more rounds, larger/richer atlas)
   before treating this as validated - in progress.
+- **Update, 4-round re-test on the same matched data**: the 2-round signal
+  did not hold up. Conservative: tok/s 58.32 avg, exactly tied with
+  baseline's 58.32 avg, full range overlap (58.07-58.50 vs 57.97-58.53).
+  Speculative (n=3, one round lost to an unrelated build-vs-test race, not
+  the mechanism's fault): hit rate 93.47%, now *below* baseline's 94.86%,
+  reversed from the earlier apparent win. Textbook regression-to-the-mean -
+  a small early sample looked like a trend by chance. **Corrected verdict:
+  no measurable benefit from atlas warming on real matched data, at this
+  sample size. Not proven harmful either - everything sits within noise of
+  baseline.** Stays off by default. Documented plainly rather than kept as
+  the earlier, more optimistic read.
 
 ## Track 1.5 — CPU-GPU split gap (from FreeToken, never carried over)
 

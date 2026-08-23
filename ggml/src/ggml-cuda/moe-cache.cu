@@ -77,6 +77,53 @@ struct moe_cache_key_hash {
     }
 };
 
+// Track 1 steps 4a/4b (docs/plan.md): a real, queryable co-activation edge -
+// which two experts were selected together (4a: same tensor, same routing
+// decision) or in sequence (4b: layer L's top pick -> layer L+1's), rather
+// than only an opaque combined hash. An opaque uint64 was the original
+// shape of both counters and turned out to be a real bug, not just a
+// missed nicety: a hash can't be reversed back into "layer 3 expert 12 ->
+// layer 4 expert 47" for anything that wants to actually look at this data
+// (a debug dump, an eventual export API, a visualization) - it was
+// observational data that had already thrown away the one thing worth
+// observing. Undirected for 4a (order doesn't mean anything within one
+// routing decision - normalized so (a,b) and (b,a) collide); directed for
+// 4b (from is genuinely earlier than to), so the constructors intentionally
+// differ in whether they sort - see moe_cache_edge_undirected/
+// moe_cache_edge_directed below.
+struct moe_cache_edge {
+    moe_cache_key from;
+    moe_cache_key to;
+
+    bool operator==(const moe_cache_edge & other) const {
+        return from == other.from && to == other.to;
+    }
+};
+
+struct moe_cache_edge_hash {
+    size_t operator()(const moe_cache_edge & e) const {
+        moe_cache_key_hash kh;
+        size_t h = kh(e.from);
+        h ^= kh(e.to) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static moe_cache_edge moe_cache_edge_undirected(moe_cache_key a, moe_cache_key b) {
+    // Same tensor is assumed and asserted by every call site (within-layer
+    // co-activation is only ever between two experts of the SAME tensor) -
+    // ordering by expert index alone is then sufficient and avoids
+    // comparing pointers for a within-tensor comparison.
+    if (b.expert < a.expert) {
+        std::swap(a, b);
+    }
+    return {a, b};
+}
+
+static moe_cache_edge moe_cache_edge_directed(moe_cache_key from, moe_cache_key to) {
+    return {from, to};
+}
+
 // LFRU eviction, hybrid design: two O(1) doubly-linked lists (probation/
 // protected_, the SLRU structure) PLUS a per-slot heat counter with
 // periodic decay (the heat-based design). Measured separately first
@@ -299,8 +346,11 @@ struct moe_cache_device {
     // token, next layer") - inventing a heuristic for that risked the same
     // class of bug the bounds-check fix above just caught for real, so it's
     // left as an explicit prerequisite rather than guessed at. Observational
-    // only, same as req_dir_* - nothing reads this yet.
-    std::unordered_map<uint64_t, uint32_t> co_activation;
+    // only, same as req_dir_* - nothing reads this yet. Keyed by a real
+    // moe_cache_edge (see the struct comment there for why this was
+    // switched from an opaque hash - that was a real bug, not a style
+    // choice), undirected.
+    std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation;
 
     // Track 1 step 4b: the missing prerequisite step 4a's comment above
     // flagged - a real token/batch-boundary signal. Reset in
@@ -316,7 +366,9 @@ struct moe_cache_device {
     // precise than that.
     moe_cache_key last_top_expert{};
     bool last_top_expert_valid = false;
-    std::unordered_map<uint64_t, uint32_t> co_activation_cross_layer;
+    // Keyed by a real, directed moe_cache_edge (from = earlier layer) -
+    // same fix as co_activation above, same reason.
+    std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation_cross_layer;
 
     // Decay rate for the centroid EMA - deliberately the same shape as the
     // heat step/decay already tuned elsewhere in this file (a fast-reacting
@@ -3910,23 +3962,6 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 #endif
 }
 
-// Track 1 step 4a (docs/plan.md): unordered-pair key for co-activation
-// counting, mixing the tensor identity with both expert indices (order-
-// independent - (a,b) and (b,a) are the same real co-activation event).
-static uint64_t moe_cache_pair_key(const void * host_base, int32_t a, int32_t b) {
-    if (a > b) {
-        std::swap(a, b);
-    }
-    uint64_t h = (uint64_t)(uintptr_t) host_base;
-    h ^= h >> 33;
-    h *= 0xff51afd7ed558ccdULL;
-    h ^= ((uint64_t)(uint32_t) a << 32) | (uint32_t) b;
-    h ^= h >> 33;
-    h *= 0xc4ceb9fe1a85ec53ULL;
-    h ^= h >> 33;
-    return h;
-}
-
 // Track 1 step 3 (docs/plan.md): Atlas-driven cache warming's actual
 // warming action. Off by default - this is the first thing in the Atlas
 // track that touches real cache state, and it hasn't been A/B'd yet, so it
@@ -4004,18 +4039,64 @@ static bool moe_cache_atlas_warm(
         }
     }
 
+    // A/B'd on 2026-08-23 restricted to free-slot-only admission: flat,
+    // no effect either way on tok/s or hit rate (58.61 vs 58.46 tok/s,
+    // 92.05% vs 91.85% hit rate, 3 interleaved rounds). Root cause found
+    // afterward, not guessed: pool.free_slots means "never used since this
+    // pool was allocated", not "currently unoccupied" - it empties
+    // permanently within the first few tokens of any real run, so
+    // free-slot-only warming had almost no window to ever act, which is
+    // why it couldn't show an effect either direction. Fixed here by
+    // letting it evict too, on the same real bounded-window mechanism
+    // moe_cache_pick_coldest_unpinned already provides everything else
+    // (speculative eviction, cross-depth agreement) - but disciplined the
+    // same way cross-depth-agreement earned its own eviction rights:
+    // capped to ONE eviction per warming pass (not per candidate), and
+    // gated on a real confidence floor, not merely "score > 0" (barely
+    // aligned still passed that). Never touches protected_ - only
+    // probation, same rule every other eviction path here follows.
+    // Two knobs, both env-overridable so the conservative default and a
+    // deliberately looser "speculative" variant can be A/B'd against each
+    // other directly - the same conservative-vs-permissive comparison
+    // GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE's agree-vs-any already made for
+    // router-lookahead eviction, applied here to this separate mechanism
+    // (this cache's eviction paths are independent per the SPEC_EVICT_MODE
+    // work - fixing/tuning one does not change another's behavior, and
+    // isolated variables stay isolated here too).
+    static const float evict_min_score = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_MIN");
+        const float v = env ? (float) atof(env) : 0.6f;
+        return v < 0.0f ? 0.0f : v;
+    }();
+    static const int evict_cap = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_CAP");
+        const int v = env ? atoi(env) : 1;
+        return v < 0 ? 0 : v;
+    }();
+    int evictions_this_pass = 0;
     bool woke = false;
     for (int i = 0; i < n_best; i++) {
-        if (pool.free_slots.empty()) {
-            break; // free-slot-only - see the function comment, this never evicts
-        }
         const int32_t expert = best[i].expert;
         const moe_cache_key key{host_base, expert};
         if (pool.map.find(key) != pool.map.end()) {
             continue; // resolved by something else since ranking above
         }
-        const int slot_index = pool.free_slots.back();
-        pool.free_slots.pop_back();
+        int slot_index = -1;
+        if (!pool.free_slots.empty()) {
+            slot_index = pool.free_slots.back();
+            pool.free_slots.pop_back();
+        } else if (evictions_this_pass < evict_cap && best[i].score >= evict_min_score) {
+            const int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
+            if (candidate < 0) {
+                break; // probation has nothing to sacrifice - stop, not just skip this candidate
+            }
+            moe_cache_slot_reset(pool, candidate, false);
+            slot_index = candidate;
+            device.evictions++;
+            evictions_this_pass++;
+        } else {
+            break; // no free slot, and either this pass's eviction budget is spent or score too weak to earn it
+        }
         moe_cache_slot & slot = pool.slots[slot_index];
         slot.key = key;
         slot.generation++;
@@ -4281,7 +4362,8 @@ static int moe_cache_plan(
             if (ids[a] < 0) continue;
             for (int b = a + 1; b < n_ids; b++) {
                 if (ids[b] < 0 || ids[b] == ids[a]) continue;
-                device.co_activation[moe_cache_pair_key(node->host_base, ids[a], ids[b])]++;
+                device.co_activation[moe_cache_edge_undirected(
+                        {node->host_base, ids[a]}, {node->host_base, ids[b]})]++;
             }
         }
     }
@@ -4298,14 +4380,8 @@ static int moe_cache_plan(
     if (n_ids > 0 && ids[0] >= 0 && ids[0] < node->n_expert) {
         const moe_cache_key top_key{node->host_base, ids[0]};
         if (device.last_top_expert_valid) {
-            // Cross-layer pairs span two different tensors (different
-            // host_base per layer), so the within-layer pair key - which
-            // mixes a single shared host_base with both expert indices -
-            // doesn't apply here: fold both tensors' identities and both
-            // expert indices into one combined hash instead.
-            uint64_t h = moe_cache_pair_key(device.last_top_expert.tensor, device.last_top_expert.expert, 0);
-            h ^= moe_cache_pair_key(top_key.tensor, top_key.expert, 1) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
-            device.co_activation_cross_layer[h]++;
+            device.co_activation_cross_layer[
+                    moe_cache_edge_directed(device.last_top_expert, top_key)]++;
         }
         device.last_top_expert = top_key;
         device.last_top_expert_valid = true;
@@ -5473,6 +5549,44 @@ static void moe_cache_set_atlas(
     }
 }
 
+// Exports Track 1 steps 4a/4b's co-activation data as real (tensor,
+// expert) identity - see the header doc comment on get_co_activation.
+// Aggregates across every live session's device (same broadcast pattern
+// moe_cache_get_summary/moe_cache_set_atlas already use), then a partial
+// sort for just the top max_entries by count - this is a top-K query, not
+// a full dump, on purpose (a visualization only ever wants the
+// significant edges, and a long-running server's edge count is otherwise
+// unbounded).
+static int moe_cache_get_co_activation(
+        int cross_layer, ggml_moe_cache_co_activation_entry * out, int max_entries) {
+    if (!out || max_entries <= 0 || g_session_count.load(std::memory_order_acquire) <= 0) {
+        return 0;
+    }
+    std::vector<std::pair<moe_cache_edge, uint32_t>> all;
+    {
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        for (moe_cache_session * session : g_sessions) {
+            std::lock_guard<std::mutex> lock(session->mu);
+            for (const auto & device_ptr : session->devices) {
+                const auto & map = cross_layer ? device_ptr->co_activation_cross_layer
+                                                : device_ptr->co_activation;
+                for (const auto & [edge, count] : map) {
+                    all.emplace_back(edge, count);
+                }
+            }
+        }
+    }
+    const int n = std::min((int) all.size(), max_entries);
+    std::partial_sort(all.begin(), all.begin() + n, all.end(),
+            [](const auto & a, const auto & b) { return a.second > b.second; });
+    for (int i = 0; i < n; i++) {
+        out[i] = {all[i].first.from.tensor, all[i].first.from.expert,
+                  all[i].first.to.tensor,   all[i].first.to.expert,
+                  all[i].second};
+    }
+    return n;
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -5493,6 +5607,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.set_atlas = moe_cache_set_atlas;
+    ggml_moe_cache.get_co_activation = moe_cache_get_co_activation;
     ggml_moe_cache.host_ptr = moe_cache_host_ptr;
     ggml_moe_cache.prefetch = moe_cache_prefetch;
     ggml_moe_cache.prefill_register_successor = moe_cache_prefill_register_successor;

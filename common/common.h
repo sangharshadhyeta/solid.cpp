@@ -1001,6 +1001,25 @@ bool common_moe_cache_set_atlas(
         const void * host_base, const std::vector<int32_t> & expert,
         const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec);
 
+// One co-activation edge, tensor identity still raw (const void *) at this
+// layer - the caller (server_context, which already builds a tensor->layer
+// map for set_atlas above) is responsible for translating to layer numbers,
+// same division of labour set_atlas already has.
+struct common_moe_cache_co_activation_entry {
+    const void * tensor_from;
+    int32_t      expert_from;
+    const void * tensor_to;
+    int32_t      expert_to;
+    uint32_t     count;
+};
+
+// Top-K co-activation edges by count, highest first. cross_layer: false =
+// within one routing decision (undirected), true = layer L's top pick ->
+// layer L+1's (directed). Returns however many were actually available (up
+// to max_entries) - empty if no CUDA moe-cache session exists yet.
+std::vector<common_moe_cache_co_activation_entry> common_moe_cache_get_co_activation(
+        bool cross_layer, int max_entries);
+
 //
 // Model utils
 //
