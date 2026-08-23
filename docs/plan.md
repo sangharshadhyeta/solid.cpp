@@ -118,6 +118,13 @@ reusing the mapping already built for `set_atlas` registration).
   sample size. Not proven harmful either - everything sits within noise of
   baseline.** Stays off by default. Documented plainly rather than kept as
   the earlier, more optimistic read.
+- **Final, n=8**: baseline 58.10 tok/s / 94.83% hit rate, conservative 58.29
+  / 94.19%, speculative 58.00 / 94.05%, spec_agree 58.34 / 94.30%. All four
+  configs land within a ~0.34 tok/s / ~0.78pp band - confirms flat. Tested
+  on a steady single-topic workload, where LFRU alone is already near-
+  optimal - see the design-flaw note below for why this doesn't settle
+  whether the *corrected* design (below) would do better on a topic-switch
+  workload, which is what it's actually meant for.
 
 **Real design flaw found, not yet fixed**: `moe_cache_atlas_warm` competes
 for free slots and evicts probation candidates to admit *new* experts - the
@@ -141,8 +148,52 @@ Separately, all A/B testing so far used a single fixed-topic prompt
 generated start to finish - exactly the regime where LFRU's reactive signal
 is already near-optimal (nothing changes, nothing to predict) and where
 atlas warming (in either the current or the corrected design) has no room to
-show a difference. The real test needs a topic-*switching* workload -
-building one now.
+show a difference. Built a topic-switch test (code-heavy prompt, then an
+immediate hard pivot to medicine, measuring the post-switch request
+specifically) and ran it against the OLD (pre-redesign, admission-competing)
+mechanism before removing it from source. **Real result, not noise**: hit
+rate right after the switch was higher with warming on in **4 of 4 rounds**,
+no exceptions (89.31% avg vs 86.56% off, +2.75pp), at a small tok/s cost
+(58.22 vs 58.40, -0.3%). This is a genuinely different, much stronger signal
+than anything the steady-state tests showed - confirms the workload
+diagnosis was right, and that the underlying concept has real value even in
+the flawed (redundant-with-prefetch) design. Re-testing the corrected
+eviction-weighting design against this same topic-switch workload next, to
+see whether it preserves or improves this result.
+
+**Resolution - three-way comparison, same topic-switch workload, same
+methodology throughout:**
+
+| Variant | Rounds won (of 4) | Hit-rate delta vs. off | tok/s cost |
+|---|---|---|---|
+| Admission only (`moe_cache_atlas_warm`, original) | **4/4** | **+2.75pp** | -0.3% |
+| Eviction-weighting only (the "corrected" redesign) | 3/4 | +0.63pp | -0.15% |
+| Both combined | 1/4 | **-0.95pp (net negative)** | -0.84% |
+
+Two real reversals in sequence, both reported honestly rather than kept as
+the more optimistic earlier read: (1) the theoretically-cleaner eviction-
+weighting redesign measurably underperformed the "redundant" admission
+design it was meant to replace - right after a topic switch, most newly-
+relevant experts genuinely aren't resident yet, so "protect what's already
+there" has nothing to work with until something else brings them in first;
+(2) combining both (on the theory that they're complementary, not
+competing) measured *worse* than either alone, not better - best guess is
+real interference, not addition: the eviction-weighting factor makes
+topically-aligned candidates resist eviction everywhere, including when
+`moe_cache_atlas_warm`'s own admission calls need to evict something to
+make room for a *different* atlas-suggested candidate, so admission ends up
+fighting itself.
+
+**Final state**: reverted to admission-only (`moe_cache_atlas_warm`,
+unchanged from the original design) - the clear, empirically-best performer
+across all three variants tested. `moe_cache_atlas_align_weight` (the
+eviction-weighting factor) was removed from the codebase entirely, not left
+disabled - it measured worse standalone and worse combined, with no
+condition under which it won. Still gated behind
+`GGML_CUDA_MOE_CACHE_ATLAS_WARM`, off by default; the topic-switch result
+(+2.75pp hit rate, 4/4 rounds, small tok/s cost) is real but has not yet
+been re-validated with more rounds the way the steady-state tests were -
+worth doing before considering a default flip.
 
 ## Track 1.5 — CPU-GPU split gap (from FreeToken, never carried over)
 
