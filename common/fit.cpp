@@ -502,7 +502,25 @@ static void common_params_fit_impl(
     // depends on the graph's node count, which depends on the model/backend/speculative config - so
     // rather than guess a number, this search targets extra headroom on top of the configured margin
     // specifically here, where a wrong answer means a hard crash instead of a merely suboptimal one.
-    const int64_t step0_margin = 3 * (int64_t) margins_s[0];
+    // GGML_SCHED_PREFETCH_EXPERTS's double-buffer (ggml-backend.cpp) allocates
+    // lazily, on first use, exactly like the CUDA-graph-capture gap above - a
+    // fit search that approves a placement without knowing this buffer is
+    // coming can leave too little room for it to grow into later, on a real
+    // prompt of a new shape, well after this probe already ran. Measured
+    // directly (llama-bench, pp2048, Gemma-4-26B-A4B, -ncmoe 15): 820 MiB net
+    // extra peak VRAM with the feature on vs off (10402 -> 11222 MiB), for
+    // its own real +13.2% pp2048 win. Reserved here, rounded up for margin,
+    // ONLY when the env var will actually enable it - checked with the exact
+    // same condition ggml-backend.cpp itself uses (set AND atoi() > 0), so a
+    // launch that never turns this on pays nothing extra.
+    int64_t prefetch_margin = 0;
+    {
+        const char * prefetch_env = getenv("GGML_SCHED_PREFETCH_EXPERTS");
+        if (prefetch_env && atoi(prefetch_env) > 0) {
+            prefetch_margin = 1024ll * 1024 * 1024; // 1 GiB, rounded up from the measured 820 MiB
+        }
+    }
+    const int64_t step0_margin = 3 * (int64_t) margins_s[0] + prefetch_margin;
     if (requested_n_ctx > 4 * n_ctx_min) {
         llama_context_params cparams_probe = *cparams;
         cparams_probe.n_ctx = n_ctx_min;
