@@ -44,25 +44,13 @@
 	let stats = $state<ApiExpertMapStats>({});
 	let atlas = $state<ApiExpertAtlas | undefined>(undefined);
 	let probeErr = $state(false);
-	// Track 1 step 5 (docs/plan.md): the 3D pathway/connectome view. Real 3D -
-	// each expert gets an (x, y, z) position (x/y from its measured atlas
-	// affinity, z from its layer depth), rotated by real rotation matrices
-	// under mouse control, projected with real perspective divide, and depth
-	// sorted so nearer geometry draws over farther. Deliberately NOT three.js
-	// or raw WebGL: a connectome of points and lines needs no shaders,
-	// materials, or scene graph, and llama.cpp's UI vendors its dependencies -
-	// adding a 3D engine for two primitive types would cost far more than the
-	// ~60 lines of projection math it replaces. The canvas element is the same
-	// 2D context the atlas view already uses; only the geometry is 3D.
-	//
-	// cross_layer edges carry a known gap (see api.d.ts): some are
-	// same-logical-layer artifacts (gate_up_exps -> down_exps sharing one
-	// router decision), not genuine depth transitions - in this view those
-	// appear as edges with zero z-extent, flat within their own layer plane.
+	// Track 1 step 5 (docs/plan.md): 'atlas' is the flat 2D circle view,
+	// 'pathway' the 3D topic-space sphere - see drawAtlas3D for what the
+	// third dimension actually encodes and why it is topic, not layer.
 	let viewMode = $state<'atlas' | 'pathway'>('atlas');
-	// Camera state for the pathway view. yaw/pitch in radians, zoom a plain
-	// scalar. Tilted slightly off-axis by default so the layer stack reads as
-	// depth immediately rather than looking like a flat disc on first paint.
+	// Camera state for the 3D view. yaw/pitch in radians, zoom a plain
+	// scalar. Tilted slightly off-axis by default so the sphere reads as a
+	// volume immediately rather than looking like a flat disc on first paint.
 	let camYaw = $state(0.6);
 	let camPitch = $state(-0.35);
 	let camZoom = $state(1);
@@ -357,22 +345,45 @@
 	}
 
 	/**
-	 * Track 1 step 5: the 3D pathway/connectome view.
+	 * Track 1 step 5: the 3D topic-space atlas.
 	 *
-	 * Real 3D, not an isometric fake: every expert has an (x, y, z) world
-	 * position, gets rotated by yaw/pitch rotation matrices, and is projected
-	 * through a real perspective divide. Painter's algorithm (sort by camera-
-	 * space depth, draw far to near) handles occlusion, which is all a scene
-	 * of points and lines needs - no depth buffer, no shaders, no scene graph,
-	 * hence no 3D engine dependency.
+	 * Real 3D: every expert gets an (x, y, z) position, rotated by real
+	 * yaw/pitch matrices and projected through a real perspective divide,
+	 * with painter's-algorithm depth sorting. No three.js / WebGL - a scene
+	 * of points and lines needs no shaders, materials, or scene graph, and
+	 * llama.cpp's UI vendors its dependencies, so a 3D engine would cost far
+	 * more than the projection math it replaces.
 	 *
-	 * The reason a pathway view wants depth at all: the flat atlas answers
-	 * "which topic is this expert for", but a token's real journey is a
-	 * *sequence* through layers, and that sequence is exactly what the
-	 * cross-layer co-activation edges record. Stacking layers along z turns
-	 * those edges from meaningless chords on a disc into visible trajectories.
+	 * The third dimension is TOPIC, not layer depth - the first version of
+	 * this put layer on z, which was the wrong axis. Layer is a single
+	 * scalar the layer x expert grid already shows perfectly well; topic
+	 * affinity is genuinely N-dimensional (9 categories today) and *that* is
+	 * where the information is being lost. Measured on a real Ornith atlas:
+	 * collapsing to the 2D circle puts 22% of experts (2136 of 9863, the
+	 * ones firing on exactly two categories) on straight chords between two
+	 * anchors, and dumps every all-category generalist on the origin next to
+	 * every expert that fired on nothing.
+	 *
+	 * Category anchors are placed on the unit sphere by the Fibonacci
+	 * (golden-angle) spiral, which is near-equidistant for any N. That also
+	 * fixes a second flaw in the circle: on a circle the anchors sit at equal
+	 * angles in *array order*, inventing an adjacency nobody measured -
+	 * "code" ends up beside "math" and, wrapping around, beside "history",
+	 * purely from position in k_probes[]. On a sphere no arbitrary pairing
+	 * dominates. An expert's position is the convex combination of its
+	 * category anchors weighted by cats[], so a pure specialist sits on the
+	 * sphere surface at its anchor and a generalist sits near the centre.
+	 *
+	 * Performance: this runs on a machine that is usually also serving the
+	 * model, so it deliberately avoids per-frame work proportional to the
+	 * full cell count where it can. Cold (never-cached) experts are the vast
+	 * majority and carry no live signal, so they are drawn as 1px fillRect
+	 * (far cheaper than arc+fill) and skipped by the depth sort entirely -
+	 * only the live points and edges, a few hundred at most, are sorted.
+	 * Redraws during a drag are coalesced onto requestAnimationFrame rather
+	 * than run per mousemove event.
 	 */
-	function drawPathway(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) {
+	function drawAtlas3D(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) {
 		if (!atlas) return;
 
 		canvas.width = wrapSize.w;
@@ -381,107 +392,162 @@
 		canvas.style.height = `${canvas.height}px`;
 		ctx.clearRect(0, 0, canvas.width, canvas.height);
 
+		const cats = atlas.categories;
+		const nCat = cats.length;
+		if (!nCat) return;
+
 		const cx = canvas.width / 2;
 		const cy = canvas.height / 2;
-		const scale = Math.min(canvas.width, canvas.height) * 0.36 * camZoom;
-		const nLayer = Math.max(1, atlas.n_layer);
+		const scale = Math.min(canvas.width, canvas.height) * 0.34 * camZoom;
+
+		// Fibonacci sphere: near-equidistant anchors for any category count,
+		// deterministic so positions are stable between runs and models.
+		const anchors = new Map<string, [number, number, number]>();
+		const golden = Math.PI * (3 - Math.sqrt(5));
+		for (let i = 0; i < nCat; i++) {
+			const z = 1 - (2 * (i + 0.5)) / nCat;
+			const r = Math.sqrt(Math.max(0, 1 - z * z));
+			const th = golden * i;
+			anchors.set(cats[i], [r * Math.cos(th), r * Math.sin(th), z]);
+		}
 
 		const cosY = Math.cos(camYaw), sinY = Math.sin(camYaw);
 		const cosP = Math.cos(camPitch), sinP = Math.sin(camPitch);
-		// Camera sits back along +z; large enough that perspective reads as
-		// depth without the near planes exploding when zoomed in.
-		const camDist = 3.2;
+		const camDist = 3.4;
 
-		// World -> camera -> screen. Layer depth is centred on 0 so rotation
-		// pivots through the middle of the stack rather than its first layer.
-		const project = (x: number, y: number, layer: number) => {
-			const z0 = (layer / (nLayer - 1 || 1) - 0.5) * 2.2;
-			// yaw about the vertical axis, then pitch about the horizontal
-			const x1 = x * cosY + z0 * sinY;
-			const z1 = -x * sinY + z0 * cosY;
+		const project = (x: number, y: number, z: number) => {
+			const x1 = x * cosY + z * sinY;
+			const z1 = -x * sinY + z * cosY;
 			const y2 = y * cosP - z1 * sinP;
 			const z2 = y * sinP + z1 * cosP;
-			const w = camDist / (camDist - z2); // perspective divide
+			const w = camDist / (camDist - z2);
 			return { sx: cx + x1 * scale * w, sy: cy + y2 * scale * w, depth: z2, w };
 		};
 
-		type Pt = { sx: number; sy: number; depth: number; w: number; cell: ApiExpertAtlasCell };
-		const pts = new Map<string, Pt>();
-		const drawList: Pt[] = [];
-		for (const cell of atlas.cells) {
-			const p = project(cell.x, cell.y, cell.layer);
-			const pt = { ...p, cell };
-			pts.set(`${cell.layer}:${cell.expert}`, pt);
-			drawList.push(pt);
-		}
-
-		// Faint layer-plane rings, so the stack reads as discrete layers
-		// rather than a diffuse cloud. Drawn first, behind everything.
+		// Wireframe sphere: three great circles, enough to read orientation
+		// while orbiting without drawing a full mesh.
+		ctx.strokeStyle = 'rgba(148, 163, 184, 0.10)';
 		ctx.lineWidth = 1;
-		for (let l = 0; l < nLayer; l += Math.max(1, Math.floor(nLayer / 8))) {
+		for (let axis = 0; axis < 3; axis++) {
 			ctx.beginPath();
-			for (let a = 0; a <= 48; a++) {
-				const ang = (a / 48) * Math.PI * 2;
-				const p = project(Math.cos(ang), Math.sin(ang), l);
+			for (let a = 0; a <= 60; a++) {
+				const t = (a / 60) * Math.PI * 2;
+				const c = Math.cos(t), s = Math.sin(t);
+				const p =
+					axis === 0 ? project(c, s, 0) : axis === 1 ? project(c, 0, s) : project(0, c, s);
 				if (a === 0) ctx.moveTo(p.sx, p.sy);
 				else ctx.lineTo(p.sx, p.sy);
 			}
-			ctx.strokeStyle = 'rgba(148, 163, 184, 0.10)';
 			ctx.stroke();
 		}
 
-		// Edges, depth-sorted with the points in one painter's pass so an
-		// edge behind a layer plane is genuinely drawn behind it.
+		type Pt = { sx: number; sy: number; depth: number; w: number; cell: ApiExpertAtlasCell };
+		const pts = new Map<string, Pt>();
+		const live: Pt[] = [];
+
+		// Cold points: cheap path. Drawn immediately as 1px rects, never
+		// sorted - they are background texture, and there are thousands.
+		ctx.fillStyle = 'rgba(58, 71, 80, 0.5)';
+		for (const cell of atlas.cells) {
+			let px = 0, py = 0, pz = 0;
+			if (cell.cats) {
+				for (const k in cell.cats) {
+					const a = anchors.get(k);
+					if (!a) continue;
+					const p = cell.cats[k];
+					px += p * a[0];
+					py += p * a[1];
+					pz += p * a[2];
+				}
+			} else {
+				// Atlas predates the cats field - fall back to the flat 2D
+				// position rather than silently placing it at the centre.
+				px = cell.x;
+				py = cell.y;
+			}
+			const pr = project(px, py, pz);
+			const [, , , tier] = cellColor(cell.layer, cell.expert);
+			if (tier === 0) {
+				ctx.fillRect(pr.sx, pr.sy, 1, 1);
+				continue;
+			}
+			const pt = { ...pr, cell };
+			pts.set(`${cell.layer}:${cell.expert}`, pt);
+			live.push(pt);
+		}
+
+		// Co-activation edges. In topic space these read as "these two
+		// regions fire together" rather than as trajectories through depth.
 		type Seg = { a: Pt; b: Pt; rgb: string; weight: number; depth: number };
 		const segs: Seg[] = [];
 		const collect = (edges: ApiCoActivationEdge[] | undefined, rgb: string) => {
 			if (!edges?.length) return;
-			const maxCount = Math.max(...edges.map((e) => e.count));
+			let maxCount = 1;
+			for (const e of edges) if (e.count > maxCount) maxCount = e.count;
 			for (const e of edges) {
 				const a = pts.get(`${e.layer_from}:${e.expert_from}`);
 				const b = pts.get(`${e.layer_to}:${e.expert_to}`);
 				if (!a || !b) continue;
-				segs.push({
-					a,
-					b,
-					rgb,
-					weight: maxCount > 0 ? e.count / maxCount : 0,
-					depth: (a.depth + b.depth) / 2
-				});
+				segs.push({ a, b, rgb, weight: e.count / maxCount, depth: (a.depth + b.depth) / 2 });
 			}
 		};
 		collect(stats.co_activation_cross_layer, '90,155,216');
 		collect(stats.co_activation_within_layer, '78,214,165');
 
-		const items: ({ kind: 'seg'; v: Seg } | { kind: 'pt'; v: Pt })[] = [
-			...segs.map((v) => ({ kind: 'seg' as const, v })),
-			...drawList.map((v) => ({ kind: 'pt' as const, v }))
+		// Only live points + edges get sorted - a few hundred, not ~10k.
+		const items: ({ k: 0; v: Seg } | { k: 1; v: Pt })[] = [
+			...segs.map((v) => ({ k: 0 as const, v })),
+			...live.map((v) => ({ k: 1 as const, v }))
 		];
-		items.sort((l, r) => l.v.depth - r.v.depth); // far (small z) first
+		items.sort((l, r) => l.v.depth - r.v.depth);
 
 		for (const item of items) {
-			if (item.kind === 'seg') {
+			if (item.k === 0) {
 				const { a, b, rgb, weight } = item.v;
 				ctx.beginPath();
 				ctx.moveTo(a.sx, a.sy);
 				ctx.lineTo(b.sx, b.sy);
-				ctx.strokeStyle = `rgba(${rgb},${(0.08 + weight * 0.42).toFixed(3)})`;
-				ctx.lineWidth = (0.5 + weight * 2) * item.v.a.w;
+				ctx.strokeStyle = `rgba(${rgb},${(0.08 + weight * 0.4).toFixed(3)})`;
+				ctx.lineWidth = (0.5 + weight * 2) * a.w;
 				ctx.stroke();
 			} else {
 				const { sx, sy, w, cell } = item.v;
-				const [rr, gg, bb, tier] = cellColor(cell.layer, cell.expert);
-				const r = (tier === 0 ? ATLAS_POINT_R * 0.5 : ATLAS_POINT_R + cell.spec * 2) * w;
+				const [rr, gg, bb] = cellColor(cell.layer, cell.expert);
 				ctx.beginPath();
-				ctx.arc(sx, sy, Math.max(0.5, r), 0, 2 * Math.PI);
-				ctx.fillStyle = `rgba(${rr},${gg},${bb},${tier === 0 ? 0.22 : 0.9})`;
+				ctx.arc(sx, sy, Math.max(0.8, (ATLAS_POINT_R + cell.spec * 2) * w), 0, 2 * Math.PI);
+				ctx.fillStyle = `rgba(${rr},${gg},${bb},0.9)`;
 				ctx.fill();
-				if (tier > 0) {
-					ctx.lineWidth = 1;
-					ctx.strokeStyle = 'rgba(226, 232, 240, 0.6)';
-					ctx.stroke();
-				}
 			}
+		}
+
+		// Category labels last, on the sphere surface at their anchors, dimmed
+		// when facing away so the far side does not compete with the near.
+		ctx.font = '11px sans-serif';
+		ctx.textAlign = 'center';
+		ctx.textBaseline = 'middle';
+		for (const [name, a] of anchors) {
+			const p = project(a[0] * 1.12, a[1] * 1.12, a[2] * 1.12);
+			ctx.fillStyle = `rgba(148, 163, 184, ${p.depth > 0 ? 0.9 : 0.32})`;
+			ctx.fillText(name, p.sx, p.sy);
+		}
+
+		// Live request-direction marker. req_dir is a 2D centroid in the old
+		// circle space, so it has no z - drawn on the equatorial plane, which
+		// is where a 2D-derived signal honestly belongs rather than faking a
+		// depth it never had.
+		if (stats.req_dir) {
+			let { x: rx, y: ry } = stats.req_dir;
+			const mag = Math.hypot(rx, ry);
+			if (mag > 1) {
+				rx /= mag;
+				ry /= mag;
+			}
+			const p = project(rx, ry, 0);
+			ctx.beginPath();
+			ctx.arc(p.sx, p.sy, 8 * p.w, 0, 2 * Math.PI);
+			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
+			ctx.lineWidth = 2;
+			ctx.stroke();
 		}
 	}
 
@@ -497,7 +563,7 @@
 
 		if (useAtlas) {
 			if (viewMode === 'pathway') {
-				drawPathway(ctx, canvas);
+				drawAtlas3D(ctx, canvas);
 			} else {
 				drawAtlas(ctx, canvas);
 			}
@@ -605,21 +671,34 @@
 		dragging = false;
 	}
 
+	// Coalesce redraws onto the next animation frame: mousemove can fire far
+	// faster than the display refreshes, and this machine is usually also
+	// busy serving the model - drawing per event would burn CPU for frames
+	// nobody ever sees.
+	let camRaf = 0;
+	function requestCamDraw() {
+		if (camRaf) return;
+		camRaf = requestAnimationFrame(() => {
+			camRaf = 0;
+			draw();
+		});
+	}
+
 	function onPathwayMove(e: MouseEvent) {
 		if (!dragging) return;
 		camYaw += (e.clientX - dragLastX) * 0.008;
-		// Clamped so the stack can't be tipped past vertical, where the
-		// layer planes degenerate to lines and the view becomes unreadable.
+		// Clamped short of straight-down/up, where the sphere's great circles
+		// degenerate to lines and orientation becomes unreadable.
 		camPitch = Math.max(-1.4, Math.min(1.4, camPitch + (e.clientY - dragLastY) * 0.008));
 		dragLastX = e.clientX;
 		dragLastY = e.clientY;
-		draw();
+		requestCamDraw();
 	}
 
 	function onPathwayWheel(e: WheelEvent) {
 		e.preventDefault();
 		camZoom = Math.max(0.4, Math.min(3, camZoom * (e.deltaY > 0 ? 0.92 : 1.08)));
-		draw();
+		requestCamDraw();
 	}
 
 	function onMove(e: MouseEvent) {
@@ -728,7 +807,7 @@
 						onclick={() => {
 							viewMode = 'pathway';
 							draw();
-						}}>Pathway 3D</button
+						}}>Atlas 3D</button
 					>
 				</div>
 			{/if}
