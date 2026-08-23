@@ -1321,6 +1321,94 @@ static bool moe_cache_moe_lfru_copy_expert(
     return true;
 }
 
+// Batched form of moe_cache_moe_lfru_copy_expert - see the doc comment on
+// ggml_moe_cache.moe_lfru_copy_experts in ggml-backend-moe-cache.h for why
+// this exists (one shared reader-release callback for a whole tensor's hits,
+// instead of one cudaLaunchHostFunc per expert). Structurally the same
+// residency scan and D2D issue as the single-expert version, just over a
+// list with one session->mu critical section and one callback for all of it.
+static int moe_cache_moe_lfru_copy_experts(
+        const void * host_base, size_t expert_size, const int32_t * ids, int n_ids,
+        void * dst_base_, uint8_t * out_hit, void * backend_) {
+    if (!host_base || !ids || n_ids <= 0 || !dst_base_ || !out_hit || !backend_) {
+        return 0;
+    }
+    char * dst_base = (char *) dst_base_;
+    cudaStream_t stream = ((ggml_backend_cuda_context *) ((ggml_backend *) backend_)->context)->stream();
+    moe_cache_session * session = nullptr;
+    moe_cache_device * device_ptr = moe_cache_prefill_first_session_and_device(&session);
+    if (!device_ptr || !session) {
+        return 0;
+    }
+    moe_cache_device & device = *device_ptr;
+
+    auto release_ctx = std::make_unique<moe_cache_prefill_reader_release_ctx>();
+    release_ctx->session = session;
+    int n_hits = 0;
+    {
+        std::lock_guard<std::mutex> slock(session->mu);
+        for (int i = 0; i < n_ids; i++) {
+            const int32_t expert = ids[i];
+            if (expert < 0) {
+                continue;
+            }
+            const moe_cache_key key{host_base, expert};
+            const void * src_ptr = nullptr;
+            for (const auto & pool_ptr : device.pools) {
+                if (pool_ptr->expert_size != expert_size) {
+                    continue;
+                }
+                auto found = pool_ptr->map.find(key);
+                if (found == pool_ptr->map.end()) {
+                    break; // an expert lives in exactly one pool shape
+                }
+                moe_cache_slot & pslot = pool_ptr->slots[found->second];
+                if (pslot.state == moe_cache_slot_state::valid) {
+                    src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                    pslot.readers++;
+                    release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+                }
+                break;
+            }
+            if (!src_ptr) {
+                continue;
+            }
+            // dst is positioned by expert id, not by this id's position in the
+            // ids[] list - the destination tensor is laid out in expert-index
+            // order regardless of what order the caller happened to list ids in.
+            if (!moe_cache_cuda_ok(device,
+                    cudaMemcpyAsync(dst_base + (size_t) expert * expert_size, src_ptr, expert_size,
+                            cudaMemcpyDeviceToDevice, stream),
+                    "lfru batch expert D2D copy", false)) {
+                // this one failed to queue - undo the pin we just took for it,
+                // the rest of the batch (already queued) still proceeds
+                if (!release_ctx->pins.empty()) {
+                    release_ctx->pins.pop_back();
+                }
+                continue;
+            }
+            out_hit[i] = 1;
+            n_hits++;
+        }
+    }
+    if (n_hits == 0) {
+        return 0; // release_ctx (empty pins) is simply dropped, nothing to release
+    }
+    moe_cache_prefill_reader_release_ctx * raw = release_ctx.release();
+    if (!moe_cache_cuda_ok(device,
+            cudaLaunchHostFunc(stream, moe_cache_prefill_release_readers_cb, raw),
+            "lfru batch reader-release enqueue", false)) {
+        moe_cache_prefill_release_readers_cb(raw);
+    }
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        static std::atomic<long long> hits{0};
+        hits += n_hits;
+        fprintf(stderr, "[lfru-copy-batch-hit] host_base=%p n_ids=%d n_hits=%d cum_hits=%lld\n",
+                host_base, n_ids, n_hits, (long long) hits.load());
+    }
+    return n_hits;
+}
+
 // Splits one successor tensor's copy into per-expert-row hit/miss: rows
 // already resident in the decode-time LFRU pool are gathered
 // device-to-device (no PCIe cost - see moe_cache_prefill_release_readers_cb
@@ -2728,6 +2816,11 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.dispatch_failures, device.collect_failures);
 }
 
+// Defined near the end of the file, alongside the rest of the bandwidth
+// profiling machinery it belongs with; forward-declared here since
+// moe_cache_session_create is the natural one-shot-per-device trigger point.
+static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device);
+
 static void * moe_cache_session_create(void * const * backends, int n_backends) {
     try {
         moe_cache_config config = moe_cache_read_config();
@@ -2773,6 +2866,7 @@ static void * moe_cache_session_create(void * const * backends, int n_backends) 
             }
 
             session->devices.emplace_back(new moe_cache_device(physical));
+            moe_cache_maybe_profile_bandwidth(*session->devices.back());
         }
 
         // A single eligible device is enough for automatic mode: the live
@@ -4722,6 +4816,139 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
     }
 }
 
+// Bandwidth profiling: standalone vs. contended H2D throughput for a
+// realistic expert-sized transfer. Standalone-then-subtract badly
+// over/under-penalizes a real fetch (see FreeToken's benchbw.py
+// measure_overlap_bw for the same lesson in a different contention pair,
+// CPU compute vs. PCIe gather) - the number that actually matters is what
+// bandwidth a fetch achieves while the GPU is ALSO busy, since that's the
+// condition every real re-fetch of an evicted expert happens under. This
+// is the missing cost term a future cost-aware (GreedyDual-Size-style)
+// eviction policy needs - "how expensive, in real achieved time, is it to
+// re-fetch this expert" - not yet wired into eviction decisions, which
+// still use plain LFRU recency; this only measures and reports.
+struct moe_cache_bandwidth_profile {
+    double standalone_gbs = 0.0;
+    double contended_gbs = 0.0;
+};
+
+static bool moe_cache_measure_bandwidth(moe_cache_device & device, moe_cache_bandwidth_profile & out) {
+    ggml_cuda_set_device(device.physical);
+
+    const size_t sample_bytes = 256u << 20;    // realistic gate_up-sized expert tensor
+    const size_t contender_bytes = 512u << 20; // kept busy on its own stream throughout
+
+    void * h_src = nullptr;
+    if (cudaMallocHost(&h_src, sample_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    void * d_dst = nullptr;
+    void * d_contender_a = nullptr;
+    void * d_contender_b = nullptr;
+    cudaStream_t measure_stream = nullptr;
+    cudaStream_t contend_stream = nullptr;
+    const bool ok =
+            cudaMalloc(&d_dst, sample_bytes) == cudaSuccess &&
+            cudaMalloc(&d_contender_a, contender_bytes) == cudaSuccess &&
+            cudaMalloc(&d_contender_b, contender_bytes) == cudaSuccess &&
+            cudaStreamCreateWithFlags(&measure_stream, cudaStreamNonBlocking) == cudaSuccess &&
+            cudaStreamCreateWithFlags(&contend_stream, cudaStreamNonBlocking) == cudaSuccess;
+    if (!ok) {
+        (void) cudaGetLastError();
+        if (d_dst) cudaFree(d_dst);
+        if (d_contender_a) cudaFree(d_contender_a);
+        if (d_contender_b) cudaFree(d_contender_b);
+        if (measure_stream) cudaStreamDestroy(measure_stream);
+        if (contend_stream) cudaStreamDestroy(contend_stream);
+        cudaFreeHost(h_src);
+        return false;
+    }
+
+    // contend: when true, re-queues one D2D copy on contend_stream right
+    // before each H2D copy on measure_stream, so the contention traffic is
+    // interleaved with (not just issued before) the measured window - an
+    // earlier version queued all the D2D contention up front, which could
+    // finish draining before the H2D measurement even started and measured
+    // near-zero contention effect as a result (100% of standalone,
+    // confirmed live). Bounded by construction: exactly `runs` D2D copies
+    // per call (runs * 512 MiB = 4 GiB for the default runs=8), so this can
+    // never queue an unbounded amount regardless of actual D2D throughput.
+    auto time_h2d_runs = [&](int runs, bool contend) -> double {
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaStreamSynchronize(measure_stream);
+        cudaEventRecord(start, measure_stream);
+        for (int i = 0; i < runs; i++) {
+            if (contend) {
+                cudaMemcpyAsync(d_contender_b, d_contender_a, contender_bytes,
+                        cudaMemcpyDeviceToDevice, contend_stream);
+            }
+            cudaMemcpyAsync(d_dst, h_src, sample_bytes, cudaMemcpyHostToDevice, measure_stream);
+        }
+        cudaEventRecord(stop, measure_stream);
+        cudaEventSynchronize(stop);
+        float ms = 0.0f;
+        cudaEventElapsedTime(&ms, start, stop);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+        return (double) sample_bytes * runs / (ms / 1000.0) / 1e9;
+    };
+
+    const int runs = 8;
+    time_h2d_runs(2, false); // warm (page faults, clocks) - not measured
+
+    out.standalone_gbs = time_h2d_runs(runs, false);
+    out.contended_gbs = time_h2d_runs(runs, true);
+
+    cudaStreamSynchronize(contend_stream); // drain before teardown - bounded by time_h2d_runs' own call count
+    cudaFree(d_dst);
+    cudaFree(d_contender_a);
+    cudaFree(d_contender_b);
+    cudaStreamDestroy(measure_stream);
+    cudaStreamDestroy(contend_stream);
+    cudaFreeHost(h_src);
+    return true;
+}
+
+// Opt-in (GGML_CUDA_MOE_BANDWIDTH_PROFILE=1), runs once per physical device
+// for the life of the process. Logged directly with fprintf, not gated
+// behind MOE_CACHE_DEBUG_GATE - this is a deliberate diagnostic invocation
+// the caller asked for, not incidental debug noise.
+//
+// Latched by physical device id in a static set, not a moe_cache_device
+// member: moe_cache_session_create runs multiple times per process (once
+// per graph-reserve/probe pass during model load - the same pattern this
+// file's other one-shot-per-device logic has had to account for
+// elsewhere), each time constructing a FRESH moe_cache_device object, so a
+// per-object flag resets every time and never actually latches. Measured
+// live: without this fix the profile ran nine times in a single launch.
+static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device) {
+    static const bool requested = getenv("GGML_CUDA_MOE_BANDWIDTH_PROFILE") != nullptr;
+    if (!requested) {
+        return;
+    }
+    static std::mutex latch_mu;
+    static std::unordered_set<int> profiled_physical_devices;
+    {
+        std::lock_guard<std::mutex> lock(latch_mu);
+        if (!profiled_physical_devices.insert(device.physical).second) {
+            return; // already profiled this physical device this process
+        }
+    }
+    moe_cache_bandwidth_profile profile;
+    if (!moe_cache_measure_bandwidth(device, profile)) {
+        fprintf(stderr, "[moe-cache-bandwidth] CUDA%d: measurement failed\n", device.physical);
+        return;
+    }
+    fprintf(stderr,
+            "[moe-cache-bandwidth] CUDA%d: standalone=%.2f GB/s contended=%.2f GB/s "
+            "(%.0f%% of standalone under concurrent GPU memory traffic)\n",
+            device.physical, profile.standalone_gbs, profile.contended_gbs,
+            profile.standalone_gbs > 0.0 ? 100.0 * profile.contended_gbs / profile.standalone_gbs : 0.0);
+}
+
 void ggml_moe_cache_register(const void * owner) {
     if (ggml_moe_cache.owner && ggml_moe_cache.owner != owner) {
         return;
@@ -4748,6 +4975,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prefill_wait = moe_cache_prefill_wait;
     ggml_moe_cache.prefill_release = moe_cache_prefill_release;
     ggml_moe_cache.moe_lfru_copy_expert = moe_cache_moe_lfru_copy_expert;
+    ggml_moe_cache.moe_lfru_copy_experts = moe_cache_moe_lfru_copy_experts;
 }
 
 #endif
