@@ -15,7 +15,12 @@
 	import { Flame } from '@lucide/svelte';
 	import { ExpertsService } from '$lib/services';
 	import { serverStore } from '$lib/stores/server.svelte';
-	import type { ApiExpertAtlas, ApiExpertAtlasCell, ApiExpertMapStats } from '$lib/types/api';
+	import type {
+		ApiCoActivationEdge,
+		ApiExpertAtlas,
+		ApiExpertAtlasCell,
+		ApiExpertMapStats
+	} from '$lib/types/api';
 
 	const TIER_LABELS = ['not cached', 'warm (probation)', 'hot (protected)'];
 	const TIER_RGB: [number, number, number][] = [
@@ -39,6 +44,31 @@
 	let stats = $state<ApiExpertMapStats>({});
 	let atlas = $state<ApiExpertAtlas | undefined>(undefined);
 	let probeErr = $state(false);
+	// Track 1 step 5 (docs/plan.md): the 3D pathway/connectome view. Real 3D -
+	// each expert gets an (x, y, z) position (x/y from its measured atlas
+	// affinity, z from its layer depth), rotated by real rotation matrices
+	// under mouse control, projected with real perspective divide, and depth
+	// sorted so nearer geometry draws over farther. Deliberately NOT three.js
+	// or raw WebGL: a connectome of points and lines needs no shaders,
+	// materials, or scene graph, and llama.cpp's UI vendors its dependencies -
+	// adding a 3D engine for two primitive types would cost far more than the
+	// ~60 lines of projection math it replaces. The canvas element is the same
+	// 2D context the atlas view already uses; only the geometry is 3D.
+	//
+	// cross_layer edges carry a known gap (see api.d.ts): some are
+	// same-logical-layer artifacts (gate_up_exps -> down_exps sharing one
+	// router decision), not genuine depth transitions - in this view those
+	// appear as edges with zero z-extent, flat within their own layer plane.
+	let viewMode = $state<'atlas' | 'pathway'>('atlas');
+	// Camera state for the pathway view. yaw/pitch in radians, zoom a plain
+	// scalar. Tilted slightly off-axis by default so the layer stack reads as
+	// depth immediately rather than looking like a flat disc on first paint.
+	let camYaw = $state(0.6);
+	let camPitch = $state(-0.35);
+	let camZoom = $state(1);
+	let dragging = false;
+	let dragLastX = 0;
+	let dragLastY = 0;
 
 	// Where the model actually lives, and why it was split that way. Static
 	// per launch (unlike everything else here, which polls), so it reads from
@@ -326,6 +356,135 @@
 		}
 	}
 
+	/**
+	 * Track 1 step 5: the 3D pathway/connectome view.
+	 *
+	 * Real 3D, not an isometric fake: every expert has an (x, y, z) world
+	 * position, gets rotated by yaw/pitch rotation matrices, and is projected
+	 * through a real perspective divide. Painter's algorithm (sort by camera-
+	 * space depth, draw far to near) handles occlusion, which is all a scene
+	 * of points and lines needs - no depth buffer, no shaders, no scene graph,
+	 * hence no 3D engine dependency.
+	 *
+	 * The reason a pathway view wants depth at all: the flat atlas answers
+	 * "which topic is this expert for", but a token's real journey is a
+	 * *sequence* through layers, and that sequence is exactly what the
+	 * cross-layer co-activation edges record. Stacking layers along z turns
+	 * those edges from meaningless chords on a disc into visible trajectories.
+	 */
+	function drawPathway(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) {
+		if (!atlas) return;
+
+		canvas.width = wrapSize.w;
+		canvas.height = wrapSize.h;
+		canvas.style.width = `${canvas.width}px`;
+		canvas.style.height = `${canvas.height}px`;
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+		const cx = canvas.width / 2;
+		const cy = canvas.height / 2;
+		const scale = Math.min(canvas.width, canvas.height) * 0.36 * camZoom;
+		const nLayer = Math.max(1, atlas.n_layer);
+
+		const cosY = Math.cos(camYaw), sinY = Math.sin(camYaw);
+		const cosP = Math.cos(camPitch), sinP = Math.sin(camPitch);
+		// Camera sits back along +z; large enough that perspective reads as
+		// depth without the near planes exploding when zoomed in.
+		const camDist = 3.2;
+
+		// World -> camera -> screen. Layer depth is centred on 0 so rotation
+		// pivots through the middle of the stack rather than its first layer.
+		const project = (x: number, y: number, layer: number) => {
+			const z0 = (layer / (nLayer - 1 || 1) - 0.5) * 2.2;
+			// yaw about the vertical axis, then pitch about the horizontal
+			const x1 = x * cosY + z0 * sinY;
+			const z1 = -x * sinY + z0 * cosY;
+			const y2 = y * cosP - z1 * sinP;
+			const z2 = y * sinP + z1 * cosP;
+			const w = camDist / (camDist - z2); // perspective divide
+			return { sx: cx + x1 * scale * w, sy: cy + y2 * scale * w, depth: z2, w };
+		};
+
+		type Pt = { sx: number; sy: number; depth: number; w: number; cell: ApiExpertAtlasCell };
+		const pts = new Map<string, Pt>();
+		const drawList: Pt[] = [];
+		for (const cell of atlas.cells) {
+			const p = project(cell.x, cell.y, cell.layer);
+			const pt = { ...p, cell };
+			pts.set(`${cell.layer}:${cell.expert}`, pt);
+			drawList.push(pt);
+		}
+
+		// Faint layer-plane rings, so the stack reads as discrete layers
+		// rather than a diffuse cloud. Drawn first, behind everything.
+		ctx.lineWidth = 1;
+		for (let l = 0; l < nLayer; l += Math.max(1, Math.floor(nLayer / 8))) {
+			ctx.beginPath();
+			for (let a = 0; a <= 48; a++) {
+				const ang = (a / 48) * Math.PI * 2;
+				const p = project(Math.cos(ang), Math.sin(ang), l);
+				if (a === 0) ctx.moveTo(p.sx, p.sy);
+				else ctx.lineTo(p.sx, p.sy);
+			}
+			ctx.strokeStyle = 'rgba(148, 163, 184, 0.10)';
+			ctx.stroke();
+		}
+
+		// Edges, depth-sorted with the points in one painter's pass so an
+		// edge behind a layer plane is genuinely drawn behind it.
+		type Seg = { a: Pt; b: Pt; rgb: string; weight: number; depth: number };
+		const segs: Seg[] = [];
+		const collect = (edges: ApiCoActivationEdge[] | undefined, rgb: string) => {
+			if (!edges?.length) return;
+			const maxCount = Math.max(...edges.map((e) => e.count));
+			for (const e of edges) {
+				const a = pts.get(`${e.layer_from}:${e.expert_from}`);
+				const b = pts.get(`${e.layer_to}:${e.expert_to}`);
+				if (!a || !b) continue;
+				segs.push({
+					a,
+					b,
+					rgb,
+					weight: maxCount > 0 ? e.count / maxCount : 0,
+					depth: (a.depth + b.depth) / 2
+				});
+			}
+		};
+		collect(stats.co_activation_cross_layer, '90,155,216');
+		collect(stats.co_activation_within_layer, '78,214,165');
+
+		const items: ({ kind: 'seg'; v: Seg } | { kind: 'pt'; v: Pt })[] = [
+			...segs.map((v) => ({ kind: 'seg' as const, v })),
+			...drawList.map((v) => ({ kind: 'pt' as const, v }))
+		];
+		items.sort((l, r) => l.v.depth - r.v.depth); // far (small z) first
+
+		for (const item of items) {
+			if (item.kind === 'seg') {
+				const { a, b, rgb, weight } = item.v;
+				ctx.beginPath();
+				ctx.moveTo(a.sx, a.sy);
+				ctx.lineTo(b.sx, b.sy);
+				ctx.strokeStyle = `rgba(${rgb},${(0.08 + weight * 0.42).toFixed(3)})`;
+				ctx.lineWidth = (0.5 + weight * 2) * item.v.a.w;
+				ctx.stroke();
+			} else {
+				const { sx, sy, w, cell } = item.v;
+				const [rr, gg, bb, tier] = cellColor(cell.layer, cell.expert);
+				const r = (tier === 0 ? ATLAS_POINT_R * 0.5 : ATLAS_POINT_R + cell.spec * 2) * w;
+				ctx.beginPath();
+				ctx.arc(sx, sy, Math.max(0.5, r), 0, 2 * Math.PI);
+				ctx.fillStyle = `rgba(${rr},${gg},${bb},${tier === 0 ? 0.22 : 0.9})`;
+				ctx.fill();
+				if (tier > 0) {
+					ctx.lineWidth = 1;
+					ctx.strokeStyle = 'rgba(226, 232, 240, 0.6)';
+					ctx.stroke();
+				}
+			}
+		}
+	}
+
 	function draw() {
 		const canvas = canvasEl;
 		const useAtlas = !!atlas?.cells.length;
@@ -337,7 +496,11 @@
 		if (!ctx) return;
 
 		if (useAtlas) {
-			drawAtlas(ctx, canvas);
+			if (viewMode === 'pathway') {
+				drawPathway(ctx, canvas);
+			} else {
+				drawAtlas(ctx, canvas);
+			}
 
 			if (rows && cols && pipCanvasEl) {
 				const pipCtx = pipCanvasEl.getContext('2d');
@@ -428,7 +591,43 @@
 		};
 	}
 
+	// Pathway-view camera controls: drag to orbit, wheel to zoom. Kept
+	// separate from the atlas view's hover-tooltip handler rather than
+	// branching inside it - they want opposite things from a mousemove
+	// (one tracks a cursor position, the other a delta since last frame).
+	function onPathwayDown(e: MouseEvent) {
+		dragging = true;
+		dragLastX = e.clientX;
+		dragLastY = e.clientY;
+	}
+
+	function onPathwayUp() {
+		dragging = false;
+	}
+
+	function onPathwayMove(e: MouseEvent) {
+		if (!dragging) return;
+		camYaw += (e.clientX - dragLastX) * 0.008;
+		// Clamped so the stack can't be tipped past vertical, where the
+		// layer planes degenerate to lines and the view becomes unreadable.
+		camPitch = Math.max(-1.4, Math.min(1.4, camPitch + (e.clientY - dragLastY) * 0.008));
+		dragLastX = e.clientX;
+		dragLastY = e.clientY;
+		draw();
+	}
+
+	function onPathwayWheel(e: WheelEvent) {
+		e.preventDefault();
+		camZoom = Math.max(0.4, Math.min(3, camZoom * (e.deltaY > 0 ? 0.92 : 1.08)));
+		draw();
+	}
+
 	function onMove(e: MouseEvent) {
+		if (viewMode === 'pathway') {
+			onPathwayMove(e);
+			return;
+		}
+
 		if (atlas?.cells.length) {
 			onMoveAtlas(e);
 			return;
@@ -511,6 +710,31 @@
 			</span>
 		</div>
 		<div class="text-muted-foreground flex flex-wrap items-center gap-4 text-xs">
+			{#if atlas?.cells.length}
+				<div class="border-border flex overflow-hidden rounded-md border">
+					<button
+						class="px-2 py-1 text-[11px] {viewMode === 'atlas'
+							? 'bg-accent text-foreground'
+							: 'hover:bg-accent/50'}"
+						onclick={() => {
+							viewMode = 'atlas';
+							draw();
+						}}>Atlas</button
+					>
+					<button
+						class="border-border border-l px-2 py-1 text-[11px] {viewMode === 'pathway'
+							? 'bg-accent text-foreground'
+							: 'hover:bg-accent/50'}"
+						onclick={() => {
+							viewMode = 'pathway';
+							draw();
+						}}>Pathway 3D</button
+					>
+				</div>
+			{/if}
+			{#if viewMode === 'pathway'}
+				<span class="text-[11px]">drag to orbit · scroll to zoom</span>
+			{/if}
 			<span class="flex items-center gap-1.5">
 				<i class="inline-block size-2.5 rounded-full" style="background: #4ed6a5"></i>
 				hot {totals[2].toLocaleString()}
@@ -546,8 +770,15 @@
 		<canvas
 			bind:this={canvasEl}
 			class="h-full w-full"
+			class:cursor-grab={viewMode === 'pathway'}
 			onmousemove={onMove}
-			onmouseleave={() => (tip = null)}
+			onmousedown={viewMode === 'pathway' ? onPathwayDown : undefined}
+			onmouseup={viewMode === 'pathway' ? onPathwayUp : undefined}
+			onwheel={viewMode === 'pathway' ? onPathwayWheel : undefined}
+			onmouseleave={() => {
+				tip = null;
+				dragging = false;
+			}}
 		></canvas>
 		{#if atlas?.cells.length && rows && cols}
 			<div
