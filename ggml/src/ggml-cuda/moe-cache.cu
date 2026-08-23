@@ -390,6 +390,7 @@ struct moe_cache_device {
     // partner_best mirrors successor_best but for the undirected
     // within-layer table, updated on both endpoints of each edge.
     std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> partner_best;
+    long long group_admits = 0;
     long long partner_pred_total = 0;
     long long partner_pred_hit   = 0;
     long long partner_chance_num = 0; // sum of (n_ids-1), for the chance-level baseline
@@ -4044,6 +4045,21 @@ static bool moe_cache_measure_pred_enabled() {
     return on;
 }
 
+// Step 7a follow-on: group-aware admission. Off by default.
+static bool moe_cache_group_admit_enabled() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_GROUP_ADMIT");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+// partner_best has two consumers now - the 7a measurement and group
+// admission - so it must be maintained if either is on.
+static bool moe_cache_partner_index_enabled() {
+    return moe_cache_measure_pred_enabled() || moe_cache_group_admit_enabled();
+}
+
 static bool moe_cache_atlas_warm_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM");
@@ -4213,6 +4229,9 @@ static int moe_cache_plan(
     int hits = 0;
     int inserts_left = session.config.inserts_per_plan;
     bool wake_worker = false;
+    // Group admission may evict at most once per plan() call - see the
+    // block after the demand-fill queue below.
+    bool group_evicted_this_call = false;
 
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping) {
@@ -4423,6 +4442,92 @@ static int moe_cache_plan(
         device.inserts++;
         inserts_left--;
         wake_worker = true;
+
+        // Step 7a follow-on: group-aware admission. We just took a REAL
+        // demand miss on `expert` - not a guess - and measurement says its
+        // most frequent partner is selected in the same routing decision
+        // 67.6% of the time (vs 2.8% chance). Admitting `expert` alone
+        // therefore leaves a ~2-in-3 miss on the partner that the current
+        // one-expert-at-a-time policy takes structurally. So admit the
+        // partner alongside it.
+        //
+        // Deliberately piggybacked on a demand fill rather than run as its
+        // own speculative pass: the trigger is a confirmed need, which is
+        // what makes this different from atlas warming (a topic guess, and
+        // measured flat). Still bounded hard - one partner per demand fill,
+        // one eviction per plan() call, probation only, never protected_ -
+        // because a 67.6% partner hit rate does not by itself prove the
+        // slot is better spent on the partner than on whatever it displaces.
+        // The A/B decides that, not the precision number.
+        const size_t group_queue_limit = session.config.queue_mb << 20;
+        if (moe_cache_group_admit_enabled() && inserts_left > 0 &&
+            (int) device.queue.size() < session.config.queue_max &&
+            // Honour the in-flight BYTE budget too, not just the entry
+            // count - the demand path above guards both, and skipping this
+            // let group admission push queued_bytes past the configured
+            // queue_mb cap.
+            node->expert_size <= group_queue_limit - std::min(group_queue_limit, device.queued_bytes)) {
+            const auto pit = device.partner_best.find(key);
+            if (pit != device.partner_best.end()) {
+                const moe_cache_key pkey = pit->second.first;
+                // pkey.tensor is expected to equal node->host_base -
+                // within-layer co-activation only ever pairs experts of the
+                // same tensor, so partner_best[{host_base, a}] can only hold
+                // a partner built from that same host_base. Checked rather
+                // than assumed: the slot is keyed by pkey but FILLED from
+                // node->host_base below, so if the two ever diverged the
+                // slot would hold another tensor's weights - silent
+                // corruption, and the same shape of unchecked assumption
+                // that caused a real segfault earlier in this work.
+                if (pkey.tensor == node->host_base &&
+                    pkey.expert >= 0 && pkey.expert < node->n_expert &&
+                    pool.map.find(pkey) == pool.map.end()) {
+                    int pslot = -1;
+                    if (!pool.free_slots.empty()) {
+                        pslot = pool.free_slots.back();
+                        pool.free_slots.pop_back();
+                    } else if (!group_evicted_this_call) {
+                        // free_slots empties permanently within the first
+                        // few tokens of any real run (it means "never used
+                        // since allocation", not "currently unoccupied"),
+                        // so without this the whole mechanism would be
+                        // inert after warmup - the exact trap the first
+                        // version of atlas warming fell into.
+                        const int cand = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
+                        if (cand >= 0) {
+                            moe_cache_slot_reset(pool, cand, false);
+                            pslot = cand;
+                            device.evictions++;
+                            group_evicted_this_call = true;
+                        }
+                    }
+                    if (pslot >= 0) {
+                        moe_cache_slot & pslot_ref = pool.slots[pslot];
+                        pslot_ref.key = pkey;
+                        pslot_ref.generation++;
+                        pslot_ref.readers = 0;
+                        pslot_ref.state = moe_cache_slot_state::copying;
+                        try {
+                            if (pool.map.emplace(pkey, pslot).second) {
+                                const void * psrc = (const char *) node->host_base +
+                                    (size_t) pkey.expert * node->expert_size;
+                                device.queue.push_back({
+                                        node->pool_index, pslot, pslot_ref.generation,
+                                        pkey, psrc, node->expert_size,
+                                        node->host_base, (size_t) node->n_expert * node->expert_size});
+                                device.queued_bytes += node->expert_size;
+                                device.group_admits++;
+                                inserts_left--;
+                            } else {
+                                moe_cache_slot_reset(pool, pslot, true);
+                            }
+                        } catch (...) {
+                            moe_cache_slot_reset(pool, pslot, true);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     // Track 1 step 4a: within-layer co-activation tracking. Capped to
@@ -4465,7 +4570,7 @@ static int moe_cache_plan(
                 const moe_cache_key ka{node->host_base, ids[a]};
                 const moe_cache_key kb{node->host_base, ids[b]};
                 const uint32_t n = ++device.co_activation[moe_cache_edge_undirected(ka, kb)];
-                if (moe_cache_measure_pred_enabled()) {
+                if (moe_cache_partner_index_enabled()) {
                     // Undirected: this count is evidence for BOTH endpoints.
                     auto & ba = device.partner_best[ka];
                     if (n > ba.second) { ba.first = kb; ba.second = n; }
