@@ -1813,6 +1813,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     // when the ids_tensor actually changes). Starts true so the very first
     // use, before ids_tensor is ever set, doesn't wrongly skip.
     bool any_h2d_needed = true;
+    // Scratch for the batched LFRU query below - reused across inputs/splits
+    // rather than allocated per call.
+    std::vector<int32_t> lfru_candidate_ids;
+    std::vector<uint8_t> lfru_hit_mask;
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
@@ -1934,15 +1938,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         // used_ids (only when the ids tensor actually changed, same
                         // as that computation) since LFRU residency, like used_ids
                         // itself, is only meaningful per-ids-tensor, not per-copy.
-                        if (ggml_moe_cache.moe_lfru_copy_expert) {
+                        // Batched rather than one call per expert: a real batch (121
+                        // experts hit in a single warm-cache prefill, measured) would
+                        // otherwise pay a cudaLaunchHostFunc dispatch per hit for no
+                        // reason, since every hit in this pass becomes releasable at
+                        // the same real time anyway.
+                        if (ggml_moe_cache.moe_lfru_copy_experts) {
+                            lfru_candidate_ids.clear();
                             for (int64_t e = 0; e < n_expert; e++) {
-                                if (!ggml_bitset_get(used_ids.data(), e)) {
-                                    continue;
+                                if (ggml_bitset_get(used_ids.data(), e)) {
+                                    lfru_candidate_ids.push_back((int32_t) e);
                                 }
-                                void * dst = (uint8_t *) input_cpy->data + e * expert_size;
-                                if (ggml_moe_cache.moe_lfru_copy_expert(
-                                        input->data, (int32_t) e, expert_size, dst, split_backend)) {
-                                    ggml_bitset_clear(used_ids.data(), e);
+                            }
+                            if (!lfru_candidate_ids.empty()) {
+                                lfru_hit_mask.assign(lfru_candidate_ids.size(), 0);
+                                ggml_moe_cache.moe_lfru_copy_experts(
+                                        input->data, expert_size, lfru_candidate_ids.data(),
+                                        (int) lfru_candidate_ids.size(), input_cpy->data,
+                                        lfru_hit_mask.data(), split_backend);
+                                for (size_t ci = 0; ci < lfru_candidate_ids.size(); ci++) {
+                                    if (lfru_hit_mask[ci]) {
+                                        ggml_bitset_clear(used_ids.data(), lfru_candidate_ids[ci]);
+                                    }
                                 }
                             }
                         }

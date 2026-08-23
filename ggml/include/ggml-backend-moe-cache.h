@@ -214,6 +214,25 @@ struct ggml_moe_cache_api {
     bool (*moe_lfru_copy_expert)(
             const void * host_base, int32_t expert, size_t expert_size, void * dst_ptr, void * backend);
 
+    // Batched form of moe_lfru_copy_expert, for the case ggml-backend.cpp's
+    // sparse-copy actually has: many candidate expert ids for the same
+    // weight tensor, checked in one pass. Checks residency for every id in
+    // ids[0..n_ids), issues a device-to-device copy for each resident one
+    // (into dst_base + ids[i]*expert_size) and sets out_hit[i] to 1 - all on
+    // the same ordering guarantee as moe_lfru_copy_expert. The difference is
+    // the reader-pin release: every hit in this call shares ONE stream
+    // callback instead of one each, since a real batch (e.g. 121 experts hit
+    // in a single warm-cache prefill, measured) would otherwise pay a
+    // cudaLaunchHostFunc dispatch (~30-50us, see FreeToken's cpu_executor.py
+    // for the same measurement in a different context) per expert for no
+    // reason - the pins all become releasable at the same real time anyway,
+    // once this call's D2D copies are done. out_hit must have room for
+    // n_ids bytes (left at 0 for misses, the caller's own responsibility to
+    // zero first if it matters). Returns the number of hits. NULL-safe.
+    int (*moe_lfru_copy_experts)(
+            const void * host_base, size_t expert_size, const int32_t * ids, int n_ids,
+            void * dst_base, uint8_t * out_hit, void * backend);
+
     // Aggregate cache health summary - see ggml_moe_cache_summary. Always
     // writes *out (zeroed on failure). NULL-safe like the other optional
     // entries here.
