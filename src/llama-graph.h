@@ -1076,6 +1076,28 @@ struct llm_graph_context {
                     int   il,
                     int   depth = 1) const;   // layers ahead being predicted; only affects the debug tensor name
 
+    // Full-layer prefill double buffer: unlike router lookahead above (which
+    // predicts which *experts* the next layer needs, since decode only ever
+    // wants a handful), a large prefill batch touches close to every expert
+    // regardless of routing, so there is nothing to predict - just register
+    // "when this layer's expert tensor is dispatched, prefetch the next
+    // layer's" so the actual copy can overlap with this layer's compute.
+    //
+    // A plain data registration (moe-cache.cu's
+    // prefill_register_successor), not a graph node: called directly, once
+    // per layer, during graph BUILD - the copy itself is issued later, at
+    // COMPUTE time, from inside ggml_cuda_mul_mat_id (ggml-cuda.cu), which is
+    // the only place that has the canonical CUDA stream a CUDA-graph capture
+    // needs the copy to be forked from. No-op (near-zero cost) when
+    // moe-cache isn't registered or a tensor is null (fused-tensor arch's
+    // next layer might not have this tensor, or arch uses separate gate/up,
+    // or the next MoE layer doesn't exist).
+    void build_moe_prefill_prefetch(
+            ggml_tensor * this_gate_up_exps,
+            ggml_tensor * this_down_exps,
+            ggml_tensor * next_gate_up_exps,
+            ggml_tensor * next_down_exps) const;
+
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,
              ggml_tensor * gate_inp,

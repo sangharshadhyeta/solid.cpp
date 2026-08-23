@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 
 #include <cstring>
 #include <climits>
@@ -461,18 +462,34 @@ struct llama_mmap::impl {
         // rejects a PROT_READ file mapping outright (CUDA_ERROR_INVALID_VALUE),
         // and the cudaHostRegisterReadOnly flag is unsupported on this driver
         // (CUDA_ERROR_NOT_SUPPORTED), so a writable mapping is the only way to
-        // page-lock model weights for direct DMA. See moe-cache HOSTREG_MB.
+        // page-lock model weights for direct DMA. See moe-cache HOSTREG_MB, and
+        // the CPU-offloaded-weight pinning pass in llama-model.cpp (needs this
+        // for cudaHostRegister to succeed on tensors the CUDA scheduler's
+        // op_offload path reads directly - a real, measured prefill win with
+        // no decode-side cost). Defaults on whenever a non-CPU backend device
+        // is registered at all, since the cost when unused (no CPU-resident
+        // weight ends up needing it) is nothing - private, unwritten pages
+        // behave the same as shared ones. LLAMA_MMAP_WRITABLE still overrides
+        // explicitly either way (0 forces off, anything else forces on).
         int prot = PROT_READ;
-        if (const char * env = getenv("LLAMA_MMAP_WRITABLE")) {
-            if (env[0] && env[0] != '0') {
-                // MAP_SHARED|PROT_WRITE on an O_RDONLY fd is EACCES, so the
-                // mapping has to become MAP_PRIVATE as well. That is the safe
-                // direction anyway: private means copy-on-write, so a stray
-                // write can never reach the model file on disk.
-                prot  |= PROT_WRITE;
-                flags &= ~MAP_SHARED;
-                flags |= MAP_PRIVATE;
+        bool writable = false;
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            if (ggml_backend_dev_type(ggml_backend_dev_get(i)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                writable = true;
+                break;
             }
+        }
+        if (const char * env = getenv("LLAMA_MMAP_WRITABLE")) {
+            writable = env[0] && env[0] != '0';
+        }
+        if (writable) {
+            // MAP_SHARED|PROT_WRITE on an O_RDONLY fd is EACCES, so the
+            // mapping has to become MAP_PRIVATE as well. That is the safe
+            // direction anyway: private means copy-on-write, so a stray
+            // write can never reach the model file on disk.
+            prot  |= PROT_WRITE;
+            flags &= ~MAP_SHARED;
+            flags |= MAP_PRIVATE;
         }
         addr = mmap(NULL, file->size(), prot, flags, fd, 0);
         if (addr == MAP_FAILED) {

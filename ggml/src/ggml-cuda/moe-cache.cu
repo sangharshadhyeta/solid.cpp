@@ -214,6 +214,51 @@ struct moe_cache_scratch {
     size_t out = 0;
 };
 
+// Ping-pong pair of full-tensor-sized device buffers for one shape (see
+// moe_cache_device::prefill_slabs). Which of the two slots a given tensor
+// lands in is decided ONCE, the first time that tensor is ever registered
+// (assigned_slot, alternating 0/1 by registration order), and never changes
+// again - NOT a runtime-toggling counter. A stable, tensor-to-slot mapping
+// means wait() can look a tensor's slot up directly instead of scanning
+// both, and means the *same* slot (and its ready/consumed events) is always
+// the one associated with a given logical layer's data across every future
+// call - relevant because, empirically, llama.cpp's CUDA graph capture for
+// this op_offload path captures roughly once per layer rather than once per
+// ubatch (see the design note above moe_cache_prefill_advance), so
+// "advance now, join a couple of layers later" almost always crosses a
+// capture boundary. `inflight_host`/`inflight_bytes` record which tensor is
+// actually resident in each slot so a wait() call can tell a stale copy from
+// a fresh one instead of trusting the caller's bookkeeping alone.
+//
+// `consumed[slot]` closes a real race: without it, prefetching layer L+2 into
+// this same slot (the ping-pong period is 2) could start overwriting the
+// buffer via cudaMemcpyAsync on prefill_stream while the GEMM reading layer
+// L's data is still in flight - and since that GEMM dispatch may belong to a
+// different capture than the one advance() is being called from now, this
+// wait is a real host sync (cudaEventSynchronize), not a captured
+// cudaStreamWaitEvent - see the design note above moe_cache_prefill_advance.
+// It costs nothing when the consumer is already done (the overwhelmingly
+// common case once prefetch is running one full layer ahead of compute).
+// consumed_valid distinguishes "never used yet" (no wait needed) from "really
+// has to wait" without a sentinel event of unknown initial state.
+struct moe_cache_prefill_slab {
+    void * dev[2] = {nullptr, nullptr};
+    size_t cap[2] = {0, 0};
+    cudaEvent_t ready[2] = {nullptr, nullptr};
+    cudaEvent_t consumed[2] = {nullptr, nullptr};
+    bool consumed_valid[2] = {false, false};
+    const void * inflight_host[2] = {nullptr, nullptr};
+    size_t inflight_bytes[2] = {0, 0};
+    // Fixed slot assignment per tensor (keyed by the tensor's own host
+    // pointer, i.e. what advance() calls next_host_base and wait() calls
+    // host_base) - see the struct comment above for why this has to be
+    // decided once and stay fixed rather than toggling. Populated by
+    // register_successor at build time; assign_next alternates 0/1 as each
+    // new distinct tensor is first seen for this slab.
+    std::unordered_map<const void *, int> assigned_slot;
+    int assign_next = 0;
+};
+
 struct moe_cache_device {
     explicit moe_cache_device(int physical) : physical(physical) {}
 
@@ -308,6 +353,33 @@ struct moe_cache_device {
     float * h_out = nullptr;
     size_t h_out_cap = 0;
 
+    // Full-layer prefill double buffer (see moe_cache_prefill_prefetch/_wait).
+    // Keyed by tensor_bytes (a shape proxy: distinct MoE tensors reuse the same
+    // slab as long as they're the same total size, same as the decode pool's
+    // keying by expert_size) rather than the per-node scratch above, which is
+    // sized for at most GGML_MOE_CACHE_MAX_BATCH_ROWS rows - a full layer is
+    // usually every expert, i.e. no reasonable row cap applies.
+    std::unordered_map<size_t, moe_cache_prefill_slab> prefill_slabs;
+    cudaStream_t prefill_stream = nullptr;
+    // host_base -> next layer's (host_base, tensor_bytes, n_expert). Populated
+    // once per architecture at graph-BUILD time
+    // (moe_cache_prefill_register_successor), never at compute time - see
+    // that function's comment for why build time is the only point in this
+    // whole pipeline that is unconditionally safe for cudaMalloc (graph
+    // capture can only ever be active during compute).
+    struct prefill_successor {
+        const void * next_host_base = nullptr;
+        size_t next_tensor_bytes = 0;
+        int64_t next_n_expert = 0;
+    };
+    std::unordered_map<const void *, prefill_successor> prefill_successors;
+
+    // Hit-D2D split diagnostics (see moe_cache_prefill_advance): how many
+    // expert rows across all prefetches were served from the decode-time LFRU
+    // pool device-to-device, out of how many rows were prefetched in total.
+    long long prefill_hit_rows = 0;
+    long long prefill_total_rows = 0;
+
     long long prefetches = 0;
     long long hits = 0;
     long long misses = 0;
@@ -390,7 +462,7 @@ struct moe_cache_node {
     int64_t n_expert = 0;
     int wtype = -1;
     std::unique_lock<std::mutex> dispatch_lock;
-    moe_cache_pin pins[64];
+    moe_cache_pin pins[GGML_MOE_CACHE_MAX_BATCH_ROWS];
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
@@ -403,8 +475,9 @@ static std::atomic<int> g_session_count{0};
 // Structural ceiling shared by the scratch buffers below (moe_cache_scratch_requirements'
 // max_rows) and the CPU-side stack arrays (ggml-cpu.c's MOE_CACHE_MAX_TOPK) - both are
 // already sized for this many rows regardless of max_batch, so this is a real capacity
-// limit, not a conservative guess.
-static constexpr int MOE_CACHE_MAX_BATCH_CEILING = 64;
+// limit, not a conservative guess. Defined once, in ggml-backend-moe-cache.h, so the two
+// sides of this handshake can't drift apart.
+static constexpr int MOE_CACHE_MAX_BATCH_CEILING = GGML_MOE_CACHE_MAX_BATCH_ROWS;
 
 // Live hint for max_batch's default, set by the caller (llama_context, via the
 // set_max_batch_hint vtable entry) to the real max concurrent sequence count
@@ -824,6 +897,10 @@ static bool moe_cache_cuda_ok(
     if (device.error_logs.fetch_add(1) < 8) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d %s failed: %s\n",
                 device.physical, operation, cudaGetErrorString(error));
+        if (getenv("MOE_CACHE_DEBUG_GATE")) {
+            fprintf(stderr, "[moe-cache-err] CUDA%d %s failed: %s\n",
+                    device.physical, operation, cudaGetErrorString(error));
+        }
     }
     if (fatal && error != cudaErrorMemoryAllocation) {
         device.dead.store(true);
@@ -854,6 +931,35 @@ static bool moe_cache_grow_device(
     return true;
 }
 
+// Like moe_cache_grow_device, but allocates exactly `required` bytes instead
+// of doubling. moe_cache_grow_device's 2x headroom amortizes the cost of a
+// pool that's expected to grow repeatedly over its lifetime - right for the
+// resizable pools it's normally used for, wrong for a prefill slab: each
+// distinct tensor byte-size gets its own slab (see
+// moe_cache_device::prefill_slabs), sized once at registration from the
+// tensor's own, fixed, architecture-determined byte count, and never resized
+// again. Doubling there would roughly triple this feature's real VRAM
+// footprint (two slots per slab, three-ish distinct tensor sizes in a
+// typical model) for no benefit - nothing ever needs a slab bigger than the
+// one exact size it was created for.
+static bool moe_cache_grow_device_exact(
+        moe_cache_device & device, void ** pointer, size_t & capacity,
+        size_t required, const char * operation) {
+    if (capacity >= required) {
+        return true;
+    }
+    void * fresh = nullptr;
+    if (!moe_cache_cuda_ok(device, cudaMalloc(&fresh, required), operation, false)) {
+        return false;
+    }
+    if (*pointer) {
+        cudaFree(*pointer);
+    }
+    *pointer = fresh;
+    capacity = required;
+    return true;
+}
+
 static size_t moe_cache_growth_capacity(size_t capacity, size_t required) {
     if (capacity >= required) {
         return capacity;
@@ -864,9 +970,17 @@ static size_t moe_cache_growth_capacity(size_t capacity, size_t required) {
     return required * 2 + 256;
 }
 
+// max_rows is the session's actual configured max_batch, not the structural
+// ceiling (GGML_MOE_CACHE_MAX_BATCH_ROWS) - reservation must scale with what
+// a session can really see, or every session pays worst-case-ceiling scratch
+// reservation regardless of its configured batch size. Bounded by the
+// ceiling below since config.max_batch is itself clamped to it.
 static bool moe_cache_scratch_requirements(
-        int64_t n_in, int64_t n_out, moe_cache_scratch & result) {
-    constexpr size_t max_rows = 64;
+        int64_t n_in, int64_t n_out, int max_batch, moe_cache_scratch & result) {
+    if (max_batch <= 0 || max_batch > GGML_MOE_CACHE_MAX_BATCH_ROWS) {
+        return false;
+    }
+    const size_t max_rows = (size_t) max_batch;
     if (n_in <= 0 || n_out <= 0 ||
         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
         return false;
@@ -936,6 +1050,578 @@ static bool moe_cache_grow_host(
     *pointer = fresh;
     capacity = requested;
     return true;
+}
+
+// v1: single-device. Prefill's first access to a tensor may be the very
+// first MoE access of the whole run (a pure prompt-processing benchmark
+// never calls the decode path at all), so this can't rely on
+// session->tensor_devices - that map is only populated by moe_cache_begin(),
+// which large (>= op_offload_min_batch_size) batches never reach. Multi-GPU
+// tensor-split would need real per-tensor device resolution; out of scope
+// for this increment.
+static moe_cache_device * moe_cache_prefill_first_device() {
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        if (session->stopping) {
+            continue;
+        }
+        for (const auto & device_ptr : session->devices) {
+            if (!device_ptr->dead.load()) {
+                return device_ptr.get();
+            }
+        }
+    }
+    return nullptr;
+}
+
+// Same lookup, but also hands back the owning session - needed by the hit-D2D
+// split in moe_cache_prefill_advance, which has to read that session's own
+// LFRU pools (session->mu protects pool/slot state, not device.dispatch_mu -
+// see the lock-ordering note there) to classify each expert row as resident
+// or not.
+static moe_cache_device * moe_cache_prefill_first_session_and_device(moe_cache_session ** out_session) {
+    if (out_session) {
+        *out_session = nullptr;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        if (session->stopping) {
+            continue;
+        }
+        for (const auto & device_ptr : session->devices) {
+            if (!device_ptr->dead.load()) {
+                if (out_session) {
+                    *out_session = session;
+                }
+                return device_ptr.get();
+            }
+        }
+    }
+    return nullptr;
+}
+
+// EXPERIMENTAL, default OFF - see the matching flag and long comment in
+// ggml_cuda_mul_mat_id (ggml-cuda.cu). This function still checks it
+// independently rather than trusting callers not to invoke it directly,
+// since a stray call would issue real CUDA work (allocation, stream/event
+// creation) for nothing.
+static bool moe_cache_prefill_buffer_enabled() {
+    static const bool enabled = getenv("GGML_CUDA_MOE_PREFILL_BUFFER") != nullptr;
+    return enabled;
+}
+
+// Registers "when host_base's node is dispatched, kick off a prefetch of
+// next_host_base" and eagerly allocates everything that prefetch will need.
+// Must be called at graph-BUILD time (once per layer, from the
+// architecture's model-building code - see build_moe_prefill_prefetch in
+// llama-graph.cpp), never at compute time.
+//
+// That timing requirement is the whole point of this function existing
+// separately from the advance step below: CUDA graph capture can only ever
+// be active during compute (llama_context::graph_compute), strictly after
+// the ggml graph has already been fully built, so a call made during BUILD
+// can never race an active capture - it is unconditionally safe to
+// cudaMalloc here. moe_cache_prefill_advance (the thing that actually runs
+// during compute, possibly inside a captured region) deliberately never
+// allocates anything for exactly this reason; it only ever touches buffers
+// this function already created.
+static void moe_cache_prefill_register_successor(
+        const void * host_base, const void * next_host_base, size_t next_tensor_bytes,
+        int64_t next_n_expert) {
+    if (!moe_cache_prefill_buffer_enabled() || !host_base || !next_host_base || next_tensor_bytes == 0) {
+        return;
+    }
+    moe_cache_device * device_ptr = moe_cache_prefill_first_device();
+    if (!device_ptr) {
+        return;
+    }
+    moe_cache_device & device = *device_ptr;
+    std::lock_guard<std::mutex> lock(device.dispatch_mu);
+
+    moe_cache_prefill_slab & slab = device.prefill_slabs[next_tensor_bytes];
+    for (int i = 0; i < 2; i++) {
+        if (!moe_cache_grow_device_exact(device, &slab.dev[i], slab.cap[i], next_tensor_bytes,
+                "prefill slab (register)")) {
+            return;
+        }
+        if (!slab.ready[i] && !moe_cache_cuda_ok(device,
+                cudaEventCreateWithFlags(&slab.ready[i], cudaEventDisableTiming),
+                "prefill event creation (register)", false)) {
+            return;
+        }
+        if (!slab.consumed[i] && !moe_cache_cuda_ok(device,
+                cudaEventCreateWithFlags(&slab.consumed[i], cudaEventDisableTiming),
+                "prefill consumed-event creation (register)", false)) {
+            return;
+        }
+    }
+    if (!device.prefill_stream && !moe_cache_cuda_ok(device,
+            cudaStreamCreateWithFlags(&device.prefill_stream, cudaStreamNonBlocking),
+            "prefill stream creation (register)", false)) {
+        return;
+    }
+    // Fixed slot for this tensor - decided once, the first time this exact
+    // next_host_base is ever registered, never touched again. See the
+    // moe_cache_prefill_slab struct comment for why.
+    if (slab.assigned_slot.find(next_host_base) == slab.assigned_slot.end()) {
+        slab.assigned_slot[next_host_base] = slab.assign_next & 1;
+        slab.assign_next++;
+    }
+    device.prefill_successors[host_base] = {next_host_base, next_tensor_bytes, next_n_expert};
+}
+
+// A cudaEvent_t recorded while a stream was NOT capturing (e.g. during the
+// uncaptured warmup pass llama.cpp always runs before it starts capturing a
+// shape) can't validly be waited on once that same stream is inside a graph
+// capture - the driver rejects it as "a previous error during capture" on
+// some later, unrelated kernel launch, since the failure itself isn't
+// reported at the cudaStreamWaitEvent call that caused it. consumed[slot]
+// crosses exactly that boundary: it's recorded by prefill_release (from the
+// consumer's ctx.stream(), which is whatever the warmup pass happened to be
+// using) and waited on later by advance(), possibly after capture has since
+// started on that same stream.
+//
+// llama.cpp's own graph splitting for this op_offload scenario turns out to
+// capture roughly one region per layer, not one region for the whole
+// ubatch/token (confirmed empirically: cudaStreamGetCaptureInfo's capture id
+// changes on origin_stream between one MoE layer's dispatch and the next).
+// That makes any synchronization scheme built on *captured* cross-stream
+// dependencies (cudaStreamWaitEvent recorded as a graph node) unusable for
+// this "prefetch N, consume N two layers later" pipeline: producer and
+// consumer are essentially always in two different captures, and a captured
+// wait can only reference an event recorded within the same capture -
+// referencing one from a different (or no) capture is rejected by the
+// driver, surfacing later as "operation failed due to a previous error
+// during capture" on some unrelated kernel launch rather than at the call
+// that actually caused it.
+//
+// So this pipeline does not try to make prefill_stream's copy part of any
+// capture at all. Under cudaStreamCaptureModeRelaxed (what llama.cpp
+// captures with), work issued to a stream other than the one being captured
+// runs as ordinary, immediate async work, invisible to the capture - exactly
+// what's wanted here. The dependency between the copy and the consumer is
+// instead enforced with a real, host-blocking cudaEventSynchronize at
+// prefill_wait time (see below): CPU-side, unrelated to whatever capture
+// origin_stream is or isn't in, and always valid regardless of capture
+// boundaries. It only actually blocks if the copy hasn't finished yet, which
+// in steady state (prefetch running a full layer or more ahead of compute)
+// it already has. The cost of this design is that it only pays off across
+// *replays* of a captured region, not within the one-time capture recording
+// itself - but capture recording is a one-time event per shape (warmup),
+// while replay is the steady-state path token after token, so that's the
+// right place to have paid for it once mmap/pinning didn't already cover.
+
+// Userdata for moe_cache_prefill_release_readers_cb below.
+struct moe_cache_prefill_reader_release_ctx {
+    moe_cache_session * session;
+    std::vector<std::pair<moe_cache_pool *, int>> pins; // (pool, slot index)
+};
+
+// Enqueued on prefill_stream, after every D2D hit-copy that read from a live
+// LFRU slot, so it runs (stream-ordered, i.e. only once every copy queued
+// ahead of it has actually completed on the GPU) before those slots' reader
+// pins are released. Without this, a slot could be evicted - and its bytes
+// overwritten by the fill worker - while our async D2D copy from it is still
+// in flight, since cudaMemcpyAsync returns as soon as the copy is queued,
+// long before session->mu is available to prove it's done. Runs on a CUDA
+// driver callback thread, not the calling thread - acquiring a plain mutex
+// there is fine, but must stay quick and must never call back into CUDA.
+static void moe_cache_prefill_release_readers_cb(void * userdata) {
+    auto * ctx = static_cast<moe_cache_prefill_reader_release_ctx *>(userdata);
+    {
+        std::lock_guard<std::mutex> lock(ctx->session->mu);
+        for (auto & pin : ctx->pins) {
+            moe_cache_pool * pool = pin.first;
+            const int idx = pin.second;
+            if (idx >= 0 && (size_t) idx < pool->slots.size() && pool->slots[idx].readers > 0) {
+                pool->slots[idx].readers--;
+            }
+        }
+    }
+    delete ctx;
+}
+
+// Scheduler-level integration point: ggml_backend_sched_compute_splits'
+// existing "copy only the experts that are used" logic (ggml-backend.cpp)
+// calls this for each selected expert row before falling back to its own
+// H2D copy for it. Finds the same (host_base, expert) key the decode-time
+// LFRU pool already uses (moe_cache_key, populated by the CPU-dispatch path
+// in ggml-cpu.c) and, if resident, issues a device-to-device copy instead -
+// no PCIe cost, no separate cache, upgrading the mechanism that's already
+// there rather than running a second one beside it. Does not take
+// device.dispatch_mu: this isn't part of the prefill_* pipeline above (no
+// prefill_slabs/prefill_successors touched), only session->mu, the same lock
+// moe_cache_plan's own decode-time lookup uses to read pool/slot state.
+static bool moe_cache_moe_lfru_copy_expert(
+        const void * host_base, int32_t expert, size_t expert_size, void * dst_ptr, void * backend_) {
+    if (!host_base || !dst_ptr || !backend_ || expert < 0) {
+        return false;
+    }
+    // Same extraction ggml_backend_cuda_set_tensor_async uses, so this copy
+    // is ordered on the exact stream the surrounding H2D copies in this
+    // split are - required for the later graph_compute_async call to see it
+    // as already complete/ordered-before, not a race.
+    cudaStream_t stream = ((ggml_backend_cuda_context *) ((ggml_backend *) backend_)->context)->stream();
+    moe_cache_session * session = nullptr;
+    moe_cache_device * device_ptr = moe_cache_prefill_first_session_and_device(&session);
+    if (!device_ptr || !session) {
+        return false;
+    }
+    moe_cache_device & device = *device_ptr;
+
+    const void * src_ptr = nullptr;
+    auto release_ctx = std::make_unique<moe_cache_prefill_reader_release_ctx>();
+    release_ctx->session = session;
+    {
+        std::lock_guard<std::mutex> slock(session->mu);
+        const moe_cache_key key{host_base, expert};
+        for (const auto & pool_ptr : device.pools) {
+            if (pool_ptr->expert_size != expert_size) {
+                continue;
+            }
+            auto found = pool_ptr->map.find(key);
+            if (found == pool_ptr->map.end()) {
+                break; // an expert lives in exactly one pool shape
+            }
+            moe_cache_slot & pslot = pool_ptr->slots[found->second];
+            if (pslot.state == moe_cache_slot_state::valid) {
+                src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                pslot.readers++;
+                release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+            }
+            break;
+        }
+    }
+    if (!src_ptr) {
+        return false; // not resident - caller's normal H2D path handles this row
+    }
+
+    if (!moe_cache_cuda_ok(device,
+            cudaMemcpyAsync(dst_ptr, src_ptr, expert_size, cudaMemcpyDeviceToDevice, stream),
+            "lfru expert D2D copy", false)) {
+        // the copy never happened - release the pin we just took, no callback needed
+        moe_cache_prefill_release_readers_cb(release_ctx.release());
+        return false;
+    }
+    // Ownership passes to the callback, which deletes ctx itself; on a failed
+    // enqueue the copy was still issued successfully (queued ahead of the
+    // failure), so release the pin immediately rather than leaking it -
+    // same tradeoff as moe_cache_prefill_copy_split's own enqueue failure path.
+    moe_cache_prefill_reader_release_ctx * raw = release_ctx.release();
+    if (!moe_cache_cuda_ok(device,
+            cudaLaunchHostFunc(stream, moe_cache_prefill_release_readers_cb, raw),
+            "lfru reader-release enqueue", false)) {
+        moe_cache_prefill_release_readers_cb(raw);
+    }
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        static std::atomic<long long> hits{0};
+        fprintf(stderr, "[lfru-copy-hit] host_base=%p expert=%d cum_hits=%lld\n",
+                host_base, expert, (long long) ++hits);
+    }
+    return true;
+}
+
+// Splits one successor tensor's copy into per-expert-row hit/miss: rows
+// already resident in the decode-time LFRU pool are gathered
+// device-to-device (no PCIe cost - see moe_cache_prefill_release_readers_cb
+// for how residency is protected against a concurrent eviction while that
+// copy is in flight); rows that are not resident are H2D'd over PCIe, with
+// contiguous runs of missing rows coalesced into one cudaMemcpyAsync each
+// rather than one call per row. Falls back to a single whole-tensor H2D copy
+// (the pre-hit-D2D behavior) if next_n_expert is 0/unknown or doesn't evenly
+// divide next_tensor_bytes - always correct, just never split.
+//
+// Caller holds device.dispatch_mu. Takes session->mu itself, nested inside
+// that - dispatch_mu is always acquired before session->mu in this file
+// (see e.g. the teardown path around device.dead.store(true) above), never
+// the reverse, so this ordering can't deadlock against it.
+static void moe_cache_prefill_copy_split(
+        moe_cache_device & device, moe_cache_session * session,
+        moe_cache_prefill_slab & slab, int slot,
+        const void * next_host_base, size_t next_tensor_bytes, int64_t next_n_expert) {
+    if (!session || next_n_expert <= 0 || next_tensor_bytes % (size_t) next_n_expert != 0) {
+        moe_cache_cuda_ok(device,
+                cudaMemcpyAsync(slab.dev[slot], next_host_base, next_tensor_bytes,
+                        cudaMemcpyHostToDevice, device.prefill_stream),
+                "prefill copy", false);
+        return;
+    }
+    const size_t expert_size = next_tensor_bytes / (size_t) next_n_expert;
+    char * dst_base = (char *) slab.dev[slot];
+    const char * src_base = (const char *) next_host_base;
+
+    std::vector<const void *> hit_src((size_t) next_n_expert, nullptr);
+    auto release_ctx = std::make_unique<moe_cache_prefill_reader_release_ctx>();
+    release_ctx->session = session;
+    {
+        std::lock_guard<std::mutex> slock(session->mu);
+        if (getenv("MOE_CACHE_DEBUG_GATE")) {
+            {
+                fprintf(stderr, "[prefill-hitd2d-pools] next_host_base=%p n_expert=%lld want_expert_size=%zu n_pools=%zu\n",
+                        next_host_base, (long long) next_n_expert, expert_size, device.pools.size());
+                for (const auto & pool_ptr : device.pools) {
+                    int any_match = 0;
+                    for (const auto & kv : pool_ptr->map) {
+                        if (kv.first.tensor == next_host_base) {
+                            any_match++;
+                        }
+                    }
+                    fprintf(stderr, "  pool expert_size=%zu n_slots=%d map_size=%zu any_match_for_this_tensor=%d\n",
+                            pool_ptr->expert_size, pool_ptr->n_slots, pool_ptr->map.size(), any_match);
+                }
+            }
+        }
+        for (int64_t e = 0; e < next_n_expert; e++) {
+            const moe_cache_key key{next_host_base, (int32_t) e};
+            for (const auto & pool_ptr : device.pools) {
+                if (pool_ptr->expert_size != expert_size) {
+                    continue;
+                }
+                auto found = pool_ptr->map.find(key);
+                if (found == pool_ptr->map.end()) {
+                    break; // an expert lives in exactly one pool shape - no point checking others
+                }
+                moe_cache_slot & pslot = pool_ptr->slots[found->second];
+                if (pslot.state == moe_cache_slot_state::valid) {
+                    hit_src[(size_t) e] = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                    pslot.readers++;
+                    release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+                }
+                break;
+            }
+        }
+    }
+
+    device.prefill_hit_rows += (long long) release_ctx->pins.size();
+    device.prefill_total_rows += next_n_expert;
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        fprintf(stderr, "[prefill-hitd2d-dbg] layer_rows=%lld/%lld cum=%lld/%lld\n",
+                (long long) release_ctx->pins.size(), (long long) next_n_expert,
+                device.prefill_hit_rows, device.prefill_total_rows);
+    }
+
+    for (int64_t e = 0; e < next_n_expert; e++) {
+        if (hit_src[(size_t) e]) {
+            moe_cache_cuda_ok(device,
+                    cudaMemcpyAsync(dst_base + (size_t) e * expert_size, hit_src[(size_t) e], expert_size,
+                            cudaMemcpyDeviceToDevice, device.prefill_stream),
+                    "prefill hit copy", false);
+        }
+    }
+    if (!release_ctx->pins.empty()) {
+        // Ownership passes to the callback on success, which deletes ctx
+        // itself; on failure (implies the stream/device is already in a bad
+        // state - the D2D copies just queued ahead of it are equally
+        // suspect) release the pins immediately instead of leaking them
+        // permanently unevictable. Trading a already-degraded stream's
+        // small residual race for a guaranteed-forever leak is the right
+        // call here.
+        moe_cache_prefill_reader_release_ctx * raw = release_ctx.release();
+        if (!moe_cache_cuda_ok(device,
+                cudaLaunchHostFunc(device.prefill_stream, moe_cache_prefill_release_readers_cb, raw),
+                "prefill reader-release enqueue", false)) {
+            moe_cache_prefill_release_readers_cb(raw);
+        }
+    }
+
+    int64_t run_start = -1;
+    for (int64_t e = 0; e <= next_n_expert; e++) {
+        const bool miss = e < next_n_expert && !hit_src[(size_t) e];
+        if (miss) {
+            if (run_start < 0) {
+                run_start = e;
+            }
+            continue;
+        }
+        if (run_start < 0) {
+            continue;
+        }
+        const size_t off = (size_t) run_start * expert_size;
+        const size_t len = (size_t) (e - run_start) * expert_size;
+        moe_cache_cuda_ok(device,
+                cudaMemcpyAsync(dst_base + off, src_base + off, len,
+                        cudaMemcpyHostToDevice, device.prefill_stream),
+                "prefill miss copy", false);
+        run_start = -1;
+    }
+}
+
+// Called from ggml_cuda_mul_mat_id while it dispatches host_base's own node,
+// to kick off the copy for whatever tensor was registered as its successor -
+// the "prefetch one layer ahead" pipeline. Never allocates - see
+// moe_cache_prefill_register_successor above for why that has to happen
+// earlier, at build time, and this function relies on it already having run.
+static void moe_cache_prefill_advance(const void * host_base, void * origin_stream_) {
+    if (!moe_cache_prefill_buffer_enabled() || !host_base || !origin_stream_) {
+        return;
+    }
+    moe_cache_session * session = nullptr;
+    moe_cache_device * device_ptr = moe_cache_prefill_first_session_and_device(&session);
+    if (!device_ptr) {
+        return;
+    }
+    moe_cache_device & device = *device_ptr;
+    std::lock_guard<std::mutex> lock(device.dispatch_mu);
+
+    if (!device.prefill_stream) {
+        return;
+    }
+    auto succ_it = device.prefill_successors.find(host_base);
+    if (succ_it == device.prefill_successors.end()) {
+        return;
+    }
+    const void * next_host_base = succ_it->second.next_host_base;
+    const size_t next_tensor_bytes = succ_it->second.next_tensor_bytes;
+    const int64_t next_n_expert = succ_it->second.next_n_expert;
+
+    auto slab_it = device.prefill_slabs.find(next_tensor_bytes);
+    if (slab_it == device.prefill_slabs.end()) {
+        return; // register_successor should have created this - defensive only
+    }
+    moe_cache_prefill_slab & slab = slab_it->second;
+    auto assign_it = slab.assigned_slot.find(next_host_base);
+    if (assign_it == slab.assigned_slot.end()) {
+        return; // register_successor never assigned this tensor a slot - defensive only
+    }
+    const int slot = assign_it->second;
+
+    // Already holding a fresh copy of exactly this tensor in this slot (this
+    // node visited more than once for the same ubatch, e.g. multiple experts
+    // sharing a layer, or a later token replaying a captured region that
+    // already has this data resident) - nothing to redo. Weight tensors are
+    // immutable for the life of the model, so a completed copy stays valid
+    // forever, across any number of future captures/replays, until this slot
+    // gets reused for a *different* tensor.
+    if (slab.inflight_host[slot] == next_host_base && slab.inflight_bytes[slot] == next_tensor_bytes) {
+        return;
+    }
+    if (!slab.dev[slot] || slab.cap[slot] < next_tensor_bytes || !slab.ready[slot] || !slab.consumed[slot]) {
+        return; // not pre-allocated - register_successor was never called for this shape
+    }
+
+    // Don't overwrite this slot until whatever previously read it (two
+    // advances ago, same slot) has actually finished - see the slab struct
+    // comment. A real host block, not a captured wait - see the design note
+    // above. Skipped the first time a slot is used.
+    if (slab.consumed_valid[slot]) {
+        if (!moe_cache_cuda_ok(device, cudaEventSynchronize(slab.consumed[slot]),
+                "prefill wait-for-consumed", false)) {
+            return;
+        }
+    }
+
+    moe_cache_prefill_copy_split(device, session, slab, slot, next_host_base, next_tensor_bytes, next_n_expert);
+    moe_cache_cuda_ok(device, cudaEventRecord(slab.ready[slot], device.prefill_stream),
+            "prefill event record", false);
+
+    slab.inflight_host[slot] = next_host_base;
+    slab.inflight_bytes[slot] = next_tensor_bytes;
+}
+
+// Must be called by the consumer once it has issued (not necessarily
+// completed - this just needs to be ordered on the same stream) every read of
+// the buffer returned by the matching prefill_wait, so the NEXT prefetch into
+// this slot (two calls from now, per the ping-pong period) knows it's safe to
+// overwrite. Skipping this call is safe but pessimistic: consumed_valid stays
+// false forever for that slot, and moe_cache_prefill_prefetch never gets to
+// skip its wait - functionally correct (the memcpy would just queue behind
+// whatever's already on prefill_stream) but only if the two streams happen to
+// serialize some other way, so callers should always call this.
+static void moe_cache_prefill_release(
+        const void * host_base, size_t tensor_bytes, int slot, void * consumer_stream_) {
+    if (!host_base || tensor_bytes == 0 || slot < 0 || slot > 1 || !consumer_stream_) {
+        return;
+    }
+    cudaStream_t consumer_stream = (cudaStream_t) consumer_stream_;
+    moe_cache_device * device_ptr = moe_cache_prefill_first_device();
+    if (!device_ptr) {
+        return;
+    }
+    moe_cache_device & device = *device_ptr;
+    std::lock_guard<std::mutex> lock(device.dispatch_mu);
+
+    auto it = device.prefill_slabs.find(tensor_bytes);
+    if (it == device.prefill_slabs.end()) {
+        return;
+    }
+    moe_cache_prefill_slab & slab = it->second;
+    if (slab.inflight_host[slot] != host_base || slab.inflight_bytes[slot] != tensor_bytes ||
+        !slab.consumed[slot]) {
+        return;
+    }
+    if (moe_cache_cuda_ok(device, cudaEventRecord(slab.consumed[slot], consumer_stream),
+            "prefill release record", false)) {
+        slab.consumed_valid[slot] = true;
+    }
+}
+
+// Blocks the calling (CPU) thread, if needed, until the copy started by the
+// matching advance() call has actually finished, then returns the device
+// pointer to compute against. A real host sync rather than a captured
+// cudaStreamWaitEvent - see the design note above moe_cache_prefill_advance
+// for why: this function runs from inside a captured dispatch call as often
+// as not, and the capture that recorded slab.ready[slot] is essentially
+// never the one being recorded now. Returns nullptr on any mismatch (wrong
+// slot, a different tensor landed in that slot since, wrong device) - caller
+// falls back to the existing op_offload/host-read path exactly as if
+// prefetch had never been called, so a mismatch here is a missed
+// optimization, not a correctness problem.
+static const void * moe_cache_prefill_wait(
+        const void * host_base, size_t tensor_bytes, void * consumer_stream_, int * out_slot) {
+    if (out_slot) {
+        *out_slot = -1;
+    }
+    if (!host_base || tensor_bytes == 0 || !consumer_stream_) {
+        return nullptr;
+    }
+    // consumer_stream_ is kept in the signature for API symmetry with
+    // prefill_release (whose consumer_stream is genuinely used, to record
+    // the matching completion event) even though this function no longer
+    // needs a stream itself - see the design note above
+    // moe_cache_prefill_advance for why the join here is a host sync, not a
+    // captured stream wait.
+    moe_cache_device * device_ptr = moe_cache_prefill_first_device();
+    if (!device_ptr) {
+        return nullptr;
+    }
+    moe_cache_device & device = *device_ptr;
+    std::lock_guard<std::mutex> lock(device.dispatch_mu);
+
+    auto it = device.prefill_slabs.find(tensor_bytes);
+    if (it == device.prefill_slabs.end()) {
+        return nullptr;
+    }
+    moe_cache_prefill_slab & slab = it->second;
+    // The consumer (a CUDA op dispatch, e.g. ggml_cuda_mul_mat_id) has no
+    // channel back to the graph-build-time hook that issued the matching
+    // prefetch, so "which slot" can only be recovered by asking the slab -
+    // but since assignment is now fixed per tensor (see the slab struct
+    // comment), this is a direct lookup rather than a scan of both slots.
+    auto assign_it = slab.assigned_slot.find(host_base);
+    if (assign_it == slab.assigned_slot.end()) {
+        return nullptr;
+    }
+    const int slot = assign_it->second;
+    if (slab.inflight_host[slot] != host_base || slab.inflight_bytes[slot] != tensor_bytes) {
+        return nullptr; // registered for this slot, but no live prefetch landed here yet
+    }
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        auto t0 = std::chrono::steady_clock::now();
+        cudaError_t err = cudaEventSynchronize(slab.ready[slot]);
+        auto us = std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+        fprintf(stderr, "[prefill-sync-dbg] bytes=%zu block_us=%lld\n", tensor_bytes, (long long) us);
+        if (!moe_cache_cuda_ok(device, err, "prefill wait", false)) {
+            return nullptr;
+        }
+    } else if (!moe_cache_cuda_ok(device, cudaEventSynchronize(slab.ready[slot]),
+            "prefill wait", false)) {
+        return nullptr;
+    }
+    if (out_slot) {
+        *out_slot = slot;
+    }
+    return slab.dev[slot];
 }
 
 // Sweep often enough that the classification is still true when the kernel acts
@@ -1649,6 +2335,11 @@ static bool moe_cache_allocate_pool(
         slot_count = INT_MAX;
     }
     if (slot_count < 64) {
+        if (getenv("MOE_CACHE_DEBUG_GATE")) {
+            fprintf(stderr, "[moe-cache-pool-dbg] pool creation SKIPPED: expert_size=%zu budget=%zu "
+                    "slots_by_budget=%zu max_entries=%lld slot_count=%zu\n",
+                    shape.expert_size, budget, slots_by_budget, (long long) max_entries, slot_count);
+        }
         return false;
     }
 
@@ -1698,6 +2389,10 @@ static bool moe_cache_allocate_pool(
     shape.pool = (int)device.pools.size() - 1;
     const size_t allocated = slot_count * shape.expert_size;
     device.allocated_bytes += allocated;
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        fprintf(stderr, "[moe-cache-pool-dbg] pool CREATED: expert_size=%zu slot_count=%zu allocated=%zu budget=%zu\n",
+                shape.expert_size, slot_count, allocated, budget);
+    }
 
     if (!moe_cache_start_worker(session, device)) {
         cudaFree(device.pools.back()->slab);
@@ -2174,6 +2869,29 @@ static void moe_cache_free_device(moe_cache_device & device) {
         cudaStreamDestroy(device.compute_stream);
         device.compute_stream = nullptr;
     }
+    if (device.prefill_stream) {
+        cudaStreamSynchronize(device.prefill_stream);
+    }
+    for (auto & [tensor_bytes, slab] : device.prefill_slabs) {
+        (void) tensor_bytes;
+        for (int i = 0; i < 2; i++) {
+            if (slab.dev[i]) {
+                cudaFree(slab.dev[i]);
+            }
+            if (slab.ready[i]) {
+                cudaEventDestroy(slab.ready[i]);
+            }
+            if (slab.consumed[i]) {
+                cudaEventDestroy(slab.consumed[i]);
+            }
+        }
+    }
+    device.prefill_slabs.clear();
+    device.prefill_successors.clear();
+    if (device.prefill_stream) {
+        cudaStreamDestroy(device.prefill_stream);
+        device.prefill_stream = nullptr;
+    }
     device.pools.clear();
     device.allocated_bytes = 0;
     device.d_ids_cap = 0;
@@ -2362,7 +3080,7 @@ static void * moe_cache_begin(
     const size_t tensor_size = (size_t)n_expert * expert_size;
     moe_cache_scratch scratch_requirements;
     if (!moe_cache_scratch_requirements(
-            n_in, n_out, scratch_requirements)) {
+            n_in, n_out, session->config.max_batch, scratch_requirements)) {
         return nullptr;
     }
 
@@ -2896,7 +3614,8 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !ids || !slot_indices || n_ids < 0 || n_ids > 64 || node->planned) {
+    if (!node || !ids || !slot_indices || n_ids < 0 ||
+        n_ids > GGML_MOE_CACHE_MAX_BATCH_ROWS || node->planned) {
         return 0;
     }
     node->planned = true;
@@ -3104,7 +3823,7 @@ static int moe_cache_dispatch(
         const int32_t * slot_indices, const float * const * act_rows) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || !node->planned || node->dispatched || n_hits <= 0 ||
-        n_hits > 64 || n_hits != node->n_pins || !slot_indices || !act_rows ||
+        n_hits > GGML_MOE_CACHE_MAX_BATCH_ROWS || n_hits != node->n_pins || !slot_indices || !act_rows ||
         wtype != node->wtype || n_in != node->n_in || n_out != node->n_out ||
         n_in > INT_MAX || n_out > INT_MAX ||
         n_in > INT64_MAX - (MATRIX_ROW_PADDING - 1)) {
@@ -3267,7 +3986,8 @@ static int moe_cache_dispatch(
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
-    if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
+    if (!node || !node->dispatched || n_hits <= 0 ||
+        n_hits > GGML_MOE_CACHE_MAX_BATCH_ROWS ||
         n_hits != node->n_pins || !dst_rows || n_out != node->n_out) {
         return 0;
     }
@@ -3833,6 +4553,11 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
         const char * env = getenv("GGML_CUDA_MOE_CACHE_PREFETCH");
         return !env || atoi(env) != 0; // on unless explicitly disabled
     }();
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        static std::atomic<long long> n{0};
+        fprintf(stderr, "[router-lookahead-dbg] host_base=%p n_ids=%d enabled=%d call=%lld\n",
+                host_base, n_ids, (int) enabled, (long long) ++n);
+    }
     if (!enabled || !host_base || !ids || n_ids <= 0 ||
         g_session_count.load(std::memory_order_acquire) <= 0) {
         return;
@@ -4018,6 +4743,11 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.host_ptr = moe_cache_host_ptr;
     ggml_moe_cache.prefetch = moe_cache_prefetch;
+    ggml_moe_cache.prefill_register_successor = moe_cache_prefill_register_successor;
+    ggml_moe_cache.prefill_advance = moe_cache_prefill_advance;
+    ggml_moe_cache.prefill_wait = moe_cache_prefill_wait;
+    ggml_moe_cache.prefill_release = moe_cache_prefill_release;
+    ggml_moe_cache.moe_lfru_copy_expert = moe_cache_moe_lfru_copy_expert;
 }
 
 #endif

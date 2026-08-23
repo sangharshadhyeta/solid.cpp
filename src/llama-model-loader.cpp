@@ -1190,6 +1190,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                             tensor_name.c_str(),
                             ggml_nbytes(t_meta) / 1024 / 1024, ggml_type_name(t_meta->type),
                             ggml_backend_buft_name(buft));
+                    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                        fprintf(stderr, "[loader-buft-dbg] tensor=%s buft=%s\n",
+                                tensor_name.c_str(), ggml_backend_buft_name(buft));
+                    }
                     break;
                 }
             }

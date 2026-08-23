@@ -5,6 +5,7 @@
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/moe-cache.cuh"
+#include "ggml-backend-moe-cache.h"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/add-id.cuh"
 #include "ggml-cuda/arange.cuh"
@@ -87,6 +88,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -2186,6 +2188,102 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
+    // Full-layer prefill double buffer, EXPERIMENTAL default OFF (opt in with
+    // GGML_CUDA_MOE_PREFILL_BUFFER=1). Compute against a device-local copy of
+    // this whole CPU-resident tensor instead of letting the kernels below
+    // read src0->data directly off the host through the scheduler's
+    // op_offload path. Both give correct results; the difference is
+    // bandwidth - a real bulk DMA measured ~24.7 GB/s here vs ~9.3 GB/s for
+    // the scattered in-kernel reads op_offload relies on. ids != nullptr
+    // confirms this is really the routed MUL_MAT_ID path. Only ever
+    // attempted for host-resident src0 - GPU-resident weights have no
+    // successor registered and prefill_wait just returns null for them.
+    //
+    // Graph-capture-safe by construction, not by detecting-and-skipping
+    // capture (an earlier version of this tried that and still corrupted
+    // captured graphs - see git history / a2d412e9e-era comments here for
+    // the postmortem): moe_cache_prefill_advance below forks any copy work
+    // off ctx.stream() (this call's canonical stream, the same one any
+    // active capture is using) via a proper CUDA event record+wait before
+    // touching prefill_stream, which is the documented way to bring a second
+    // stream's work into an in-progress capture, and prefill_wait's
+    // cudaStreamWaitEvent joins it back for the consumer. Nothing here
+    // allocates - moe_cache_prefill_register_successor (called once per
+    // layer at graph-BUILD time, from the architecture's model-building
+    // code, never here) pre-creates every buffer this needs, since capture
+    // can only ever be active during compute, strictly after build.
+    const void * prefill_host_base = nullptr;
+    size_t prefill_tensor_bytes = 0;
+    int prefill_slot = -1;
+    ggml_tensor src0_prefetched_storage;
+    const ggml_tensor * src0_active = src0;
+    // No buffer/is_host gate here on purpose: measured directly that an
+    // op_offloaded node's src0 here is not the original weight tensor object
+    // (view_src is nil, so it isn't a formal ggml "view" either) - it's a
+    // scheduler-created per-backend duplicate (name "CUDA0#realname#0"),
+    // whose ->buffer reports CUDA0/is_host()==false regardless of where the
+    // bytes actually live, since that's what marks it as scheduled onto the
+    // CUDA backend in the first place. Its ->data still points at the real
+    // (possibly host) memory - that's the whole premise op_offload's
+    // zero-copy read relies on - so it's the same value
+    // build_moe_prefill_prefetch registered under at build time, and the
+    // lookup below naturally misses for anything that was never registered
+    // (dense/GPU-resident layers).
+    //
+    // That miss is correct but not free: prefill_advance/prefill_wait each
+    // take device.dispatch_mu and do a couple of hash-map lookups, and a
+    // typical model has as many GPU-resident (never offloaded) MoE layers as
+    // offloaded ones, all funneling through this same ids-gated path. Paying
+    // that cost on every dispatch for tensors that were structurally never
+    // going to hit measured as a real, if modest, net regression on prompt
+    // processing. src0's own name is a free, reliable pre-filter: a
+    // scheduler-duplicated tensor's name always has the "realname#backend#n"
+    // form (see the comment above), which a plain GGUF-loaded tensor name
+    // never contains, so a GPU-resident layer's src0 can be recognized and
+    // skipped before taking the lock at all.
+    const bool src0_is_dup = strchr(src0->name, '#') != nullptr;
+    if (getenv("MOE_CACHE_DEBUG_GATE")) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1) < 20000) {
+            fprintf(stderr, "[prefill-gate2] name=%s ids=%p data=%p dup=%d\n",
+                    src0->name, (void*)ids, src0->data, (int) src0_is_dup);
+        }
+    }
+    if (ids && !src0_is_dup) {
+        cudaStream_t origin_stream = ctx.stream();
+        if (ggml_moe_cache.prefill_advance) {
+            ggml_moe_cache.prefill_advance(src0->data, origin_stream);
+        }
+        if (ggml_moe_cache.prefill_wait) {
+            prefill_tensor_bytes = ggml_nbytes(src0);
+            const void * dev_ptr = ggml_moe_cache.prefill_wait(
+                    src0->data, prefill_tensor_bytes, origin_stream, &prefill_slot);
+            if (dev_ptr) {
+                src0_prefetched_storage = *src0;
+                src0_prefetched_storage.data = const_cast<void *>(dev_ptr);
+                src0_active = &src0_prefetched_storage;
+                prefill_host_base = src0->data;
+            }
+            if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                static std::atomic<int> hit_count{0}, miss_count{0};
+                int c;
+                if (dev_ptr) { c = ++hit_count; } else { c = -(++miss_count); }
+                if (hit_count.load() + miss_count.load() <= 20000) {
+                    fprintf(stderr, "[prefill-dbg] name=%s bytes=%zu %s (hit=%d miss=%d)\n",
+                            src0->name, prefill_tensor_bytes, dev_ptr ? "HIT" : "MISS",
+                            hit_count.load(), miss_count.load());
+                }
+                (void) c;
+            }
+        }
+    }
+    const auto prefill_done = [&] {
+        if (prefill_host_base && ggml_moe_cache.prefill_release) {
+            ggml_moe_cache.prefill_release(
+                    prefill_host_base, prefill_tensor_bytes, prefill_slot, ctx.stream());
+        }
+    };
+
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
@@ -2193,27 +2291,32 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
                 if (ne2 <= mmvq_mmid_max) {
-                    ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_q(ctx, src0_active, src1, ids, dst);
+                    prefill_done();
                     return;
                 }
             } else {
                 if (GGML_CUDA_CC_IS_AMD(cc)) {
-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+                    ggml_cuda_mul_mat_vec_f(ctx, src0_active, src1, ids, dst);
+                    prefill_done();
                     return;
                 }
             }
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
-            ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_q(ctx, src0_active, src1, ids, dst);
+            prefill_done();
             return;
         }
 
         if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
-            ggml_cuda_mul_mat_f(ctx, src0, src1, ids, dst);
+            ggml_cuda_mul_mat_f(ctx, src0_active, src1, ids, dst);
+            prefill_done();
             return;
         }
     }
+    prefill_done(); // fell through to the general path below, which still reads src0->data directly
 
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
@@ -4922,6 +5025,36 @@ bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size) {
 #endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
 }
 
+// EXPERIMENT: same as ggml_backend_cuda_register_host_buffer, but falls back to
+// cudaHostRegisterDefault (no ReadOnly flag) when ReadOnly registration is
+// rejected by the driver - mirrors moe-cache.cu's own fallback (see its
+// "first fill" hostreg path), needed on hardware where ReadOnly registration
+// is unsupported outright. Requires the region to actually be writable
+// (LLAMA_MMAP_WRITABLE=1) for the fallback to succeed. Not wired into the
+// generic register_host_buffer proc address to avoid changing pinning
+// behavior for the stock mmap-fragment loader path.
+bool ggml_backend_cuda_register_host_buffer_rw(void * buffer, size_t size) {
+#if CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA) || defined(GGML_USE_HIP)
+    cudaError_t err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+    if (err == cudaSuccess) {
+        return true;
+    }
+    (void)cudaGetLastError();
+    err = cudaHostRegister(buffer, size, cudaHostRegisterPortable | cudaHostRegisterDefault);
+    if (err != cudaSuccess) {
+        (void)cudaGetLastError();
+        GGML_LOG_DEBUG("%s: failed to register %.2f MiB of pinned memory (rw fallback): %s\n", __func__,
+                           size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+#else
+    GGML_UNUSED(buffer);
+    GGML_UNUSED(size);
+    return false;
+#endif // CUDART_VERSION >= 11010 || defined(GGML_USE_MUSA)
+}
+
 void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
     cudaError_t err = cudaHostUnregister(buffer);
     if (err != cudaSuccess) {
@@ -5760,6 +5893,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_register_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_register_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_register_host_buffer_rw") == 0) {
+        return (void *)ggml_backend_cuda_register_host_buffer_rw;
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;

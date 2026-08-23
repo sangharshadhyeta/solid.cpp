@@ -3,6 +3,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// Structural ceiling on how many (token, selected-expert) pairs a single
+// cache-eligible MUL_MAT_ID node may carry. Shared between the CUDA
+// provider (moe-cache.cu, which sizes its per-node pin array and scratch
+// reservation off this) and the CPU dispatch path (ggml-cpu.c, which sizes
+// its stack-local id/row arrays off the same value) so the two halves of
+// this handshake cannot drift apart - they used to be two separately
+// maintained "64"s that only a comment tied together. 4096 covers a full
+// n_ubatch=512 prefill chunk at up to 8 selected experts/token (the common
+// range for today's MoE models); raise further only after checking the
+// per-device scratch reservation this adds (grows linearly with this
+// value, a few tens of MB at 4096 for typical hidden/ffn sizes).
+#define GGML_MOE_CACHE_MAX_BATCH_ROWS 4096
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -115,6 +128,91 @@ struct ggml_moe_cache_api {
     // accurate, so these fills must never displace an expert the cache is
     // confident about. Speculation loses ties to certainty.
     void (*prefetch)(const void * host_base, const int32_t * ids, int n_ids);
+
+    // Full-layer prefill double buffer, split into a build-time and a
+    // compute-time half - CUDA graph capture can only ever be active during
+    // compute, so anything that allocates (cudaMalloc) has to happen at
+    // build time to be unconditionally capture-safe, while the thing that
+    // runs every call (the copy itself) has to happen at compute time to
+    // actually refresh the buffer on every graph replay, not just once.
+    //
+    // Call at graph-BUILD time (once per layer, never at compute time):
+    // registers "when host_base's node is dispatched, prefetch
+    // next_host_base (its complete byte size, not a per-row scratch size)"
+    // and eagerly allocates everything that will need. next_n_expert is the
+    // successor tensor's own expert count (its ne[2]) - needed so
+    // prefill_advance can split the copy per expert row and skip whichever
+    // rows are already resident in the decode-time LFRU pool (a
+    // device-to-device copy instead of one over PCIe). Pass 0 if unknown, in
+    // which case the whole tensor is always copied over PCIe as one block
+    // (the pre-hit-D2D behavior). NULL-safe.
+    void (*prefill_register_successor)(
+            const void * host_base, const void * next_host_base, size_t next_tensor_bytes,
+            int64_t next_n_expert);
+
+    // Call at compute time, from inside the consumer that is dispatching
+    // host_base's own node (e.g. ggml_cuda_mul_mat_id) - kicks off the copy
+    // for whatever tensor was registered as host_base's successor, on a
+    // private prefill stream. origin_stream (a cudaStream_t, opaque here
+    // since this header is shared with plain-C callers) is unused by the
+    // copy itself but kept in the signature for symmetry with prefill_wait/
+    // prefill_release. The copy deliberately is NOT made part of whatever
+    // CUDA graph capture may currently be active on origin_stream - see the
+    // implementation's own design note for why (capture granularity for this
+    // op_offload path is roughly one region per layer, so a cross-layer
+    // producer/consumer relationship almost never shares a single capture).
+    // Never allocates. NULL-safe.
+    void (*prefill_advance)(const void * host_base, void * origin_stream);
+
+    // Blocks the calling thread, if needed, until the copy started by a
+    // matching prefill_advance call has actually finished (searched for
+    // internally - the caller doesn't need to know which slot it landed in,
+    // since it's typically a different call site than the one that issued
+    // the prefetch), then returns the device pointer to compute against - or
+    // NULL if no live prefetch matches (never started, already released, or
+    // a different tensor occupies the slot for this shape), in which case
+    // the caller must fall back to its normal path exactly as if prefetch
+    // had never been called. A real (host) synchronization rather than a
+    // stream-ordered one - see prefill_advance's doc comment for why.
+    // consumer_stream (a cudaStream_t, opaque here since this header is
+    // shared with plain-C callers) is kept for symmetry with prefill_release,
+    // whose consumer_stream is genuinely used. On a non-NULL return,
+    // *out_slot receives the slot found - pass it to prefill_release once the
+    // caller is done reading. out_slot may be NULL if the caller has no
+    // matching prefill_release call (e.g. just probing).
+    const void * (*prefill_wait)(const void * host_base, size_t tensor_bytes, void * consumer_stream, int * out_slot);
+
+    // Must be called once the caller has issued (not necessarily completed -
+    // this only needs to be ordered on consumer_stream) every read of the
+    // buffer prefill_wait returned, passing the slot *out_slot reported, so
+    // the slot can be safely overwritten by a future prefetch two calls from
+    // now (the ping-pong period). Skipping this call is safe but pessimistic,
+    // never incorrect - see the implementation's own comment for why.
+    // NULL-safe like the other optional entries here.
+    void (*prefill_release)(const void * host_base, size_t tensor_bytes, int slot, void * consumer_stream);
+
+    // Called from ggml_backend_sched_compute_splits' existing "copy only the
+    // experts that are used" logic (ggml-backend.cpp), for one selected
+    // expert row, before that code falls back to its normal H2D path for it.
+    // If this expert is already resident in the decode-time LFRU pool for
+    // this device, issues a device-to-device copy of expert_size bytes from
+    // the resident slot into dst_ptr, ordered on the same stream backend's
+    // own async tensor-copy calls use (backend is a ggml_backend_t, opaque
+    // here since this header is shared with plain-C callers and has no
+    // ggml-backend.h dependency of its own - the implementation extracts its
+    // stream the same way ggml_backend_cuda_set_tensor_async does, from
+    // backend->context), and returns true - the caller should then exclude
+    // this row from whatever H2D it was about to do. Returns false
+    // (host_base/expert not resident, or no moe-cache session live) with no
+    // side effects, in which case the caller's normal H2D path is unchanged.
+    // This is the scheduler-level integration point for LFRU-aware "skip the
+    // PCIe copy for what's already resident" - upgrading the existing
+    // sparse-copy mechanism in place, not a parallel path to it. Pins the
+    // source slot against eviction until the copy is actually complete (via
+    // a stream callback), so it's safe to call this from inside an active
+    // split computation. NULL-safe.
+    bool (*moe_lfru_copy_expert)(
+            const void * host_base, int32_t expert, size_t expert_size, void * dst_ptr, void * backend);
 
     // Aggregate cache health summary - see ggml_moe_cache_summary. Always
     // writes *out (zeroed on failure). NULL-safe like the other optional

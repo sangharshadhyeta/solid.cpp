@@ -1567,8 +1567,10 @@ static void ggml_compute_forward_mul_mat_id(
     const int n_ids = ids->ne[0]; // n_expert_used
     const int n_as  = ne02;       // n_expert
 
-    // MoE expert cache state is used by thread 0 only.
-    enum { MOE_CACHE_MAX_TOPK = 64 };
+    // MoE expert cache state is used by thread 0 only. Ceiling is shared with
+    // the CUDA provider (moe-cache.cu) via GGML_MOE_CACHE_MAX_BATCH_ROWS so
+    // the two sides of this handshake can't drift apart.
+    enum { MOE_CACHE_MAX_TOPK = GGML_MOE_CACHE_MAX_BATCH_ROWS };
     void *        moe_cache_node = NULL;
     int           moe_cache_n_hits = 0;
     int32_t       moe_cache_slot_idx[MOE_CACHE_MAX_TOPK];
@@ -1642,6 +1644,9 @@ static void ggml_compute_forward_mul_mat_id(
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
             n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+            if (getenv("MOE_CACHE_DEBUG_GATE")) {
+                fprintf(stderr, "[moe-cache-begin-dbg] name=%s data=%p\n", src0->name, src0->data);
+            }
             moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                   ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (moe_cache_node) {

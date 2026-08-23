@@ -2,6 +2,10 @@
 #include "ggml-backend.h"
 #include "ggml-backend-moe-cache.h"
 
+#ifdef MOE_CACHE_TEST_HAS_CUDA
+#include <cuda_runtime.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1164,6 +1168,14 @@ static bool run_admission_policy_once(
     set_env("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", "2");
     set_env("GGML_CUDA_MOE_CACHE_THROTTLE", "8");
     set_env("GGML_CUDA_MOE_CACHE_STATS", "0");
+    // Scratch reservation scales with the configured max_batch (so a session
+    // that will only ever see small batches doesn't pay for headroom it can
+    // never use). This test wants a pool one slot short of n_expert (65) to
+    // exercise eviction at capacity, so pin max_batch to the value the slot
+    // math below assumes - configure_cache() sets it to 1, which would leave
+    // a much bigger pool (66+, since less scratch is withheld from budget)
+    // and never force the eviction this test is checking for.
+    set_env("GGML_CUDA_MOE_CACHE_MAX_BATCH", "64");
     capture.clear();
 
     void * session = create_direct_session(cuda, cpu);
@@ -1262,6 +1274,160 @@ static bool run_admission_policy(
     printf("cache-admission-policy: %s\n", ok ? "OK" : "FAIL");
     return ok;
 }
+
+#ifdef MOE_CACHE_TEST_HAS_CUDA
+// Exercises the full-layer prefill double buffer (prefill_prefetch/_wait)
+// directly: correctness of the copy, ping-pong slot alternation across
+// distinct tensors of the same shape, and that a wait() call correctly
+// rejects a slot that holds a different tensor than the one asked for.
+static bool run_prefill_prefetch(ggml_backend_t cuda, ggml_backend_t cpu) {
+    if (!ggml_moe_cache.prefill_register_successor || !ggml_moe_cache.prefill_advance ||
+        !ggml_moe_cache.prefill_wait || !ggml_moe_cache.prefill_release) {
+        printf("prefill-prefetch: SKIP (not available)\n");
+        return true;
+    }
+    // The register/advance split is gated behind this env var (default off -
+    // see ggml_cuda_mul_mat_id's comment in ggml-cuda.cu for the full
+    // rationale). This test drives it directly to validate the buffer
+    // mechanism's correctness (data integrity, slot reuse, the
+    // fork/consumed-event ordering); it uses a single stream as both the
+    // "origin" (what a capture would use) and the "consumer", which doesn't
+    // exercise actual CUDA-graph capture itself - that needs a real graph
+    // capture/replay test, not written here.
+    set_env("GGML_CUDA_MOE_PREFILL_BUFFER", "1");
+    configure_cache(nullptr);
+    void * session = create_direct_session(cuda, cpu);
+    if (!session) {
+        printf("prefill-prefetch: FAIL (no session)\n");
+        return false;
+    }
+    ggml_moe_cache.session_enter(session);
+
+    const size_t tensor_bytes = 4 * 1024 * 1024;
+    std::vector<uint8_t> host_a(tensor_bytes);
+    std::vector<uint8_t> host_b(tensor_bytes);
+    for (size_t i = 0; i < tensor_bytes; i++) {
+        host_a[i] = (uint8_t)(i & 0xFF);
+        host_b[i] = (uint8_t)(~i & 0xFF);
+    }
+    // Dummy "this layer" keys - register_successor only ever uses these as
+    // map keys (never dereferences them), so any distinct stable addresses
+    // work; real callers pass an actual weight tensor's ->data.
+    int key1 = 1, key2 = 2;
+
+    cudaStream_t stream = nullptr;
+    cudaStreamCreate(&stream);
+
+    bool ok = true;
+
+    ggml_moe_cache.prefill_register_successor(&key1, host_a.data(), tensor_bytes, 0);
+    ggml_moe_cache.prefill_advance(&key1, stream);
+    int slot_a = -1;
+    const void * dev_a = ggml_moe_cache.prefill_wait(host_a.data(), tensor_bytes, stream, &slot_a);
+    ok = ok && dev_a != nullptr && slot_a >= 0;
+
+    std::vector<uint8_t> readback(tensor_bytes);
+    if (ok) {
+        cudaMemcpyAsync(readback.data(), dev_a, tensor_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        ok = ok && memcmp(readback.data(), host_a.data(), tensor_bytes) == 0;
+    }
+
+    // A second tensor of the same shape, registered under a different key,
+    // must ping-pong into the other slot, not clobber the first (still
+    // referenced) one.
+    if (ok) {
+        ggml_moe_cache.prefill_register_successor(&key2, host_b.data(), tensor_bytes, 0);
+        ggml_moe_cache.prefill_advance(&key2, stream);
+    }
+
+    // The first slot's data must still be exactly what host_a wrote - a real
+    // regression here would mean the ping-pong allocator reused a live slot.
+    const void * dev_a_again = ok
+        ? ggml_moe_cache.prefill_wait(host_a.data(), tensor_bytes, stream, nullptr) : nullptr;
+    ok = ok && dev_a_again == dev_a;
+
+    // A host pointer that was never prefetched for this shape must fail -
+    // no false positive from an unrelated live slot.
+    if (ok) {
+        std::vector<uint8_t> host_never(tensor_bytes);
+        const void * never = ggml_moe_cache.prefill_wait(host_never.data(), tensor_bytes, stream, nullptr);
+        ok = ok && never == nullptr;
+    }
+
+    int slot_b = -1;
+    const void * dev_b = ok
+        ? ggml_moe_cache.prefill_wait(host_b.data(), tensor_bytes, stream, &slot_b) : nullptr;
+    ok = ok && dev_b != nullptr && dev_b != dev_a && slot_b >= 0 && slot_b != slot_a;
+    if (ok) {
+        cudaMemcpyAsync(readback.data(), dev_b, tensor_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        ok = ok && memcmp(readback.data(), host_b.data(), tensor_bytes) == 0;
+    }
+
+    // Release both slots (as a real caller must, right after issuing its last
+    // read of each), then advance both keys again with new successors - this
+    // exercises the actual race the consumed-event exists to prevent: key1's
+    // new successor (host_c below) reuses the physical buffer slot_a pointed
+    // at, and must not be allowed to start copying until the release for
+    // host_a was recorded. If the wait-on-consumed in moe_cache_prefill_advance
+    // were missing or broken, this would still very likely pass on a fast/idle
+    // GPU (the race window is small) - it's a regression guard, not a proof of
+    // absence - but a wrong wait direction or a skipped record would show up
+    // as corrupted readback contents here often enough to catch in practice.
+    if (ok) {
+        ggml_moe_cache.prefill_release(host_a.data(), tensor_bytes, slot_a, stream);
+        ggml_moe_cache.prefill_release(host_b.data(), tensor_bytes, slot_b, stream);
+    }
+
+    std::vector<uint8_t> host_c(tensor_bytes);
+    std::vector<uint8_t> host_d(tensor_bytes);
+    for (size_t i = 0; i < tensor_bytes; i++) {
+        host_c[i] = (uint8_t)((i * 3 + 7) & 0xFF);
+        host_d[i] = (uint8_t)((i * 5 + 11) & 0xFF);
+    }
+
+    if (ok) {
+        ggml_moe_cache.prefill_register_successor(&key1, host_c.data(), tensor_bytes, 0);
+        ggml_moe_cache.prefill_advance(&key1, stream);
+    }
+    int slot_c = -1;
+    const void * dev_c = ok
+        ? ggml_moe_cache.prefill_wait(host_c.data(), tensor_bytes, stream, &slot_c) : nullptr;
+    ok = ok && dev_c == dev_a && slot_c == slot_a; // same physical buffer, reused
+    if (ok) {
+        cudaMemcpyAsync(readback.data(), dev_c, tensor_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        ok = ok && memcmp(readback.data(), host_c.data(), tensor_bytes) == 0;
+    }
+    if (ok) {
+        ggml_moe_cache.prefill_release(host_c.data(), tensor_bytes, slot_c, stream);
+    }
+
+    if (ok) {
+        ggml_moe_cache.prefill_register_successor(&key2, host_d.data(), tensor_bytes, 0);
+        ggml_moe_cache.prefill_advance(&key2, stream);
+    }
+    int slot_d = -1;
+    const void * dev_d = ok
+        ? ggml_moe_cache.prefill_wait(host_d.data(), tensor_bytes, stream, &slot_d) : nullptr;
+    ok = ok && dev_d == dev_b && slot_d == slot_b;
+    if (ok) {
+        cudaMemcpyAsync(readback.data(), dev_d, tensor_bytes, cudaMemcpyDeviceToHost, stream);
+        cudaStreamSynchronize(stream);
+        ok = ok && memcmp(readback.data(), host_d.data(), tensor_bytes) == 0;
+    }
+    if (ok) {
+        ggml_moe_cache.prefill_release(host_d.data(), tensor_bytes, slot_d, stream);
+    }
+
+    cudaStreamDestroy(stream);
+    ggml_moe_cache.session_leave(session);
+    ggml_moe_cache.session_destroy(session);
+    printf("prefill-prefetch: %s\n", ok ? "OK" : "FAIL");
+    return ok;
+}
+#endif // MOE_CACHE_TEST_HAS_CUDA
 
 } // namespace
 
@@ -1442,6 +1608,9 @@ int main() {
     ok &= run_shape_liveness(cuda, cpu);
     ok &= run_route_override(cuda_device, cuda, cpu);
     ok &= run_admission_policy(cuda, cpu, capture);
+#ifdef MOE_CACHE_TEST_HAS_CUDA
+    ok &= run_prefill_prefetch(cuda, cpu);
+#endif
 
     free_graph(graph);
     ggml_backend_free(cuda);
