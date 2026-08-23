@@ -47,14 +47,22 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
      never runs - verified no slowdown on a ~2000-token prefill (1.8s, no
      crash) and no crash across normal decode traffic either. Observational
      only, same as req_dir - nothing reads it yet.
-   - **4b, blocked, not started**: true *cross-layer* pathway tracking (the
-     actual "fire together" signal the brain-folding discussion was about)
-     needs a token-boundary signal this cache doesn't have - nothing
-     currently tells it "a new token's forward pass just started" vs. "same
-     token, next layer." Inventing a heuristic for that risked the same bug
-     class caught below; left as an explicit prerequisite instead of guessed
-     at. This is the more direct answer to "why can't the atlas be dynamic"
-     than nudging static positions from a live-classified topic would be.
+   - **4b, done**: the token/batch-boundary prerequisite turned out to
+     already exist - `moe_cache_session_enter` is called exactly once per
+     real `ggml_backend_sched_compute_splits` invocation (one graph compute
+     = one forward pass/batch) via an existing RAII scope in
+     `ggml-backend.cpp`, so resetting `last_top_expert_valid` there needed
+     no new API surface at all. Cross-layer edges tracked using `ids[0]`
+     (rank-ordered router output, index 0 = top pick) as each layer's
+     representative expert, into `device.co_activation_cross_layer`.
+     Imperfect for a multi-sequence batched compute call (mixes different
+     sequences into one shared "last layer" state for that call) - same
+     granularity limit `req_dir_x/y` already has as a single per-device
+     value, not pretending otherwise. Verified live: 3 concurrent requests
+     (the case most likely to expose issues in session-wide state), a real
+     ~2000-token prefill, no crash in either. This is the more direct answer
+     to "why can't the atlas be dynamic" than nudging static positions from
+     a live-classified topic would be.
 5. **[not started]** Pathway/connectome visualization — add Z = layer depth
    to the Atlas view; plot real per-token trajectories through the resulting
    3D volume using step 4's co-activation data. Recurring pathways should

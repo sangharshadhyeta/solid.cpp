@@ -301,6 +301,23 @@ struct moe_cache_device {
     // left as an explicit prerequisite rather than guessed at. Observational
     // only, same as req_dir_* - nothing reads this yet.
     std::unordered_map<uint64_t, uint32_t> co_activation;
+
+    // Track 1 step 4b: the missing prerequisite step 4a's comment above
+    // flagged - a real token/batch-boundary signal. Reset in
+    // moe_cache_session_enter, which is already called exactly once per
+    // real ggml_backend_sched_compute_splits invocation (one graph compute
+    // = one forward pass/batch) via the existing moe_cache_scope RAII in
+    // ggml-backend.cpp - no new API needed, this reuses a call site that
+    // already exists and is already exercised by every session. Imperfect
+    // for a multi-sequence batched compute call (mixes different
+    // sequences' tokens into one shared "last layer" state for that call),
+    // same granularity limitation req_dir_x/y already has as a single
+    // per-device value in multi-slot serving - not pretending to be more
+    // precise than that.
+    moe_cache_key last_top_expert{};
+    bool last_top_expert_valid = false;
+    std::unordered_map<uint64_t, uint32_t> co_activation_cross_layer;
+
     // Decay rate for the centroid EMA - deliberately the same shape as the
     // heat step/decay already tuned elsewhere in this file (a fast-reacting
     // but not noise-chasing signal), not yet independently measured. Revisit
@@ -3281,6 +3298,16 @@ static void moe_cache_session_enter(void * opaque) {
         return;
     }
     session->active_scopes++;
+
+    // Track 1 step 4b's token/batch-boundary signal (see the struct comment
+    // on moe_cache_device::last_top_expert_valid): this scope wraps exactly
+    // one real graph compute, so its start is exactly "a new forward pass
+    // is beginning" - reset here means the first MoE layer plan() sees
+    // inside this compute can never link back to the previous compute's
+    // last layer as a false cross-layer edge.
+    for (const auto & device_ptr : session->devices) {
+        device_ptr->last_top_expert_valid = false;
+    }
 }
 
 static void moe_cache_session_leave(void * opaque) {
@@ -4257,6 +4284,31 @@ static int moe_cache_plan(
                 device.co_activation[moe_cache_pair_key(node->host_base, ids[a], ids[b])]++;
             }
         }
+    }
+
+    // Track 1 step 4b: cross-layer co-activation, now that
+    // moe_cache_session_enter resets last_top_expert_valid at the real
+    // token/batch boundary. ids[0] is used as this layer's single
+    // representative expert (real top-k router outputs are rank-ordered,
+    // index 0 = highest score) rather than the full selected set - the
+    // combinatorial cost of tracking every cross-layer pair would be
+    // (this layer's n_ids) x (previous layer's n_ids), unbounded in a way
+    // step 4a's own within-layer n_ids<=32 cap doesn't cover, since it's a
+    // product across two different calls, not a self-pairing within one.
+    if (n_ids > 0 && ids[0] >= 0 && ids[0] < node->n_expert) {
+        const moe_cache_key top_key{node->host_base, ids[0]};
+        if (device.last_top_expert_valid) {
+            // Cross-layer pairs span two different tensors (different
+            // host_base per layer), so the within-layer pair key - which
+            // mixes a single shared host_base with both expert indices -
+            // doesn't apply here: fold both tensors' identities and both
+            // expert indices into one combined hash instead.
+            uint64_t h = moe_cache_pair_key(device.last_top_expert.tensor, device.last_top_expert.expert, 0);
+            h ^= moe_cache_pair_key(top_key.tensor, top_key.expert, 1) + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+            device.co_activation_cross_layer[h]++;
+        }
+        device.last_top_expert = top_key;
+        device.last_top_expert_valid = true;
     }
 
     // Track 1 step 3: Atlas-driven warming, rate-limited to once every 64
