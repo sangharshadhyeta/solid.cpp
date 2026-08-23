@@ -15,12 +15,7 @@
 	import { Flame } from '@lucide/svelte';
 	import { ExpertsService } from '$lib/services';
 	import { serverStore } from '$lib/stores/server.svelte';
-	import type {
-		ApiCoActivationEdge,
-		ApiExpertAtlas,
-		ApiExpertAtlasCell,
-		ApiExpertMapStats
-	} from '$lib/types/api';
+	import type { ApiExpertAtlas, ApiExpertAtlasCell, ApiExpertMapStats } from '$lib/types/api';
 
 	const TIER_LABELS = ['not cached', 'warm (probation)', 'hot (protected)'];
 	const TIER_RGB: [number, number, number][] = [
@@ -44,19 +39,6 @@
 	let stats = $state<ApiExpertMapStats>({});
 	let atlas = $state<ApiExpertAtlas | undefined>(undefined);
 	let probeErr = $state(false);
-	// Track 1 step 5 (docs/plan.md): 'atlas' is the flat 2D circle view,
-	// 'pathway' the 3D topic-space sphere - see drawAtlas3D for what the
-	// third dimension actually encodes and why it is topic, not layer.
-	let viewMode = $state<'atlas' | 'pathway'>('atlas');
-	// Camera state for the 3D view. yaw/pitch in radians, zoom a plain
-	// scalar. Tilted slightly off-axis by default so the sphere reads as a
-	// volume immediately rather than looking like a flat disc on first paint.
-	let camYaw = $state(0.6);
-	let camPitch = $state(-0.35);
-	let camZoom = $state(1);
-	let dragging = false;
-	let dragLastX = 0;
-	let dragLastY = 0;
 
 	// Where the model actually lives, and why it was split that way. Static
 	// per launch (unlike everything else here, which polls), so it reads from
@@ -275,280 +257,6 @@
 			ctx.strokeStyle = 'rgba(226, 232, 240, 0.7)';
 			ctx.stroke();
 		}
-
-		// Track 1 steps 4a/4b/5 (docs/plan.md): co-activation edges, drawn
-		// faint underneath everything else already rendered above (points,
-		// then the req_dir marker below, both stay legible on top). Endpoint
-		// positions come from atlasPointsPx, keyed by (layer,expert) - the
-		// edges themselves only carry layer/expert, not x/y, so this is a
-		// lookup, not a direct plot. An edge whose endpoint isn't in this
-		// atlas (shouldn't happen if server-side translation is correct, but
-		// cheap to guard) is skipped rather than drawn from a wrong origin.
-		const posOf = new Map<string, { px: number; py: number }>();
-		for (const { px, py, cell } of atlasPointsPx) {
-			posOf.set(`${cell.layer}:${cell.expert}`, { px, py });
-		}
-		const drawEdges = (
-			edges: { layer_from: number; expert_from: number; layer_to: number; expert_to: number; count: number }[] | undefined,
-			rgb: string
-		) => {
-			if (!edges?.length) return;
-			const maxCount = Math.max(...edges.map((e) => e.count));
-			for (const e of edges) {
-				const a = posOf.get(`${e.layer_from}:${e.expert_from}`);
-				const b = posOf.get(`${e.layer_to}:${e.expert_to}`);
-				if (!a || !b) continue;
-				const weight = maxCount > 0 ? e.count / maxCount : 0;
-				ctx.beginPath();
-				ctx.moveTo(a.px, a.py);
-				ctx.lineTo(b.px, b.py);
-				ctx.strokeStyle = `rgba(${rgb},${(0.06 + weight * 0.3).toFixed(3)})`;
-				ctx.lineWidth = 0.5 + weight * 1.5;
-				ctx.stroke();
-			}
-		};
-		// Cross-layer first (a known gap - see api.d.ts - some of these are
-		// same-layer artifacts, so they're drawn under, not over, the
-		// within-layer edges) then within-layer on top, in a distinct hue.
-		drawEdges(stats.co_activation_cross_layer, '90,155,216'); // warm blue
-		drawEdges(stats.co_activation_within_layer, '78,214,165'); // hot green
-
-		// Live request-direction marker (Track 1 step 0/1) - same (x,y)
-		// space as every cell above, same projection. Clamped to the disc:
-		// unlike a cell's x/y (bounded by construction, a weighted average
-		// of unit vectors), req_dir is a raw decaying EMA and has no such
-		// guarantee - drawing it outside the ring it's meant to sit in
-		// would look like a bug even when the math is fine.
-		if (stats.req_dir) {
-			let { x: rx, y: ry } = stats.req_dir;
-			const mag = Math.sqrt(rx * rx + ry * ry);
-			if (mag > 1) {
-				rx /= mag;
-				ry /= mag;
-			}
-			const mx = cx + rx * radius;
-			const my = cy + ry * radius;
-			ctx.beginPath();
-			ctx.arc(mx, my, 9, 0, 2 * Math.PI);
-			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
-			ctx.lineWidth = 2;
-			ctx.stroke();
-			ctx.beginPath();
-			ctx.moveTo(mx - 5, my);
-			ctx.lineTo(mx + 5, my);
-			ctx.moveTo(mx, my - 5);
-			ctx.lineTo(mx, my + 5);
-			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
-			ctx.lineWidth = 1.5;
-			ctx.stroke();
-		}
-	}
-
-	/**
-	 * Track 1 step 5: the 3D topic-space atlas.
-	 *
-	 * Real 3D: every expert gets an (x, y, z) position, rotated by real
-	 * yaw/pitch matrices and projected through a real perspective divide,
-	 * with painter's-algorithm depth sorting. No three.js / WebGL - a scene
-	 * of points and lines needs no shaders, materials, or scene graph, and
-	 * llama.cpp's UI vendors its dependencies, so a 3D engine would cost far
-	 * more than the projection math it replaces.
-	 *
-	 * The third dimension is TOPIC, not layer depth - the first version of
-	 * this put layer on z, which was the wrong axis. Layer is a single
-	 * scalar the layer x expert grid already shows perfectly well; topic
-	 * affinity is genuinely N-dimensional (9 categories today) and *that* is
-	 * where the information is being lost. Measured on a real Ornith atlas:
-	 * collapsing to the 2D circle puts 22% of experts (2136 of 9863, the
-	 * ones firing on exactly two categories) on straight chords between two
-	 * anchors, and dumps every all-category generalist on the origin next to
-	 * every expert that fired on nothing.
-	 *
-	 * Category anchors are placed on the unit sphere by the Fibonacci
-	 * (golden-angle) spiral, which is near-equidistant for any N. That also
-	 * fixes a second flaw in the circle: on a circle the anchors sit at equal
-	 * angles in *array order*, inventing an adjacency nobody measured -
-	 * "code" ends up beside "math" and, wrapping around, beside "history",
-	 * purely from position in k_probes[]. On a sphere no arbitrary pairing
-	 * dominates. An expert's position is the convex combination of its
-	 * category anchors weighted by cats[], so a pure specialist sits on the
-	 * sphere surface at its anchor and a generalist sits near the centre.
-	 *
-	 * Performance: this runs on a machine that is usually also serving the
-	 * model, so it deliberately avoids per-frame work proportional to the
-	 * full cell count where it can. Cold (never-cached) experts are the vast
-	 * majority and carry no live signal, so they are drawn as 1px fillRect
-	 * (far cheaper than arc+fill) and skipped by the depth sort entirely -
-	 * only the live points and edges, a few hundred at most, are sorted.
-	 * Redraws during a drag are coalesced onto requestAnimationFrame rather
-	 * than run per mousemove event.
-	 */
-	function drawAtlas3D(ctx: CanvasRenderingContext2D, canvas: HTMLCanvasElement) {
-		if (!atlas) return;
-
-		canvas.width = wrapSize.w;
-		canvas.height = wrapSize.h;
-		canvas.style.width = `${canvas.width}px`;
-		canvas.style.height = `${canvas.height}px`;
-		ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-		const cats = atlas.categories;
-		const nCat = cats.length;
-		if (!nCat) return;
-
-		const cx = canvas.width / 2;
-		const cy = canvas.height / 2;
-		const scale = Math.min(canvas.width, canvas.height) * 0.34 * camZoom;
-
-		// Fibonacci sphere: near-equidistant anchors for any category count,
-		// deterministic so positions are stable between runs and models.
-		const anchors = new Map<string, [number, number, number]>();
-		const golden = Math.PI * (3 - Math.sqrt(5));
-		for (let i = 0; i < nCat; i++) {
-			const z = 1 - (2 * (i + 0.5)) / nCat;
-			const r = Math.sqrt(Math.max(0, 1 - z * z));
-			const th = golden * i;
-			anchors.set(cats[i], [r * Math.cos(th), r * Math.sin(th), z]);
-		}
-
-		const cosY = Math.cos(camYaw), sinY = Math.sin(camYaw);
-		const cosP = Math.cos(camPitch), sinP = Math.sin(camPitch);
-		const camDist = 3.4;
-
-		const project = (x: number, y: number, z: number) => {
-			const x1 = x * cosY + z * sinY;
-			const z1 = -x * sinY + z * cosY;
-			const y2 = y * cosP - z1 * sinP;
-			const z2 = y * sinP + z1 * cosP;
-			const w = camDist / (camDist - z2);
-			return { sx: cx + x1 * scale * w, sy: cy + y2 * scale * w, depth: z2, w };
-		};
-
-		// Wireframe sphere: three great circles, enough to read orientation
-		// while orbiting without drawing a full mesh.
-		ctx.strokeStyle = 'rgba(148, 163, 184, 0.10)';
-		ctx.lineWidth = 1;
-		for (let axis = 0; axis < 3; axis++) {
-			ctx.beginPath();
-			for (let a = 0; a <= 60; a++) {
-				const t = (a / 60) * Math.PI * 2;
-				const c = Math.cos(t), s = Math.sin(t);
-				const p =
-					axis === 0 ? project(c, s, 0) : axis === 1 ? project(c, 0, s) : project(0, c, s);
-				if (a === 0) ctx.moveTo(p.sx, p.sy);
-				else ctx.lineTo(p.sx, p.sy);
-			}
-			ctx.stroke();
-		}
-
-		type Pt = { sx: number; sy: number; depth: number; w: number; cell: ApiExpertAtlasCell };
-		const pts = new Map<string, Pt>();
-		const live: Pt[] = [];
-
-		// Cold points: cheap path. Drawn immediately as 1px rects, never
-		// sorted - they are background texture, and there are thousands.
-		ctx.fillStyle = 'rgba(58, 71, 80, 0.5)';
-		for (const cell of atlas.cells) {
-			let px = 0, py = 0, pz = 0;
-			if (cell.cats) {
-				for (const k in cell.cats) {
-					const a = anchors.get(k);
-					if (!a) continue;
-					const p = cell.cats[k];
-					px += p * a[0];
-					py += p * a[1];
-					pz += p * a[2];
-				}
-			} else {
-				// Atlas predates the cats field - fall back to the flat 2D
-				// position rather than silently placing it at the centre.
-				px = cell.x;
-				py = cell.y;
-			}
-			const pr = project(px, py, pz);
-			const [, , , tier] = cellColor(cell.layer, cell.expert);
-			if (tier === 0) {
-				ctx.fillRect(pr.sx, pr.sy, 1, 1);
-				continue;
-			}
-			const pt = { ...pr, cell };
-			pts.set(`${cell.layer}:${cell.expert}`, pt);
-			live.push(pt);
-		}
-
-		// Co-activation edges. In topic space these read as "these two
-		// regions fire together" rather than as trajectories through depth.
-		type Seg = { a: Pt; b: Pt; rgb: string; weight: number; depth: number };
-		const segs: Seg[] = [];
-		const collect = (edges: ApiCoActivationEdge[] | undefined, rgb: string) => {
-			if (!edges?.length) return;
-			let maxCount = 1;
-			for (const e of edges) if (e.count > maxCount) maxCount = e.count;
-			for (const e of edges) {
-				const a = pts.get(`${e.layer_from}:${e.expert_from}`);
-				const b = pts.get(`${e.layer_to}:${e.expert_to}`);
-				if (!a || !b) continue;
-				segs.push({ a, b, rgb, weight: e.count / maxCount, depth: (a.depth + b.depth) / 2 });
-			}
-		};
-		collect(stats.co_activation_cross_layer, '90,155,216');
-		collect(stats.co_activation_within_layer, '78,214,165');
-
-		// Only live points + edges get sorted - a few hundred, not ~10k.
-		const items: ({ k: 0; v: Seg } | { k: 1; v: Pt })[] = [
-			...segs.map((v) => ({ k: 0 as const, v })),
-			...live.map((v) => ({ k: 1 as const, v }))
-		];
-		items.sort((l, r) => l.v.depth - r.v.depth);
-
-		for (const item of items) {
-			if (item.k === 0) {
-				const { a, b, rgb, weight } = item.v;
-				ctx.beginPath();
-				ctx.moveTo(a.sx, a.sy);
-				ctx.lineTo(b.sx, b.sy);
-				ctx.strokeStyle = `rgba(${rgb},${(0.08 + weight * 0.4).toFixed(3)})`;
-				ctx.lineWidth = (0.5 + weight * 2) * a.w;
-				ctx.stroke();
-			} else {
-				const { sx, sy, w, cell } = item.v;
-				const [rr, gg, bb] = cellColor(cell.layer, cell.expert);
-				ctx.beginPath();
-				ctx.arc(sx, sy, Math.max(0.8, (ATLAS_POINT_R + cell.spec * 2) * w), 0, 2 * Math.PI);
-				ctx.fillStyle = `rgba(${rr},${gg},${bb},0.9)`;
-				ctx.fill();
-			}
-		}
-
-		// Category labels last, on the sphere surface at their anchors, dimmed
-		// when facing away so the far side does not compete with the near.
-		ctx.font = '11px sans-serif';
-		ctx.textAlign = 'center';
-		ctx.textBaseline = 'middle';
-		for (const [name, a] of anchors) {
-			const p = project(a[0] * 1.12, a[1] * 1.12, a[2] * 1.12);
-			ctx.fillStyle = `rgba(148, 163, 184, ${p.depth > 0 ? 0.9 : 0.32})`;
-			ctx.fillText(name, p.sx, p.sy);
-		}
-
-		// Live request-direction marker. req_dir is a 2D centroid in the old
-		// circle space, so it has no z - drawn on the equatorial plane, which
-		// is where a 2D-derived signal honestly belongs rather than faking a
-		// depth it never had.
-		if (stats.req_dir) {
-			let { x: rx, y: ry } = stats.req_dir;
-			const mag = Math.hypot(rx, ry);
-			if (mag > 1) {
-				rx /= mag;
-				ry /= mag;
-			}
-			const p = project(rx, ry, 0);
-			ctx.beginPath();
-			ctx.arc(p.sx, p.sy, 8 * p.w, 0, 2 * Math.PI);
-			ctx.strokeStyle = 'rgba(248, 113, 113, 0.9)';
-			ctx.lineWidth = 2;
-			ctx.stroke();
-		}
 	}
 
 	function draw() {
@@ -562,11 +270,7 @@
 		if (!ctx) return;
 
 		if (useAtlas) {
-			if (viewMode === 'pathway') {
-				drawAtlas3D(ctx, canvas);
-			} else {
-				drawAtlas(ctx, canvas);
-			}
+			drawAtlas(ctx, canvas);
 
 			if (rows && cols && pipCanvasEl) {
 				const pipCtx = pipCanvasEl.getContext('2d');
@@ -657,56 +361,7 @@
 		};
 	}
 
-	// Pathway-view camera controls: drag to orbit, wheel to zoom. Kept
-	// separate from the atlas view's hover-tooltip handler rather than
-	// branching inside it - they want opposite things from a mousemove
-	// (one tracks a cursor position, the other a delta since last frame).
-	function onPathwayDown(e: MouseEvent) {
-		dragging = true;
-		dragLastX = e.clientX;
-		dragLastY = e.clientY;
-	}
-
-	function onPathwayUp() {
-		dragging = false;
-	}
-
-	// Coalesce redraws onto the next animation frame: mousemove can fire far
-	// faster than the display refreshes, and this machine is usually also
-	// busy serving the model - drawing per event would burn CPU for frames
-	// nobody ever sees.
-	let camRaf = 0;
-	function requestCamDraw() {
-		if (camRaf) return;
-		camRaf = requestAnimationFrame(() => {
-			camRaf = 0;
-			draw();
-		});
-	}
-
-	function onPathwayMove(e: MouseEvent) {
-		if (!dragging) return;
-		camYaw += (e.clientX - dragLastX) * 0.008;
-		// Clamped short of straight-down/up, where the sphere's great circles
-		// degenerate to lines and orientation becomes unreadable.
-		camPitch = Math.max(-1.4, Math.min(1.4, camPitch + (e.clientY - dragLastY) * 0.008));
-		dragLastX = e.clientX;
-		dragLastY = e.clientY;
-		requestCamDraw();
-	}
-
-	function onPathwayWheel(e: WheelEvent) {
-		e.preventDefault();
-		camZoom = Math.max(0.4, Math.min(3, camZoom * (e.deltaY > 0 ? 0.92 : 1.08)));
-		requestCamDraw();
-	}
-
 	function onMove(e: MouseEvent) {
-		if (viewMode === 'pathway') {
-			onPathwayMove(e);
-			return;
-		}
-
 		if (atlas?.cells.length) {
 			onMoveAtlas(e);
 			return;
@@ -789,31 +444,6 @@
 			</span>
 		</div>
 		<div class="text-muted-foreground flex flex-wrap items-center gap-4 text-xs">
-			{#if atlas?.cells.length}
-				<div class="border-border flex overflow-hidden rounded-md border">
-					<button
-						class="px-2 py-1 text-[11px] {viewMode === 'atlas'
-							? 'bg-accent text-foreground'
-							: 'hover:bg-accent/50'}"
-						onclick={() => {
-							viewMode = 'atlas';
-							draw();
-						}}>Atlas</button
-					>
-					<button
-						class="border-border border-l px-2 py-1 text-[11px] {viewMode === 'pathway'
-							? 'bg-accent text-foreground'
-							: 'hover:bg-accent/50'}"
-						onclick={() => {
-							viewMode = 'pathway';
-							draw();
-						}}>Atlas 3D</button
-					>
-				</div>
-			{/if}
-			{#if viewMode === 'pathway'}
-				<span class="text-[11px]">drag to orbit · scroll to zoom</span>
-			{/if}
 			<span class="flex items-center gap-1.5">
 				<i class="inline-block size-2.5 rounded-full" style="background: #4ed6a5"></i>
 				hot {totals[2].toLocaleString()}
@@ -849,15 +479,8 @@
 		<canvas
 			bind:this={canvasEl}
 			class="h-full w-full"
-			class:cursor-grab={viewMode === 'pathway'}
 			onmousemove={onMove}
-			onmousedown={viewMode === 'pathway' ? onPathwayDown : undefined}
-			onmouseup={viewMode === 'pathway' ? onPathwayUp : undefined}
-			onwheel={viewMode === 'pathway' ? onPathwayWheel : undefined}
-			onmouseleave={() => {
-				tip = null;
-				dragging = false;
-			}}
+			onmouseleave={() => (tip = null)}
 		></canvas>
 		{#if atlas?.cells.length && rows && cols}
 			<div
