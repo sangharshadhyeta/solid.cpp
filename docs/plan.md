@@ -63,7 +63,14 @@ signal for the VRAM expert cache, on top of plain LFRU heat.
      ~2000-token prefill, no crash in either. This is the more direct answer
      to "why can't the atlas be dynamic" than nudging static positions from
      a live-classified topic would be.
-5. **[not started]** Pathway/connectome visualization — add Z = layer depth
+5. **[done]** 3D topic-space visualization (commit `ec1354bc1`) — third axis is
+   TOPIC, not layer: `llama-expert-atlas` now keeps the per-category vector
+   (`cats{}`) instead of discarding it, and the Brain view projects it onto
+   Fibonacci-sphere anchors (near-equidistant, no arbitrary array-order
+   adjacency). Drag to orbit, scroll to zoom. Kept cheap: cold experts draw
+   as 1px rects and skip the depth sort; drag redraws coalesce onto rAF.
+   Originally built with layer on z — that was the wrong axis, corrected.
+   ~~Pathway/connectome visualization~~ — add Z = layer depth
    to the Atlas view; plot real per-token trajectories through the resulting
    3D volume using step 4's co-activation data. Recurring pathways should
    show up as literal bundles of parallel lines through the volume (the
@@ -194,6 +201,36 @@ condition under which it won. Still gated behind
 (+2.75pp hit rate, 4/4 rounds, small tok/s cost) is real but has not yet
 been re-validated with more rounds the way the steady-state tests were -
 worth doing before considering a default flip.
+
+## Track 1.6 — Discovered topics from co-activation (not started)
+
+The atlas's 9 categories are human guesses hardcoded in `k_probes[]`, and a
+*dynamic* atlas built on them has a trap: live traffic carries no category
+label, so the only available labeller is `req_dir` — itself inferred from
+the static atlas. Updating the atlas from that is self-training, and the
+known failure mode is confirmation drift (a slightly wrong estimate
+reinforces itself).
+
+Co-activation (steps 4a/4b, already collected) sidesteps both problems at
+once. "These two experts fired in the same routing decision" is a direct
+observation, not an inferred label, so there is no circularity — and
+embedding/clustering that graph yields dimensions that are *discovered*
+rather than assigned, including structure no human would have thought to
+name. One mechanism answers both "can the atlas be dynamic" and "must it
+use preset topics", with no damping leash required.
+
+Sketch: build an expert-by-expert co-activation matrix, factor or cluster it
+(spectral / NMF / graph embedding), use the resulting components as axes.
+The `cats{}` vector now emitted by `llama-expert-atlas` makes the two
+directly comparable — discovered axes can be scored against the labelled
+ones to see how much of the human category set the model actually
+reproduces on its own. Not started; needs its own design pass.
+
+If instead staying with labelled probes, the cheap intermediate is simply
+more categories: `cats{}` is schema-stable under a changing category set,
+and the sphere anchors are computed for any N, so growing `k_probes[]` and
+regenerating needs no code change on either side. Untested — no measurement
+has been taken of whether more categories actually improves anything.
 
 ## Track 1.5 — CPU-GPU split gap (from FreeToken, never carried over)
 
