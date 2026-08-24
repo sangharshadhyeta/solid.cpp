@@ -1256,6 +1256,46 @@ co-activation. Selecting by triple co-occurrence with the other experts in the
 same decision is the direct test of whether the higher-order structure converts
 into a better mechanism, and it reuses data already collected.
 
+## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
+
+The question behind the GLM-scale vision: extract a small working set of a huge
+model into VRAM and run the rest from host RAM. Simulated with the SHIPPED
+logic (LRU eviction, demand admission, rank-ordered stand-in selection), 113,685
+decisions, 4,713 distinct (layer, expert) units:
+
+| resident | slots | hit | no candidate | stand-in vs missed | retained mass |
+|---|---|---|---|---|---|
+| 18.5% | 871 | 96.90% | 0.68% | 277.1% | 99.11% |
+| 10.0% | 471 | 87.21% | 0.79% | 252.7% | 98.93% |
+| 5.0% | 235 | 70.31% | 2.56% | 232.0% | 96.33% |
+| 2.5% | 117 | 53.66% | 7.62% | 225.1% | 89.55% |
+| **1.2%** | 56 | 38.67% | 15.62% | **227.6%** | **80.37%** |
+| 0.6% | 28 | 26.80% | 22.86% | 231.5% | 73.11% |
+
+**Stand-in quality does not degrade.** 277% -> ~230% and then flat from 5% down
+to 0.6%: even with a 0.6% working set the substitute is still rated HIGHER by
+the router than the pick it replaced. Structural reason: misses concentrate on
+the router's weak picks (rank 7 misses 44% against rank 0's 20%), so whatever
+is resident tends to outrank what was lost, and shrinking the cache only
+concentrates it further onto the hot core.
+
+**This is why hit rate is the wrong metric for this design.** Hit rate collapses
+96.9% -> 26.8%, but retained gate mass degrades gracefully 99% -> 73%. At the
+1.2% residency corresponding to an "8B working set" of a ~750B model, a
+fetch-based design faces a 61% miss rate and is bandwidth-dead, while
+substitution executes **80% of the router's intended weight** with only 15.6%
+of picks falling back to CPU.
+
+Caveats:
+- Retained gate mass is a PROXY. The +0.47% perplexity bound was measured at
+  18.5% residency; nobody has measured quality at 1.2%, which is where
+  substitution actually bites.
+- The no-candidate tail grows fast (0.7% -> 15.6% -> 22.9%). At very low
+  residency the cost shifts from PCIe bandwidth to CPU compute.
+- Scale is NOT proven: 4,713 units here, and the low cells are 28-117 slots. A
+  750B model is far wider and whether its hot core stays this compact is
+  untested.
+
 ## Substitution stand-in selection — router score beats co-activation by 78%
 
 The substitution mechanism picks a stand-in by pairwise co-activation, but that
