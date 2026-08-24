@@ -528,6 +528,10 @@ struct moe_cache_device {
     long long prefetches = 0;
     long long hits = 0;
     long long misses = 0;
+    // Hit/miss split by the router's rank for each pick (0 = top choice).
+    // Observational only - nothing reads these to make a decision.
+    long long rank_hits[GGML_MOE_CACHE_MAX_RANK] = {};
+    long long rank_misses[GGML_MOE_CACHE_MAX_RANK] = {};
     long long inserts = 0;
     long long fills = 0;
     long long fill_failures = 0;
@@ -620,6 +624,9 @@ struct moe_cache_node {
     int64_t n_in = 0;
     int64_t n_out = 0;
     int64_t n_expert = 0;
+    // Rows in this node's ids tensor, so plan() can turn a flat ids index
+    // back into the router's per-token rank (index % top_k).
+    int64_t n_tokens = 0;
     int wtype = -1;
     // Logical layer index, parsed from the tensor name in moe_cache_begin
     // (-1 when the name doesn't follow llama.cpp's "blk.N." convention).
@@ -3822,6 +3829,7 @@ static void * moe_cache_begin(
     node->n_in = n_in;
     node->n_out = n_out;
     node->n_expert = n_expert;
+    node->n_tokens = n_tokens;
     node->wtype = wtype;
     // llama.cpp names every per-layer tensor "blk.<layer>.<what>.weight"
     // (llm_tn / LLM_TENSOR_NAMES), so the logical layer is already carried
@@ -4365,11 +4373,21 @@ static int moe_cache_plan(
 
     }
 
+    // Router rank for each flat ids index. ggml-cpu.c lays the ids out as
+    // [token][rank] (see the expert_ids fill in ggml_compute_forward_mul_mat_id),
+    // and the router emits them rank-ordered, so index % top_k recovers the
+    // rank. Guarded: a zero/inconsistent n_tokens folds everything into
+    // rank 0 rather than dividing by zero.
+    const int rank_top_k = (node->n_tokens > 0 && n_ids >= node->n_tokens)
+        ? (int) (n_ids / node->n_tokens) : 0;
+
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
             continue;
         }
+        const int rank_bucket = std::min(
+            rank_top_k > 0 ? index % rank_top_k : 0, GGML_MOE_CACHE_MAX_RANK - 1);
 
         if (residency && (size_t) expert < residency->last_seen.size()) {
             residency->last_seen[expert] = age_now;
@@ -4444,14 +4462,17 @@ static int moe_cache_plan(
                 node->pins[node->n_pins++] = {found->second};
                 slot_indices[index] = found->second;
                 device.hits++;
+                device.rank_hits[rank_bucket]++;
                 hits++;
             } else {
                 device.misses++;
+                device.rank_misses[rank_bucket]++;
             }
             continue;
         }
 
         device.misses++;
+        device.rank_misses[rank_bucket]++;
         moe_cache_demand * demand = nullptr;
         try {
             demand = &device.demand_count[key];
@@ -5305,6 +5326,10 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
                 sum.fill_failures   += device.fill_failures;
                 sum.admission_skips += device.admission_skips;
                 sum.prefetches      += device.prefetches;
+                for (int r = 0; r < GGML_MOE_CACHE_MAX_RANK; r++) {
+                    sum.rank_hits[r]   += device.rank_hits[r];
+                    sum.rank_misses[r] += device.rank_misses[r];
+                }
                 sum.allocated_bytes += device.allocated_bytes;
                 sum.budget_bytes    += device.budget_limit;
 

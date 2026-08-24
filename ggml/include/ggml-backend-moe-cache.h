@@ -35,6 +35,11 @@ struct ggml_moe_cache_co_activation_entry {
 	uint32_t     count;
 };
 
+// Router-rank resolution for the residency histogram below. Ranks at or
+// beyond this are folded into the last bucket; real top-k is far smaller
+// (8 on the models this was built for), so the tail is normally empty.
+#define GGML_MOE_CACHE_MAX_RANK 16
+
 struct ggml_moe_cache_summary {
 	long long hits;
 	long long misses;
@@ -57,6 +62,14 @@ struct ggml_moe_cache_summary {
 	// whichever device's session was iterated last - fine for the
 	// visualization this feeds, not meant to be a precise cross-device
 	// aggregate the way the counters above are.
+	// Hit/miss split by the router's own rank for that pick (0 = the
+	// router's top choice). Answers whether cache misses are concentrated
+	// in the low-confidence tail of top-k - which is what decides whether
+	// re-ranking toward resident experts could recover them cheaply, or
+	// would have to overrule the router's strongest picks.
+	long long rank_hits[GGML_MOE_CACHE_MAX_RANK];
+	long long rank_misses[GGML_MOE_CACHE_MAX_RANK];
+
 	float req_dir_x;
 	float req_dir_y;
 	int   req_dir_valid;

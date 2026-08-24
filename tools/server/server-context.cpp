@@ -4725,6 +4725,8 @@ void server_routes::init_routes() {
             {"slots_total",     cs.slots_total},
             {"protected_slots", cs.protected_slots},
             {"avg_heat",        cs.avg_heat},
+            {"rank_hits",       cs.rank_hits},
+            {"rank_misses",     cs.rank_misses},
             {"allocated_mib",   cs.allocated_bytes >> 20},
             {"budget_mib",      cs.budget_bytes >> 20},
         } : json::object();
