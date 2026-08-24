@@ -994,7 +994,51 @@ hard rule governing PLACEMENT (who stands in for whom, who sits near whom),
 and recency/heat is the soft rule governing RETENTION probability. Applying a
 placement signal to a retention decision has now failed six times.
 
-### Incremental atlas — settles, but learns nothing
+### Incremental atlas with AdaGrad, and the SILO WARNING (2026-08-25)
+
+Per-node AdaGrad replaces uniform averaging: each node's step scales by its own
+accumulated gradient history, so frequent experts damp down as their history
+grows while rare ones keep moving — "keep the history of affinity rather than
+overwrite it", applied per node. Base learning rate still constant.
+
+Dynamics are now correct: 89.9 deg -> 7.7 deg over 14 epochs, still decreasing,
+no oscillation, no collapse (pairwise cosine sd 0.177), and no edge-sticking
+(mean radius 0.398 in the 2D projection, 5.1% in the outer 20%). Persistence
+verified: resuming adds to the saved map (152.8M -> 178.3M steps) and settling
+continues smoothly rather than restarting.
+
+Held-out link prediction is still **AUC 0.4823 — chance** (0.4991 under uniform
+averaging). AdaGrad fixed the dynamics, not the prediction.
+
+**But the isolated test does not predict integrated behaviour.** Loaded onto
+8099 against the probe atlas, with prompts absent from all 12 trace topics and
+every earlier A/B, 2 reps each:
+
+| atlas | tok/s | hit | fills |
+|---|---|---|---|
+| probe (9 categories) | 58.45 | 71.20% | 21,714 |
+| incremental (AUC 0.48) | 58.43 | 71.28% | 20,875 |
+
+**Identical.** A map scoring at chance performs exactly as well in the running
+system as one scoring 0.7116. Cause: atlas warming is rate-limited to once per
+64 `plan()` calls and admission-gated, contributing ~2% of fills, so the system
+barely consumes the atlas — consistent with the warming on/off result
+(+0.27 tok/s, within noise).
+
+Consequence for how this is evaluated: **the probe atlas's link-prediction
+advantage is real as a statement about the maps, but it never reaches the
+system.** No atlas comparison run through 8099 can currently distinguish a good
+map from a bad one, because the consuming mechanism has almost no leverage.
+Any future claim that one atlas beats another must say which of the two it
+means. The incremental map did produce 3.9% fewer fills, consistently across
+both reps, which is the direction fill cost rewards.
+
+Untested suspicion: training negatives are drawn uniformly from same-layer
+experts while the graph is 22.9% dense, so ~a quarter of the "negatives" are
+real co-firing pairs. That would poison SGNS and could explain chance-level AUC
+despite clean convergence.
+
+### Incremental atlas — first attempt, settles but learns nothing
 
 `scripts/moe-incremental-atlas.py`: SGNS over co-firing pairs, constant
 learning rate by design (annealing would manufacture the appearance of
