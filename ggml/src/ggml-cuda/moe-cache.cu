@@ -5619,6 +5619,82 @@ static int moe_cache_dispatch(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
     }
 
+    // GGML_CUDA_MOE_CACHE_VERIFY_MMV=1: run the SAME rows through the SAME
+    // kernel one at a time and diff against the batched result. Same weights,
+    // same activations, same slots - only the batching differs, so any
+    // disagreement is the batching itself. This is the instrument for the
+    // open corruption bug, where max_batch=1 is clean and every value >= 2
+    // corrupts.
+    // Verify the slots AT DISPATCH TIME, not at plan time. plan() pins each
+    // slot (readers++) and checks it then, but the fill worker runs
+    // concurrently - if it copies a new expert into a slot that is pinned and
+    // about to be read, the weights change underneath the kernel. That race
+    // would be invisible to every check made at plan time, and would get more
+    // likely as more rows are in flight, which matches max_batch=1 being clean.
+    static const bool verify_at_dispatch = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_VERIFY_DISPATCH");
+        return env && atoi(env) != 0;
+    }();
+    if (ok && verify_at_dispatch) {
+        std::lock_guard<std::mutex> lock(session.mu);
+        static std::atomic<int> reported{0};
+        for (int i = 0; i < n_hits; i++) {
+            const int si = slot_indices[i];
+            if (si < 0 || si >= (int) pool.slots.size()) continue;
+            const moe_cache_slot & slot = pool.slots[si];
+            if (slot.state != moe_cache_slot_state::valid || slot.readers <= 0) {
+                if (reported.fetch_add(1) < 20) {
+                    fprintf(stderr, "[moe-cache] DISPATCH SLOT UNPINNED/INVALID row=%d slot=%d "
+                            "state=%d readers=%d\n", i, si, (int) slot.state, slot.readers);
+                }
+                continue;
+            }
+            moe_cache_verify_slot(pool, si, slot.key, device.physical);
+        }
+    }
+
+    static const bool verify_mmv = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_VERIFY_MMV");
+        return env && atoi(env) != 0;
+    }();
+    if (ok && verify_mmv && n_hits > 1) {
+        const int64_t ne10_padded = ((n_in + MATRIX_ROW_PADDING - 1) / MATRIX_ROW_PADDING) * MATRIX_ROW_PADDING;
+        const int64_t s11_blocks = ne10_padded / QK8_1;
+        float * d_ref = nullptr;
+        std::vector<float> batched((size_t) n_hits * n_out), single((size_t) n_hits * n_out);
+        if (cudaMalloc((void **) &d_ref, (size_t) n_hits * n_out * sizeof(float)) == cudaSuccess) {
+            for (int i = 0; i < n_hits; i++) {
+                const char * act_i = (const char *) device.d_act_q8 +
+                    (activation_rows > 1 ? (size_t) i * s11_blocks * sizeof(block_q8_1) : 0);
+                ggml_cuda_moe_cache_mmv(
+                        pool.slab, (ggml_type)wtype, act_i,
+                        device.d_ids + i, d_ref + (size_t) i * n_out,
+                        n_in, n_out, pool.n_slots, (int64_t)pool.expert_size,
+                        /*n_hits=*/1, /*act_rows=*/1, device.compute_stream);
+            }
+            cudaMemcpyAsync(batched.data(), device.d_out, batched.size()*sizeof(float),
+                            cudaMemcpyDeviceToHost, device.compute_stream);
+            cudaMemcpyAsync(single.data(), d_ref, single.size()*sizeof(float),
+                            cudaMemcpyDeviceToHost, device.compute_stream);
+            cudaStreamSynchronize(device.compute_stream);
+            static std::atomic<int> reported{0};
+            for (int i = 0; i < n_hits; i++) {
+                double worst = 0.0; int worst_c = -1;
+                for (int64_t c = 0; c < n_out; c++) {
+                    const double d = std::fabs(batched[(size_t)i*n_out+c] - single[(size_t)i*n_out+c]);
+                    if (d > worst) { worst = d; worst_c = (int) c; }
+                }
+                if (worst > 1e-3 && reported.fetch_add(1) < 20) {
+                    fprintf(stderr, "[moe-cache] MMV BATCH MISMATCH row=%d/%d slot=%d "
+                            "act_rows=%d col=%d batched=%.6f single=%.6f absdiff=%.6f\n",
+                            i, n_hits, slot_indices[i], activation_rows, worst_c,
+                            batched[(size_t)i*n_out+worst_c], single[(size_t)i*n_out+worst_c], worst);
+                }
+            }
+            cudaFree(d_ref);
+        }
+    }
+
     if (!ok) {
         cudaStreamSynchronize(device.compute_stream);
         std::lock_guard<std::mutex> lock(session.mu);
