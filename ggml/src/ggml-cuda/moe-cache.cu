@@ -307,6 +307,30 @@ struct moe_cache_prefill_slab {
     int assign_next = 0;
 };
 
+// Each expert's measured topic-affinity position (see ggml_moe_cache.set_atlas).
+// At namespace scope rather than nested in moe_cache_device because the Track
+// 1.5 warm request below has to name it, and that request has to be a complete
+// type before the device that queues it.
+struct moe_cache_atlas_cell { float x = 0.0f, y = 0.0f, spec = 0.0f; };
+using moe_cache_atlas_row = std::vector<std::pair<int32_t, moe_cache_atlas_cell>>;
+
+// Track 1.5 (docs/plan.md): one deferred atlas-warming pass, handed from the
+// dispatch path to the fill worker. Everything the ranking scan needs is
+// captured here at enqueue time - the atlas row by shared_ptr (so a
+// concurrent set_atlas cannot free it mid-scan) and the request direction by
+// value (so the worker ranks against where the request was heading when the
+// hint was raised, not wherever the centroid has drifted to by the time it
+// gets there).
+struct moe_cache_warm_request {
+    std::shared_ptr<const moe_cache_atlas_row> row;
+    int pool_index = -1;
+    const void * host_base = nullptr;
+    size_t expert_size = 0;
+    int64_t n_expert = 0;
+    float req_dir_x = 0.0f;
+    float req_dir_y = 0.0f;
+};
+
 struct moe_cache_device {
     explicit moe_cache_device(int physical) : physical(physical) {}
 
@@ -323,12 +347,30 @@ struct moe_cache_device {
     // centroid of where the current request is trending in that same space.
     // Observational only right now: updated on real demand hits, nowhere
     // yet read to make a promotion or eviction decision.
-    struct atlas_cell { float x = 0.0f, y = 0.0f, spec = 0.0f; };
+    using atlas_cell = moe_cache_atlas_cell;
     std::unordered_map<moe_cache_key, atlas_cell, moe_cache_key_hash> atlas;
     // Secondary index for the warming scan (Track 1 step 3): "every expert
     // atlas covers for this tensor", so ranking candidates for one layer
     // doesn't mean scanning the whole model's atlas data on every attempt.
-    std::unordered_map<const void *, std::vector<std::pair<int32_t, atlas_cell>>> atlas_by_tensor;
+    // Held behind a shared_ptr for Track 1.5: the async ranking pass takes a
+    // reference to one row in O(1) while holding the session lock and then
+    // scans it with the lock released, so set_atlas has to publish a whole
+    // new row rather than mutate one a worker may be walking.
+    using atlas_row = moe_cache_atlas_row;
+    std::unordered_map<const void *, std::shared_ptr<const atlas_row>> atlas_by_tensor;
+    // Track 1.5: deferred warming passes awaiting the fill worker. Bounded to
+    // one entry by moe_cache_atlas_warm_enqueue - see the comment there for
+    // why dropping, not queueing, is right when the worker is behind.
+    std::deque<moe_cache_warm_request> warm_queue;
+    // Track 1.5 measurement (GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1): how
+    // long the warming block costs *on the dispatch path* specifically.
+    // That is the quantity this track is about, and tok/s cannot resolve it
+    // - the block runs once every 64 plan() calls, so even a large
+    // per-call saving is a rounding error at the throughput level. Measured
+    // directly instead of inferred, same reason step 6/7a were measured
+    // before anything was built on them.
+    long long warm_path_ns = 0;
+    long long warm_path_calls = 0;
     float req_dir_x = 0.0f;
     float req_dir_y = 0.0f;
     bool  req_dir_valid = false;
@@ -2246,6 +2288,12 @@ static size_t moe_cache_pin_budget_bytes() {
     return value;
 }
 
+// Track 1.5: defined further down with the rest of the atlas-warming code,
+// declared here because the worker is the thread that runs it.
+static bool moe_cache_atlas_warm_service(
+        moe_cache_session * session, moe_cache_device * device,
+        std::unique_lock<std::mutex> & lock);
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -2263,7 +2311,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // meant it could never fire in the one state it exists for.
             const bool have_work = session->cv.wait_for(lock, MOE_CACHE_COLD_SWEEP_INTERVAL, [&] {
                 return session->stopping || device->dead.load() ||
-                    !device->queue.empty();
+                    !device->queue.empty() || !device->warm_queue.empty();
             });
             // Promotions first, and the expensive part outside the lock. Decode
             // only recorded intent; the malloc, the copy and the madvise happen
@@ -2282,6 +2330,22 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     lock.unlock();
                     moe_cache_host_promote_locked_free(*device, res, base, exp, esz);
                     lock.lock();
+                }
+                continue;
+            }
+
+            // Track 1.5: the deferred atlas ranking pass. Placed after
+            // promotions and before the fill dequeue for the same reason
+            // promotions are placed where they are - this is CPU work the
+            // decode path handed over precisely so it would happen here, on
+            // the worker's time, while the GPU is busy with the previous
+            // layer. It releases the lock for the scan itself (see
+            // moe_cache_atlas_warm_service) and may queue fills of its own,
+            // so loop round rather than falling through with a stale view of
+            // the queue.
+            if (!device->dead.load() && !device->warm_queue.empty()) {
+                if (moe_cache_atlas_warm_service(session, device, lock)) {
+                    session->cv.notify_all();
                 }
                 continue;
             }
@@ -4159,32 +4223,48 @@ static bool moe_cache_atlas_warm_enabled() {
     return enabled;
 }
 
-static bool moe_cache_atlas_warm(
-        moe_cache_device & device, moe_cache_pool & pool, int pool_index,
-        const void * host_base, size_t expert_size, int64_t n_expert) {
-    if (!device.req_dir_valid || n_expert <= 0) {
-        return false;
-    }
-    const auto it = device.atlas_by_tensor.find(host_base);
-    if (it == device.atlas_by_tensor.end() || it->second.empty()) {
-        return false;
-    }
-    const float rx = device.req_dir_x, ry = device.req_dir_y;
-    const float rmag = std::sqrt(rx * rx + ry * ry);
-    if (rmag < 1e-6f) {
-        return false; // decaying centroid hasn't moved off the origin yet - nothing to rank against
-    }
+// Track 1.5 (docs/plan.md): atlas warming has two halves with very different
+// costs. The ranking pass below is a cosine-similarity scan over every
+// atlas-covered expert of one tensor (a sqrt and a few flops per candidate,
+// up to n_expert of them) and touches no cache state at all; the admission
+// half that follows is a handful of hash lookups and a queue push. Only the
+// second half has to happen under the session lock, and neither half has to
+// happen on the thread that is about to issue a GPU op. Splitting them lets
+// the expensive one run on the fill worker while the GPU is busy with the
+// previous layer, leaving the dispatch path with just an O(1) enqueue - the
+// CPU/GPU split FreeToken's architecture keeps and this port never carried
+// over. Both halves are unchanged in what they compute; only where they run
+// is configurable (GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC).
+struct moe_cache_atlas_cand { int32_t expert; float score; };
 
-    // Rank by cosine similarity to the live request direction, discounted
-    // by each candidate's own specialization confidence (a high-cosine
-    // match to a barely-specialized expert is a much weaker signal than
-    // the same cosine to a sharply-specialized one). Bounded top-K, no
-    // allocation - this runs on a rate-limited decode-path call, not off it.
-    constexpr int K = 2;
-    struct cand { int32_t expert; float score; };
-    cand best[K];
+// How many candidates the ranking pass keeps, and how many of those may
+// actually be admitted. These differ now, which is the one real behavior
+// change in this split: the original scan skipped already-resident experts
+// inline, which needs pool.map and therefore the lock. The lock-free pass
+// cannot, so it keeps a deeper list and lets the admission half - which
+// holds the lock and already re-checked residency anyway - walk down it,
+// admitting the same top-2 non-resident candidates in the same score order.
+// Only when 3+ of the top 4 are already resident do the two differ, and
+// then only by not looking further down the list than the old code would
+// have. Noted rather than hidden: the topic-switch result in docs/plan.md
+// was measured with the old scan and would need re-validating if this ever
+// goes on by default.
+static constexpr int MOE_CACHE_ATLAS_RANK_K  = 4;
+static constexpr int MOE_CACHE_ATLAS_ADMIT_K = 2;
+
+// The expensive half. Pure: reads only the (immutable, shared_ptr-held)
+// atlas row and the request direction snapshot it is handed, writes only
+// best[]. No session lock required, and none taken.
+static int moe_cache_atlas_rank(
+        const moe_cache_device::atlas_row & candidates,
+        float rx, float ry, int64_t n_expert,
+        moe_cache_atlas_cand * best, int k) {
+    const float rmag = std::sqrt(rx * rx + ry * ry);
+    if (rmag < 1e-6f || k <= 0) {
+        return 0; // decaying centroid hasn't moved off the origin yet - nothing to rank against
+    }
     int n_best = 0;
-    for (const auto & [expert, cell] : it->second) {
+    for (const auto & [expert, cell] : candidates) {
         // Atlas data can be stale (a different model/shape than what's
         // actually loaded, or an architecture change since the offline
         // probe ran) or, in this session's own testing, was deliberately
@@ -4199,27 +4279,37 @@ static bool moe_cache_atlas_warm(
         if (expert < 0 || expert >= n_expert) {
             continue;
         }
-        const moe_cache_key key{host_base, expert};
-        if (pool.map.find(key) != pool.map.end()) {
-            continue; // already resident or already in flight
-        }
         const float cmag = std::sqrt(cell.x * cell.x + cell.y * cell.y);
         if (cmag < 1e-6f) {
             continue; // this expert never showed real affinity to any probed category
         }
+        // Cosine similarity to the live request direction, discounted by
+        // the candidate's own specialization confidence (a high-cosine
+        // match to a barely-specialized expert is a much weaker signal than
+        // the same cosine to a sharply-specialized one).
         const float score = ((cell.x * rx + cell.y * ry) / (cmag * rmag)) * cell.spec;
         if (score <= 0.0f) {
             continue; // only warm candidates genuinely aligned with the live direction
         }
-        if (n_best < K) {
+        // Bounded top-K, no allocation.
+        if (n_best < k) {
             best[n_best++] = {expert, score};
-            std::sort(best, best + n_best, [](const cand & a, const cand & b) { return a.score > b.score; });
-        } else if (score > best[K - 1].score) {
-            best[K - 1] = {expert, score};
-            std::sort(best, best + K, [](const cand & a, const cand & b) { return a.score > b.score; });
+            std::sort(best, best + n_best, [](const moe_cache_atlas_cand & a, const moe_cache_atlas_cand & b) { return a.score > b.score; });
+        } else if (score > best[k - 1].score) {
+            best[k - 1] = {expert, score};
+            std::sort(best, best + k, [](const moe_cache_atlas_cand & a, const moe_cache_atlas_cand & b) { return a.score > b.score; });
         }
     }
+    return n_best;
+}
 
+// The cheap half. Must hold session.mu: touches pool.map, the slot table,
+// the LRU list and the fill queue. Returns whether anything was queued, so
+// the caller can fold it into its own worker wake.
+static bool moe_cache_atlas_admit(
+        moe_cache_device & device, moe_cache_pool & pool, int pool_index,
+        const void * host_base, size_t expert_size,
+        const moe_cache_atlas_cand * best, int n_best) {
     // A/B'd on 2026-08-23 restricted to free-slot-only admission: flat,
     // no effect either way on tok/s or hit rate (58.61 vs 58.46 tok/s,
     // 92.05% vs 91.85% hit rate, 3 interleaved rounds). Root cause found
@@ -4255,12 +4345,13 @@ static bool moe_cache_atlas_warm(
         return v < 0 ? 0 : v;
     }();
     int evictions_this_pass = 0;
+    int admitted = 0;
     bool woke = false;
-    for (int i = 0; i < n_best; i++) {
+    for (int i = 0; i < n_best && admitted < MOE_CACHE_ATLAS_ADMIT_K; i++) {
         const int32_t expert = best[i].expert;
         const moe_cache_key key{host_base, expert};
         if (pool.map.find(key) != pool.map.end()) {
-            continue; // resolved by something else since ranking above
+            continue; // already resident or in flight - the only residency check now, see MOE_CACHE_ATLAS_RANK_K
         }
         int slot_index = -1;
         if (!pool.free_slots.empty()) {
@@ -4294,12 +4385,134 @@ static bool moe_cache_atlas_warm(
                     expert_size});
             device.queued_bytes += expert_size;
             device.prefetches++;
+            admitted++;
             woke = true;
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
         }
     }
-    return woke; // caller (moe_cache_plan) folds this into its own wake_worker/notify
+    return woke;
+}
+
+// Synchronous path (GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=0, the default
+// until the split is measured): both halves inline on the dispatch thread,
+// session lock held throughout, exactly as before Track 1.5.
+static bool moe_cache_atlas_warm(
+        moe_cache_device & device, moe_cache_pool & pool, int pool_index,
+        const void * host_base, size_t expert_size, int64_t n_expert) {
+    if (!device.req_dir_valid || n_expert <= 0) {
+        return false;
+    }
+    const auto it = device.atlas_by_tensor.find(host_base);
+    if (it == device.atlas_by_tensor.end() || !it->second || it->second->empty()) {
+        return false;
+    }
+    moe_cache_atlas_cand best[MOE_CACHE_ATLAS_RANK_K];
+    const int n_best = moe_cache_atlas_rank(
+            *it->second, device.req_dir_x, device.req_dir_y, n_expert,
+            best, MOE_CACHE_ATLAS_RANK_K);
+    if (n_best <= 0) {
+        return false;
+    }
+    return moe_cache_atlas_admit(device, pool, pool_index, host_base, expert_size, best, n_best);
+}
+
+// Opt-in, and read once - see device.warm_path_ns for what it measures and
+// why tok/s is the wrong instrument for it.
+static bool moe_cache_atlas_warm_timing_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool moe_cache_atlas_warm_async_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Asynchronous path: everything moe_cache_plan does for warming, which is
+// now a bounds check, a hash lookup and a push_back onto a one-deep queue.
+// The row is captured by shared_ptr here (O(1), under the lock the caller
+// already holds) so the worker never has to re-find it, and so a concurrent
+// set_atlas cannot pull it out from under the scan.
+static bool moe_cache_atlas_warm_enqueue(
+        moe_cache_device & device, int pool_index,
+        const void * host_base, size_t expert_size, int64_t n_expert) {
+    if (!device.req_dir_valid || n_expert <= 0) {
+        return false;
+    }
+    const auto it = device.atlas_by_tensor.find(host_base);
+    if (it == device.atlas_by_tensor.end() || !it->second || it->second->empty()) {
+        return false;
+    }
+    // One deep on purpose. A warming request is a hint about where the
+    // request is heading *now*; if the worker is far enough behind that one
+    // is still pending, a second is already stale by the time it would run,
+    // and queueing it would only make the worker do the expensive scan twice
+    // for the same answer. Dropping is the correct behavior, not a shortcut.
+    if (!device.warm_queue.empty()) {
+        return false;
+    }
+    device.warm_queue.push_back({
+            it->second, pool_index, host_base, expert_size, n_expert,
+            device.req_dir_x, device.req_dir_y});
+    return true;
+}
+
+// Worker side of the async path. Called with the session lock held and an
+// empty fill queue is NOT required - this runs before the worker blocks on
+// its next job, so the ranking overlaps whatever the GPU is doing. The lock
+// is released for the scan itself and retaken for admission; both the pool
+// index and the atlas row are re-validated afterward, since anything can
+// have happened to the cache while the lock was down.
+static bool moe_cache_atlas_warm_service(
+        moe_cache_session * session, moe_cache_device * device,
+        std::unique_lock<std::mutex> & lock) {
+    if (device->warm_queue.empty() || device->dead.load()) {
+        return false;
+    }
+    const moe_cache_warm_request req = device->warm_queue.front();
+    device->warm_queue.pop_front();
+    if (!req.row) {
+        return false;
+    }
+
+    moe_cache_atlas_cand best[MOE_CACHE_ATLAS_RANK_K];
+    int n_best = 0;
+    {
+        // The whole point of Track 1.5: this scan runs with the session lock
+        // released, off the dispatch path, on the fill worker's own time.
+        // req.row is a shared_ptr, so it stays alive and immutable here even
+        // if set_atlas republishes the tensor's row in the meantime.
+        lock.unlock();
+        n_best = moe_cache_atlas_rank(
+                *req.row, req.req_dir_x, req.req_dir_y, req.n_expert,
+                best, MOE_CACHE_ATLAS_RANK_K);
+        lock.lock();
+    }
+    if (n_best <= 0 || session->stopping || device->dead.load()) {
+        return false;
+    }
+    if (req.pool_index < 0 || (size_t) req.pool_index >= device->pools.size()) {
+        return false; // pools can only grow today, but this is not the thread that guarantees it
+    }
+    moe_cache_pool * pool = device->pools[req.pool_index].get();
+    // expert_size is re-checked, not assumed: admission writes a job whose
+    // byte count has to match the slab's slot stride, and unlike the inline
+    // path this one carries a size captured before the lock was ever
+    // released. Pools are append-only and keyed by (expert_size, wtype)
+    // today, so this should never fire - it costs a compare, and a wrong
+    // stride here would be a silent overwrite of a neighbouring slot.
+    if (!pool || !pool->slab || pool->expert_size != req.expert_size) {
+        return false;
+    }
+    return moe_cache_atlas_admit(*device, *pool, req.pool_index,
+            req.host_base, req.expert_size, best, n_best);
 }
 
 static int moe_cache_plan(
@@ -4775,7 +4988,30 @@ static int moe_cache_plan(
     if (moe_cache_atlas_warm_enabled() &&
         (long long) device.nodes - device.atlas_warm_last_calls >= 64) {
         device.atlas_warm_last_calls = (long long) device.nodes;
-        if (moe_cache_atlas_warm(device, pool, node->pool_index, node->host_base, node->expert_size, node->n_expert)) {
+        // Track 1.5: with ASYNC on, all this path does is hand the worker a
+        // hint (a hash lookup and a push_back); the cosine scan and the
+        // admission both happen there, off the thread that has to issue the
+        // next GPU op. Either way the worker still has to be woken - for the
+        // fills the sync path just queued, or for the ranking pass the async
+        // path just deferred to it.
+        const bool timing = moe_cache_atlas_warm_timing_enabled();
+        const auto warm_t0 = timing ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        const bool queued = moe_cache_atlas_warm_async_enabled()
+            ? moe_cache_atlas_warm_enqueue(device, node->pool_index, node->host_base, node->expert_size, node->n_expert)
+            : moe_cache_atlas_warm(device, pool, node->pool_index, node->host_base, node->expert_size, node->n_expert);
+        if (timing) {
+            device.warm_path_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - warm_t0).count();
+            if (++device.warm_path_calls % 256 == 0) {
+                fprintf(stderr, "[atlas-warm] %s: %.1f us avg on the dispatch path (%lld calls)\n",
+                        moe_cache_atlas_warm_async_enabled() ? "async" : "sync",
+                        (double) device.warm_path_ns / (double) device.warm_path_calls / 1000.0,
+                        device.warm_path_calls);
+                fflush(stderr);
+            }
+        }
+        if (queued) {
             wake_worker = true;
         }
     }
@@ -5911,9 +6147,14 @@ static void moe_cache_set_atlas(
         std::lock_guard<std::mutex> lock(session->mu);
         for (const auto & device_ptr : session->devices) {
             moe_cache_device & device = *device_ptr;
-            auto & by_tensor = device.atlas_by_tensor[host_base];
-            by_tensor.clear(); // a second registration for this host_base replaces its entries, both indices
-            by_tensor.reserve((size_t) n_cells);
+            // A second registration for this host_base replaces its
+            // entries in both indices. The row is rebuilt off to the side
+            // and published by pointer swap, never mutated in place - a
+            // Track 1.5 ranking pass may be scanning the previous row right
+            // now with the session lock released, and its shared_ptr keeps
+            // that row alive until it is done with it.
+            auto row = std::make_shared<moe_cache_device::atlas_row>();
+            row->reserve((size_t) n_cells);
             for (int i = 0; i < n_cells; i++) {
                 if (expert[i] < 0) {
                     continue;
@@ -5921,8 +6162,9 @@ static void moe_cache_set_atlas(
                 const moe_cache_device::atlas_cell cell{x[i], y[i], spec[i]};
                 const moe_cache_key key{host_base, expert[i]};
                 device.atlas[key] = cell;
-                by_tensor.emplace_back(expert[i], cell);
+                row->emplace_back(expert[i], cell);
             }
+            device.atlas_by_tensor[host_base] = std::move(row);
         }
     }
 }
