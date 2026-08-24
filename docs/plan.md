@@ -1138,7 +1138,62 @@ What IS established:
 - The cache expands to fill VRAM down to the ~128 MiB reserve floor regardless
   of `-ngl`, which is worth fixing on its own merits but is NOT this bug.
 
-**Next step must be a controlled matrix** - cache x context x prompt, one
+**CONTROLLED MATRIX RUN (36 fresh servers, one per sample so a poisoned server
+never contaminates the next cell, max_tokens/temperature/-ngl pinned):**
+
+| cache | ctx | prompt | degenerate |
+|---|---|---|---|
+| auto | 2048 / 4096 / 65536 | train | **3/3 each** |
+| auto | any | halting | 0/9 |
+| off | any | either | 0/18 |
+
+`by cache: auto=9/18, off=0/18` · `by prompt: train=9/18, halting=0/18` ·
+`by context: 3/12 at every size - NO effect`
+
+So it IS moe-cache, interacting with a specific prompt, deterministic in both
+directions. The earlier retraction of that diagnosis was wrong: the arm that
+seemed to exonerate the cache (`cache=0 -c 2048 -ncmoe 40`) was broken by a
+hand-set `-ncmoe 40` on a model whose expert map has only 30 rows - a
+misconfiguration introduced by the investigator, not the cache.
+
+**Greedy (temperature=0) divergence: character 0.** Cache-on and cache-off
+diverge on the very first generated token, so the damage is already present
+before any decode step.
+
+**Sharp bisect on batch size:**
+
+```
+GGML_CUDA_MOE_CACHE_MAX_BATCH=1  -> clean
+                              2  -> DEGENERATE
+                              4/8/16/64 -> DEGENERATE
+```
+
+`max_batch=1` admits only single-token nodes. Everything >= 2 corrupts. This is
+the tightest handle on the bug so far.
+
+**Hypothesis tested and REJECTED**: that the multi-activation path is at fault.
+`ggml_cuda_moe_cache_mmv`'s parameter mapping carries the comment "ne12 = ne13
+= 1 (single token)", suggesting it is only correct when all hits share one
+activation row. Refusing nodes with `!shared_activation` did NOT fix the
+corruption, so `shared_activation` is true in the failing case and
+multi-activation is not the mechanism. Guard reverted rather than left in as a
+false fix.
+
+**Five hypotheses have now been tested and rejected** (atlas warming, moe-cache
+as a whole, OOM/VRAM, scratch-capacity overrun, multi-activation mapping). The
+bug is real, deterministic, and still unexplained.
+
+**Current stopgap**: `GGML_CUDA_MOE_CACHE_MAX_BATCH=1` keeps the cache ON and
+active (hit rate 0.70, 5650 slots) and is clean 4/4 including the reproducer,
+at 44 t/s - the same as cache-off, so the multi-token path was carrying the
+throughput benefit. Better than disabling the cache outright.
+
+**Next step**: instrument inside the `max_batch >= 2` path specifically -
+compare a multi-token node's GPU result against a CPU recomputation of the same
+rows, which turns "output is wrong" into "row R of node N differs", the fact
+that will finally name it.
+
+**Superseded note - the original next step was a controlled matrix** - cache x context x prompt, one
 variable at a time, repeated - not another hypothesis. Related prior art: a
 dangling commit (`c45ae5b309`, 2026-08-13) documents a real OOM-vs-throughput
 interaction with `cudaMalloc failed: out of memory` on the KV cache, and the
