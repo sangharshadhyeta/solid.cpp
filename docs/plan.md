@@ -1256,6 +1256,44 @@ co-activation. Selecting by triple co-occurrence with the other experts in the
 same decision is the direct test of whether the higher-order structure converts
 into a better mechanism, and it reuses data already collected.
 
+## Substitution stand-in selection — router score beats co-activation by 78%
+
+The substitution mechanism picks a stand-in by pairwise co-activation, but that
+selector was never validated - only substitution on/off was measured. Tested
+offline on 151,584 decisions, scoring each method by the ROUTER'S OWN score for
+the stand-in it chose (a good substitute is one the router also rated highly
+for this token):
+
+| method | mean stand-in score | vs missed expert | vs random |
+|---|---|---|---|
+| random resident | 0.01387 | 87.9% | - |
+| pairwise co-activation | 0.02132 | 130.9% | **+53.7%** |
+| triple co-occurrence | 0.02175 | 133.9% | +56.9% |
+| **router score among resident** | **0.03792** | **238.2%** | **+173.5%** |
+
+Three conclusions:
+
+1. **The pairwise selector is real work**, +53.7% over random. It was doing
+   something, contrary to doubt.
+2. **Triples add only +2.0% over pairs** for this decision. The 3-way structure
+   is genuinely there (96.7% of triples exceed pairwise prediction) but does
+   not convert into better stand-in selection.
+3. **Router score is the right selector** - 78% better than the current
+   pairwise implementation. Co-activation is a *proxy* for "which expert suits
+   this input"; the router computed that answer exactly, and selecting by
+   co-activation discards it.
+
+Stand-ins scoring ABOVE 100% of the missed expert is expected, not anomalous:
+misses concentrate on the router's weak picks (rank 7 misses 44% of the time
+against rank 0's 20%), so the best resident alternative is frequently an expert
+the router rated higher than the one that was lost.
+
+**Implementation**: `ffn_moe_probs` is computed before the argsort that selects
+top-k, so the full score vector exists at decision time. `plan()` currently
+receives only the chosen ids. Plumbing the score vector through is the change,
+after which the stand-in is `argmax(probs masked by residency)` - the
+constrained-routing formulation, with no prediction and no new data.
+
 ## Anti-co-firing as a probabilistic modifier — tested properly, still fails
 
 Earlier it was tested standalone and deterministic, which was the wrong shape.
