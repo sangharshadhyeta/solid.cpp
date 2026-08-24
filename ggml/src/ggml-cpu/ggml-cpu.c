@@ -1695,6 +1695,10 @@ static void ggml_compute_forward_mul_mat_id(
         }
 
         if (moe_cache_node && moe_cache_n_hits > 0) {
+            if (ggml_moe_cache.verify_rows) {
+                ggml_moe_cache.verify_rows(moe_cache_node, moe_cache_n_hits,
+                                           moe_cache_compact, moe_cache_experts);
+            }
             if (!ggml_moe_cache.dispatch(moe_cache_node, (int) type, ne00, ne01,
                                          moe_cache_n_hits, moe_cache_compact, moe_cache_acts)) {
                 for (int i = 0; i < moe_cache_n_hits; i++) {

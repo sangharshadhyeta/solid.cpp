@@ -4426,6 +4426,44 @@ static void moe_cache_verify_slot(const moe_cache_pool & pool, int slot_index,
     }
 }
 
+static void moe_cache_verify_rows(void * opaque, int n_hits, const int32_t * slot_idx,
+                                  const int32_t * experts) {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_VERIFY_ROWS");
+        return env && atoi(env) != 0;
+    }();
+    if (!on || !opaque || !slot_idx || !experts) {
+        return;
+    }
+    moe_cache_node * node = (moe_cache_node *) opaque;
+    if (!node->pool) {
+        return;
+    }
+    moe_cache_pool & pool = *node->pool;
+    std::lock_guard<std::mutex> lock(node->session->mu);
+    static std::atomic<int> reported{0};
+    for (int i = 0; i < n_hits; i++) {
+        const int si = slot_idx[i];
+        if (si < 0 || si >= (int) pool.slots.size()) {
+            if (reported.fetch_add(1) < 20) {
+                fprintf(stderr, "[moe-cache] ROW BAD SLOT i=%d slot=%d n_slots=%zu\n",
+                        i, si, pool.slots.size());
+            }
+            continue;
+        }
+        const moe_cache_slot & slot = pool.slots[si];
+        if (slot.key.expert != experts[i] || slot.key.tensor != node->host_base ||
+            slot.state != moe_cache_slot_state::valid) {
+            if (reported.fetch_add(1) < 20) {
+                fprintf(stderr, "[moe-cache] ROW MISMATCH i=%d/%d slot=%d "
+                        "slot_expert=%d wanted_expert=%d slot_tensor=%p node_tensor=%p state=%d\n",
+                        i, n_hits, si, slot.key.expert, experts[i],
+                        slot.key.tensor, node->host_base, (int) slot.state);
+            }
+        }
+    }
+}
+
 static bool moe_cache_mask_audit_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_MASK_AUDIT");
@@ -6600,6 +6638,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
+    ggml_moe_cache.verify_rows    = moe_cache_verify_rows;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.set_atlas = moe_cache_set_atlas;
     ggml_moe_cache.get_co_activation = moe_cache_get_co_activation;
