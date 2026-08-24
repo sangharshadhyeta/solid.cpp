@@ -307,6 +307,45 @@ The folds, if they exist, live *within* each layer with cross-layer alignment
 stitching corresponding regions — not as one undifferentiated cloud, which is
 what the global embedding assumed.
 
+### Label-free rebuild on 31.6x the data — the discovered atlas still loses
+
+Rebuilt on 909,480 pooled decisions from 12 topics (2,000 tokens each), with
+the topic labels discarded entirely, and scored by held-out link prediction
+(`scripts/moe-link-prediction.py`): given two experts in a layer, will they
+fire in the SAME routing decision later? Positives are held-out pairs that
+were **never seen in training** — predicting a pair already observed is
+memorisation, not prediction. Negatives are sampled within the same layer, so
+layer structure confers no advantage either way.
+
+The data objection is now answered: median edge weight 4 (was 2), mean 16.0,
+seen-once down to 21.8% (was 46%).
+
+| method | AUC |
+|---|---|
+| popularity control (`log f_a + log f_b`) | 0.5437 |
+| **probe atlas (9 categories)** | **0.7116** |
+| discovered co-activation (16 dims) | 0.5706 |
+| discovered co-activation (32 dims) | 0.5715 |
+| discovered co-activation (64 dims) | 0.5761 |
+
+The discovered embedding **does** beat the popularity control, so it has
+learned something real rather than reflecting expert frequency — but it
+saturates around 0.576 and under-parameterisation is not the explanation.
+
+The uncomfortable part, stated plainly: **the probe atlas predicts co-firing
+better than an embedding built from co-firing itself**, and it does so having
+never seen this traffic. Topic affinity appears to be a better organising
+principle for "which experts work together" than the co-firing graph's own
+spectral structure. That is an argument FOR keeping the 9 categories, arrived
+at by a test designed to be fair to the alternative.
+
+**Still genuinely open**: the algorithm. Everything tested so far is one-shot
+spectral factorisation of a snapshot. The design intent — co-firing experts
+*moving nearer*, the map *settling over a long run*, persisted across restarts
+like `session.history` — is incremental attraction dynamics and has not been
+built. Spectral factoring is not a fast approximation of it. That remains the
+untested hypothesis, and it is the one worth building next.
+
 **Next**: rebuild on ~34x the data (12 topics x 2,000 tokens), pooled and
 UNLABELED, and score by held-out link prediction
 (`scripts/moe-link-prediction.py`) rather than by agreement with the 9
