@@ -4255,10 +4255,17 @@ static constexpr int MOE_CACHE_ATLAS_ADMIT_K = 2;
 // The expensive half. Pure: reads only the (immutable, shared_ptr-held)
 // atlas row and the request direction snapshot it is handed, writes only
 // best[]. No session lock required, and none taken.
+// resident_pool is the one concession to re-validating the pre-Track-1.5
+// result: when non-null the scan filters already-resident experts inline,
+// exactly as the old code did, which means the caller must hold session.mu.
+// Only the legacy comparison arm passes it - see
+// moe_cache_atlas_warm_legacy_rank_enabled.
 static int moe_cache_atlas_rank(
         const moe_cache_device::atlas_row & candidates,
         float rx, float ry, int64_t n_expert,
-        moe_cache_atlas_cand * best, int k) {
+        moe_cache_atlas_cand * best, int k,
+        const moe_cache_pool * resident_pool = nullptr,
+        const void * host_base = nullptr) {
     const float rmag = std::sqrt(rx * rx + ry * ry);
     if (rmag < 1e-6f || k <= 0) {
         return 0; // decaying centroid hasn't moved off the origin yet - nothing to rank against
@@ -4278,6 +4285,12 @@ static int moe_cache_atlas_rank(
         // indices come from an external file, not the model's own router.
         if (expert < 0 || expert >= n_expert) {
             continue;
+        }
+        if (resident_pool) {
+            const moe_cache_key key{host_base, expert};
+            if (resident_pool->map.find(key) != resident_pool->map.end()) {
+                continue; // already resident or already in flight (legacy arm only)
+            }
         }
         const float cmag = std::sqrt(cell.x * cell.x + cell.y * cell.y);
         if (cmag < 1e-6f) {
@@ -4394,6 +4407,21 @@ static bool moe_cache_atlas_admit(
     return woke;
 }
 
+// Measurement-only arm: reproduces the pre-Track-1.5 scan exactly (residency
+// filtered inline, top-2 kept) so the +2.75pp topic-switch result recorded in
+// docs/plan.md can be re-validated head to head against the new scan in one
+// build, one session, one interleaving - rather than compared across
+// sessions, which would not be evidence of much. Sync path only: the filter
+// needs pool.map and therefore the lock, which is the whole reason the new
+// scan does not have it.
+static bool moe_cache_atlas_warm_legacy_rank_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_LEGACY_RANK");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 // Synchronous path (GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=0, the default
 // until the split is measured): both halves inline on the dispatch thread,
 // session lock held throughout, exactly as before Track 1.5.
@@ -4407,10 +4435,12 @@ static bool moe_cache_atlas_warm(
     if (it == device.atlas_by_tensor.end() || !it->second || it->second->empty()) {
         return false;
     }
+    const bool legacy = moe_cache_atlas_warm_legacy_rank_enabled();
     moe_cache_atlas_cand best[MOE_CACHE_ATLAS_RANK_K];
     const int n_best = moe_cache_atlas_rank(
             *it->second, device.req_dir_x, device.req_dir_y, n_expert,
-            best, MOE_CACHE_ATLAS_RANK_K);
+            best, legacy ? MOE_CACHE_ATLAS_ADMIT_K : MOE_CACHE_ATLAS_RANK_K,
+            legacy ? &pool : nullptr, host_base);
     if (n_best <= 0) {
         return false;
     }
