@@ -164,6 +164,18 @@ struct moe_cache_pool {
     std::vector<moe_cache_slot> slots;
     std::vector<int> free_slots;
     std::unordered_map<moe_cache_key, int, moe_cache_key_hash> map;
+    // Resident-set bitmask, one bit per expert, keyed by tensor. Exactly the
+    // same information `map` already holds - kept alongside it because the two
+    // are read very differently. `map` answers "which slot holds this one
+    // expert" and costs a hash per question, which is the right shape when the
+    // caller asks about the 8 experts the router picked. Substitution has to
+    // ask about a whole candidate window (~64 by measurement) in one decision,
+    // and 64 hashes on the dispatch path is precisely the cost Track 1.5
+    // exists to remove; against the mask that is one hash for the tensor and
+    // then 64 bit tests over ~4 words, which stay in L1.
+    // Maintained only through moe_cache_map_insert/erase, under the same lock
+    // as `map`, so the two cannot drift; moe_cache_mask_audit() proves it.
+    std::unordered_map<const void *, std::vector<uint64_t>> resident_mask;
     int lru_head = -1;       // probation segment (new/one-off admissions)
     int lru_tail = -1;
     int protected_head = -1; // protected segment (proven hot: re-requested at least once while resident)
@@ -1221,12 +1233,96 @@ static void moe_cache_promote_to_protected(const moe_cache_device & device, moe_
     moe_cache_segment_push_back(pool, index, moe_cache_segment::protected_);
 }
 
+// Set or clear one expert's bit. The word vector grows on demand rather than
+// being sized from n_expert: not every caller that admits an expert has the
+// tensor's expert count to hand, and growing costs one reallocation per tensor
+// over the whole run (256 experts = 4 words).
+static void moe_cache_mask_set(moe_cache_pool & pool, const moe_cache_key & key, bool resident) {
+    if (!key.tensor || key.expert < 0) {
+        return;
+    }
+    const size_t word = (size_t) key.expert >> 6;
+    const uint64_t bit = 1ull << ((size_t) key.expert & 63);
+    if (!resident) {
+        auto it = pool.resident_mask.find(key.tensor);
+        if (it != pool.resident_mask.end() && word < it->second.size()) {
+            it->second[word] &= ~bit;
+        }
+        return;
+    }
+    try {
+        auto & words = pool.resident_mask[key.tensor];
+        if (word >= words.size()) {
+            words.resize(word + 1, 0ull);
+        }
+        words[word] |= bit;
+    } catch (...) {
+        // Best-effort, exactly like the other side tables here: the mask is a
+        // read accelerator for `map`, never the source of truth, so failing to
+        // grow it must not fail a decode.
+    }
+}
+
+// True only if this expert currently occupies a valid slot. Cheap enough to
+// call across a whole candidate window; the caller is expected to hoist the
+// per-tensor lookup out of that loop via moe_cache_mask_words().
+static const std::vector<uint64_t> * moe_cache_mask_words(const moe_cache_pool & pool, const void * tensor) {
+    auto it = pool.resident_mask.find(tensor);
+    return it == pool.resident_mask.end() ? nullptr : &it->second;
+}
+
+static inline bool moe_cache_mask_test(const std::vector<uint64_t> * words, int32_t expert) {
+    if (!words || expert < 0) {
+        return false;
+    }
+    const size_t word = (size_t) expert >> 6;
+    return word < words->size() && ((*words)[word] >> ((size_t) expert & 63)) & 1ull;
+}
+
+// Single admission choke point, mirroring moe_cache_map_erase below. Returns
+// false when the key was already mapped, matching emplace().second so callers
+// keep their existing error handling.
+static bool moe_cache_map_insert(moe_cache_pool & pool, const moe_cache_key & key, int index) {
+    if (!pool.map.emplace(key, index).second) {
+        return false;
+    }
+    moe_cache_mask_set(pool, key, true);
+    return true;
+}
+
 static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
     moe_cache_slot & slot = pool.slots[index];
     auto it = pool.map.find(slot.key);
     if (it != pool.map.end() && it->second == index) {
         pool.map.erase(it);
+        moe_cache_mask_set(pool, slot.key, false);
     }
+}
+
+// Proves the mask agrees with `map`, both directions. Off unless
+// GGML_CUDA_MOE_CACHE_MASK_AUDIT is set - it walks every slot and every mask
+// bit, which is far too heavy for the dispatch path. Returns the number of
+// disagreements, so 0 is the assertion.
+static int moe_cache_mask_audit(const moe_cache_pool & pool) {
+    int bad = 0;
+    for (const auto & kv : pool.map) {
+        if (!moe_cache_mask_test(moe_cache_mask_words(pool, kv.first.tensor), kv.first.expert)) {
+            bad++; // mapped but not marked resident
+        }
+    }
+    for (const auto & kv : pool.resident_mask) {
+        for (size_t w = 0; w < kv.second.size(); w++) {
+            uint64_t bits = kv.second[w];
+            while (bits) {
+                const int e = (int) (w << 6) + __builtin_ctzll(bits);
+                bits &= bits - 1;
+                if (pool.map.find(moe_cache_key{kv.first, e}) == pool.map.end()) {
+                    bad++; // marked resident but not mapped
+                }
+            }
+        }
+    }
+    return bad;
 }
 
 static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_free) {
@@ -3066,7 +3162,7 @@ static void moe_cache_prewarm_from_history(
         slot.readers = 0;
         slot.state = moe_cache_slot_state::copying;
         try {
-            if (!pool.map.emplace(key, slot_index).second) {
+            if (!moe_cache_map_insert(pool, key, slot_index)) {
                 moe_cache_slot_reset(pool, slot_index, true);
                 continue;
             }
@@ -4223,6 +4319,14 @@ static bool moe_cache_partner_index_enabled() {
     return moe_cache_measure_pred_enabled() || moe_cache_group_admit_enabled();
 }
 
+static bool moe_cache_mask_audit_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_MASK_AUDIT");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool moe_cache_atlas_warm_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM");
@@ -4396,7 +4500,7 @@ static bool moe_cache_atlas_admit(
         slot.readers = 0;
         slot.state = moe_cache_slot_state::copying;
         try {
-            if (!pool.map.emplace(key, slot_index).second) {
+            if (!moe_cache_map_insert(pool, key, slot_index)) {
                 moe_cache_slot_reset(pool, slot_index, true);
                 continue;
             }
@@ -4775,8 +4879,8 @@ static int moe_cache_plan(
         slot.readers = 0;
         slot.state = moe_cache_slot_state::copying;
         try {
-            const auto inserted = pool.map.emplace(key, slot_index);
-            if (!inserted.second) {
+            const bool inserted_ok = moe_cache_map_insert(pool, key, slot_index);
+            if (!inserted_ok) {
                 moe_cache_slot_reset(pool, slot_index, true);
                 device.insert_skips++;
                 continue;
@@ -4888,7 +4992,7 @@ static int moe_cache_plan(
                         pslot_ref.readers = 0;
                         pslot_ref.state = moe_cache_slot_state::copying;
                         try {
-                            if (pool.map.emplace(pkey, pslot).second) {
+                            if (moe_cache_map_insert(pool, pkey, pslot)) {
                                 const void * psrc = (const char *) node->host_base +
                                     (size_t) pkey.expert * node->expert_size;
                                 device.queue.push_back({
@@ -5607,6 +5711,26 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
 
                 for (const auto & pool_ptr : device.pools) {
                     const moe_cache_pool & pool = *pool_ptr;
+                    // GGML_CUDA_MOE_CACHE_MASK_AUDIT=1 verifies the resident
+                    // bitmask still agrees with pool.map, both directions.
+                    // Runs here rather than on the dispatch path because it
+                    // walks every slot and every set bit - fine on a stats
+                    // poll, ruinous per plan() call. Silent when clean.
+                    if (moe_cache_mask_audit_enabled()) {
+                        const int bad = moe_cache_mask_audit(pool);
+                        if (bad > 0) {
+                            // fprintf, not MOE_CACHE_LOG: the server installs a
+                            // ggml log callback that drops GGML_LOG_INFO, so the
+                            // macro is invisible here - the same reason the
+                            // "first fill" line above writes to stderr directly.
+                            fprintf(stderr, "[moe-cache] MASK AUDIT FAILED: %d disagreement(s) between "
+                                    "resident_mask and map in pool %zu B/expert wtype=%d\n",
+                                    bad, pool.expert_size, pool.wtype);
+                        } else {
+                            fprintf(stderr, "[moe-cache] mask audit clean: %zu tensor(s), %zu mapped experts\n",
+                                    pool.resident_mask.size(), pool.map.size());
+                        }
+                    }
                     sum.slots_total += (size_t) pool.n_slots;
                     sum.slots_used  += (size_t) pool.n_slots - pool.free_slots.size();
                     for (int i = pool.protected_head; i >= 0; i = pool.slots[i].next) {
@@ -6028,7 +6152,7 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                 slot.readers = 0;
                 slot.state = moe_cache_slot_state::copying;
                 try {
-                    if (!pool.map.emplace(key, slot_index).second) {
+                    if (!moe_cache_map_insert(pool, key, slot_index)) {
                         moe_cache_slot_reset(pool, slot_index, true);
                         continue;
                     }
