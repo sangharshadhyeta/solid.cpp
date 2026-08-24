@@ -149,6 +149,14 @@ struct ggml_moe_cache_api {
     // caller can retry with a bigger buffer). NULL-safe like get_stats.
     int (*get_expert_map)(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols);
 
+    // Debug only, NULL-safe: assert that each compacted hit row is about to be
+    // served by a slot actually holding the expert that row asked for. The
+    // slot CONTENTS have been verified correct, so a corruption that survives
+    // that check has to be correct weights reaching the wrong row - which is
+    // exactly what this catches. Enabled by GGML_CUDA_MOE_CACHE_VERIFY_ROWS.
+    void (*verify_rows)(void * node, int n_hits, const int32_t * slot_idx,
+                        const int32_t * experts);
+
     // Host-side hot-expert buffer. Returns a pointer to this expert's weights
     // in memory the cache owns, or NULL to use the caller's own (mmap'd)
     // pointer. Called on the CPU expert path for every expert of every MoE
