@@ -310,6 +310,82 @@ the warming decision itself is good. Not started - needs its own scoped
 design, likely reusing the existing `device.queue`/worker-thread plumbing
 rather than inventing new infrastructure.
 
+**BUILT (2026-08-24), NOT YET MEASURED.** The split now exists, off by
+default behind `GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=1` (and only reachable
+at all with `GGML_CUDA_MOE_CACHE_ATLAS_WARM=1`, which is itself off by
+default). It reuses the existing fill-worker thread and session lock; no new
+thread, no new synchronization primitive.
+
+What changed:
+
+- `moe_cache_atlas_warm` was split into its two real halves.
+  `moe_cache_atlas_rank` is the expensive one - a cosine scan over the
+  tensor's whole atlas-covered candidate set, a `sqrt` and a few flops each,
+  up to `n_expert` of them - and is now *pure*: it touches no cache state and
+  takes no lock. `moe_cache_atlas_admit` is the cheap one - a few hash
+  lookups, at most one eviction, a queue push - and is the only half that
+  needs `session.mu`.
+- Async path: `moe_cache_plan` now does a bounds check, a hash lookup and a
+  `push_back` (`moe_cache_atlas_warm_enqueue`), and nothing else. The fill
+  worker picks the request up in its existing wait loop, **releases the
+  session lock for the ranking scan**, retakes it, re-validates the pool, and
+  admits. Ranking therefore overlaps whatever the GPU is doing, which is the
+  FreeToken split this port never carried over.
+- The warm queue is deliberately **one deep**. A warming hint describes where
+  the request is heading *now*; if one is still pending, a second is already
+  stale by the time it would run, and queueing it would only make the worker
+  do the same scan twice. Dropping is correct, not a shortcut.
+- `atlas_by_tensor` rows are now `shared_ptr<const ...>` and `set_atlas`
+  publishes a replacement row instead of mutating in place. Without that, a
+  re-registration could free the vector the worker is mid-scan on. The
+  ranking pass also captures `req_dir_x/y` **by value** at enqueue time, so
+  it ranks against where the request was heading when the hint was raised,
+  not wherever the centroid drifted to by the time the worker got there.
+- The sync path (default) still runs both halves inline under the lock, so
+  the old behavior is what ships and the two are directly A/B-able.
+
+**One real behavior change, not hidden:** the old scan skipped
+already-resident experts inline, which needs `pool.map` and therefore the
+lock. The lock-free pass cannot, so it keeps a deeper list
+(`MOE_CACHE_ATLAS_RANK_K=4`) and the admission half - which holds the lock
+and already re-checked residency anyway - walks down it admitting the same
+top-2 non-resident candidates in the same score order
+(`MOE_CACHE_ATLAS_ADMIT_K=2`). The two differ only when 3+ of the top 4 are
+already resident. Small, but it means the +2.75pp topic-switch number above
+was measured with the *old* scan and would need re-validating before any
+default flip.
+
+**Measurement hook, not yet run**: `GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1`
+accumulates the time the warming block costs *on the dispatch path
+specifically* and prints a running average every 256 warm calls. That is the
+quantity this track is about, and tok/s is the wrong instrument for it - the
+block fires once every 64 `plan()` calls, so even a large per-call saving is
+a rounding error at the throughput level. Measuring the thing directly, for
+the same reason steps 6 and 7a were measured before anything was built on
+them.
+
+**Blocked on GPU availability.** The A/B needs the GPU, and the live 8099
+deployment (Ornith-1.5-35B, 64k ctx) was holding 11.7 GiB of 12 GiB with
+152 MiB free - the exact co-residency condition documented above as a
+corruption trigger, so a second instance is not an option. To run it:
+
+```
+# sync (baseline) then async, same prompt, on a scratch port
+GGML_CUDA_MOE_CACHE_ATLAS_WARM=1 GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1 \
+GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=0 ./build/bin/llama-server ... --port 8098
+GGML_CUDA_MOE_CACHE_ATLAS_WARM=1 GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1 \
+GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=1 ./build/bin/llama-server ... --port 8098
+```
+
+Read the `[atlas-warm] sync|async: N us avg on the dispatch path` lines. What
+would make this a win: async's dispatch-path average collapsing toward the
+cost of a hash lookup while hit rate and output stay unchanged. What would
+refute it: the saving being sub-microsecond (the scan is cheaper than
+assumed), or hit rate dropping because ranking one worker-hop late is
+ranking against a stale direction. Correctness under the concurrency change
+(coherent output, no crash, hit rate in line with sync) is the first thing to
+check, before any latency number.
+
 ## Track 2 — Unified tiered placement — RESCOPED (mostly already exists)
 
 Original framing was "remove the hard `-ncmoe` boundary, give every MoE layer
@@ -347,6 +423,14 @@ capacity that cannot cover the extra demand, and the constrained-regime
 result (33% hit rate at a 512 MiB budget) shows what the far end of that
 looks like. The optimum is empirical, which is exactly why
 `--moe-calibrate` exists.
+
+**Status (2026-08-24): NOT RUN.** The rescope (`2b721d844`) is the last thing
+that happened here - it established that items 1 and 2 need no code, which is
+what makes this track look further along than it is. The one thing actually
+left, the (a)-vs-(b) placement comparison, has not been measured: no commit,
+no numbers, nothing in `docs/index.html`. It needs no code at all, only the
+GPU - and the same 8099 occupancy blocking the Track 1.5 A/B blocks it too.
+Track 2 is therefore *descoped*, not *done*.
 
 ## Track 3 — "True MoE" emulation
 
