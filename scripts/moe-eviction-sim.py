@@ -19,25 +19,44 @@ per eviction is not implementable):
 
 Result on Ornith 35B, 4 topic-diverse traces, 1421 slots (18.5%), window 64:
 
-  fill |    policy |  retained |  hit rate
-     1 |    random |    72.51% |    53.31%
-     1 |       lru |    75.61% |    58.58%   <- best
-     1 |     score |    68.90% |    46.27%   <- worst
-     1 | lru+score |    71.42% |    48.95%
-     1 |     atlas |    71.06% |    51.59%
-     4 |       lru |    78.99% |    63.39%   <- best
+  fill |     policy |  retained |  hit rate
+     1 |        lru |    75.72% |    58.63%   <- best on retained
+     1 |    random  |    72.51% |    53.31%
+     1 |      coact |    72.74% |    58.12%
+     1 |      atlas |    71.06% |    51.59%
+     1 |      score |    68.90% |    46.27%   <- worst
+     4 |        lru |    78.98% |    63.37%
+     4 |      coact |    78.61% |    64.88%   <- best on HIT RATE (+1.51pp)
+     4 |      atlas |    74.45% |    55.19%
 
-Plain LRU wins at both fill rates, and every semantic policy loses to it -
-most of them lose to random. Recency is doing real work that neither topic
-affinity nor router score can replace: both of those rank experts
-context-free, with no idea what was just used, so evicting by them tears up
-the working set. This is also why Belady beat LRU by 16.9pp earlier - Belady
-is recency with perfect foresight. The headroom is in predicting REUSE
-DISTANCE, not in semantics.
+Plain LRU wins on retained gate mass at every fill rate, and every semantic
+policy loses to it - atlas and router score lose to random too. Topic
+affinity and router score rank experts context-free, with no knowledge of
+what was just used, so evicting by them tears up the working set recency is
+successfully holding.
 
-Untested and the obvious next candidate: cross-layer co-activation (Track 1
-steps 4a/4b, already collected, nothing reads it). It encodes "these fire
-together", which is a recurrence signal rather than a semantic one.
+Co-activation is the one signal that beats LRU on anything: at fill 4 it
+gives +1.51pp HIT RATE, while giving up 0.37pp of retained mass. The two
+metrics genuinely diverge - it keeps more of the wanted experts resident,
+but the ones LRU keeps are worth more gate mass. It is accumulated ONLINE
+here, exactly as production does, so there is no future peeking.
+
+Admission control, tested separately with LRU eviction, is monotonically
+harmful on this workload:
+
+  fill | admit_after |  retained |  hit rate
+     4 |           1 |    79.00% |    63.36%   admit everything
+     4 |           2 |    78.66% |    62.99%   production default, -0.34pp
+     4 |           4 |    77.36% |    61.66%
+
+That was the most promising remaining hypothesis, because Belady's edge on a
+heavy-tailed stream is refusing to spend a slot on a one-off, and admission
+control is how a causal policy does that. It does not transfer.
+
+Standing conclusion: LRU is at or near the practical ceiling for causal
+policies here. Belady still beats it by ~17pp, but none of the five signals
+available (topic/atlas, router score, co-activation, frequency, admission
+demand) approximates reuse distance well enough to close it.
 """
 import json, array, random, math
 
