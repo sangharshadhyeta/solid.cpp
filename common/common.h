@@ -982,6 +982,13 @@ struct common_moe_cache_summary {
     size_t allocated_bytes    = 0;
     size_t budget_bytes       = 0;
 
+    // Hit/miss split by the router's own rank for that pick (0 = the
+    // router's top choice). Sized by GGML_MOE_CACHE_MAX_RANK on the ggml
+    // side; kept as a plain vector here so this header stays free of the
+    // CUDA-specific one, same reason the scalars above are mirrored.
+    std::vector<long long> rank_hits;
+    std::vector<long long> rank_misses;
+
     // Step 0 of Atlas-driven cache warming - live request-direction
     // centroid. req_dir_valid false (and x/y left at 0) until at least one
     // atlas-covered expert has actually been selected.
