@@ -67,6 +67,12 @@ struct ggml_moe_cache_summary {
 	// in the low-confidence tail of top-k - which is what decides whether
 	// re-ranking toward resident experts could recover them cheaply, or
 	// would have to overrule the router's strongest picks.
+	// Misses served by running a resident stand-in instead of falling back
+	// to CPU compute (GGML_CUDA_MOE_CACHE_SUBSTITUTE). Not folded into hits:
+	// a substitution is a miss that was made cheap, not a hit.
+	long long substitutions;
+	long long substitute_declined;
+
 	long long rank_hits[GGML_MOE_CACHE_MAX_RANK];
 	long long rank_misses[GGML_MOE_CACHE_MAX_RANK];
 
