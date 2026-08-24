@@ -1067,6 +1067,68 @@ Reference points on the same test: probe atlas 0.7116, spectral discovered
 89.69%. Rankings held throughout, but earlier absolute simulation figures are
 pessimistic.
 
+## CRITICAL: moe-cache corrupts output — PRE-EXISTING, still open (2026-08-25)
+
+**Deterministic reproducer**: `--moe-cache auto`, any context size, prompt
+"Work through this step by step: a train leaves A at 60mph, another leaves B
+200 miles away at 40mph one hour later. Explain your full reasoning." at
+max_tokens=600. Output is `////` from character 0.
+
+**Once triggered the server is permanently poisoned** — a subsequent "Name
+three primary colours" also returns `////`. Only a restart clears it.
+
+**Pre-existing, not introduced this session.** Reproduces identically on
+`5de4ff917` (fingerprint b10601), the build from before this session's work.
+
+What has been ruled out:
+- **Not atlas warming.** An earlier isolation blamed warming, but that
+  experiment varied max_tokens between arms (500 clean / 600 degenerate) and
+  was worthless. With length held fixed, WARM=0 and WARM=1 both corrupt.
+- **Not generation length alone** — 800 tokens is clean on a server that has
+  not yet seen the trigger prompt.
+- **Not any optional subsystem**: HOST_MB=0, HOSTREG_MB=0, COLD_AFTER_S=0,
+  GGML_SCHED_PREFETCH_EXPERTS=0, ATLAS_WARM_ASYNC=0/1 all still corrupt.
+- **Not offload depth** — corrupts at 27, 28 and 30 CPU MoE layers alike.
+- **Not eviction** — `evictions: 0` at the moment of corruption.
+- **Not corrupted slot contents.** A sampled verifier
+  (`GGML_CUDA_MOE_CACHE_VERIFY_SLOTS=N`) comparing each hit's slot against the
+  host weights it mirrors, across head/middle/tail windows, reports **zero
+  mismatches** through a full corrupting generation. The cache holds the RIGHT
+  DATA. `fill_failures` is also 0.
+
+So it is an **indexing/routing bug, not a data bug**: correct expert weights
+reaching the wrong row, or the wrong slot being selected for a row. The row
+bookkeeping in `ggml_compute_forward_mul_mat_id` is the place to look; its six
+parallel arrays are correctly sized (all MOE_CACHE_MAX_TOPK=4096, matching the
+`n_ids * ids->ne[1] <= 4096` gate), and the collect-failure fallback's apparent
+missing `matrix_row_counts` increment is NOT a bug — it recomputes each row
+immediately after writing the mapping, so reusing the scratch index is safe.
+
+**Only known-safe configuration is `GGML_CUDA_MOE_CACHE=0`**, which costs ~21%
+throughput (44 t/s vs ~56).
+
+### Consequence for this session's server-measured numbers
+
+Degenerate output generates FASTER than clean (68-69 t/s vs 55-56), so any A/B
+arm that silently corrupted would read as a throughput win. Every server
+measurement taken before this was found lacked a degeneration check.
+
+Re-measured with every sample degeneration-checked (0/4 degenerate in all
+arms), 2 reps:
+
+| arm | tok/s |
+|---|---|
+| substitution OFF | 57.81, 57.67 |
+| substitution ON | 60.55, 60.34 |
+
+**+4.7%, confirmed real** (previously reported as +5.4% unguarded). The
+perplexity bound is unaffected — those runs used `llama-perplexity`, where
+corruption would have produced absurd PPL rather than 6.31.
+
+Still to re-measure with the guard: the admission A/B (-7.6% for removing the
+gate), the atlas warming A/B (+0.27 tok/s), and the fill-cost model calibrated
+from those arms.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:

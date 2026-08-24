@@ -59,7 +59,13 @@ def pairs_from(seq, nodes, grow=True):
             {l: np.array(sorted(v), dtype=np.int64) for l, v in by_layer.items()})
 
 
-def sgd_epoch(emb, G, A, B, layer_of, layer_members, lr, negs, rng, batch=1_000_000):
+def pair_key(layer, a, b, n_expert=256):
+    lo = np.minimum(a, b); hi = np.maximum(a, b)
+    return layer.astype(np.int64) * n_expert * n_expert + lo * n_expert + hi
+
+
+def sgd_epoch(emb, G, A, B, layer_of, expert_of, layer_members, pos_keys,
+              lr, negs, rng, batch=1_000_000):
     """One pass, AdaGrad per node per dimension. Constant base lr by design.
 
     Uniform averaging (dividing each node's accumulated update by how often it
@@ -89,6 +95,24 @@ def sgd_epoch(emb, G, A, B, layer_of, layer_members, lr, negs, rng, batch=1_000_
                 m = ls == l
                 mem = layer_members[l]
                 c[m] = mem[rng.integers(0, len(mem), size=int(m.sum()))]
+            # REJECT negatives that are actually observed co-firing pairs. The
+            # graph is ~23% dense, so uniform sampling makes roughly a quarter
+            # of every "negative" a real positive - the model is then trained to
+            # push apart the same pairs it is pulling together, which is enough
+            # to cancel the signal entirely (AUC 0.48, chance, despite clean
+            # convergence). Three resample rounds clear almost all of them;
+            # whatever survives is rare enough not to matter.
+            for _ in range(3):
+                k = pair_key(ls, expert_of[a], expert_of[c])
+                bad = np.isin(k, pos_keys)
+                if not bad.any():
+                    break
+                idx = np.flatnonzero(bad)
+                lb = ls[idx]
+                for l in np.unique(lb):
+                    m = lb == l
+                    mem = layer_members[l]
+                    c[idx[m]] = mem[rng.integers(0, len(mem), size=int(m.sum()))]
             ua, uc = emb[a], emb[c]
             sig = 1.0 / (1.0 + np.exp(np.clip(-np.einsum('ij,ij->i', ua, uc), -30, 30)))
             g = -sig[:, None]
@@ -137,14 +161,17 @@ def main():
     if G is None or len(G) != len(emb):
         G = np.zeros_like(emb)
     layer_of = np.zeros(len(nodes), dtype=np.int64)
+    expert_of = np.zeros(len(nodes), dtype=np.int64)
     for (l, e), i in nodes.items():
-        layer_of[i] = l
+        layer_of[i] = l; expert_of[i] = e
+    pos_keys = np.unique(pair_key(layer_of[A], expert_of[A], expert_of[B]))
+    print(f"observed positive pairs (excluded from negatives): {len(pos_keys):,}")
 
     print(f"positive pairs/epoch: {len(A):,}   lr={a.lr} (CONSTANT), negs={a.negs}")
     for ep in range(a.epochs):
         prev = emb.copy()
         t0 = time.time()
-        sgd_epoch(emb, G, A, B, layer_of, members, a.lr, a.negs, rng)
+        sgd_epoch(emb, G, A, B, layer_of, expert_of, members, pos_keys, a.lr, a.negs, rng)
         steps += len(A)
         # On the unit sphere, chord distance is a direct read of how far each
         # expert actually moved this pass.
