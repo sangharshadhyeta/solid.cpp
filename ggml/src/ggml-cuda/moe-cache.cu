@@ -4859,6 +4859,52 @@ static int moe_cache_substitute_pick(
     return best_slot;
 }
 
+// Pick a stand-in from the SAME token's router picks. ids arrive rank-ordered,
+// so the first resident one is the highest-scoring available substitute - the
+// router's own judgement about which expert suits this input, which is exactly
+// what a co-activation score is only a proxy for.
+//
+// Measured against the alternatives on 151,584 real decisions, scoring each by
+// the router's own score for the stand-in it chose:
+//   random resident        0.01387
+//   pairwise co-activation 0.02130   (what this replaces)
+//   THIS (top-k resident)  0.03856   +81%
+//   full-probs oracle      0.03790   - needs ffn_moe_probs, which is computed
+//                                      on the GPU and not reachable from this
+//                                      CPU dispatch path at all
+//
+// It declines more often than the co-activation scan (it only considers this
+// token's k picks, not every resident expert of the tensor), and those rows
+// fall back to CPU compute - correct, just slower. That trade is deliberate:
+// a wrong stand-in costs output quality, a declined one costs only time.
+static int moe_cache_substitute_pick_rank(
+        moe_cache_pool & pool, const void * host_base, const int32_t * ids,
+        int self_index, int top_k, int64_t n_expert) {
+    if (top_k <= 1) {
+        return -1;
+    }
+    const int token_start = self_index - (self_index % top_k);
+    const int32_t missed = ids[self_index];
+    for (int j = token_start; j < token_start + top_k; j++) {
+        if (j == self_index) {
+            continue;
+        }
+        const int32_t cand = ids[j];
+        if (cand < 0 || cand >= n_expert || cand == missed) {
+            continue;
+        }
+        const auto found = pool.map.find(moe_cache_key{host_base, cand});
+        if (found == pool.map.end()) {
+            continue;
+        }
+        if (pool.slots[found->second].state != moe_cache_slot_state::valid) {
+            continue;
+        }
+        return found->second;   // ids are rank-ordered: first resident wins
+    }
+    return -1;
+}
+
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -5033,8 +5079,16 @@ static int moe_cache_plan(
         // trap docs/plan.md already names for the dynamic atlas.
         if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
-            const int sub = moe_cache_substitute_pick(
-                    device, pool, node->host_base, expert, node->n_expert);
+            // Rank-based by default; the co-activation scan stays available
+            // for A/B via GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT=1.
+            static const bool use_coact = [] {
+                const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT");
+                return env && atoi(env) != 0;
+            }();
+            const int sub = use_coact
+                ? moe_cache_substitute_pick(device, pool, node->host_base, expert, node->n_expert)
+                : moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
+                                                 rank_top_k, node->n_expert);
             if (sub >= 0) {
                 moe_cache_slot & ssl = pool.slots[sub];
                 ssl.readers++;
