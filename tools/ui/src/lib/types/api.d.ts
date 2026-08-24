@@ -249,6 +249,13 @@ export interface ApiExpertAtlasCell {
 }
 
 export interface ApiExpertAtlas {
+	/** True when the axes were FACTORED OUT of observed co-activation rather
+	 * than measured against the hardcoded k_probes[] category list. The two
+	 * are not interchangeable to a viewer: probe axes are named topics and a
+	 * cell's x/y is a convex combination of category anchors, while discovered
+	 * axes are eigenvector components with no name and no anchor geometry -
+	 * so the category ring must not be drawn over them. */
+	discovered?: boolean;
 	categories: string[];
 	n_layer: number;
 	n_probes: number;
