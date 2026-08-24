@@ -1694,6 +1694,34 @@ static void ggml_compute_forward_mul_mat_id(
             }
         }
 
+        // Row accounting: every (token, slot) pair must end up in exactly one of
+        // three places - zeroed as a sentinel, handed to the cache as a hit, or
+        // routed to matrix_rows for CPU compute. A row in none of them leaves its
+        // dst uninitialised, which is garbage in the residual stream.
+        if (getenv("MOE_CACHE_ROW_AUDIT")) {
+            int64_t routed = 0;
+            for (int a = 0; a < n_as; a++) {
+                routed += matrix_row_counts[a];
+            }
+            const int64_t total = (int64_t) n_ids * ids->ne[1];
+            int64_t sentinels = 0;
+            for (int64_t t = 0; t < ids->ne[1]; ++t) {
+                for (int k = 0; k < n_ids; ++k) {
+                    if (*(const int32_t *)((const char *) ids->data + t*ids->nb[1] + k*ids->nb[0]) < 0) {
+                        sentinels++;
+                    }
+                }
+            }
+            if (routed + moe_cache_n_hits + sentinels != total) {
+                fprintf(stderr, "[moe-cache] ROW AUDIT MISMATCH total=%lld routed=%lld hits=%d "
+                        "sentinels=%lld missing=%lld (n_ids=%d n_tokens=%lld n_as=%d)\n",
+                        (long long) total, (long long) routed, moe_cache_n_hits,
+                        (long long) sentinels,
+                        (long long) (total - routed - moe_cache_n_hits - sentinels),
+                        n_ids, (long long) ids->ne[1], n_as);
+            }
+        }
+
         if (moe_cache_node && moe_cache_n_hits > 0) {
             if (ggml_moe_cache.verify_rows) {
                 ggml_moe_cache.verify_rows(moe_cache_node, moe_cache_n_hits,

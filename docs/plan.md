@@ -1104,7 +1104,49 @@ parallel arrays are correctly sized (all MOE_CACHE_MAX_TOPK=4096, matching the
 missing `matrix_row_counts` increment is NOT a bug — it recomputes each row
 immediately after writing the mapping, so reusing the scratch index is safe.
 
-**Only known-safe configuration is `GGML_CUDA_MOE_CACHE=0`**, which costs ~21%
+**INVESTIGATION STATUS (2026-08-25, unresolved).** Three separate "found it"
+claims were made and all three were WRONG, each because more than one variable
+moved between arms:
+
+1. *Atlas warming* - arms differed in max_tokens (500 clean / 600 degenerate).
+2. *moe-cache itself* - `GGML_CUDA_MOE_CACHE=0` looked clean, but that arm also
+   had `-c 65536`; with `-c 2048 -ncmoe 40` and no cache it degenerates too.
+3. *VRAM exhaustion / OOM* - `GGML_CUDA_MOE_CACHE_RESERVE_MB=2560` leaves
+   2544 MiB free and it still degenerates 3/3. Not memory pressure.
+
+Contradictory observations that no single variable explains:
+
+| config | result |
+|---|---|
+| `cache=0, -c 65536` (train prompt included) | clean |
+| `cache=0, -c 2048 -ncmoe 40` | DEGENERATE |
+| `cache=auto, -c 65536` | DEGENERATE |
+| `cache=auto, -c 4096`, 800-token generation | clean |
+| `cache=auto, -c 4096`, then train prompt | DEGENERATE |
+
+What IS established:
+- Deterministic trigger prompt (the train word-problem), and once triggered the
+  server stays poisoned for unrelated later requests until restart.
+- Pre-existing: reproduces on `5de4ff917` from before this session.
+- Slot CONTENTS are correct (`GGML_CUDA_MOE_CACHE_VERIFY_SLOTS`, 0 mismatches).
+- Slot->expert MAPPING is correct (`GGML_CUDA_MOE_CACHE_VERIFY_ROWS`, 0
+  mismatches).
+- Row accounting BALANCES (`MOE_CACHE_ROW_AUDIT`, 0 mismatches) - no dropped rows.
+- Persists with `GGML_CUDA_MOE_CACHE_FAIL=dispatch`, i.e. with all expert math
+  on the CPU.
+- No `cudaMalloc failed` / OOM lines in any log.
+- The cache expands to fill VRAM down to the ~128 MiB reserve floor regardless
+  of `-ngl`, which is worth fixing on its own merits but is NOT this bug.
+
+**Next step must be a controlled matrix** - cache x context x prompt, one
+variable at a time, repeated - not another hypothesis. Related prior art: a
+dangling commit (`c45ae5b309`, 2026-08-13) documents a real OOM-vs-throughput
+interaction with `cudaMalloc failed: out of memory` on the KV cache, and the
+user recalls an uncommitted "loud failure" guard for this class of problem
+that has not been located (dangling candidates are either already merged - the
+64->4096 ceiling - or superseded).
+
+**No configuration is currently known-safe.** `GGML_CUDA_MOE_CACHE=0`, which costs ~21%
 throughput (44 t/s vs ~56).
 
 ### Consequence for this session's server-measured numbers
@@ -1128,6 +1170,44 @@ corruption would have produced absurd PPL rather than 6.31.
 Still to re-measure with the guard: the admission A/B (-7.6% for removing the
 gate), the atlas warming A/B (+0.27 tok/s), and the fill-cost model calibrated
 from those arms.
+
+## Pending work queue (2026-08-25)
+
+**Blocking**
+1. The corruption bug above. Until it is understood, no server-measured number
+   is trustworthy and the cache cannot be relied on.
+
+**Invalidated, need re-running with the degeneration guard**
+2. Admission A/B (-7.6% for removing the gate) - the empirical basis for
+   "racing to fill is the wrong move".
+3. Atlas warming A/B (+0.27 tok/s, "neutral").
+4. Fill-cost model - calibrated from those arms, so every simulation ranking
+   that used it is provisional.
+
+**Confirmed, ready to progress**
+5. Substitution: +4.7% guarded, quality bounded at +0.47% perplexity. Needs a
+   reasoning-benchmark check before shipping; off by default.
+
+**Requested, not yet done**
+6. Anti-co-firing as a PROBABILISTIC modifier layered on the existing eviction
+   logic (it was only ever tested standalone and deterministic, which is the
+   wrong shape).
+7. The fold thesis - higher-order 3-way/4-way structure. The test was killed
+   mid-run to free RAM and never repeated.
+8. Fix the embedding implementation: a trivial common-neighbours baseline
+   scores AUC 0.653, the learned embedding 0.490. It should at least match the
+   baseline.
+9. Integrate a mechanism that actually CONSUMES the atlas. Warming touches ~2%
+   of fills, which is why a chance-level map and a 0.71 map perform identically
+   on 8099 - no integrated atlas comparison means anything until this exists.
+
+**Open research**
+10. Reuse-distance prediction - the 17pp Belady gap. Six signals have failed;
+    none of them addresses the actual quantity.
+11. Persist co-activation across runs like `session.history`, for cold start.
+12. Track 1.5 - merged, value never independently verified.
+13. The cache filling VRAM to a 128 MiB floor regardless of `-ngl`; the reserve
+    should scale with the device, and the budget should yield under pressure.
 
 ## Open, no proposal yet
 
