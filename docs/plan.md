@@ -256,7 +256,66 @@ not automatically mean group admission wins, because admitting B early also
 costs a slot that something else could have used. The A/B decides it, not
 the precision number.
 
-## Track 1.6 — Discovered topics from co-activation (not started)
+## Track 1.6 — Discovered topics from co-activation — ATTEMPTED, inconclusive (2026-08-25)
+
+Built (`scripts/moe-discovered-atlas.py`): factor the co-activation graph, use
+its components as axes, no category list at all. Global graph over all
+(layer, expert) nodes rather than one embedding per layer — per-layer
+factorings each come out in their own arbitrary rotation, and `req_dir`
+averages positions across layers, so it needs one shared space. Randomised
+subspace iteration over sparse matvecs, so 8,661 nodes never need a dense
+factorisation. Output matches the existing atlas schema, so it is a drop-in.
+
+Built on co-activation, NOT `req_dir`, which is the whole point — the
+circularity argument below still holds. Verified in code that substitution
+does not break it: `co_activation` is keyed on `ids[a]`/`ids[b]`, the
+router's *requested* experts, so a substituted pick never feeds back.
+
+**Held-out result** (graph from the first half of each trace, scored on the
+second): the discovered axes carry essentially no topic information.
+
+| space | Fisher | topic-acc (chance 25%) |
+|---|---|---|
+| human 9 categories (probe-measured) | 0.4136 | **71.6%** |
+| discovered (raw) | 0.0005 | 25.5% |
+| discovered (layer-centred) | 0.0030 | 31.0% |
+
+**Diagnosis — the axes encode LAYER, not topic.** Fisher ratio for layer
+identity is **2.5420** against 0.0005 for topic. A co-activation graph is a
+set of per-layer cliques (experts only co-fire within a layer), so that is by
+far its dominant structure and spectral factoring spends every component on
+it. Not a cross-layer sampling artifact either: weighting all-pairs
+cross-layer edges up to 64x moved layer-Fisher only 2.475 → 2.279, with topic
+accuracy pinned at chance throughout.
+
+**Why this is NOT yet a verdict.** Two objections, both fair:
+
+1. *The data was far too thin.* 28,800 decisions over 4 topics gives a
+   co-activation graph at 22.9% fill with **median edge weight 2, and 46% of
+   pairs seen exactly once**. Half the graph is noise. Projection: median
+   weight 20 needs ~10x the data (~1,800 tokens/topic), median 50 needs ~25x.
+2. *One-shot spectral is not the mechanism described.* The design intent was
+   experts that co-fire *moving nearer* and the map *settling over a long
+   run* — incremental attraction dynamics, accumulated and persisted like
+   `session.history`. Eigendecomposition solves a fixed objective on a fixed
+   snapshot in one step; it has no notion of settling and no memory between
+   runs. It is a different algorithm, not a fast approximation of that one.
+
+What does survive, because it is about graph topology rather than counts: the
+layer blocks are intrinsic and any method here must handle them explicitly.
+The folds, if they exist, live *within* each layer with cross-layer alignment
+stitching corresponding regions — not as one undifferentiated cloud, which is
+what the global embedding assumed.
+
+**Next**: rebuild on ~34x the data (12 topics x 2,000 tokens), pooled and
+UNLABELED, and score by held-out link prediction
+(`scripts/moe-link-prediction.py`) rather than by agreement with the 9
+categories — scoring "did it recover our labels" is rigged toward the probes.
+The popularity control in that script is the one that matters: frequently-used
+experts co-fire often merely because they are frequent, so any embedding that
+cannot beat popularity has not earned its complexity.
+
+## Track 1.6 — original note (circularity argument, still stands)
 
 The atlas's 9 categories are human guesses hardcoded in `k_probes[]`, and a
 *dynamic* atlas built on them has a trap: live traffic carries no category
@@ -696,6 +755,152 @@ to extend this to `qwen35moe`. That effort would only make a measured
 regression available to more architectures. The coverage gap documented
 above is therefore not worth closing as things stand; it would need the
 per-dispatch overhead reduced first, and only then re-measured.
+
+## Resident-constrained routing ("use what is in VRAM") — 2026-08-25
+
+Design premise: stop racing to fill VRAM in time, and instead run whichever
+experts are already resident. Measured end to end this session.
+
+### The premise is correct, and here is the measurement that proves it
+
+Removing the admission gate entirely (`ADMIT_AFTER=1` + `THROTTLE=1`) buys
+**+10.79pp hit rate and costs -7.6% throughput** (52.43 vs 56.75 tok/s,
+evictions 110,169 vs 23,714). The racing *succeeds* at filling VRAM and loses
+anyway, because fill traffic is the binding constraint. `ADMIT_AFTER=1` alone
+is ~neutral (+0.6 tok/s), because `readmit_after` defaults to **8** and
+`max(admit_after, readmit_after)` is the gate that actually binds for anything
+previously evicted.
+
+Corollary: **hit rate is purchasable and therefore not a valid objective on
+its own.** 79.25% is available for one env var and a slower server.
+
+### Prefetching is capped, not merely weak
+
+Atlas warming gains **+0.31pp** hit rate in simulation. A *topic oracle* with
+perfect foreknowledge of the segment's experts gains **+0.30pp**. The atlas is
+already at the ceiling; the ceiling is the problem. Cause: every topic touches
+~6,000 of 7,680 experts, with top-1000 covering only 52-61% of selections —
+there is no compact topic hot set to preload. This single result explains
+every refuted Track 1 A/B at once.
+
+Atlas warming on/off on the live server, 2 reps each: **+0.27 tok/s, +0.71pp
+hit, +509 fills out of ~23,000** — within run-to-run spread, i.e. neutral to
+marginally positive. It is rate-limited to once per 64 `plan()` calls and
+admission-gated, so it never generates enough fill traffic to compete with
+demand. It is not free-loading.
+
+### Where the headroom actually is: eviction
+
+Belady's optimal beats LRU by **+16.86pp** at the real 18.5% cache ratio
+(81.85% vs 64.98%). Cross-check: the live server measures 68.7% hit on
+topic-diverse traffic against the LRU simulation's 64.98%, so the production
+policy is behaving near-LRU here and that headroom is real.
+
+Five signals tested as eviction policies (`scripts/moe-eviction-sim.py`), all
+scored on retained gate mass, sampled eviction K=32:
+
+| policy | retained | hit |
+|---|---|---|
+| **lru** | **75.72%** | 58.63% |
+| random | 72.51% | 53.31% |
+| coact | 72.74% | 58.12% |
+| atlas | 71.06% | 51.59% |
+| router score | 68.90% | 46.27% |
+
+**LRU wins on retained mass at every fill rate**, and atlas and router score
+lose to *random*. Both rank experts context-free, with no knowledge of what
+was just used, so evicting by them tears up the working set recency is
+holding. Belady is recency with perfect foresight — so the 17pp lives in
+predicting **reuse distance**, and none of the available signals approximates
+it. Co-activation is the sole exception: it beats LRU on **hit rate** at fill
+rates above 1 (64.88% vs 63.37% at fill 4), reaching a higher hit rate with
+*fewer* fills.
+
+### Fill cost — and a retraction
+
+Both simulators originally scored hits and gate mass with **no notion that
+admitting an expert costs anything**, and consequently recommended "admit
+everything" — the worst arm on real hardware. `scripts/moe_cost_model.py`
+fits tok/s to three measured arms rather than inventing constants:
+
+```
+tok/s = -42.290 + 153.014*hit - 140.862*fills_per_pick
+  1pp of hit rate  = +1.5301 tok/s
+  1 fill/1000 picks = -0.1409 tok/s
+  break-even: 1pp of hit must not cost more than 10.9 extra fills/1000 picks
+```
+
+Distinct from the cache's existing `MOE_CACHE_COST_TIER_NVME/RAM` weight (5.8
+vs 1.0), which ranks *which* expert is dearer to refetch, not the cost of
+filling at all. Applying it inverts the earlier conclusions: fill_rate 1 beats
+fill_rate 8, and the corrected model reproduces the ordering it previously got
+backwards ("admit everything" now ranks last, 10.34 vs 30.17). Absolute
+predictions are NOT trustworthy — the sims run at 52-450 fills/1000 picks
+against a calibration range of 40-188. Ranking only.
+
+### Substitution — BUILT, measured, off by default
+
+`GGML_CUDA_MOE_CACHE_SUBSTITUTE=1`. On a miss, run the best resident expert of
+the same tensor instead of the CPU fallback. Mechanically only needs
+`slot_indices[]` to point at a different slot; the gate weight applied
+afterwards is still the one the router computed for the expert it asked for.
+
+Stand-in chosen by **co-activation** — how often the candidate fired in the
+same routing decision as the expert it replaces. Candidates enumerated from
+the resident bitmask (one hash for the tensor, then bit tests over ~4 words),
+which is why that structure exists: 64 hash lookups per decision on the
+dispatch path is what Track 1.5 exists to avoid.
+
+Admission bookkeeping deliberately still follows what the *router wanted*, not
+what was executed, or resident experts become the only ones ever used and
+therefore the only ones ever kept. A stand-in earns heat but never promotion
+to protected.
+
+| | tok/s | hit | substitutions |
+|---|---|---|---|
+| OFF | 56.82 | 67.62% | 0 |
+| ON | **59.88** | 65.51% | 200,637 (99.5% of misses) |
+
+**+5.4% throughput.** Quality, paired per-chunk over 120 chunks (the unpaired
+±1.5% bars cannot resolve this; pairing tightens it 11x):
+
+```
+mean   +0.181% perplexity
+95% CI [-0.106%, +0.468%]     t = 1.23, NOT significant
+chunks where ON was worse: 59/120 (49%)
+```
+
+So the cost is **bounded at +0.47% perplexity at 95% confidence** for +5.4%
+throughput. Caveats: one corpus (this repo's docs), and perplexity is a weak
+proxy — it will not catch degradation in long-form reasoning at a 99.5%
+substitution rate. Keep off by default until run against a reasoning
+benchmark.
+
+Measuring this needed `-b 4 -ub 4`: co-activation is only recorded when
+`n_ids <= 32`, so any larger batch leaves the substitution table empty and
+both arms return byte-identical PPL. Cost two wasted runs to rediscover.
+It also means **substitution is inherently decode-only**.
+
+### Instrumentation added
+
+- **Rank-resolved hit/miss** (`rank_hits`/`rank_misses` on `/experts`): misses
+  concentrate in the router's low-confidence tail — rank 0 misses 20.0% of the
+  time, rank 7 misses 44.0%, monotonic, with only **8.0% of all misses landing
+  on the router's top pick**. That is what makes substitution cheap.
+- **Signal 3** (`MOE_TRACE_SCORES=1` in `llama-moe-trace`): the router's score
+  per pick, not just its ranking. Rank 0 carries 26.48% of gate mass, rank 7
+  carries 6.82% (3.88x spread); ranks 4-7 together carry 32.17%.
+- **Resident bitmask** (`GGML_CUDA_MOE_CACHE_MASK_AUDIT=1` proves it): one bit
+  per expert per tensor, maintained only through
+  `moe_cache_map_insert`/`erase`. Validated live with the pool saturated and
+  13,639 evictions of churn: 8 audits, 0 disagreements.
+
+### Hit rate is workload-dependent — quote it with its traffic
+
+A single repeated prompt measures **100.00%** (0 misses in 601,440 lookups).
+Four topic-diverse prompts measure **68.7%**. Same cache, same size. Topic
+diversity produces misses, not cache pressure — so any hit-rate figure quoted
+without its workload's topic spread is meaningless.
 
 ## Open, no proposal yet
 
