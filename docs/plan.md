@@ -941,6 +941,88 @@ Four topic-diverse prompts measure **68.7%**. Same cache, same size. Topic
 diversity produces misses, not cache pressure — so any hit-rate figure quoted
 without its workload's topic spread is meaningless.
 
+## Anti-co-firing and the incremental atlas — both tested, both fail (2026-08-25)
+
+### Anti-co-firing exists, and is stronger than attraction
+
+Measured over 70,800 frequent same-layer pairs (expected co-fires >= 5), on
+909,480 pooled decisions:
+
+```
+NEVER co-fire despite that expectation : 6.68%
+PMI mean -1.123   median -0.784
+share negative (anti-associated)       : 71.5%
+share strongly negative (PMI < -1)     : 45.0%
+share strongly positive (PMI > +1)     :  8.2%
+```
+
+Strong repulsion (45%) is 5x more prevalent than strong attraction (8.2%).
+Every mechanism built so far uses only the attraction half.
+
+*Correction*: a first pass computed expected co-fires as `pa*pb*N*(K-1)`. The
+extra `(K-1)` inflates the expectation 7x and biases every PMI down by
+log(7)=1.95, which produced a spurious "98.6% anti-associated". Correct
+expectation under independence is `N*pa*pb`.
+
+### As an eviction signal it is the worst arm yet
+
+1421 slots, window 64, all scores accumulated online, 151,580 decisions:
+
+| fill | policy | retained | hit | fills/1k | pred tok/s |
+|---|---|---|---|---|---|
+| 1 | **lru** | **89.69%** | 77.45% | 92.4 | **63.20** |
+| 1 | random | 86.37% | 71.09% | 106.9 | 51.43 |
+| 1 | coact | 82.70% | 72.98% | 88.2 | 56.95 |
+| 1 | anti | 73.76% | 59.11% | 108.2 | 32.91 |
+| 1 | anti+lru | 74.71% | 60.26% | 106.9 | 34.85 |
+
+Worse than random, and it generates MORE fills. The reason is structural and
+general: anti-co-firing measures **simultaneity** ("not in the same decision"),
+while eviction needs **temporal proximity** ("not needed soon"). An expert can
+be strongly anti-associated with the current picks and fire on the very next
+token.
+
+**That is now six signals beaten by plain LRU** — atlas, router score,
+co-activation, frequency, admission demand, anti-co-firing. Every
+co-activation-derived signal describes within-decision relationships in one
+polarity or the other; eviction is an across-time question. The single place
+such a signal has ever won is SUBSTITUTION, a placement decision, where it
+delivered +5.4%.
+
+This supports separating the two roles explicitly: co-firing structure is a
+hard rule governing PLACEMENT (who stands in for whom, who sits near whom),
+and recency/heat is the soft rule governing RETENTION probability. Applying a
+placement signal to a retention decision has now failed six times.
+
+### Incremental atlas — settles, but learns nothing
+
+`scripts/moe-incremental-atlas.py`: SGNS over co-firing pairs, constant
+learning rate by design (annealing would manufacture the appearance of
+settling), state persisted to .npz and resumed on the next run so it
+accumulates like `session.history`.
+
+Two failure modes found and fixed in order: (1) unnormalised vectors diverge
+to 1e70 within 4 epochs; (2) with normalisation they OSCILLATE, flipping to
+the antipode every pass (median move 2.0 on a unit sphere), because `np.add.at`
+applies every update a node collected in a batch at once, so a frequently
+selected expert takes a step proportional to its frequency. Averaging each
+node's update by its occurrence count fixes both.
+
+It then settles cleanly — 0.25 deg/epoch, stable from epoch 2, and does NOT
+collapse (pairwise cosine mean -0.0013, sd 0.1767, range -0.69..+0.65, so
+negative sampling supplies real repulsion). But held-out link prediction gives
+**AUC 0.4991 — pure chance**. It settled into something with no predictive
+content: the per-node averaging that cured the oscillation shrank each step
+enough to underfit. That is an implementation failure, not a refutation of the
+incremental idea, and it remains the one untested variant.
+
+Reference points on the same test: probe atlas 0.7116, spectral discovered
+0.5761, popularity control 0.5437.
+
+*Note*: with 5x the data LRU's absolute retained mass rose from 75.72% to
+89.69%. Rankings held throughout, but earlier absolute simulation figures are
+pessimistic.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:
