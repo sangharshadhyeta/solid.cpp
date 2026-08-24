@@ -310,6 +310,111 @@ the warming decision itself is good. Not started - needs its own scoped
 design, likely reusing the existing `device.queue`/worker-thread plumbing
 rather than inventing new infrastructure.
 
+**BUILT (2026-08-24), NOT YET MEASURED.** The split now exists, off by
+default behind `GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=1` (and only reachable
+at all with `GGML_CUDA_MOE_CACHE_ATLAS_WARM=1`, which is itself off by
+default). It reuses the existing fill-worker thread and session lock; no new
+thread, no new synchronization primitive.
+
+What changed:
+
+- `moe_cache_atlas_warm` was split into its two real halves.
+  `moe_cache_atlas_rank` is the expensive one - a cosine scan over the
+  tensor's whole atlas-covered candidate set, a `sqrt` and a few flops each,
+  up to `n_expert` of them - and is now *pure*: it touches no cache state and
+  takes no lock. `moe_cache_atlas_admit` is the cheap one - a few hash
+  lookups, at most one eviction, a queue push - and is the only half that
+  needs `session.mu`.
+- Async path: `moe_cache_plan` now does a bounds check, a hash lookup and a
+  `push_back` (`moe_cache_atlas_warm_enqueue`), and nothing else. The fill
+  worker picks the request up in its existing wait loop, **releases the
+  session lock for the ranking scan**, retakes it, re-validates the pool, and
+  admits. Ranking therefore overlaps whatever the GPU is doing, which is the
+  FreeToken split this port never carried over.
+- The warm queue is deliberately **one deep**. A warming hint describes where
+  the request is heading *now*; if one is still pending, a second is already
+  stale by the time it would run, and queueing it would only make the worker
+  do the same scan twice. Dropping is correct, not a shortcut.
+- `atlas_by_tensor` rows are now `shared_ptr<const ...>` and `set_atlas`
+  publishes a replacement row instead of mutating in place. Without that, a
+  re-registration could free the vector the worker is mid-scan on. The
+  ranking pass also captures `req_dir_x/y` **by value** at enqueue time, so
+  it ranks against where the request was heading when the hint was raised,
+  not wherever the centroid drifted to by the time the worker got there.
+- The sync path (default) still runs both halves inline under the lock, so
+  the old behavior is what ships and the two are directly A/B-able.
+
+**One real behavior change, not hidden:** the old scan skipped
+already-resident experts inline, which needs `pool.map` and therefore the
+lock. The lock-free pass cannot, so it keeps a deeper list
+(`MOE_CACHE_ATLAS_RANK_K=4`) and the admission half - which holds the lock
+and already re-checked residency anyway - walks down it admitting the same
+top-2 non-resident candidates in the same score order
+(`MOE_CACHE_ATLAS_ADMIT_K=2`). The two differ only when 3+ of the top 4 are
+already resident. Small, but it means the +2.75pp topic-switch number above
+was measured with the *old* scan and would need re-validating before any
+default flip.
+
+**Measurement hook, not yet run**: `GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1`
+accumulates the time the warming block costs *on the dispatch path
+specifically* and prints a running average every 256 warm calls. That is the
+quantity this track is about, and tok/s is the wrong instrument for it - the
+block fires once every 64 `plan()` calls, so even a large per-call saving is
+a rounding error at the throughput level. Measuring the thing directly, for
+the same reason steps 6 and 7a were measured before anything was built on
+them.
+
+### MEASURED (2026-08-24) - the hypothesis holds, and the caveat matters more
+
+Ornith-1.5-35B Q4_K_M, `--moe-cache auto -c 65536 -ngl 99`, its own matched
+atlas, `GGML_CUDA_MOE_CACHE_ATLAS_WARM=1`, scratch server on 8098 (the live
+8099 deployment was stopped for the test and restored to its exact
+last-known-good command immediately afterward). Two interleaved rounds per
+arm, four 700-token generations each (alternating a code-heavy and a
+medical prompt), timing read from
+`GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1`.
+
+| | dispatch-path cost | hit rate | prefetches | evictions |
+|---|---|---|---|---|
+| sync (old, default) | **4.9 us** / 4.9 us | 77.60% / 77.53% | 3591 / 3584 | 53015 / 53268 |
+| async (Track 1.5) | **0.6 us** / 0.5 us | 77.67% / 77.71% | 3592 / 3623 | 52808 / 52535 |
+| | **-88%** | +0.13pp | +0.6% | -0.9% |
+
+Both arms coherent, zero `CUDA error` / `ggml_abort` / copy-failure-disable
+markers across all four servers. The per-arm averages were flat from the
+first 2048-call print to the last (4.8-4.9 vs 0.5-0.6), so this is converged,
+not a warmup artifact - the cleanest signal since the D2D measurement, and in
+the same style: near-zero within-arm variance, no overlap between arms.
+
+**What it means, stated narrowly.** The ranking scan really was ~4.3 us of
+synchronous CPU work sitting on the GPU-dispatch path, and moving it to the
+worker removes essentially all of it - what remains (0.5-0.6 us) is the hash
+lookup and `push_back` the enqueue still has to do. The cache does the *same
+work*: prefetch counts land within 1% and hit rate within 0.2pp, i.e.
+deferring the ranking by one worker hop did not make it rank against a
+meaningfully staler direction, which was the main correctness worry.
+
+**What it does NOT mean.** This is not a throughput win and should not be
+reported as one. tok/s was 58.6-62.0 in both arms with full overlap
+(59.72/61.93/58.61/60.97 sync vs 59.11/62.00/59.25/61.32 async) - exactly as
+expected, because 4.3 us saved once every 64 `plan()` calls is ~0.07 us per
+call against a ~17000 us token, i.e. four orders of magnitude below anything
+tok/s can resolve. The honest summary is: **the latency this track set out to
+remove is real and is now gone, and it was never large enough to matter for
+throughput at the current 1-in-64 rate limit.** That is a completed
+architectural fix, not a performance result.
+
+Where it *would* start to matter: any future change that raises the warming
+rate (a lower rate limit, per-layer warming, a larger candidate set, or a
+richer atlas with more categories per expert - all of which scale the scan,
+none of which now scale the dispatch path). The split is what makes those
+affordable to try; it is not itself a win to bank.
+
+Still off by default. Nothing here re-validates the +2.75pp topic-switch
+result, which was measured with the old residency-filtering scan (see the
+behavior-change note above) - that remains the open question before any
+default flip, and this measurement deliberately did not touch it.
+
 ## Track 2 — Unified tiered placement — RESCOPED (mostly already exists)
 
 Original framing was "remove the hard `-ncmoe` boundary, give every MoE layer
@@ -347,6 +452,14 @@ capacity that cannot cover the extra demand, and the constrained-regime
 result (33% hit rate at a 512 MiB budget) shows what the far end of that
 looks like. The optimum is empirical, which is exactly why
 `--moe-calibrate` exists.
+
+**Status (2026-08-24): NOT RUN.** The rescope (`2b721d844`) is the last thing
+that happened here - it established that items 1 and 2 need no code, which is
+what makes this track look further along than it is. The one thing actually
+left, the (a)-vs-(b) placement comparison, has not been measured: no commit,
+no numbers, nothing in `docs/index.html`. It needs no code at all, only the
+GPU - and the same 8099 occupancy blocking the Track 1.5 A/B blocks it too.
+Track 2 is therefore *descoped*, not *done*.
 
 ## Track 3 — "True MoE" emulation
 
