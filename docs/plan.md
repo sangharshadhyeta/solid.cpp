@@ -1226,6 +1226,54 @@ Still to re-measure with the guard: the admission A/B (-7.6% for removing the
 gate), the atlas warming A/B (+0.27 tok/s), and the fill-cost model calibrated
 from those arms.
 
+## Fold thesis — VALIDATED: real 3-way structure beyond pairs (2026-08-25)
+
+Groups of experts fire together as sets, not merely as correlated pairs. Tested
+on 113,685 pooled decisions, held-out split, triples with count >= 5, scored
+against the Kirkwood superposition (what the three pairwise marginals predict):
+
+```
+mean log-lift  +1.050    (2.9x more often than pairwise predicts)
+median         +1.017
+share above pairwise prediction:  96.7%
+strongly above (>+0.5):           83.1%
+```
+
+**96.7% of triples exceed what pairwise structure explains.** Every mechanism
+built so far - co-activation substitution, the atlas, all the eviction arms -
+reads only the pairwise shadow of this.
+
+Order limits: recurrence falls with order (2-way 65.3% of train groups recur
+held-out, 3-way 30.4%, 4-way 14.4%) and seen-once rises (30.4% / 54.7% /
+70.1%). Triples are the usable order; 4-way is mostly noise at this sample size.
+
+Note the selection process constrains exactly 8 of 256 per decision, which
+induces *competition* between experts and would bias higher-order correlation
+NEGATIVE - so a +1.05 positive lift is not a selection artifact.
+
+**Actionable**: substitution currently picks a stand-in by pairwise
+co-activation. Selecting by triple co-occurrence with the other experts in the
+same decision is the direct test of whether the higher-order structure converts
+into a better mechanism, and it reuses data already collected.
+
+## Anti-co-firing as a probabilistic modifier — tested properly, still fails
+
+Earlier it was tested standalone and deterministic, which was the wrong shape.
+Re-tested layered on the existing logic: LRU narrows a 32-candidate sample to
+its M stalest, and anti-affinity only breaks that tie. M=1 is pure LRU.
+
+| fill | M | retained | hit | pred tok/s |
+|---|---|---|---|---|
+| 1 | **1** | **89.62%** | 77.50% | **63.32** |
+| 1 | 2 | 89.41% | 77.36% | 63.16 |
+| 1 | 4 | 88.82% | 76.70% | 62.11 |
+| 1 | 8 | 87.26% | 74.30% | 57.94 |
+| 1 | 32 | 73.86% | 59.28% | 33.20 |
+
+Monotonically worse as anti-affinity gets more say. Even the mildest blend
+(M=2) is neutral-to-slightly-negative. Recency dominates even when the
+alternative signal only has to break a tie.
+
 ## Pending work queue (2026-08-25)
 
 **Blocking**
