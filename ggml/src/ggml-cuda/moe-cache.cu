@@ -586,6 +586,10 @@ struct moe_cache_device {
     // Observational only - nothing reads these to make a decision.
     long long rank_hits[GGML_MOE_CACHE_MAX_RANK] = {};
     long long rank_misses[GGML_MOE_CACHE_MAX_RANK] = {};
+    // Substitution: a miss served by running a RESIDENT expert in place of the
+    // one the router asked for, rather than falling back to CPU compute.
+    long long substitutions = 0;      // misses served by a stand-in
+    long long substitute_declined = 0;// misses where no acceptable stand-in existed
     long long inserts = 0;
     long long fills = 0;
     long long fill_failures = 0;
@@ -4319,6 +4323,48 @@ static bool moe_cache_partner_index_enabled() {
     return moe_cache_measure_pred_enabled() || moe_cache_group_admit_enabled();
 }
 
+// CHANGES MODEL OUTPUT. Off by default and deliberately not folded into any
+// other flag: every other knob in this cache is output-identical to mainline,
+// and this one is not. When a router pick is not resident, run the best
+// resident expert of the same tensor instead of paying a CPU fallback.
+//
+// Why this is even defensible: the picks that miss are the ones the router
+// weights least (measured - rank 7 misses 44% of the time against rank 0's
+// 20%, and ranks 4-7 carry only 32% of the gate mass), so the substituted
+// weight is small. Whether the output damage is acceptable is a question for
+// perplexity, which has NOT been run yet.
+static bool moe_cache_substitute_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// How many resident candidates the stand-in search may examine. The offline
+// cost model put the useful window near 64; beyond that the scan cost on the
+// dispatch path outweighs what a better stand-in is worth.
+static int moe_cache_substitute_scan() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_SCAN");
+        const int v = env ? atoi(env) : 64;
+        return v < 1 ? 1 : (v > 256 ? 256 : v);
+    }();
+    return n;
+}
+
+// Minimum co-activation count before a resident expert is accepted as a
+// stand-in. 0 would let an arbitrary resident expert stand in for one it has
+// never fired alongside, which is the case most likely to damage output.
+static uint32_t moe_cache_substitute_min_coact() {
+    static const uint32_t n = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_COACT");
+        const int v = env ? atoi(env) : 1;
+        return (uint32_t) (v < 0 ? 0 : v);
+    }();
+    return n;
+}
+
 static bool moe_cache_mask_audit_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_MASK_AUDIT");
@@ -4657,6 +4703,63 @@ static bool moe_cache_atlas_warm_service(
             req.host_base, req.expert_size, best, n_best);
 }
 
+// Pick a resident stand-in for `missed`, or -1. Walks this tensor's resident
+// bitmask (one hash for the tensor, then bit tests over ~4 words - the whole
+// reason the mask exists) and scores each candidate by how often it has fired
+// in the SAME routing decision as the expert it would replace. Co-activation
+// rather than atlas position or router score, because those two rank experts
+// context-free and both lost their eviction A/Bs to plain recency; co-firing
+// is the only signal here that says "these two do the same job for this
+// input". Ties break toward the hotter slot, which is the cheaper one to keep.
+//
+// Caller must hold the session lock, as everything reading pool state does.
+static int moe_cache_substitute_pick(
+        moe_cache_device & device, moe_cache_pool & pool,
+        const void * host_base, int32_t missed, int64_t n_expert) {
+    const std::vector<uint64_t> * words = moe_cache_mask_words(pool, host_base);
+    if (!words) {
+        return -1;
+    }
+    const moe_cache_key mkey{host_base, missed};
+    const uint32_t min_coact = moe_cache_substitute_min_coact();
+    const int scan_cap = moe_cache_substitute_scan();
+    int best_slot = -1;
+    uint32_t best_count = 0;
+    uint16_t best_heat = 0;
+    int examined = 0;
+    for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
+        uint64_t bits = (*words)[w];
+        while (bits && examined < scan_cap) {
+            const int cand = (int) (w << 6) + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (cand == missed || cand >= (int) n_expert) {
+                continue;
+            }
+            examined++;
+            const auto cit = device.co_activation.find(
+                    moe_cache_edge_undirected(mkey, moe_cache_key{host_base, cand}));
+            if (cit == device.co_activation.end() || cit->second < min_coact) {
+                continue;
+            }
+            const auto found = pool.map.find(moe_cache_key{host_base, cand});
+            if (found == pool.map.end()) {
+                continue; // mask and map disagree - trust the map, it is the truth
+            }
+            const moe_cache_slot & slot = pool.slots[found->second];
+            if (slot.state != moe_cache_slot_state::valid) {
+                continue;
+            }
+            if (cit->second > best_count ||
+                (cit->second == best_count && slot.heat > best_heat)) {
+                best_count = cit->second;
+                best_heat  = slot.heat;
+                best_slot  = found->second;
+            }
+        }
+    }
+    return best_slot;
+}
+
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -4820,6 +4923,35 @@ static int moe_cache_plan(
 
         device.misses++;
         device.rank_misses[rank_bucket]++;
+
+        // Substitution. Deliberately does NOT skip the admission bookkeeping
+        // below: the router still wanted this expert, and admission must keep
+        // following what the router wanted rather than what it was forced to
+        // run. Feeding admission from substituted picks would close a
+        // self-confirming loop where resident experts are the only ones ever
+        // used and therefore the only ones ever kept - the confirmation-drift
+        // trap docs/plan.md already names for the dynamic atlas.
+        if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
+            node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
+            const int sub = moe_cache_substitute_pick(
+                    device, pool, node->host_base, expert, node->n_expert);
+            if (sub >= 0) {
+                moe_cache_slot & ssl = pool.slots[sub];
+                ssl.readers++;
+                // Heat, but no promotion to protected: it was genuinely used,
+                // so it earns recency, but it was never actually demanded by
+                // the router and must not claim eviction protection on the
+                // strength of standing in.
+                ssl.heat = std::min(MOE_CACHE_HEAT_MAX, ssl.heat + MOE_CACHE_HEAT_STEP);
+                node->pins[node->n_pins++] = {sub};
+                slot_indices[index] = sub;
+                device.substitutions++;
+                hits++;   // dispatchable row, though NOT counted in device.hits
+            } else {
+                device.substitute_declined++;
+            }
+        }
+
         moe_cache_demand * demand = nullptr;
         try {
             demand = &device.demand_count[key];
@@ -5696,6 +5828,8 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
                 sum.fill_failures   += device.fill_failures;
                 sum.admission_skips += device.admission_skips;
                 sum.prefetches      += device.prefetches;
+                sum.substitutions       += device.substitutions;
+                sum.substitute_declined += device.substitute_declined;
                 for (int r = 0; r < GGML_MOE_CACHE_MAX_RANK; r++) {
                     sum.rank_hits[r]   += device.rank_hits[r];
                     sum.rank_misses[r] += device.rank_misses[r];

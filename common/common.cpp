@@ -2451,6 +2451,8 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
     out.avg_heat         = raw.avg_heat;
     out.allocated_bytes  = raw.allocated_bytes;
     out.budget_bytes     = raw.budget_bytes;
+    out.substitutions       = raw.substitutions;
+    out.substitute_declined = raw.substitute_declined;
     out.rank_hits.assign(raw.rank_hits, raw.rank_hits + GGML_MOE_CACHE_MAX_RANK);
     out.rank_misses.assign(raw.rank_misses, raw.rank_misses + GGML_MOE_CACHE_MAX_RANK);
     out.req_dir_x        = raw.req_dir_x;

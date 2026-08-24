@@ -986,6 +986,9 @@ struct common_moe_cache_summary {
     // router's top choice). Sized by GGML_MOE_CACHE_MAX_RANK on the ggml
     // side; kept as a plain vector here so this header stays free of the
     // CUDA-specific one, same reason the scalars above are mirrored.
+    long long substitutions       = 0;
+    long long substitute_declined = 0;
+
     std::vector<long long> rank_hits;
     std::vector<long long> rank_misses;
 
