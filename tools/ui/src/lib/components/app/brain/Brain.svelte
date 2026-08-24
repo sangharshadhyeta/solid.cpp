@@ -210,7 +210,10 @@
 		ctx.fillStyle = 'rgba(148, 163, 184, 0.8)';
 		ctx.textAlign = 'center';
 		ctx.textBaseline = 'middle';
-		const nCat = atlas.categories.length;
+		// Discovered axes have no anchor geometry - a cell's x/y is not a
+		// weighted average of category positions, so a ring of labels around
+		// the disc would assert an adjacency that was never measured.
+		const nCat = atlas.discovered ? 0 : atlas.categories.length;
 		for (let c = 0; c < nCat; c++) {
 			const angle = (2 * Math.PI * c) / nCat;
 			const lx = cx + Math.cos(angle) * (radius + 22);
@@ -374,7 +377,7 @@
 	}
 
 	function closestCategory(cell: ApiExpertAtlasCell): string | undefined {
-		if (!atlas || !atlas.categories.length) return undefined;
+		if (!atlas || atlas.discovered || !atlas.categories.length) return undefined;
 		if (Math.hypot(cell.x, cell.y) < 0.05) return undefined; // too central to attribute
 
 		const angle = Math.atan2(cell.y, cell.x);
@@ -508,7 +511,8 @@
 			<span>Brain</span>
 			<span class="text-muted-foreground text-sm font-normal">
 				{#if atlas?.cells.length}
-					— {atlas.cells.length} experts positioned by topic affinity
+					— {atlas.cells.length} experts positioned by
+					{atlas.discovered ? 'discovered co-activation axes' : 'topic affinity'}
 				{:else if rows && cols}
 					— {rows} layers × {cols} experts
 				{:else}
