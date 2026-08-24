@@ -514,6 +514,46 @@ its LFRU **D2D** path) is unavailable to every other architecture,
 including Ornith (`qwen35moe`). That is a real coverage gap, not a bug in
 the mechanism.
 
+## Prefill double-buffer coverage gap — attempted, REVERTED (2026-08-24)
+
+Only `gemma4.cpp` calls `build_moe_prefill_prefetch`, so the moe-cache
+prefill double-buffer and the LFRU **device-to-device** path riding on it
+(a cache-resident expert copied D2D instead of over PCIe) are unavailable
+to every other architecture, including Ornith (`qwen35moe`). Measured
+before any change: **0 prefill hits on qwen35moe** (162 consulted, 162
+miss) vs **122 hits / 40 misses on gemma4**.
+
+Tried closing it by adding the same registration to `qwen35moe.cpp`.
+**Registration works** - hits went 0 -> 14 (of 48 consulted) - **but the
+model then crashes**:
+
+```
+prefill wait-for-consumed failed: operation not permitted on an event
+last recorded in a capturing stream
+CUDA error: operation failed due to a previous error during capture
+-> ggml_abort
+```
+
+`moe_cache_prefill_advance` does a host-side `cudaEventSynchronize` on the
+slot's `consumed` event before overwriting the buffer. That call is illegal
+while a CUDA graph capture is active on the stream that recorded the event.
+Gemma's capture boundaries evidently avoid this; qwen35moe's do not.
+
+**Reverted** - a crashing change is worse than a missing optimization, and
+this is not something to leave in the tree unattended. Verified clean after
+revert (correct output, zero crash markers).
+
+**So the coverage gap is not an oversight - it is gated on a real
+capture-safety problem.** Closing it properly means making the
+wait-for-consumed step capture-safe, e.g. skipping the host sync when a
+capture is active and relying on stream ordering instead, or restructuring
+so the overwrite cannot race the consumer. That is a careful, standalone
+piece of work with a genuine correctness hazard (the wait exists to stop a
+prefetch two calls later from overwriting a buffer still being read), and
+should not be attempted casually. This is the natural next task for anyone
+picking Track 1 back up, and it is the prerequisite for the D2D-instead-of-
+PCIe idea on any non-Gemma model.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:
