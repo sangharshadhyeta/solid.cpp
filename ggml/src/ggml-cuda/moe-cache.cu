@@ -4365,6 +4365,67 @@ static uint32_t moe_cache_substitute_min_coact() {
     return n;
 }
 
+// Sampled integrity check: does the slot actually hold the expert it claims?
+// Set GGML_CUDA_MOE_CACHE_VERIFY_SLOTS=N to check one hit in every N. Reads
+// three windows (head, middle, tail) rather than one, because a partial copy
+// leaves the head correct and only diverges later - checking the first bytes
+// alone would report everything healthy.
+//
+// This is a debugging tool, not a guard: it holds the session lock across a
+// synchronous D2H copy, so any N small enough to be useful is far too slow
+// for production.
+static int moe_cache_verify_slots_rate() {
+    static const int n = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_VERIFY_SLOTS");
+        return env ? atoi(env) : 0;
+    }();
+    return n;
+}
+
+static void moe_cache_verify_slot(const moe_cache_pool & pool, int slot_index,
+                                  const moe_cache_key & key, int device_id) {
+    const int rate = moe_cache_verify_slots_rate();
+    if (rate <= 0 || !key.tensor || pool.expert_size == 0 || !pool.slab) {
+        return;
+    }
+    static std::atomic<long long> seen{0};
+    if ((seen.fetch_add(1, std::memory_order_relaxed) % rate) != 0) {
+        return;
+    }
+    const size_t win = std::min<size_t>(2048, pool.expert_size);
+    const size_t offsets[3] = { 0, (pool.expert_size / 2) & ~size_t(15),
+                                pool.expert_size > win ? pool.expert_size - win : 0 };
+    const char * host = (const char *) key.tensor + (size_t) key.expert * pool.expert_size;
+    const char * dev  = pool.slab + (size_t) slot_index * pool.expert_size;
+    std::vector<char> buf(win);
+    ggml_cuda_set_device(device_id);
+    for (int w = 0; w < 3; w++) {
+        if (cudaMemcpy(buf.data(), dev + offsets[w], win, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            continue;
+        }
+        if (memcmp(buf.data(), host + offsets[w], win) != 0) {
+            size_t first = 0;
+            while (first < win && buf[first] == host[offsets[w] + first]) first++;
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] SLOT MISMATCH slot=%d expert=%d tensor=%p "
+                        "expert_size=%zu window@%zu first_diff=+%zu dev=%02x%02x%02x%02x "
+                        "host=%02x%02x%02x%02x\n",
+                        slot_index, key.expert, key.tensor, pool.expert_size,
+                        offsets[w], first,
+                        (unsigned char)buf[first], (unsigned char)buf[first+1 < win ? first+1 : first],
+                        (unsigned char)buf[first+2 < win ? first+2 : first],
+                        (unsigned char)buf[first+3 < win ? first+3 : first],
+                        (unsigned char)host[offsets[w]+first],
+                        (unsigned char)host[offsets[w]+first+1],
+                        (unsigned char)host[offsets[w]+first+2],
+                        (unsigned char)host[offsets[w]+first+3]);
+            }
+            return;
+        }
+    }
+}
+
 static bool moe_cache_mask_audit_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_MASK_AUDIT");
@@ -4911,6 +4972,7 @@ static int moe_cache_plan(
                 moe_cache_promote_to_protected(device, pool, found->second);
                 node->pins[node->n_pins++] = {found->second};
                 slot_indices[index] = found->second;
+                moe_cache_verify_slot(pool, found->second, key, device.physical);
                 device.hits++;
                 device.rank_hits[rank_bucket]++;
                 hits++;
