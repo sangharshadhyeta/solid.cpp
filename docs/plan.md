@@ -1256,6 +1256,101 @@ co-activation. Selecting by triple co-occurrence with the other experts in the
 same decision is the direct test of whether the higher-order structure converts
 into a better mechanism, and it reuses data already collected.
 
+## DESIGN ARGUMENT — read this before proposing new cache work (2026-08-25)
+
+The reasoning behind the current direction, recorded because several sessions
+have re-derived (and mis-derived) it. The measurements backing each claim are
+in the sections below.
+
+### 1. Hit rate is the wrong metric for this design
+
+Hit rate is what a FETCH-based cache lives or dies by: a miss means a stall, so
+minimising misses is the whole game. Under SUBSTITUTION a miss costs no time at
+all - it costs a slightly different expert. The right measure is **retained gate
+mass**: how much of the weight the router intended actually got executed.
+
+The two diverge violently at low residency. From 18.5% down to 1.2%:
+
+- hit rate collapses 96.9% -> 38.7% (looks fatal)
+- retained gate mass degrades 99.1% -> 80.4% (entirely workable)
+
+An earlier assessment in this project extrapolated from hit rate and concluded
+the GLM-scale vision was out of reach. That conclusion was WRONG, and wrong
+specifically because it used the fetch-design metric on a substitution design.
+
+Hit rate is also *purchasable*, which disqualifies it as an objective on its
+own: removing the admission gate buys +10.79pp of hit rate and costs 7.6% of
+throughput. Any optimisation target has to price fills.
+
+### 2. Why substitutes stay good as the cache shrinks (structural, not luck)
+
+Stand-in quality is FLAT at ~230% of the replaced pick's router score from 5%
+residency down to 0.6%. The substitute is consistently rated HIGHER than what
+it replaced. That is not an artifact:
+
+- Misses concentrate on the router's weak picks - rank 7 misses 44% of the time
+  against rank 0's 20%, monotonic across all 8 ranks.
+- So the expert that goes missing is usually one the router rated poorly.
+- Whatever IS resident is, by construction, the frequently-selected hot core -
+  experts the router rates highly.
+- Shrinking the cache concentrates it further onto that core, which keeps the
+  relationship intact rather than eroding it.
+
+This is why the design should be expected to scale to models where residency is
+1% rather than 18%.
+
+### 3. The binding constraint at scale is COVERAGE, not accuracy
+
+The number that actually degrades with residency is the **no-candidate tail** -
+picks with neither a hit nor any resident stand-in, which fall back to CPU:
+
+```
+18.5% residency ->  0.68%
+ 5.0%           ->  2.56%
+ 1.2%           -> 15.62%
+ 0.6%           -> 22.86%
+```
+
+At GLM-scale residency roughly one pick in six has nothing usable resident.
+That, not stand-in quality, is what would set throughput. It is a different
+problem from everything worked on so far: it asks "is SOMETHING usable always
+reachable?" rather than "is the RIGHT expert present?".
+
+### 4. Consequence — an eviction objective nobody has tried
+
+Six signals have been tested as eviction policies and all lost to plain LRU
+(atlas, router score, co-activation, frequency, admission demand,
+anti-co-firing). But every one of them was scored on **hit rate or retained
+mass** - i.e. on getting the right expert resident.
+
+Nobody has asked a policy to maximise **coverage**: keep at least one viable
+stand-in reachable for every likely pick, accepting a worse hit rate to do it.
+That is a group property rather than a per-expert one, so it is also the most
+plausible place for the validated 3-way fold structure (96.7% of triples exceed
+pairwise prediction) to finally earn its keep - a policy that keeps one member
+of each active group resident, rather than the k hottest individuals.
+
+### 5. What is settled and what is open
+
+**Settled - stop re-testing these:**
+- Prefetching cannot pay. Capped at +0.30pp even with a perfect topic oracle,
+  because every topic touches ~6,000 of 7,680 experts.
+- Placement/"which experts to keep" is effectively solved. LRU wins, and Belady
+  bounds ANY policy's remaining headroom at ~17pp on hit rate.
+- The atlas is neutral-to-marginal as a policy input and cannot currently be
+  evaluated through the server at all (warming touches ~2% of fills).
+- Filling harder loses. Removing admission control costs 7.6% throughput.
+
+**Open, in priority order:**
+1. The corruption bug - blocks every live measurement.
+2. Perplexity at LOW residency. The +0.47% bound is an 18.5% number;
+   substitution actually bites at 1.2%. This does NOT need the bug fixed -
+   `llama-perplexity` with a small `GGML_CUDA_MOE_CACHE_BUDGET_MB` measures it.
+   It is the single result that could still sink the design.
+3. Coverage-oriented eviction (section 4).
+4. Scale validation: 4,713 units here, low cells only 28-117 slots. Whether a
+   750B model's hot core stays this compact is untested.
+
 ## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
 
 The question behind the GLM-scale vision: extract a small working set of a huge
@@ -1383,7 +1478,12 @@ alternative signal only has to break a tie.
    on 8099 - no integrated atlas comparison means anything until this exists.
 
 **Open research**
-10. Reuse-distance prediction - the 17pp Belady gap. Six signals have failed;
+10. Coverage-oriented eviction - maximise "some viable stand-in is always
+    resident" rather than hit rate. Never tried; the most plausible home for the
+    validated 3-way fold structure. See DESIGN ARGUMENT section 4.
+11. Perplexity at low residency (1-2%), which is where substitution bites. Does
+    NOT need the corruption bug fixed. The result most likely to sink the design.
+12. Reuse-distance prediction - the 17pp Belady gap. Six signals have failed;
     none of them addresses the actual quantity.
 11. Persist co-activation across runs like `session.history`, for cold start.
 12. Track 1.5 - merged, value never independently verified.
