@@ -472,36 +472,47 @@ Round 1 showed +43%, round 2 showed +1.5%, at essentially identical
 acceptance - so the acceptance gap is solid but the throughput claim needs
 more rounds before it means anything.
 
-## Prefill double-buffer appears inert in server mode (2026-08-24, overnight)
+## Silent corruption fix — VALIDATED (2026-08-24, overnight)
 
-Found while trying to validate the silent-corruption fix with fault
-injection. Two separate problems, both real:
+The fix in `b321b6259` is now proven against a deterministic reproduction,
+not just assumed. Getting there corrected two of my own wrong conclusions.
 
-1. **Only `gemma4.cpp` calls `build_moe_prefill_prefetch`.** No other model
-   builder registers prefill successors, so `GGML_SCHED_PREFETCH_EXPERTS`
-   and the LFRU **D2D prefill path** are completely inert for every other
-   architecture - including Ornith (`qwen35moe`). The measured +12.7%
-   applies to Gemma-4 only. Anyone enabling that flag on another model gets
-   nothing, silently.
-2. **Even on Gemma, the path shows 0 hits under `llama-server`**: 162
-   consulted, 162 MISS, with and without fault injection. The +12.7% was
-   measured with `llama-bench -p 2048` (one large batch); the server chunks
-   prompts into ubatches, so the large-batch gate the double-buffer needs
-   may never be met in serving. Not yet root-caused - worth checking
-   whether slabs are allocated at all (`register_successor` at build time)
-   before assuming the gate is the cause.
+**Wrong conclusion 1 (mine): "the prefill double-buffer is inert in server
+mode."** It is not. There are TWO separate prefetch mechanisms and I was
+enabling the wrong one for hours:
+- `GGML_SCHED_PREFETCH_EXPERTS` - the ggml-backend scheduler's prefetch
+  slots (the +12.7% pp2048 measurement)
+- `GGML_CUDA_MOE_PREFILL_BUFFER` - moe-cache's own prefill double-buffer
+  (`register_successor` / `advance` / `wait` / `copy_split`), which is
+  where the corruption fix lives
 
-**Consequence: the silent-corruption fix (`b321b6259`) is still
-UNVALIDATED.** Its recovery path lives in `moe_cache_prefill_copy_split`,
-which is never reached in either configuration tested, so fault injection
-(`GGML_CUDA_MOE_CACHE_FAULT_INJECT`) exercised nothing. Output stayed
-correct in every run, but that proves only that the fix does not misfire.
+With the correct flag the path is healthy: **122 HIT / 40 MISS**.
 
-Also worth noting: one `////////` did appear during an injection run that
-was later shown not to be exercising the injected path at all - i.e. the
-original intermittent corruption reproduced spontaneously, unprompted,
-under normal operation. That is evidence the underlying bug is still live
-and is NOT limited to the prefill path.
+**Wrong conclusion 2 (mine): "fault injection proves the fix is
+incomplete."** That run showed `////////`, but it was never exercising the
+injected path (wrong flag), so it was the original intermittent bug
+appearing spontaneously - not evidence against the fix.
+
+**Validation, Gemma-4, `GGML_CUDA_MOE_PREFILL_BUFFER=1`, fault injection
+every 3rd copy:**
+
+| | no injection | injection |
+|---|---|---|
+| prefill HIT | 122 | 19 |
+| prefill MISS | 40 | 143 |
+| output | OK | **OK 3/3** |
+| loud disable | - | **fired** |
+
+Hits collapse (failed copies are no longer published), callers fall back,
+output stays correct where this path previously produced `////`, and the
+safety valve logs once: `CUDA0 DISABLED after 8 copy failures (likely VRAM
+exhaustion) - falling back to uncached offload`.
+
+**Still true and still worth fixing separately**: only `gemma4.cpp` calls
+`build_moe_prefill_prefetch`, so the moe-cache prefill double-buffer (and
+its LFRU **D2D** path) is unavailable to every other architecture,
+including Ornith (`qwen35moe`). That is a real coverage gap, not a bug in
+the mechanism.
 
 ## Open, no proposal yet
 
