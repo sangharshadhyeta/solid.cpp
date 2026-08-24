@@ -364,27 +364,56 @@ a rounding error at the throughput level. Measuring the thing directly, for
 the same reason steps 6 and 7a were measured before anything was built on
 them.
 
-**Blocked on GPU availability.** The A/B needs the GPU, and the live 8099
-deployment (Ornith-1.5-35B, 64k ctx) was holding 11.7 GiB of 12 GiB with
-152 MiB free - the exact co-residency condition documented above as a
-corruption trigger, so a second instance is not an option. To run it:
+### MEASURED (2026-08-24) - the hypothesis holds, and the caveat matters more
 
-```
-# sync (baseline) then async, same prompt, on a scratch port
-GGML_CUDA_MOE_CACHE_ATLAS_WARM=1 GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1 \
-GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=0 ./build/bin/llama-server ... --port 8098
-GGML_CUDA_MOE_CACHE_ATLAS_WARM=1 GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1 \
-GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=1 ./build/bin/llama-server ... --port 8098
-```
+Ornith-1.5-35B Q4_K_M, `--moe-cache auto -c 65536 -ngl 99`, its own matched
+atlas, `GGML_CUDA_MOE_CACHE_ATLAS_WARM=1`, scratch server on 8098 (the live
+8099 deployment was stopped for the test and restored to its exact
+last-known-good command immediately afterward). Two interleaved rounds per
+arm, four 700-token generations each (alternating a code-heavy and a
+medical prompt), timing read from
+`GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1`.
 
-Read the `[atlas-warm] sync|async: N us avg on the dispatch path` lines. What
-would make this a win: async's dispatch-path average collapsing toward the
-cost of a hash lookup while hit rate and output stay unchanged. What would
-refute it: the saving being sub-microsecond (the scan is cheaper than
-assumed), or hit rate dropping because ranking one worker-hop late is
-ranking against a stale direction. Correctness under the concurrency change
-(coherent output, no crash, hit rate in line with sync) is the first thing to
-check, before any latency number.
+| | dispatch-path cost | hit rate | prefetches | evictions |
+|---|---|---|---|---|
+| sync (old, default) | **4.9 us** / 4.9 us | 77.60% / 77.53% | 3591 / 3584 | 53015 / 53268 |
+| async (Track 1.5) | **0.6 us** / 0.5 us | 77.67% / 77.71% | 3592 / 3623 | 52808 / 52535 |
+| | **-88%** | +0.13pp | +0.6% | -0.9% |
+
+Both arms coherent, zero `CUDA error` / `ggml_abort` / copy-failure-disable
+markers across all four servers. The per-arm averages were flat from the
+first 2048-call print to the last (4.8-4.9 vs 0.5-0.6), so this is converged,
+not a warmup artifact - the cleanest signal since the D2D measurement, and in
+the same style: near-zero within-arm variance, no overlap between arms.
+
+**What it means, stated narrowly.** The ranking scan really was ~4.3 us of
+synchronous CPU work sitting on the GPU-dispatch path, and moving it to the
+worker removes essentially all of it - what remains (0.5-0.6 us) is the hash
+lookup and `push_back` the enqueue still has to do. The cache does the *same
+work*: prefetch counts land within 1% and hit rate within 0.2pp, i.e.
+deferring the ranking by one worker hop did not make it rank against a
+meaningfully staler direction, which was the main correctness worry.
+
+**What it does NOT mean.** This is not a throughput win and should not be
+reported as one. tok/s was 58.6-62.0 in both arms with full overlap
+(59.72/61.93/58.61/60.97 sync vs 59.11/62.00/59.25/61.32 async) - exactly as
+expected, because 4.3 us saved once every 64 `plan()` calls is ~0.07 us per
+call against a ~17000 us token, i.e. four orders of magnitude below anything
+tok/s can resolve. The honest summary is: **the latency this track set out to
+remove is real and is now gone, and it was never large enough to matter for
+throughput at the current 1-in-64 rate limit.** That is a completed
+architectural fix, not a performance result.
+
+Where it *would* start to matter: any future change that raises the warming
+rate (a lower rate limit, per-layer warming, a larger candidate set, or a
+richer atlas with more categories per expert - all of which scale the scan,
+none of which now scale the dispatch path). The split is what makes those
+affordable to try; it is not itself a win to bank.
+
+Still off by default. Nothing here re-validates the +2.75pp topic-switch
+result, which was measured with the old residency-filtering scan (see the
+behavior-change note above) - that remains the open question before any
+default flip, and this measurement deliberately did not touch it.
 
 ## Track 2 — Unified tiered placement — RESCOPED (mostly already exists)
 
