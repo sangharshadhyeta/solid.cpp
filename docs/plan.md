@@ -554,6 +554,36 @@ should not be attempted casually. This is the natural next task for anyone
 picking Track 1 back up, and it is the prerequisite for the D2D-instead-of-
 PCIe idea on any non-Gemma model.
 
+## moe-cache prefill double-buffer (the D2D path) — MEASURED, costs 5%
+
+Never benchmarked before tonight: the documented +12.7% belongs to the
+SEPARATE `GGML_SCHED_PREFETCH_EXPERTS` mechanism, not to this one. Gemma-4
+is the only architecture that registers prefill successors, so it is the
+only place this could be measured at all.
+
+`llama-bench -p 2048 -ncmoe 15 --moe-cache auto`, 3 rounds:
+
+| `GGML_CUDA_MOE_PREFILL_BUFFER` | pp2048 | values |
+|---|---|---|
+| off | **953.00** | 954.8, 951.8, 952.4 |
+| on (D2D active) | 905.35 | 906.3, 905.0, 904.8 |
+| | **-5.00%** | 3/3 rounds |
+
+Near-zero variance within each arm - the cleanest signal measured in this
+whole effort, and unambiguous.
+
+**So the D2D path does not pay, even where it works.** D2D genuinely avoids
+PCIe for cache-resident experts, but the double-buffer machinery wrapping
+it - per-layer slab bookkeeping, host-side event syncs, `advance`/`wait`
+lock traffic on every dispatch - costs more than the PCIe traffic it saves
+at this scale.
+
+**Direct consequence: do NOT do the CUDA-graph capture-safety work** needed
+to extend this to `qwen35moe`. That effort would only make a measured
+regression available to more architectures. The coverage gap documented
+above is therefore not worth closing as things stand; it would need the
+per-dispatch overhead reduced first, and only then re-measured.
+
 ## Open, no proposal yet
 
 From the original table, marked "to be discussed" and not designed further:
