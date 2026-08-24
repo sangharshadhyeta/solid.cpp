@@ -330,6 +330,11 @@ struct server_slot {
     // Speculative decoding stats
     int32_t n_draft_total = 0;      // Total draft tokens generated
     int32_t n_draft_accepted = 0;   // Draft tokens actually accepted
+    // One-shot latch for the low-acceptance warning below. Deliberately NOT
+    // reset in reset() - the condition is a property of the model/draft
+    // pairing, not of any one request, so re-warning every task would just
+    // be noise.
+    mutable bool warned_low_draft_acceptance = false;
     int32_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
     std::vector<int32_t> n_accepted_per_pos; // Accepted tokens per draft position
 
@@ -674,6 +679,31 @@ struct server_slot {
             SLT_INF(*this,
                     "draft acceptance = %0.5f (%5d accepted / %5d generated), mean len = %5.2f\n",
                     draft_ratio, n_draft_accepted, n_draft_total, mean_acc_len);
+
+            // Persistently low acceptance is not a small inefficiency - it is
+            // a large net LOSS, and a silent one. Every drafted token costs a
+            // draft pass plus its share of a verify pass; if most are
+            // rejected that work is thrown away and speculative decoding ends
+            // up slower than not speculating at all. Measured here:
+            // Ornith-1.5-35B (qwen35moe) with its own built-in MTP head runs
+            // at ~0.19 acceptance and is ~2x SLOWER than plain decoding,
+            // while Gemma-4 with a matched MTP draft model reaches ~0.72 on
+            // the same build. Nothing in the output distinguished those two
+            // cases, so a user hitting the bad one just sees a slow server.
+            // Warned once per slot, only after a large enough sample that the
+            // rate means something.
+            if (!warned_low_draft_acceptance &&
+                n_draft_total >= 200 && draft_ratio < 0.35) {
+                warned_low_draft_acceptance = true;
+                SLT_WRN(*this,
+                        "draft acceptance is only %.1f%% over %d drafted tokens - speculative "
+                        "decoding is very likely making this SLOWER, not faster. Each rejected "
+                        "draft still costs a draft pass and part of a verify pass. This usually "
+                        "means the draft head/model is a poor match for this checkpoint (e.g. a "
+                        "finetune whose built-in MTP head was not retrained). Consider running "
+                        "without --spec-type, or with a draft model matched to this checkpoint.\n",
+                        100.0 * draft_ratio, n_draft_total);
+            }
             SLT_TRC(*this,
                     "     acc per pos = (%s)\n", acceptance_rates_per_pos.c_str());
         }
