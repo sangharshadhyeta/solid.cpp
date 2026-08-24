@@ -41,8 +41,16 @@ metrics genuinely diverge - it keeps more of the wanted experts resident,
 but the ones LRU keeps are worth more gate mass. It is accumulated ONLINE
 here, exactly as production does, so there is no future peeking.
 
-Admission control, tested separately with LRU eviction, is monotonically
-harmful on this workload:
+SUPERSEDED - the admission finding below was produced by a model with no
+fill cost in it, and is WRONG. See scripts/moe_cost_model.py: admitting an
+expert costs throughput, and on real hardware removing the admission gate
+buys 10.79pp of hit rate while losing 7.6% of tok/s. With fill cost applied
+the ordering inverts and matches the measurement - "admit everything" ranks
+last by a wide margin, not first. The eviction rankings above are unaffected,
+because those arms all hold the fill rate fixed and so pay the same fill cost.
+
+Admission control, tested separately with LRU eviction, appeared monotonically
+harmful on this workload - which is exactly the artifact described above:
 
   fill | admit_after |  retained |  hit rate
      4 |           1 |    79.00% |    63.36%   admit everything
