@@ -15,19 +15,73 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <unordered_map>
 
 struct trace_ctx {
     FILE * f  = nullptr;
     FILE * hf = nullptr;    // hidden states: int32 il, int32 tok, int32 n_dim, float[n_dim]
     long long recs = 0;
+
+    // Signal 3: the router's own score for each expert, not just its ranking.
+    // The ranking alone says which pick was lost to a cache miss; the score
+    // says what substituting the best resident alternative would actually
+    // cost. Off unless MOE_TRACE_SCORES is set - the default line format is
+    // unchanged for anything already parsing this file.
+    bool scores = false;
+    // ffn_moe_probs for the layer currently being computed, keyed by layer.
+    // probs is produced before the argsort that ranks it (the argsort's input
+    // derives from it), so by the time a layer's ranking arrives its scores
+    // are already here. Cleared as each layer is emitted.
+    std::unordered_map<int, std::vector<float>> probs;
+    std::unordered_map<int, int64_t>            probs_n_expert;
 };
+
+// True only for "<prefix><digits>" - ggml appends suffixes like " (reshaped)"
+// to views of a tensor, and those views share the base name. Matching on the
+// prefix alone let ffn_moe_probs-0 (reshaped), a [1, ...] view, overwrite the
+// real [n_expert, n_tokens] probs and silently suppress every score.
+static bool name_is_indexed(const char * name, const char * prefix, size_t plen) {
+    if (!name || strncmp(name, prefix, plen) != 0 || name[plen] == '\0') {
+        return false;
+    }
+    for (const char * p = name + plen; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    return true;
+}
 
 static bool trace_cb(ggml_tensor * t, bool ask, void * ud) {
     trace_ctx * d = (trace_ctx *) ud;
     const bool want_topk = t->name && strncmp(t->name, "ffn_moe_argsort", 15) == 0 && t->type == GGML_TYPE_I32;
     const bool want_hid  = d->hf && t->name && strncmp(t->name, "ffn_moe_router_in", 17) == 0 && t->type == GGML_TYPE_F32;
+    // Trailing '-' matters: it selects ffn_moe_probs-<il> and not the
+    // ffn_moe_probs_biased/_masked variants, which are the selection-time
+    // scores. The plain probs are the ones that become the expert weights
+    // (weights = get_rows(probs, selected_experts) in build_moe_ffn), so
+    // they are what a substitution's cost has to be measured against.
+    const bool want_probs = d->scores &&
+        name_is_indexed(t->name, "ffn_moe_probs-", 14) && t->type == GGML_TYPE_F32;
     if (ask) {
-        return want_topk || want_hid;
+        // MOE_TRACE_NAMES=1 lists every MoE tensor the scheduler offers, so a
+        // name that silently stops matching is visible rather than guessed at.
+        if (getenv("MOE_TRACE_NAMES") && t->name && strstr(t->name, "ffn_moe")) {
+            fprintf(stderr, "[moe-trace-name] %s type=%d ne0=%lld\n",
+                    t->name, (int) t->type, (long long) t->ne[0]);
+        }
+        return want_topk || want_hid || want_probs;
+    }
+    if (want_probs) {
+        int il = -1;
+        if (const char * dash = strrchr(t->name, '-')) {
+            il = atoi(dash + 1);
+        }
+        std::vector<float> buf(ggml_nelements(t));
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+        d->probs_n_expert[il] = t->ne[0];
+        d->probs[il]          = std::move(buf);
+        return true;
     }
     if (want_hid) {
         int il = -1;
@@ -59,14 +113,28 @@ static bool trace_cb(ggml_tensor * t, bool ask, void * ud) {
     const int64_t n_used = envk ? atoll(envk) : 6;   // leading entries are the selection
     std::vector<int32_t> buf(ggml_nelements(t));
     ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
-    // one line per (layer, token): the selected expert ids
+    // one line per (layer, token): the selected expert ids, each optionally
+    // followed by ':' and the router's score for it.
+    const auto pit = d->probs.find(il);
+    const bool have_scores = d->scores && pit != d->probs.end();
+    const int64_t n_prob_expert = have_scores ? d->probs_n_expert[il] : 0;
     for (int64_t tok = 0; tok < n_tokens; tok++) {
         fprintf(d->f, "%d %lld", il, (long long) tok);
         for (int64_t k = 0; k < n_used && k < n_expert; k++) {
-            fprintf(d->f, " %d", buf[tok * n_expert + k]);
+            const int32_t id = buf[tok * n_expert + k];
+            fprintf(d->f, " %d", id);
+            if (have_scores && id >= 0 && id < n_prob_expert) {
+                const size_t off = (size_t) tok * (size_t) n_prob_expert + (size_t) id;
+                if (off < pit->second.size()) {
+                    fprintf(d->f, ":%.6g", pit->second[off]);
+                }
+            }
         }
         fputc('\n', d->f);
         d->recs++;
+    }
+    if (have_scores) {
+        d->probs.erase(il);   // consumed; the next batch recomputes it
     }
     return true;
 }
@@ -84,6 +152,7 @@ int main(int argc, char ** argv) {
     const char * out = getenv("MOE_TRACE") ? getenv("MOE_TRACE") : "moe-trace.txt";
     d.f = fopen(out, "w");
     if (!d.f) { LOG_ERR("cannot open %s\n", out); return 1; }
+    d.scores = getenv("MOE_TRACE_SCORES") != nullptr;
     const char * hout = getenv("MOE_TRACE_HIDDEN");
     if (hout) {
         d.hf = fopen(hout, "wb");
