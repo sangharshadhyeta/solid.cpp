@@ -2597,7 +2597,68 @@ static uint64_t moe_cache_weight_hash(const void * src, size_t bytes) {
 }
 
 // Re-hash every expert admitted so far. Returns the number that changed.
+// GGML_CUDA_MOE_CACHE_MAP_AUDIT=1: pool.map is supposed to be injective - each
+// slot index should belong to at most one (tensor, expert) key. If two keys
+// ever map to the same slot without the old one being properly evicted
+// first, both readers of that slot see whichever content landed last,
+// silently. This fits a corruption pattern that is confined to specific
+// experts rather than global: with kv_unified=false, a sequence whose
+// routing never touches the colliding slot stays clean while one that does
+// goes DEGEN, which is exactly what the per-slot probe showed. Walks every
+// live session's every pool; heavier than the weight-guard sweep, so kept
+// on its own flag and only run from the same idle tick.
+static void moe_cache_map_audit() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_MAP_AUDIT");
+        return e && atoi(e) != 0;
+    }();
+    if (!on) {
+        return;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            for (const auto & pool_ptr : device_ptr->pools) {
+                moe_cache_pool & pool = *pool_ptr;
+                std::unordered_map<int, std::vector<moe_cache_key>> by_slot;
+                for (const auto & kv : pool.map) {
+                    by_slot[kv.second].push_back(kv.first);
+                }
+                long long collisions = 0, state_mismatches = 0, key_mismatches = 0;
+                for (const auto & kv : by_slot) {
+                    if (kv.second.size() > 1) {
+                        collisions++;
+                        fprintf(stderr, "[moe-cache] MAP COLLISION slot=%d holds %zu keys:",
+                                kv.first, kv.second.size());
+                        for (const auto & k : kv.second) {
+                            fprintf(stderr, " (tensor=%p expert=%d)", k.tensor, k.expert);
+                        }
+                        fprintf(stderr, "\n");
+                    }
+                }
+                for (const auto & kv : pool.map) {
+                    if (kv.second < 0 || (size_t) kv.second >= pool.slots.size()) {
+                        continue;
+                    }
+                    const moe_cache_slot & slot = pool.slots[kv.second];
+                    if (slot.state != moe_cache_slot_state::valid) {
+                        state_mismatches++;
+                    } else if (!(slot.key == kv.first)) {
+                        key_mismatches++;
+                    }
+                }
+                fprintf(stderr, "[moe-cache] MAP AUDIT pool slots=%d map_entries=%zu "
+                        "collisions=%lld state_mismatches=%lld key_mismatches=%lld\n",
+                        pool.n_slots, pool.map.size(), collisions, state_mismatches, key_mismatches);
+            }
+        }
+    }
+    fflush(stderr);
+}
+
 static void moe_cache_weight_guard_sweep() {
+    moe_cache_map_audit();
     if (!moe_cache_weight_guard_on()) {
         return;
     }
@@ -5421,6 +5482,32 @@ static int moe_cache_plan(
     // far larger, and several 4096-sized arrays on both sides of the handshake are
     // undersized for it.
     if (getenv("GGML_CUDA_MOE_CACHE_WIDTH")) {
+        // Ring buffer of the last 48 layer-2 dispatches, dumped at the first
+        // identity flip so we can see what the cache was doing in the moments
+        // BEFORE the fault, not after it.
+        static std::mutex ring_mu;
+        static std::vector<std::string> ring;
+        static size_t ring_pos = 0;
+        if (node->layer == 2) {
+            char line[512];
+            const int k = node->n_tokens > 0 ? (int) (n_ids / node->n_tokens) : 0;
+            int off = snprintf(line, sizeof(line),
+                    "n_tokens=%lld n_ids=%d top_k=%d hits=%lld misses=%lld evict=%lld inflight=%d ids=",
+                    (long long) node->n_tokens, (int) n_ids, k,
+                    device.hits, device.misses, device.evictions,
+                    device.inflight ? 1 : 0);
+            for (int i = 0; i < 40 && i < (int) n_ids && off < (int) sizeof(line) - 8; i++) {
+                off += snprintf(line + off, sizeof(line) - off, "%d,", ids[i]);
+            }
+            std::lock_guard<std::mutex> rlock(ring_mu);
+            if (ring.size() < 48) {
+                ring.push_back(line);
+            } else {
+                ring[ring_pos] = line;
+            }
+            ring_pos = (ring_pos + 1) % 48;
+        }
+
         // Identity routing (ids == 0,1,2..top_k-1) is what top-k returns when the
         // router logits are all NaN/equal. It is the fingerprint of the failure.
         // Log the FIRST layer that flips, which is where the NaN originates.
@@ -5434,6 +5521,16 @@ static int moe_cache_plan(
             if (identity && flipped.fetch_add(1) < 12) {
                 fprintf(stderr, "[moe-cache] IDENTITY ROUTING layer=%d top_k=%d n_tokens=%lld\n",
                         node->layer, k, (long long) node->n_tokens);
+                static std::atomic<int> dumped{0};
+                if (dumped.fetch_add(1) == 0) {
+                    std::lock_guard<std::mutex> rlock(ring_mu);
+                    fprintf(stderr, "[moe-cache] --- last %zu layer-2 dispatches before first flip ---\n",
+                            ring.size());
+                    for (size_t i = 0; i < ring.size(); i++) {
+                        const size_t idx = (ring_pos + i) % ring.size();
+                        fprintf(stderr, "[moe-cache] L2[%02zu] %s\n", i, ring[idx].c_str());
+                    }
+                }
                 fflush(stderr);
             }
         }

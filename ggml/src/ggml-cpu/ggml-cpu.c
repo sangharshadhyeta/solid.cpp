@@ -1533,6 +1533,48 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
     return ptr;
 }
 
+// GGML_CUDA_MOE_CACHE_NAN_PROBE=1: scan this MoE node's INPUT activations for
+// NaN/Inf before compute. Routing collapse (identity top-k) only tells us when
+// the damage became visible; the first node whose *input* is already NaN tells
+// us where it entered, because that input is the previous layer's output.
+static void moe_cache_nan_probe(const char * name, const struct ggml_tensor * src1) {
+    static int on = -1;
+    if (on == -1) {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_NAN_PROBE");
+        on = (e && atoi(e) != 0) ? 1 : 0;
+    }
+    if (!on || src1->type != GGML_TYPE_F32) {
+        return;
+    }
+    static _Atomic long long step = 0;
+    const long long my = step++;
+    static _Atomic int reported = 0;
+    const int64_t n = ggml_nelements(src1);
+    const float * p = (const float *) src1->data;
+    int64_t bad = 0;
+    int64_t first = -1;
+    for (int64_t i = 0; i < n; i++) {
+        if (!isfinite(p[i])) {
+            if (first < 0) first = i;
+            bad++;
+        }
+    }
+    if (bad > 0 && reported++ < 12) {
+        fprintf(stderr, "[moe-cache] NAN INPUT step=%lld node=%s bad=%lld/%lld first=%lld\n",
+                my, name, (long long) bad, (long long) n, (long long) first);
+        fflush(stderr);
+    }
+}
+
+static bool moe_cache_max_tokens_ok(int64_t n_tokens) {
+    static int limit = -2;
+    if (limit == -2) {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_TOKENS");
+        limit = e ? atoi(e) : 0;
+    }
+    return limit <= 0 || n_tokens <= (int64_t) limit;
+}
+
 static void ggml_compute_forward_mul_mat_id(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -1636,6 +1678,7 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0) {
+        moe_cache_nan_probe(src0->name, src1);
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
         if (ggml_moe_cache.begin && ggml_moe_cache.plan &&
@@ -1643,7 +1686,16 @@ static void ggml_compute_forward_mul_mat_id(
             src0->op == GGML_OP_NONE && src0_buffer &&
             ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
             src1->type == GGML_TYPE_F32 &&
-            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK) {
+            n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK &&
+            // GGML_CUDA_MOE_CACHE_MAX_TOKENS=N: bypass the cache entirely for any
+            // batch of more than N tokens, falling back to the ordinary CPU path.
+            // Unlike NO_HITS this creates no node at all, so there is no
+            // hits-without-slot-indices inconsistency - it is a clean control.
+            // The layer-2 ring buffer showed 47 healthy n_tokens=1 dispatches
+            // followed by a first n_tokens=4 batch that was already degenerate,
+            // with no fill in flight and no eviction spike, so the suspect is the
+            // multi-token row split rather than admission or eviction.
+            moe_cache_max_tokens_ok(ids->ne[1])) {
             if (getenv("MOE_CACHE_DEBUG_GATE")) {
                 fprintf(stderr, "[moe-cache-begin-dbg] name=%s data=%p\n", src0->name, src0->data);
             }
