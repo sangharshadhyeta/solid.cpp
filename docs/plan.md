@@ -1179,7 +1179,23 @@ corruption, so `shared_activation` is true in the failing case and
 multi-activation is not the mechanism. Guard reverted rather than left in as a
 false fix.
 
-**Five hypotheses have now been tested and rejected** (atlas warming, moe-cache
+**Hypothesis SIX: CUDA-graph capture collision - REJECTED (2026-08-25).**
+The cache's fill worker issues cudaMemcpyAsync on its own stream while a graph
+capture may be live on the main stream, and plan.md already records this codebase
+hitting exactly that ("operation not permitted on an event last recorded in a
+capturing stream ... Gemma's capture boundaries evidently avoid this;
+qwen35moe's do not"). Ornith is qwen35moe-class. It also uniquely explained the
+shape of the evidence: a timing collision corrupts nothing that a state check
+would see, which is why every verifier comes back clean. Measured:
+
+```
+graphs ON  (default), cache on : DEGEN DEGEN DEGEN
+graphs OFF, cache on           : DEGEN DEGEN DEGEN
+```
+
+`GGML_CUDA_DISABLE_GRAPHS=1` changes nothing. Rejected.
+
+**Six hypotheses have now been tested and rejected** (atlas warming, moe-cache
 as a whole, OOM/VRAM, scratch-capacity overrun, multi-activation mapping). The
 bug is real, deterministic, and still unexplained.
 
