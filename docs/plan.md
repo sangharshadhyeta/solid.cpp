@@ -1903,6 +1903,59 @@ Not yet implemented in the cache - this is a simulation result on
 `traces/big-*.txt`, and it needs the per-expert resident-partner count
 maintained cheaply on the eviction path before it could ship.
 
+## SUBSTITUTION FAILS AT LOW RESIDENCY — measured, and it sinks the design there (2026-08-25)
+
+The measurement repeatedly flagged as the one that could sink substitution.
+`llama-perplexity` (where the cache is correct), `--moe-cache 512` = 852 slots,
+27% hit rate:
+
+| config | PPL |
+|---|---|
+| substitution OFF | **6.74** |
+| substitution ON | **41.32** |
+
+**A 6x degradation.** At high residency substitution was free (+0.181%, CI
+spanning zero, measured twice). At this residency it destroys the model.
+
+This retires the optimistic reading of the cache-size sweep. That sweep showed
+retained gate mass degrading gracefully (99% -> 80% at 1.2% residency) and was
+used to argue the GLM-scale vision was tractable. **Retained gate mass was a bad
+proxy** - it was flagged as a proxy at the time, and it has now been falsified
+by direct measurement. Executing 80% of the router's intended weight does NOT
+mean the output is 80% as good; substituting the missing 20% with resident
+experts wrecks it.
+
+Consequence for the design: substitution is viable ONLY at high residency,
+which is precisely where it is least needed. The "8B working set of a 750B
+model" case runs at ~1.5% residency, and this says substitution cannot carry
+that. The mechanism is not dead - it is free at high residency and still worth
++4.7% throughput there - but it does not scale down, and the scale argument was
+the reason to care about it.
+
+## Coverage eviction in the real cache — does NOT reproduce (2026-08-25)
+
+Implemented (`GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1`): bounded partner adjacency
+mirrored from co-activation, and a rank-combined victim choice over the existing
+LRU window (coverage 1.0, atlas 0.5, heat 0.5).
+
+It shows the predicted *signature* - it gives up hit rate (0.2711 -> 0.2678
+without substitution) - but not the predicted *benefit*:
+
+| eviction | decline rate | hit rate | PPL |
+|---|---|---|---|
+| LRU | 18.59% | 0.2861 | 41.32 |
+| coverage | **19.01%** | 0.2802 | 42.18 |
+
+`substitute_declined` is the real-system counterpart of the simulation's
+"no candidate" tail, and coverage eviction made it slightly WORSE, not the
+-3.3pp the simulation predicted (+6.18pp retained mass).
+
+Candidate reasons, untested: the real eviction window is not the
+sample-of-32-take-8 the simulation used; the partner adjacency starts EMPTY and
+only populates while coverage eviction is enabled, so early evictions see
+redundancy 0 for every candidate and degenerate to atlas+heat; and the residency
+regime differs. Kept behind the flag, off by default, pending diagnosis.
+
 ## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
 
 The question behind the GLM-scale vision: extract a small working set of a huge
