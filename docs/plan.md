@@ -1498,6 +1498,37 @@ Untested refinement: WEIGHTED rank-sum, with coverage weighted above atlas and
 score to reflect their individual strengths, which keeps every gradient while
 respecting that they are not equally informative.
 
+## Gemma UD-quant substitution test — INVALID, baseline broken (2026-08-25)
+
+Question: does substitution cost more on an Unsloth dynamic quant, whose bit
+budget is spent on attention and keeps MoE experts thinnest? That matters for
+the 2-bit GLM plan, where quantisation and substitution would degrade the same
+component.
+
+Ran gemma-4-26B-A4B-it-UD-Q4_K_M, same corpus and settings as Ornith:
+
+```
+off  PPL = 141.10 +/- 7.06
+on   PPL = 139.65 +/- 6.98
+paired -1.026%  CI [-4.434%, +2.502%]  not significant, 25/60 chunks worse
+```
+
+**The baseline is broken.** PPL 141 against Ornith's 4.34-7.04 on the identical
+corpus is not a quantisation difference - the model is producing near-garbage
+regardless of substitution, so on/off against it means nothing. The +-4.4% CI
+also swamps the ~1% effects being hunted.
+
+No warnings in the log and the config loaded normally (n_ctx=512, batch 4).
+Most likely cause: gemma-4 uses interleaved local/global attention with a
+sliding window, and n_ctx=512 is too small for it on raw technical prose.
+Ornith tolerates that context size; gemma evidently does not.
+
+**To answer the question properly** the gemma arm needs a config where its
+baseline PPL is sane (larger n_ctx, and possibly a corpus closer to its
+training distribution), verified BEFORE comparing substitution on/off. Until
+then the UD-quant interaction with substitution is unmeasured, and the 2-bit
+GLM plan rests on an untested assumption.
+
 ## Signal weighting and orthogonality — the eviction recipe (2026-08-25)
 
 A flat 3-way rank-sum lets coverage be outvoted 2:1 by atlas and score, which
