@@ -1767,10 +1767,23 @@ static void ggml_compute_forward_mul_mat_id(
         // cache's copy cannot be evicted behind our back, whereas the mapped
         // pages are at the kernel's discretion and it cannot tell a hot expert
         // from a cold one. NULL means "not held", i.e. exactly today's path.
+        // GGML_CUDA_MOE_CACHE_NO_HOST_PTR=1 disables this redirect only, leaving
+        // admissions, device fills, dispatch and eviction fully enabled. It is the
+        // one cache-touched path that every GPU-side isolation arm (SKIP_COPY,
+        // FAIL=dispatch, NO_HITS) leaves running, and like those arms it is gated
+        // on an expert having been admitted - which is the single necessary
+        // condition for the corruption.
         if (ggml_moe_cache.host_ptr) {
-            const void * cached = ggml_moe_cache.host_ptr(src0->data, (int) cur_a);
-            if (cached) {
-                src0_cur = (const char *) cached;
+            static int no_host_ptr = -1;
+            if (no_host_ptr < 0) {
+                const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_HOST_PTR");
+                no_host_ptr = (e && atoi(e) != 0) ? 1 : 0;
+            }
+            if (!no_host_ptr) {
+                const void * cached = ggml_moe_cache.host_ptr(src0->data, (int) cur_a);
+                if (cached) {
+                    src0_cur = (const char *) cached;
+                }
             }
         }
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;

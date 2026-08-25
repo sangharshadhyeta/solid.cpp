@@ -2557,10 +2557,64 @@ static bool moe_cache_atlas_warm_service(
         moe_cache_session * session, moe_cache_device * device,
         std::unique_lock<std::mutex> & lock);
 
+// GGML_CUDA_MOE_CACHE_NO_RT_ALLOC=1: create the fill stream and the pinned
+// staging buffer ONCE, here at worker startup, and never allocate again for
+// the life of the thread. cudaMallocHost/cudaFreeHost/cudaStreamCreate are
+// device-wide synchronizing operations; the default lazy path below runs them
+// on this background thread *during decode*, concurrently with the main
+// thread's graph capture and dispatch. That is the only channel left that is
+// (a) reached by every corrupting arm and (b) short-circuited by FAIL=insert,
+// which is the sole clean one. If corruption vanishes under this flag with
+// admissions still fully enabled, the runtime allocation is the fault.
+// The stage is sized by GGML_CUDA_MOE_CACHE_STAGE_MB (default 64); a job
+// larger than it falls through to the unstaged cudaMemcpy path, which is
+// correct, just slower - so pinning the size can never break a fill.
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
     cudaStream_t stream = nullptr;
+
+    static const bool no_rt_alloc = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_RT_ALLOC");
+        return e && atoi(e) != 0;
+    }();
+
+    if (no_rt_alloc) {
+        static const size_t stage_bytes = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_STAGE_MB");
+            const long long mb = e ? atoll(e) : 64;
+            return (size_t)(mb > 0 ? mb : 64) << 20;
+        }();
+
+        ggml_cuda_set_device(device->physical);
+
+        int least_priority = 0;
+        int greatest_priority = 0;
+        if (cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority) == cudaSuccess) {
+            if (cudaStreamCreateWithPriority(&stream, cudaStreamNonBlocking, least_priority) != cudaSuccess) {
+                (void)cudaGetLastError();
+                stream = nullptr;
+            }
+        } else {
+            (void)cudaGetLastError();
+        }
+        if (!stream && cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) != cudaSuccess) {
+            (void)cudaGetLastError();
+            stream = nullptr;
+        }
+
+        char * fresh = nullptr;
+        if (cudaMallocHost((void **)&fresh, stage_bytes) == cudaSuccess) {
+            stage = fresh;
+            stage_capacity = stage_bytes;
+        } else {
+            (void)cudaGetLastError();
+        }
+
+        fprintf(stderr, "[moe-cache] NO_RT_ALLOC stream=%s stage=%zu MiB\n",
+                stream ? "preallocated" : "FAILED",
+                stage_capacity >> 20);
+    }
 
     for (;;) {
         moe_cache_job job;
@@ -2662,7 +2716,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         if (device->dead.load() || moe_cache_fail(*session, "insert")) {
             error = cudaErrorUnknown;
         }
-        if (error == cudaSuccess && !stream) {
+        if (error == cudaSuccess && !stream && !no_rt_alloc) {
             int least_priority = 0;
             int greatest_priority = 0;
             error = cudaDeviceGetStreamPriorityRange(
@@ -2676,7 +2730,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         &stream, cudaStreamNonBlocking);
             }
         }
-        if (error == cudaSuccess && stage_capacity < job.bytes) {
+        if (error == cudaSuccess && stage_capacity < job.bytes && !no_rt_alloc) {
             char * fresh = nullptr;
             cudaError_t alloc_error = cudaMallocHost((void **)&fresh, job.bytes);
             if (alloc_error == cudaSuccess) {
