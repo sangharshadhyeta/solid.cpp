@@ -1336,8 +1336,29 @@ static int moe_cache_mask_audit(const moe_cache_pool & pool) {
     return bad;
 }
 
+static bool moe_cache_pin_audit_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_PIN_AUDIT");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
 static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_free) {
     moe_cache_slot & slot = pool.slots[index];
+    // slot.readers is zeroed unconditionally below. If anyone still holds this
+    // slot, that pin is silently discarded and the slot can be refilled with a
+    // DIFFERENT expert while a dispatch still references it. That is the pin
+    // discipline breaking, and it is invisible afterwards because the refcount
+    // is gone.
+    if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
+        static std::atomic<int> n{0};
+        if (n.fetch_add(1, std::memory_order_relaxed) < 20) {
+            fprintf(stderr, "[moe-cache] *** PIN VIOLATION: slot_reset on slot=%d with readers=%d "
+                    "(expert=%d state=%d) - pin discarded\n",
+                    index, slot.readers, slot.key.expert, (int) slot.state);
+        }
+    }
     if (slot.state == moe_cache_slot_state::valid) {
         moe_cache_segment_remove(pool, index);
     }
@@ -3268,6 +3289,27 @@ static void moe_cache_prewarm_from_history(
         slot.key = key;
         slot.generation++;
         slot.readers = 0;
+        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
+            static std::atomic<int> nc{0};
+            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
+                        slot.readers);
+            }
+        }
+        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
+            static std::atomic<int> nc{0};
+            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
+                        slot.readers);
+            }
+        }
+        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
+            static std::atomic<int> nc{0};
+            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
+                        slot.readers);
+            }
+        }
         slot.state = moe_cache_slot_state::copying;
         try {
             if (!moe_cache_map_insert(pool, key, slot_index)) {
