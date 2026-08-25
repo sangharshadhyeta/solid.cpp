@@ -1132,6 +1132,27 @@ arrives sooner; larger caches merely delay it. Any framing that treats one
 prompt as the trigger is wrong - what matters is how many admissions have
 happened.
 
+**THE CACHE IS CORRECT IN `llama-perplexity` - the fault is in how the SERVER
+drives it.** Same binary, same cache, heavily exercised:
+
+```
+-c 512,  4-token batches : PPL 7.3347 (vs 7.2856 cache off)  1.19M hits, 379k evictions
+-c 2048, 4-token batches : PPL 5.0367                        2.28M hits, 780k evictions
+-c 512,  1-token batches : PPL 6.7508                        371k hits,   83k evictions
+```
+
+Millions of hits and hundreds of thousands of evictions with normal perplexity
+(corruption reads as 141+). So fills, hits, evictions, single-token batches and
+larger contexts are all sound. Every remaining hypothesis must explain why only
+`llama-server` breaks.
+
+**Pin discipline audit: clean.** `GGML_CUDA_MOE_CACHE_PIN_AUDIT=1` flags any
+`slot_reset` or refill (`state -> copying`) performed on a slot with
+`readers > 0`. Motivated by `moe_cache_slot_reset` zeroing `slot.readers`
+UNCONDITIONALLY, which would silently discard a live pin. **Zero violations**
+through a corrupting generation, so no slot is ever torn down or refilled while
+referenced.
+
 **Fill logging + VRAM canary: the copy is provably correct.**
 `GGML_CUDA_MOE_CACHE_LOG_FILLS=1` logs every fill's slab range, destination and
 size; `GGML_CUDA_MOE_CACHE_CANARY=1` allocates a 1 MiB 0xA5-filled buffer right
@@ -1335,7 +1356,22 @@ dependence on cache state is no longer stable**, which undermines the
 controlled matrix's central finding (auto 9/18 vs off 0/18). Everything
 downstream of that matrix needs re-confirmation.
 
-**Five hypotheses have been tested and rejected; the sixth is untested (broken control)** (atlas warming, moe-cache
+**Excluded so far** (all re-verified under a VALID control - `--moe-cache off`
+on the CLI - with a conservative detector that requires unique-char ratio <0.02
+or a 20+ character run): atlas warming; OOM / VRAM pressure (256 MiB cache with
+4.6 GB free still corrupts); scratch overrun; multi-activation mmv mapping;
+CUDA graphs; speculative eviction; fill-copy overrun (canary + per-fill logging
+clean); evictions (corrupts with evictions=0); weight repacking; host pinning;
+admission demand thresholds; cold-page sweep; group admission; prediction
+measurement; slot count and continuous batching; KV unification and prefix
+reuse; context size; pin discipline (audit clean); the copy itself (SKIP_COPY
+still corrupts); and row routing (NO_HITS still corrupts).
+
+**Required**: admissions. `FAIL=insert` is the only cache-enabled configuration
+that is clean.
+
+**Remaining surface**: whatever differs between `llama-server` and
+`llama-perplexity` in how they drive `llama_decode` around an admitting cache. (atlas warming, moe-cache
 as a whole, OOM/VRAM, scratch-capacity overrun, multi-activation mapping). The
 bug is real, deterministic, and still unexplained.
 
