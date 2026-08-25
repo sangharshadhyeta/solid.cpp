@@ -1288,6 +1288,29 @@ co-activation. Selecting by triple co-occurrence with the other experts in the
 same decision is the direct test of whether the higher-order structure converts
 into a better mechanism, and it reuses data already collected.
 
+## Commit audit — behaviour changes shipped in the days before the bug (2026-08-25)
+
+The corruption reproduces on `5de4ff917` (08-24 09:33), so it predates this
+session. Auditing what landed on the MoE execution path in the days before,
+most commits are instrumentation, measurement or reverts. The ones that changed
+DEFAULT behaviour for every user:
+
+- **`107389751` (08-23 20:04) "default SPEC_EVICT_MODE to agree, not off"** -
+  ships SPECULATIVE EVICTION on by default. Its own message argues "Safe even
+  though it's now the default". Evicting a slot on a *prediction* is precisely
+  the shape of a bug that corrupts output while every state check passes, and
+  it landed before the earliest commit the corruption is confirmed on.
+  **Leading suspect.** Disable with
+  `GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=off`.
+- `ef2c30b43` (08-23 19:56) - fixes agree-mode at depth 3+, same subsystem.
+- `fce3e9fa5` (08-23 19:30) - introduces cross-depth-agreement spec eviction.
+- `30d0f8447` (08-23 20:25) - mincore-verified NVMe cost tier (read-only, low risk).
+- `b321b6259` (08-24 04:27) - prefill copy-failure guard (a FIX for a prior
+  silent-corruption bug in the same area).
+
+Test queued: control (cache off) FIRST - the previous graph test was void
+because its control degenerated - then spec_evict default vs off.
+
 ## DESIGN ARGUMENT — read this before proposing new cache work (2026-08-25)
 
 The reasoning behind the current direction, recorded because several sessions
