@@ -1633,6 +1633,16 @@ static bool ggml_cuda_kernel_can_use_pdl(const void * kernel) {
     // We have to guard on a loaded kernel's PTX version so a kernel forward-JIT'ed
     // from pre-Hopper PTX to a Hopper-or-newer GPU does not opt into PDL.
     const bool can_use_pdl = attr.ptxVersion >= 90;
+    if (getenv("GGML_CUDA_PDL_VERIFY_LOG")) {
+        // Already inside cache_mutex's lock_guard above, so a plain static is
+        // safe here without its own atomic.
+        static int n = 0;
+        if (n++ < 30) {
+            fprintf(stderr, "[pdl-verify] device=%d ptxVersion=%d can_use_pdl=%d\n",
+                    device, attr.ptxVersion, (int) can_use_pdl);
+            fflush(stderr);
+        }
+    }
     cache.emplace(key, can_use_pdl);
     return can_use_pdl;
 }
