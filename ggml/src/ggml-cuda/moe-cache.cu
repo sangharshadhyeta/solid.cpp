@@ -1617,7 +1617,19 @@ static bool moe_cache_grow_device(
         fflush(stderr);
     }
 
-    const size_t requested = required * 2 + 256;
+    // GGML_CUDA_MOE_CACHE_PRESIZE_X=N: multiply the FIRST-ever growth request
+    // by N instead of the normal 2x+256, so in practice no second mid-decode
+    // cudaMalloc ever fires for the rest of the run - the direct test of
+    // "is the mid-decode cudaMalloc itself (not graph capture, not a
+    // free-race - both already excluded) the cause", verified via
+    // GROWTH_LOG's event count, not assumed from this multiplier alone.
+    static const long long presize_x = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_PRESIZE_X");
+        return e ? atoll(e) : 1;
+    }();
+    const size_t requested = capacity == 0 && presize_x > 1
+        ? required * (size_t) presize_x + 256
+        : required * 2 + 256;
     void * fresh = nullptr;
     if (!moe_cache_cuda_ok(device, cudaMalloc(&fresh, requested), operation, false)) {
         return false;
@@ -1751,7 +1763,13 @@ static bool moe_cache_grow_host(
         return false;
     }
 
-    const size_t requested = required * 2 + 256;
+    static const long long presize_x = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_PRESIZE_X");
+        return e ? atoll(e) : 1;
+    }();
+    const size_t requested = capacity == 0 && presize_x > 1
+        ? required * (size_t) presize_x + 256
+        : required * 2 + 256;
     void * fresh = nullptr;
     if (!moe_cache_cuda_ok(device, cudaMallocHost(&fresh, requested), operation, false)) {
         return false;
