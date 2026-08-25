@@ -1987,7 +1987,31 @@ central guarantee and is a much larger design change than a ranking tweak.
 policy sees, not just the scoring function. Every eviction result in this
 document that used the sample-of-32 pool inherits this caveat.
 
-Kept behind `GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1`, off by default.
+**Protected segment made evictable** (the change the root cause implied), so
+candidates come from both segments as the simulation's pool did:
+
+| eviction | decline rate | hit rate | PPL |
+|---|---|---|---|
+| LRU (probation only) | 18.57% | 0.2878 | 42.66 |
+| coverage, both segments | **18.28%** | 0.2661 | 49.24 |
+| coverage, both, heat_w=0 | 20.20% | 0.2424 | 51.05 |
+
+The target metric finally moves the right way - decline rate -0.29pp - but that
+is a tenth of the simulation's -3.3pp, and it costs 2.2pp of hit rate and
+weakens LFRU's guarantee that a proven-hot expert stays resident.
+
+**COVERAGE EVICTION HAS NO REGIME WHERE IT PAYS.** Its entire purpose is to
+keep a viable stand-in reachable, i.e. to serve SUBSTITUTION. But:
+
+- at LOW residency, substitution itself is broken (PPL 6.74 -> 41.32), so
+  optimising its decline rate optimises a mechanism that must not be used;
+- at HIGH residency, substitution is free but the no-candidate tail is already
+  negligible (0.68% at 18.5% residency), so there is nothing left to win.
+
+The objective is sound and the implementation now reproduces its direction, but
+the window where it would matter does not exist. Kept behind
+`GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1`, off by default, as a working
+implementation should the substitution picture change.
 
 ## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
 
