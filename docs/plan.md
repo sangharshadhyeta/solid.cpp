@@ -1387,6 +1387,40 @@ have all lost to the probe atlas (0.7116). Four independent methods, one
 verdict - and the verdict is about the SIGNAL, not the method. Keeping the
 hand-written probes is the better-supported position.
 
+## Low-residency perplexity — partial result (2026-08-25)
+
+Substitution's quality cost measured with `llama-perplexity`, 60 chunks per
+arm, paired per-chunk against a substitution-OFF baseline, residency varied via
+`GGML_CUDA_MOE_CACHE_RESERVE_MB` (`BUDGET_MB` is ignored - verified: identical
+11,797 MiB peak at 3413 and 256):
+
+| arm | delta PPL | 95% CI | significant | worse chunks |
+|---|---|---|---|---|
+| full residency | -0.217% | [-0.597%, +0.165%] | no | 28/60 |
+| RESERVE 1500 | -0.035% | [-0.462%, +0.395%] | no | 31/60 |
+| **RESERVE 2500** | **+0.998%** | **[+0.148%, +1.855%]** | **YES** | 36/60 |
+| RESERVE 3300 | -0.069% | [-0.433%, +0.296%] | no | 29/60 |
+
+**At full residency substitution is free** - CI spans zero, 28/60 chunks worse,
+a coin flip. Independently confirms the earlier 120-chunk result (+0.181%, CI
+[-0.106%, +0.468%]) on a different corpus slice.
+
+**At one reduced-residency point it costs ~1%** - the first statistically
+significant quality cost measured for substitution anywhere in this project,
+and still small.
+
+**The curve is NOT established.** The ladder was not clean: RESERVE 3300 shows
+ZERO moe-cache log lines, i.e. the cache never allocated at all, so there were
+no substitutions and its null result is meaningless as a low-residency point.
+That leaves two live rungs and no way to tell their residency apart, because
+`llama-perplexity` exposes no `slots_used`.
+
+Methodological note: RESERVE_MB was used as a residency proxy without verifying
+it produced a graded ladder. It does not - it goes full -> reduced -> off, with
+no readback. **To finish this measurement the cache needs to report residency
+from a non-server binary** (a stderr summary at exit would do), or the server
+route, which is blocked by the corruption bug.
+
 ## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
 
 Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
