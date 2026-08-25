@@ -2549,6 +2549,24 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         if (error == cudaSuccess && !destination) {
             error = cudaErrorInvalidValue;
         }
+
+        // The destination stride is pool->expert_size, but the copy length is
+        // job.bytes, carried from the NODE. Nothing validated that the two
+        // agree. If job.bytes exceeds the slot stride the fill runs past its
+        // slot - into the next slot, or off the end of the slab entirely -
+        // which corrupts whatever VRAM follows and is invisible to every
+        // read-side check, because the slot it was asked about still reads
+        // back correctly. Refuse the fill instead, loudly.
+        if (error == cudaSuccess && pool && job.bytes > pool->expert_size) {
+            static std::atomic<int> reported{0};
+            if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] FILL OVERRUN REFUSED slot=%d job.bytes=%zu "
+                        "pool.expert_size=%zu pool=%d n_slots=%d (would overrun by %zu bytes)\n",
+                        job.slot, job.bytes, pool->expert_size, job.pool, pool->n_slots,
+                        job.bytes - pool->expert_size);
+            }
+            error = cudaErrorInvalidValue;
+        }
         {
             std::unique_lock<std::mutex> fill_lock(
                     session->fill_mu, std::defer_lock);
