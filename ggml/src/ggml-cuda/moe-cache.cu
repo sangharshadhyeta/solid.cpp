@@ -412,6 +412,14 @@ struct moe_cache_device {
     // switched from an opaque hash - that was a real bug, not a style
     // choice), undirected.
     std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation;
+    // Bounded adjacency list, for coverage-aware eviction. co_activation is
+    // keyed by EDGE, which answers "do these two co-fire" in O(1) but cannot
+    // enumerate a given expert's partners without scanning every edge. Eviction
+    // needs the enumeration ("how many of this expert's partners are still
+    // resident"), so the neighbours are mirrored here as they are recorded.
+    // Capped per expert: redundancy only needs a representative sample, and an
+    // unbounded list would grow with the square of the expert count.
+    std::unordered_map<moe_cache_key, std::vector<int32_t>, moe_cache_key_hash> partners;
 
     // Track 1 step 4b: the missing prerequisite step 4a's comment above
     // flagged - a real token/batch-boundary signal. Reset in
@@ -1206,7 +1214,100 @@ static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
 // active readers. Shared by real-miss eviction and, now, speculative-fill
 // eviction: same criterion used to choose what to keep should decide what to
 // let go, rather than a separate, unprincipled policy for each path.
+static constexpr size_t MOE_CACHE_MAX_PARTNERS = 32;
+
+// Coverage-aware eviction. Measured offline on 909k real decisions at 1.2%
+// residency: LRU alone retains 78.30% of the router's intended gate mass;
+// ranking the LRU window by coverage(1.0) + atlas(0.5) + score(0.5) retains
+// 84.47%, a +6.18pp gain, by cutting the "no resident stand-in" tail from
+// 17.69% to 13.06%. It deliberately GIVES UP hit rate (-2.8pp) to do so, which
+// is why no hit-rate-scored experiment ever found it.
+//
+// Weights are not arbitrary: coverage measures STRUCTURE (would evicting this
+// orphan a neighbourhood) while atlas and score both measure an individual
+// expert's worth, so coverage is weighted equal to their sum. Combining by RANK
+// rather than by value is deliberate too - the three quantities have
+// incommensurable scales, and every value-space combination tried (raw product,
+// calibrated log-additive) lost to rank aggregation because one factor's range
+// dominated. See docs/plan.md.
+static bool moe_cache_coverage_evict_enabled() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+// Rank-combined victim choice over the same LRU window the heat-only scan uses.
+// Three signals, each ranked most-evictable-first, summed with weights:
+//   coverage 1.0  how many of this expert's co-firing partners are still
+//                 resident - evicting a redundant expert leaves a stand-in
+//   atlas    0.5  alignment with the live request direction; misaligned first
+//   heat     0.5  the existing weighted heat, coldest first
+// Measured +6.18pp retained gate mass at 1.2% residency. See the comment on
+// moe_cache_coverage_evict_enabled.
+static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache_pool & pool, int head) {
+    struct cand_t { int slot; int redundancy; double align; double heat; };
+    cand_t cands[MOE_CACHE_EVICT_WINDOW];
+    int n = 0;
+    for (int c = head; c >= 0 && n < MOE_CACHE_EVICT_WINDOW; c = pool.slots[c].next) {
+        if (pool.slots[c].readers > 0) {
+            continue;
+        }
+        const moe_cache_slot & slot = pool.slots[c];
+        int redundancy = 0;
+        const auto pit = device.partners.find(slot.key);
+        if (pit != device.partners.end()) {
+            for (int32_t other : pit->second) {
+                if (pool.map.find(moe_cache_key{slot.key.tensor, other}) != pool.map.end()) {
+                    redundancy++;
+                }
+            }
+        }
+        double align = 0.0;
+        if (device.req_dir_valid) {
+            const auto ait = device.atlas.find(slot.key);
+            if (ait != device.atlas.end()) {
+                const double mx = device.req_dir_x, my = device.req_dir_y;
+                const double m = std::sqrt(mx*mx + my*my);
+                const double cl = std::sqrt((double)ait->second.x*ait->second.x +
+                                            (double)ait->second.y*ait->second.y);
+                if (m > 1e-9 && cl > 1e-9) {
+                    align = (ait->second.x*mx + ait->second.y*my) / (m*cl);
+                }
+            }
+        }
+        cands[n++] = { c, redundancy, align, moe_cache_weighted_heat(device, slot) };
+    }
+    if (n == 0) {
+        return -1;
+    }
+    double total[MOE_CACHE_EVICT_WINDOW] = {};
+    int order[MOE_CACHE_EVICT_WINDOW];
+    // most redundant first (weight 1.0)
+    for (int i = 0; i < n; i++) order[i] = i;
+    std::sort(order, order + n, [&](int a, int b){ return cands[a].redundancy > cands[b].redundancy; });
+    for (int r = 0; r < n; r++) total[order[r]] += 1.0 * r;
+    // least aligned with the request direction first (weight 0.5)
+    for (int i = 0; i < n; i++) order[i] = i;
+    std::sort(order, order + n, [&](int a, int b){ return cands[a].align < cands[b].align; });
+    for (int r = 0; r < n; r++) total[order[r]] += 0.5 * r;
+    // coldest first (weight 0.5)
+    for (int i = 0; i < n; i++) order[i] = i;
+    std::sort(order, order + n, [&](int a, int b){ return cands[a].heat < cands[b].heat; });
+    for (int r = 0; r < n; r++) total[order[r]] += 0.5 * r;
+
+    int best = 0;
+    for (int i = 1; i < n; i++) {
+        if (total[i] < total[best]) best = i;
+    }
+    return cands[best].slot;
+}
+
 static int moe_cache_pick_coldest_unpinned(const moe_cache_device & device, moe_cache_pool & pool, int head) {
+    if (moe_cache_coverage_evict_enabled()) {
+        return moe_cache_pick_by_coverage(device, pool, head);
+    }
     int best = -1;
     double best_score = 0.0;
     int candidate = head;
@@ -5531,6 +5632,16 @@ static int moe_cache_plan(
                 const moe_cache_key ka{node->host_base, ids[a]};
                 const moe_cache_key kb{node->host_base, ids[b]};
                 const uint32_t n = ++device.co_activation[moe_cache_edge_undirected(ka, kb)];
+                if (moe_cache_coverage_evict_enabled()) {
+                    auto add_partner = [&](const moe_cache_key & self, int32_t other) {
+                        auto & v = device.partners[self];
+                        if (v.size() >= MOE_CACHE_MAX_PARTNERS) return;
+                        for (int32_t x : v) { if (x == other) return; }
+                        v.push_back(other);
+                    };
+                    add_partner(ka, kb.expert);
+                    add_partner(kb, ka.expert);
+                }
                 if (moe_cache_partner_index_enabled()) {
                     // Undirected: this count is evidence for BOTH endpoints.
                     auto & ba = device.partner_best[ka];
