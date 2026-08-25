@@ -2569,6 +2569,74 @@ static bool moe_cache_atlas_warm_service(
 // The stage is sized by GGML_CUDA_MOE_CACHE_STAGE_MB (default 64); a job
 // larger than it falls through to the unstaged cudaMemcpy path, which is
 // correct, just slower - so pinning the size can never break a fill.
+// --- weight-immutability guard (GGML_CUDA_MOE_CACHE_WEIGHT_GUARD=1) ---------
+// Comparing an expert only against its own previous admission is blind whenever
+// experts stay resident once admitted. So record the hash at admission and
+// RE-VERIFY EVERY tracked expert on the worker's idle tick, which keeps running
+// during and after the degenerate request.
+struct moe_weight_rec { const void * src; size_t bytes; uint64_t hash; };
+static std::mutex moe_guard_mu;
+static std::unordered_map<uint64_t, moe_weight_rec> moe_guard_seen;
+
+static bool moe_cache_weight_guard_on() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_WEIGHT_GUARD");
+        return e && atoi(e) != 0;
+    }();
+    return on;
+}
+
+static uint64_t moe_cache_weight_hash(const void * src, size_t bytes) {
+    uint64_t h = 1469598103934665603ull;
+    const unsigned char * p = (const unsigned char *) src;
+    for (size_t i = 0; i < bytes; i++) {
+        h ^= p[i];
+        h *= 1099511628211ull;
+    }
+    return h;
+}
+
+// Re-hash every expert admitted so far. Returns the number that changed.
+static void moe_cache_weight_guard_sweep() {
+    if (!moe_cache_weight_guard_on()) {
+        return;
+    }
+    // A sticky CUDA error explains every observation at once: permanent for the
+    // life of the process, cleared only by a restart, weights intact, KV
+    // irrelevant, and reached only once an admission has run. The cache swallows
+    // statuses in several places ((void)cudaGetLastError()), so a real fault can
+    // be discarded here and surface as garbage everywhere else. Peek, do not
+    // clear.
+    {
+        const cudaError_t sticky = cudaPeekAtLastError();
+        static cudaError_t reported = cudaSuccess;
+        if (sticky != cudaSuccess && sticky != reported) {
+            reported = sticky;
+            fprintf(stderr, "[moe-cache] STICKY CUDA ERROR %d: %s\n",
+                    (int) sticky, cudaGetErrorString(sticky));
+            fflush(stderr);
+        }
+    }
+    std::lock_guard<std::mutex> lock(moe_guard_mu);
+    if (moe_guard_seen.empty()) {
+        return;
+    }
+    long long changed = 0;
+    for (auto & [id, rec] : moe_guard_seen) {
+        const uint64_t now = moe_cache_weight_hash(rec.src, rec.bytes);
+        if (now != rec.hash) {
+            changed++;
+            fprintf(stderr, "[moe-cache] WEIGHT MUTATED src=%p bytes=%zu was=%016llx now=%016llx\n",
+                    rec.src, rec.bytes,
+                    (unsigned long long) rec.hash, (unsigned long long) now);
+            rec.hash = now;
+        }
+    }
+    fprintf(stderr, "[moe-cache] weight guard sweep: %zu experts verified, %lld mutated\n",
+            moe_guard_seen.size(), changed);
+    fflush(stderr);
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -2630,6 +2698,13 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty() || !device->warm_queue.empty();
             });
+            if (!have_work) {
+                // Idle: nothing is decoding, so a full re-verify costs nothing a
+                // token would otherwise have.
+                lock.unlock();
+                moe_cache_weight_guard_sweep();
+                lock.lock();
+            }
             // Promotions first, and the expensive part outside the lock. Decode
             // only recorded intent; the malloc, the copy and the madvise happen
             // here, where they cost the fill worker's time rather than a token's.
@@ -2804,44 +2879,14 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // expert) purely so the following copy can start from pinned memory -
             // which cancels most of what pinning is worth. Registering the tensor
             // once removes the copy: 506 us -> 303 us per expert.
-            // GGML_CUDA_MOE_CACHE_WEIGHT_GUARD=1: the model weights are supposed
-            // to be immutable for the life of the process. Hash each expert's
-            // source bytes here - the one place we already touch every one of
-            // them - and compare against the hash taken the last time this same
-            // expert was admitted. A mismatch means something mutated the model
-            // mapping under us, which is the only hypothesis that explains BOTH
-            // "admissions are necessary" AND "no consumer of the cached data
-            // matters": if the source weights are damaged, every reader is wrong,
-            // GPU or CPU, cached or uncached. It also explains why the poisoning
-            // is permanent within a process and cleared only by a restart, which
-            // re-maps the file.
-            {
-                static const bool guard = [] {
-                    const char * e = getenv("GGML_CUDA_MOE_CACHE_WEIGHT_GUARD");
-                    return e && atoi(e) != 0;
-                }();
-                if (guard && job.source && job.bytes) {
-                    uint64_t h = 1469598103934665603ull;
-                    const unsigned char * p = (const unsigned char *) job.source;
-                    for (size_t i = 0; i < job.bytes; i++) {
-                        h ^= p[i];
-                        h *= 1099511628211ull;
-                    }
-                    const uint64_t id = ((uint64_t) (uintptr_t) job.source) ^ (job.bytes * 2654435761ull);
-                    static std::mutex gmu;
-                    static std::unordered_map<uint64_t, uint64_t> seen;
-                    std::lock_guard<std::mutex> glock(gmu);
-                    auto it = seen.find(id);
-                    if (it == seen.end()) {
-                        seen.emplace(id, h);
-                    } else if (it->second != h) {
-                        fprintf(stderr,
-                                "[moe-cache] WEIGHT MUTATED src=%p bytes=%zu was=%016llx now=%016llx\n",
-                                job.source, job.bytes,
-                                (unsigned long long) it->second, (unsigned long long) h);
-                        fflush(stderr);
-                        it->second = h;
-                    }
+            // Record this expert's source hash the first time we admit it; the
+            // idle-tick sweep re-verifies all of them.
+            if (moe_cache_weight_guard_on() && job.source && job.bytes) {
+                const uint64_t id = ((uint64_t) (uintptr_t) job.source) ^ (job.bytes * 2654435761ull);
+                std::lock_guard<std::mutex> glock(moe_guard_mu);
+                if (moe_guard_seen.find(id) == moe_guard_seen.end()) {
+                    moe_guard_seen.emplace(id, moe_weight_rec{
+                            job.source, job.bytes, moe_cache_weight_hash(job.source, job.bytes)});
                 }
             }
             bool direct = false;
@@ -5371,6 +5416,49 @@ static int moe_cache_plan(
     // and the router emits them rank-ordered, so index % top_k recovers the
     // rank. Guarded: a zero/inconsistent n_tokens folds everything into
     // rank 0 rather than dividing by zero.
+    // GGML_CUDA_MOE_CACHE_WIDTH=1: per-node routing width. If the early layers
+    // really are selecting every expert, n_ids is not n_tokens*top_k but something
+    // far larger, and several 4096-sized arrays on both sides of the handshake are
+    // undersized for it.
+    if (getenv("GGML_CUDA_MOE_CACHE_WIDTH")) {
+        // Identity routing (ids == 0,1,2..top_k-1) is what top-k returns when the
+        // router logits are all NaN/equal. It is the fingerprint of the failure.
+        // Log the FIRST layer that flips, which is where the NaN originates.
+        {
+            const int k = node->n_tokens > 0 ? (int) (n_ids / node->n_tokens) : 0;
+            bool identity = k > 0 && n_ids >= k;
+            for (int i = 0; identity && i < k; i++) {
+                if (ids[i] != i) identity = false;
+            }
+            static std::atomic<int> flipped{0};
+            if (identity && flipped.fetch_add(1) < 12) {
+                fprintf(stderr, "[moe-cache] IDENTITY ROUTING layer=%d top_k=%d n_tokens=%lld\n",
+                        node->layer, k, (long long) node->n_tokens);
+                fflush(stderr);
+            }
+        }
+        static std::atomic<int> shots{0};
+        const int shot = shots.fetch_add(1);
+        if (shot < 240) {
+            int distinct = 0;
+            {
+                std::vector<unsigned char> seen_e((size_t) node->n_expert, 0);
+                for (int i = 0; i < (int) n_ids; i++) {
+                    const int e = ids[i];
+                    if (e >= 0 && e < node->n_expert && !seen_e[(size_t) e]) {
+                        seen_e[(size_t) e] = 1;
+                        distinct++;
+                    }
+                }
+            }
+            fprintf(stderr, "[moe-cache] WIDTH layer=%d n_tokens=%lld n_ids=%d "
+                    "top_k=%d distinct=%d/%d\n",
+                    node->layer, (long long) node->n_tokens, (int) n_ids,
+                    node->n_tokens > 0 ? (int) (n_ids / node->n_tokens) : -1,
+                    distinct, node->n_expert);
+            fflush(stderr);
+        }
+    }
     const int rank_top_k = (node->n_tokens > 0 && n_ids >= node->n_tokens)
         ? (int) (n_ids / node->n_tokens) : 0;
 
@@ -5462,7 +5550,26 @@ static int moe_cache_plan(
                     const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_HITS");
                     return e && atoi(e) != 0;
                 }();
-                node->pins[node->n_pins++] = {found->second};
+                // The substitution path below already bounds this write; this one
+                // did not. pins[] is followed in the struct by n_pins, planned and
+                // dispatched, so an overflow clobbers its own count and the
+                // dispatch flags before running off the end - permanent damage to
+                // a long-lived node, which is exactly the observed failure: garbage
+                // for the life of the process, weights intact, cleared only by a
+                // restart, and reachable only once experts are being admitted.
+                if (node->n_pins >= GGML_MOE_CACHE_MAX_BATCH_ROWS) {
+                    static std::atomic<int> once{0};
+                    if (once.fetch_add(1) == 0) {
+                        fprintf(stderr,
+                                "[moe-cache] PIN OVERFLOW n_pins=%d ceiling=%d n_ids=%d "
+                                "n_tokens=%lld - hit not pinned\n",
+                                node->n_pins, GGML_MOE_CACHE_MAX_BATCH_ROWS,
+                                (int) n_ids, (long long) node->n_tokens);
+                        fflush(stderr);
+                    }
+                } else {
+                    node->pins[node->n_pins++] = {found->second};
+                }
                 if (!no_hits) {
                     slot_indices[index] = found->second;
                 }
