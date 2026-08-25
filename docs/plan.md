@@ -1950,11 +1950,44 @@ without substitution) - but not the predicted *benefit*:
 "no candidate" tail, and coverage eviction made it slightly WORSE, not the
 -3.3pp the simulation predicted (+6.18pp retained mass).
 
-Candidate reasons, untested: the real eviction window is not the
-sample-of-32-take-8 the simulation used; the partner adjacency starts EMPTY and
-only populates while coverage eviction is enabled, so early evictions see
-redundancy 0 for every candidate and degenerate to atlas+heat; and the residency
-regime differs. Kept behind the flag, off by default, pending diagnosis.
+Two implementation defects were found and FIXED, and it still does not
+reproduce: the partner adjacency was only populated while the flag was on (so
+it was empty exactly when the cache first fills), and the third signal was
+`weighted_heat` where the simulation used the ROUTER SCORE EMA - a quantity
+`plan()` cannot see, since it receives ids and never gate weights. After both
+fixes:
+
+| eviction | decline rate | hit rate |
+|---|---|---|
+| LRU | **18.39%** | 0.2895 |
+| coverage+atlas+heat | 18.93% | 0.2824 |
+| coverage+atlas only | 18.77% | 0.2791 |
+
+**ROOT CAUSE: the simulation modelled a different eviction architecture.**
+
+```
+MOE_CACHE_EVICT_WINDOW = 8
+moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head)
+lru_head = "probation segment (new/one-off admissions)"
+```
+
+The real cache only ever considers the PROBATION segment - 8 new/one-off
+admissions. The protected segment (proven-hot experts) is never an eviction
+candidate. The simulation sampled 32 slots at random from the ENTIRE resident
+set and took the 8 stalest, a pool containing hot, well-connected experts -
+and discriminating among those is exactly where the coverage signal earns its
++6.18pp. In the real system every candidate is a fresh one-off admission with
+near-identical redundancy, so the ranking has nothing to separate.
+
+The +6.18pp was real for the architecture simulated. Realising it would mean
+letting eviction consider the protected segment too, which changes LFRU's
+central guarantee and is a much larger design change than a ranking tweak.
+
+**Lesson**: an offline policy simulation must model the candidate SET the real
+policy sees, not just the scoring function. Every eviction result in this
+document that used the sample-of-32 pool inherits this caveat.
+
+Kept behind `GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1`, off by default.
 
 ## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
 

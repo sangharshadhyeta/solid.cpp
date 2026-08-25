@@ -1293,9 +1293,20 @@ static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache
     std::sort(order, order + n, [&](int a, int b){ return cands[a].align < cands[b].align; });
     for (int r = 0; r < n; r++) total[order[r]] += 0.5 * r;
     // coldest first (weight 0.5)
-    for (int i = 0; i < n; i++) order[i] = i;
-    std::sort(order, order + n, [&](int a, int b){ return cands[a].heat < cands[b].heat; });
-    for (int r = 0; r < n; r++) total[order[r]] += 0.5 * r;
+    // NOTE: the simulation's third signal was the ROUTER SCORE EMA, which the
+    // cache cannot see - plan() receives ids, never the gate weights. Heat is a
+    // proxy for it and may not behave the same, so its weight is tunable and
+    // can be set to 0 to test the coverage+atlas pair the simulation scored at
+    // +5.01pp on its own.
+    static const double heat_w = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_COVERAGE_HEAT_W");
+        return e ? atof(e) : 0.5;
+    }();
+    if (heat_w != 0.0) {
+        for (int i = 0; i < n; i++) order[i] = i;
+        std::sort(order, order + n, [&](int a, int b){ return cands[a].heat < cands[b].heat; });
+        for (int r = 0; r < n; r++) total[order[r]] += heat_w * r;
+    }
 
     int best = 0;
     for (int i = 1; i < n; i++) {
@@ -5632,7 +5643,13 @@ static int moe_cache_plan(
                 const moe_cache_key ka{node->host_base, ids[a]};
                 const moe_cache_key kb{node->host_base, ids[b]};
                 const uint32_t n = ++device.co_activation[moe_cache_edge_undirected(ka, kb)];
-                if (moe_cache_coverage_evict_enabled()) {
+                {
+                    // Populated unconditionally: gating this on the eviction
+                    // flag left the adjacency EMPTY at the moment the cache
+                    // first fills, so every candidate scored redundancy 0 and
+                    // the coverage term silently contributed nothing exactly
+                    // when it mattered most. Cost is one bounded vector per
+                    // expert.
                     auto add_partner = [&](const moe_cache_key & self, int32_t other) {
                         auto & v = device.partners[self];
                         if (v.size() >= MOE_CACHE_MAX_PARTNERS) return;
