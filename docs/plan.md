@@ -1454,6 +1454,50 @@ Untested and now the obvious next step: **combinations** - coverage as primary
 tie-break with atlas or router score as a secondary, since the three positive
 signals may be capturing different structure.
 
+## Combined eviction signals — all three, softly (2026-08-25)
+
+Once retested in the tie-break shape, three signals are positive (coverage
++4.18pp, atlas +1.20pp, router score +0.70pp). Combined at 1.2% residency, LRU
+narrowing a 32-sample to its M=8 stalest:
+
+| combination | hit | no candidate | retained | vs LRU |
+|---|---|---|---|---|
+| coverage | 36.89% | 14.48% | 82.48% | +4.18pp |
+| coverage+atlas | 38.54% | 13.57% | 83.31% | +5.01pp |
+| coverage+score | 36.80% | 14.42% | 83.17% | +4.87pp |
+| atlas+score | 38.08% | 14.78% | 82.64% | +4.34pp |
+| **all three (rank-sum)** | 37.56% | **13.35%** | **84.23%** | **+5.93pp** |
+
+Every pair beats its members and the triple beats every pair, so the three are
+capturing different structure rather than restating one signal.
+
+### A hierarchy was tried and LOST
+
+Reasoning said coverage should be a hard VETO (never evict the sole resident
+representative of a neighbourhood), then atlas for relevance, then score for
+value. Measured:
+
+| policy | retained | vs LRU |
+|---|---|---|
+| rank-sum of all three | 84.23% | +5.93pp |
+| coverage veto -> LRU | 78.31% | +0.02pp |
+| coverage veto -> atlas -> score | 78.82% | +0.52pp |
+| coverage veto -> score -> atlas | 79.30% | +1.01pp |
+
+**The veto is worth nothing.** It only excludes redundancy == 0, and at 1.2%
+residency almost nothing has zero redundancy, so it rarely fires and the policy
+degenerates to LRU.
+
+**Redundancy's value is in its GRADIENT, not its extreme.** "How redundant"
+carries signal across its whole range; "is it the very last one" is a threshold
+that almost never trips. Promoting a graded signal to a hard rule destroys the
+part doing the work - the same failure mode as testing signals as whole
+policies, one level down.
+
+Untested refinement: WEIGHTED rank-sum, with coverage weighted above atlas and
+score to reflect their individual strengths, which keeps every gradient while
+respecting that they are not equally informative.
+
 ## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
 
 Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
