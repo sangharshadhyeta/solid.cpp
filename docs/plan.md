@@ -1100,6 +1100,23 @@ accounting, batched-vs-single kernel, dispatch-time re-check) came back clean.
 Admissions into a small pool also force evictions, so eviction racing with
 in-flight use is the leading remaining candidate.
 
+**The corruption needs ONLY the host->device copy.** With
+`GGML_CUDA_MOE_CACHE_FAIL=dispatch` the cache never runs a kernel, and it still
+corrupts; with `FAIL=insert` (never admits) it is clean. So the sole remaining
+GPU action - an H2D `cudaMemcpyAsync` into the slab, followed by
+`cudaStreamSynchronize` - is sufficient to corrupt model weights.
+
+Also excluded under a VALID control (`--moe-cache N`, not the env var):
+- evictions: `--moe-cache 4096` corrupts with **evictions = 0**
+- weight repacking: `--no-repack` does not help, and explicit modes already
+  disable it
+- host pinning: `HOSTREG_MB=0` does not help
+- speculative eviction: `SPEC_EVICT_MODE=off` does not help
+- slab sizing: `n_slots` is set from the FINAL `slot_count` after the
+  allocation retry loop, so the bounds check matches the allocation
+- fill/dispatch race: the fill does `cudaStreamSynchronize` before marking the
+  slot valid, and `serial_fill` defaults true with a single worker
+
 Checked and NOT the cause: the fill copy overruns its slot. `job.bytes` is
 carried from the node while the destination stride is `pool->expert_size`, and
 nothing validated they agree - a real missing check, now added and logging
