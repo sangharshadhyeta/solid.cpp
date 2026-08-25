@@ -176,6 +176,13 @@ struct moe_cache_pool {
     // Maintained only through moe_cache_map_insert/erase, under the same lock
     // as `map`, so the two cannot drift; moe_cache_mask_audit() proves it.
     std::unordered_map<const void *, std::vector<uint64_t>> resident_mask;
+
+    // Canary allocated immediately after the slab, filled with a known pattern.
+    // If a fill writes past its slot the canary is the first thing after the
+    // slab in the allocator's address space, so it catches an overrun that the
+    // in-bounds arithmetic cannot see. GGML_CUDA_MOE_CACHE_CANARY=1.
+    char * canary = nullptr;
+    size_t canary_bytes = 0;
     int lru_head = -1;       // probation segment (new/one-off admissions)
     int lru_tail = -1;
     int protected_head = -1; // protected segment (proven hot: re-requested at least once while resident)
@@ -2557,6 +2564,22 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         // which corrupts whatever VRAM follows and is invisible to every
         // read-side check, because the slot it was asked about still reads
         // back correctly. Refuse the fill instead, loudly.
+        if (pool && getenv("GGML_CUDA_MOE_CACHE_LOG_FILLS")) {
+            static std::atomic<int> nlog{0};
+            const int k = nlog.fetch_add(1, std::memory_order_relaxed);
+            if (k < 40) {
+                const char * slab_end = pool->slab + (size_t) pool->n_slots * pool->expert_size;
+                const char * dst_end  = destination ? destination + job.bytes : nullptr;
+                fprintf(stderr, "[moe-cache] FILL #%d pool=%d slot=%d/%d slab=%p end=%p "
+                        "dst=%p dst_end=%p bytes=%zu stride=%zu %s\n",
+                        k, job.pool, job.slot, pool->n_slots,
+                        (void*)pool->slab, (void*)slab_end, (void*)destination, (void*)dst_end,
+                        job.bytes, pool->expert_size,
+                        (destination && dst_end && destination >= pool->slab && dst_end <= slab_end)
+                            ? "in-bounds" : "*** OUT OF BOUNDS ***");
+            }
+        }
+
         if (error == cudaSuccess && pool && job.bytes > pool->expert_size) {
             static std::atomic<int> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 20) {
@@ -2666,6 +2689,22 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     slot.generation == job.generation && slot.key == job.key) {
                     if (error == cudaSuccess) {
                         slot.state = moe_cache_slot_state::valid;
+                        if (pool && pool->canary) {
+                            static std::atomic<int> creport{0};
+                            std::vector<char> back(pool->canary_bytes);
+                            if (cudaMemcpy(back.data(), pool->canary, pool->canary_bytes,
+                                           cudaMemcpyDeviceToHost) == cudaSuccess) {
+                                size_t bad = 0, first = pool->canary_bytes;
+                                for (size_t i = 0; i < back.size(); i++) {
+                                    if (back[i] != (char)0xA5) { if (!bad) first = i; bad++; }
+                                }
+                                if (bad && creport.fetch_add(1, std::memory_order_relaxed) < 10) {
+                                    fprintf(stderr, "[moe-cache] *** CANARY CORRUPTED *** after fill slot=%d: "
+                                            "%zu/%zu bytes changed, first at +%zu\n",
+                                            job.slot, bad, pool->canary_bytes, first);
+                                }
+                            }
+                        }
                         // Fresh admission - starts in probation regardless
                         // of how many pre-admission misses it took to get
                         // here (that's a different signal from "reused
@@ -3066,6 +3105,21 @@ static bool moe_cache_allocate_pool(
         pool->wtype = shape.wtype;
         pool->slab = slab;
         pool->n_slots = (int)slot_count;
+        if (getenv("GGML_CUDA_MOE_CACHE_CANARY")) {
+            const size_t cb = 1u << 20;
+            char * canary = nullptr;
+            if (cudaMalloc((void **)&canary, cb) == cudaSuccess) {
+                std::vector<char> pattern(cb, (char)0xA5);
+                if (cudaMemcpy(canary, pattern.data(), cb, cudaMemcpyHostToDevice) == cudaSuccess) {
+                    pool->canary = canary; pool->canary_bytes = cb;
+                    fprintf(stderr, "[moe-cache] CANARY armed: slab=%p..%p (%zu slots x %zu B) canary=%p+%zu\n",
+                            (void*)slab, (void*)(slab + slot_count*shape.expert_size),
+                            slot_count, shape.expert_size, (void*)canary, cb);
+                } else {
+                    cudaFree(canary);
+                }
+            }
+        }
         pool->slots.resize(slot_count);
         pool->free_slots.reserve(slot_count);
         pool->map.reserve(slot_count);
