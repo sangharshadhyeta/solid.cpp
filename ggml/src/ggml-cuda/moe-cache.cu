@@ -2943,6 +2943,28 @@ static bool moe_cache_prepare_budget(
 
     device.budget_limit = std::max(available, committed);
 
+    // An EXPLICIT budget is a hard ceiling. The never-shrink-below-committed
+    // rule above exists so a live re-check landing under what is already
+    // allocated cannot make the cache inert (see its comment), but it also let
+    // an explicit GGML_CUDA_MOE_CACHE_BUDGET_MB ratchet upward: once pools grew
+    // past the budget, `committed` exceeded it and max() adopted the overrun as
+    // the new limit. Measured: BUDGET_MB=256 and 3413 both peaked at 11,797 MiB
+    // - the knob did nothing at all.
+    //
+    // Growth is what escapes the budget: moe_cache_grow_device() cudaMallocs
+    // without consulting budget_limit, so the ceiling has to be reasserted here
+    // on every re-check rather than trusted to hold from pool creation.
+    if (session.config.budget_mb > 0) {
+        const size_t hard = session.config.budget_mb << 20;
+        if (device.budget_limit > hard) {
+            if (first_check) {
+                MOE_CACHE_LOG("[moe-cache] CUDA%d budget capped to %zu MiB by "
+                        "GGML_CUDA_MOE_CACHE_BUDGET_MB\n", device.physical, hard >> 20);
+            }
+            device.budget_limit = hard;
+        }
+    }
+
     if (!first_check && available != previous_limit) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d cache budget re-evaluated: %zu -> %zu MiB (%zu MiB free, %zu MiB already cached)\n",
                 device.physical, previous_limit >> 20, available >> 20,
@@ -3565,6 +3587,36 @@ static void moe_cache_session_destroy(void * opaque) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
+    }
+
+    // Residency readback. /experts gives this on the server, but a
+    // non-server binary (llama-perplexity, llama-bench) had no way to report
+    // where the cache actually landed - which made a residency sweep
+    // unmeasurable: RESERVE_MB was used as a proxy without any way to confirm
+    // it produced a graded ladder, and it did not (one arm allocated nothing
+    // at all and its null result was mistaken for a low-residency datapoint).
+    // fprintf, not MOE_CACHE_LOG, because the server installs a ggml log
+    // callback that drops GGML_LOG_INFO.
+    if (getenv("GGML_CUDA_MOE_CACHE_SUMMARY")) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            const moe_cache_device & d = *device_ptr;
+            size_t used = 0, total = 0;
+            for (const auto & pool_ptr : d.pools) {
+                total += (size_t) pool_ptr->n_slots;
+                used  += (size_t) pool_ptr->n_slots - pool_ptr->free_slots.size();
+            }
+            const long long lookups = d.hits + d.misses;
+            fprintf(stderr, "[moe-cache] SUMMARY CUDA%d slots=%zu/%zu (%.2f%% of pool) "
+                    "allocated=%zu MiB budget=%zu MiB hits=%lld misses=%lld hit_rate=%.4f "
+                    "substitutions=%lld declined=%lld evictions=%lld fills_failed=%lld\n",
+                    d.physical, used, total,
+                    total ? 100.0 * (double) used / (double) total : 0.0,
+                    d.allocated_bytes >> 20, d.budget_limit >> 20,
+                    d.hits, d.misses,
+                    lookups ? (double) d.hits / (double) lookups : 0.0,
+                    d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+        }
     }
 
     {
