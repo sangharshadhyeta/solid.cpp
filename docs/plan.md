@@ -1117,6 +1117,21 @@ Also excluded under a VALID control (`--moe-cache N`, not the env var):
 - fill/dispatch race: the fill does `cudaStreamSynchronize` before marking the
   slot valid, and `serial_fill` defaults true with a single worker
 
+**CUDA graphs: properly rejected at last (2026-08-25).** Rejected twice before
+on fake controls; re-run with `--moe-cache off` as the control:
+
+```
+cache 512, graphs ON (default) : train=DEGEN  halting=DEGEN
+cache 512, GRAPHS DISABLED     : train=DEGEN  halting=DEGEN
+cache OFF, graphs ON (CONTROL) : train=clean  halting=clean
+```
+
+**The "trigger prompt" was never special.** At 512 MiB the halting prompt
+degenerates too. A smaller cache churns admissions faster, so corruption
+arrives sooner; larger caches merely delay it. Any framing that treats one
+prompt as the trigger is wrong - what matters is how many admissions have
+happened.
+
 **Fill logging + VRAM canary: the copy is provably correct.**
 `GGML_CUDA_MOE_CACHE_LOG_FILLS=1` logs every fill's slab range, destination and
 size; `GGML_CUDA_MOE_CACHE_CANARY=1` allocates a 1 MiB 0xA5-filled buffer right

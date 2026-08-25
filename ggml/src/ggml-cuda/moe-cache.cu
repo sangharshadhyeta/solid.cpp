@@ -2659,7 +2659,17 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 }
             }
             if (error == cudaSuccess && direct) {
-                error = cudaMemcpyAsync(
+                // GGML_CUDA_MOE_CACHE_SKIP_COPY=1: keep every bit of bookkeeping
+                // (slot allocation, state machine, map/bitmask, pins) but never
+                // touch device memory. Combined with FAIL=dispatch the cached
+                // bytes are never read either, so if corruption SURVIVES this
+                // the fault is in the bookkeeping, and if it VANISHES the fault
+                // is the copy operation itself.
+                static const bool skip_copy = [] {
+                    const char * e = getenv("GGML_CUDA_MOE_CACHE_SKIP_COPY");
+                    return e && atoi(e) != 0;
+                }();
+                error = skip_copy ? cudaSuccess : cudaMemcpyAsync(
                         destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
@@ -5178,8 +5188,20 @@ static int moe_cache_plan(
                 // from eviction churn. Heat then decides how long that
                 // protection actually lasts, at the next decay sweep.
                 moe_cache_promote_to_protected(device, pool, found->second);
+                // GGML_CUDA_MOE_CACHE_NO_HITS=1: do every bit of accounting a
+                // hit normally does (heat, promotion, pin, counters) but never
+                // report the hit to the caller, so ggml-cpu.c routes the row
+                // through the ordinary CPU path instead of the compact arrays.
+                // Splits "plan()'s internal bookkeeping" from "the row-routing
+                // that a reported hit triggers".
+                static const bool no_hits = [] {
+                    const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_HITS");
+                    return e && atoi(e) != 0;
+                }();
                 node->pins[node->n_pins++] = {found->second};
-                slot_indices[index] = found->second;
+                if (!no_hits) {
+                    slot_indices[index] = found->second;
+                }
                 moe_cache_verify_slot(pool, found->second, key, device.physical);
                 device.hits++;
                 device.rank_hits[rank_bucket]++;
