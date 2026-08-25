@@ -2202,3 +2202,74 @@ graph capture state.
 - `GGML_SCHED_PREFETCH_EXPERTS` VRAM wiring: real measured cost (820 MiB)
   reserved additively in `fit.cpp`'s margin. Commit `3417a616b`. Feature
   itself still ships off by default — this only makes it safe to opt into.
+
+## Fast, reliable, content-independent reproducer found (properly verified)
+
+Three days of chasing a single-prompt, single-sequence trigger just gave way
+to something much simpler: **4 concurrent long-generation requests, on
+completely unrelated benign prompts, corrupt reliably at full speed with no
+special prompt content at all.**
+
+Verified twice, the second time with full rigor (fresh restart, PID change
+confirmed, a single request checked clean BEFORE the real test, so this is
+not carrying state from a prior arm):
+
+```
+--moe-cache 512, fresh server, born-clean confirmed, then 4 concurrent
+requests (Roman Empire essay / how computers work / water cycle / mountain
+journey, 500 tokens each, --parallel default 4):
+
+A slot=0 elapsed=19.31s -> ////////... (DEGEN)
+B slot=1 elapsed=19.31s -> ////////... (DEGEN)
+C slot=2 elapsed=19.31s -> ////////... (DEGEN)
+D slot=3 elapsed=19.31s -> ////////... (DEGEN)
+```
+
+All four slots, all four completely different prompts, corrupted at the
+**same elapsed time to the hundredth of a second**. That is not four
+independent failures - it is one shared piece of state breaking and
+instantly poisoning every concurrently-batched sequence at once.
+
+**A single 4-way SHORT concurrent burst (64 tokens each) does NOT reproduce
+it** - same prompts pattern, same slot spread, all four came back clean. So
+short concurrency alone is insufficient; sustained/longer concurrent
+exposure is required. This points at a genuine race whose window is normally
+too narrow to hit, opened wide enough by either (a) heavy instrumentation
+slowdown (compute-sanitizer reproduced it on a single BENIGN short prompt,
+no concurrency needed at all - see below) or (b) enough real concurrent
+decode duration at full speed.
+
+**Directly ties to the earlier TSan finding**: `ggml_compute_forward_mul_mat_id`
+(ggml-cpu.c) runs a two-phase quantize-then-dot-product pattern against a
+SHARED `wdata` scratch buffer covering the WHOLE combined ubatch when
+multiple sequences are batched together (continuous batching's normal
+behavior). TSan flagged a real race between the quantize-write phase
+(`quantize_row_q8_K`) and the dot-product-read phase
+(`ggml_vec_dot_q4_K_q8_K`) inside this exact function, though a structural
+read of the barrier between them (ggml-cpu.c:~1806) didn't reveal how it
+happens, and a same-thread reentrancy guard around the two moe-cache lock
+sites the TSan stack named found zero violations - so the mechanism is not
+confirmed, but the SHARED-BUFFER-ACROSS-CONCURRENT-SEQUENCES shape is exactly
+consistent with "one race hit corrupts every sequence in that ubatch
+simultaneously," which is precisely what this reproducer shows.
+
+**Also reproduced under compute-sanitizer with NO concurrency needed at
+all**: a single benign "Name three primary colours" request, run alone
+(sequential, not concurrent) under `--tool memcheck`'s heavy per-kernel
+instrumentation, produced literal `////` output too (verified against raw
+response content, not just the classifier). Memcheck itself found zero
+out-of-bounds/uninitialized-read violations through that run - so whatever
+this is, it isn't the specific violation classes memcheck checks for. This
+independently confirms that TIMING ALONE (no concurrency) is also
+sufficient, given enough distortion - concurrency and slowdown are two
+different ways of reaching the same underlying race.
+
+**Next steps**: (1) use this fast reproducer (~20s, not minutes) to iterate
+far faster than the old sequential trigger ever allowed - re-run every
+existing instrument (NAN_PROBE, IDENTITY routing probe, GROWTH_LOG,
+COLLECT_BOUNDS) against 4-way concurrent long generation instead of the slow
+single-sequence trigger; (2) chase the ggml-cpu.c mul_mat_id barrier logic
+specifically under REAL multi-sequence concurrent load (not warmup, not
+sequential) - the TSan report analyzed so far was largely from warmup and a
+single sequential trigger run, never from genuine concurrent decode traffic
+hitting the shared wdata buffer this reproducer implicates directly.
