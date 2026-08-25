@@ -1584,6 +1584,53 @@ training distribution), verified BEFORE comparing substitution on/off. Until
 then the UD-quant interaction with substitution is unmeasured, and the 2-bit
 GLM plan rests on an untested assumption.
 
+## How to combine eviction signals — four forms tried (2026-08-25)
+
+Criticism that prompted this: sum vs product was being chosen by result rather
+than by what the quantities mean. Correct, and worth resolving properly.
+
+The eviction decision should minimise expected future loss:
+
+```
+Loss(evict X) = P(X requested soon) x value(X) x P(no good substitute)
+```
+
+which is a product of probabilities, i.e. a SUM OF LOG-PROBABILITIES. So
+addition and multiplication are the same model in different spaces; what was
+genuinely arbitrary was combining raw RANKS, which are neither. Also noted:
+recency is itself an estimator of P(requested soon), so treating LRU as a
+separate narrowing stage rather than a factor was a modelling error.
+
+Results, all at 1.2% residency:
+
+| form | vs LRU |
+|---|---|
+| hierarchy (coverage veto -> relevance -> value) | +0.02 to +1.01pp |
+| product of raw quantities | +4.72 to +4.84pp |
+| calibrated log-additive expected loss | **-9.51pp** |
+| **weighted rank-sum (heuristic)** | **+6.18pp** |
+
+**Why the principled forms lost - both times it was the inputs, not the form.**
+The product let whichever factor had the widest dynamic range dominate (score
+EMA spans orders of magnitude, cosine is bounded in [-1,1], redundancy is a
+small integer), silently discarding two of three signals. The log-additive
+model was calibrated with a 2000-decision reuse window, which turned out to be
+so long that P(reused) sits between 0.86 and 0.99 - almost everything returns,
+so the term carries nearly no information and the value term takes over.
+Recency's predictive content is not WHETHER an expert returns but HOW SOON.
+
+**Why rank-sum keeps winning**: ranks are invariant to miscalibration. Every
+principled form needs its inputs correctly scaled or calibrated, and that
+requirement was violated both times. Rank aggregation needs only each signal's
+ORDERING to be informative - a much weaker condition, and the one these signals
+actually meet.
+
+That is not a claim that rank-sum is theoretically superior. It is the right
+tool for three signals of unknown calibration, which is the situation here. A
+log-additive model remains the better target IF the factors are calibrated
+properly - and the failure above shows the calibration, especially the reuse
+window, is where the work is.
+
 ## Signal weighting and orthogonality — the eviction recipe (2026-08-25)
 
 A flat 3-way rank-sum lets coverage be outvoted 2:1 by atlas and score, which
