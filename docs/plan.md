@@ -1351,6 +1351,49 @@ of each active group resident, rather than the k hottest individuals.
 4. Scale validation: 4,713 units here, low cells only 28-117 slots. Whether a
    750B model's hot core stays this compact is untested.
 
+## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
+
+Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
+policies, but every one was scored on getting the RIGHT expert resident. This
+asks instead for COVERAGE - keep at least one viable stand-in reachable.
+
+Signal: **redundancy** - how many of an expert's co-firing partners are still
+resident. Evict the most redundant; protect the sole resident representative of
+a neighbourhood.
+
+**As a whole policy it is catastrophic**: no-candidate rises 12-18pp and hit
+rate collapses (24% vs LRU's 71% at 5% residency). Redundancy correlates with
+being well-connected, which is the hot core, so "evict the most redundant"
+evicts precisely the experts that both get hit and serve as stand-ins.
+
+**As a tie-break inside LRU it wins.** LRU narrows a 32-candidate sample to its
+M stalest; redundancy picks the most redundant of those. M=1 is pure LRU:
+
+| resident | M | hit | no candidate | retained mass |
+|---|---|---|---|---|
+| 2.5% | 1 | 54.51% | 8.05% | 89.33% |
+| 2.5% | 8 | 51.29% | **6.17%** | **92.01%** (+2.68pp) |
+| 1.2% | 1 | 39.70% | 17.69% | 78.29% |
+| 1.2% | 8 | 36.90% | **14.44%** | **82.52%** (+4.23pp) |
+
+It LOSES hit rate (-2.8pp) and WINS retained gate mass (+4.23pp) by cutting the
+no-candidate tail. That is the trade section 1 of the design argument says is
+worth taking, and it is invisible to any hit-rate-scored experiment - which is
+why six previous signals missed it.
+
+Two properties that matter:
+- **The gain grows as residency falls** (+2.68pp at 2.5%, +4.23pp at 1.2%) -
+  the direction needed for the GLM-scale case at ~1.5% residency.
+- **Monotone in M** up to 8, so the optimum has not been found; M>8 untested.
+
+Same structural lesson as anti-co-firing: a signal that is destructive as a
+whole policy can still be useful as a tie-break inside recency. The difference
+is that this one survives the tie-break test and anti-co-firing did not.
+
+Not yet implemented in the cache - this is a simulation result on
+`traces/big-*.txt`, and it needs the per-expert resident-partner count
+maintained cheaply on the eviction path before it could ship.
+
 ## Cache-size sweep — stand-in quality holds as residency collapses (2026-08-25)
 
 The question behind the GLM-scale vision: extract a small working set of a huge
