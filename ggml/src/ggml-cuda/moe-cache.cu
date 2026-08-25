@@ -1588,12 +1588,54 @@ static bool moe_cache_grow_device(
         return false;
     }
 
+    // GGML_CUDA_MOE_CACHE_GROWTH_LOG=1: this cudaMalloc/cudaFree pair runs
+    // synchronously on the DECODE thread, from moe_cache_dispatch, whenever a
+    // batch's real row count exceeds every previous one - not at build time,
+    // not on the fill worker. cudaMalloc during active CUDA graph capture is
+    // documented as unsafe; this is the one call site in the whole file that
+    // fires conditionally, exactly when a batch is bigger than any seen
+    // before, which is exactly the shape of "first n_tokens=4 batch, or first
+    // dispatch of a new tensor's (n_in,n_out) shape, corrupts". Logs whether
+    // a CUDA graph capture is active on our own compute_stream at this exact
+    // moment - the direct test, not an inference from timing.
+    static const bool growth_log = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_GROWTH_LOG");
+        return e && atoi(e) != 0;
+    }();
+    if (growth_log) {
+        cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+        cudaError_t cap_err = device.compute_stream
+            ? cudaStreamIsCapturing(device.compute_stream, &capture_status)
+            : cudaErrorInvalidValue;
+        fprintf(stderr, "[moe-cache] GROWTH op=%s old_cap=%zu required=%zu "
+                "compute_stream=%p capturing=%s(err=%d)\n",
+                operation, capacity, required, (void *) device.compute_stream,
+                cap_err == cudaSuccess
+                    ? (capture_status == cudaStreamCaptureStatusActive ? "ACTIVE" : "none")
+                    : "unknown",
+                (int) cap_err);
+        fflush(stderr);
+    }
+
     const size_t requested = required * 2 + 256;
     void * fresh = nullptr;
     if (!moe_cache_cuda_ok(device, cudaMalloc(&fresh, requested), operation, false)) {
         return false;
     }
     if (*pointer) {
+        // GGML_CUDA_MOE_CACHE_GROWTH_SYNC=1: synchronize our own compute_stream
+        // before freeing the OLD scratch buffer, so any kernel/copy still
+        // reading it (queued earlier on this same stream, or from elsewhere)
+        // is provably finished first. Independent of the graph-capture theory
+        // (already excluded: GRAPHS DISABLED still corrupts) - this tests
+        // whether growth's free/realloc itself races an in-flight reader.
+        static const bool growth_sync = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_GROWTH_SYNC");
+            return e && atoi(e) != 0;
+        }();
+        if (growth_sync && device.compute_stream) {
+            cudaStreamSynchronize(device.compute_stream);
+        }
         cudaFree(*pointer);
     }
     *pointer = fresh;

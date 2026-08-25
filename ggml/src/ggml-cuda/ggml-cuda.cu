@@ -4656,6 +4656,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    if (getenv("GGML_CUDA_GRAPH_VERIFY_LOG")) {
+        static std::atomic<long long> n{0};
+        if (n.fetch_add(1) < 5000) {
+            fprintf(stderr, "[cuda-graph-verify] call=%lld use_cuda_graph=%d "
+                    "update_required=%d disable_env=%s\n",
+                    (long long) n.load(), (int) use_cuda_graph, (int) cuda_graph_update_required,
+                    getenv("GGML_CUDA_DISABLE_GRAPHS") ? "SET" : "unset");
+            fflush(stderr);
+        }
+    }
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
