@@ -1248,42 +1248,58 @@ static bool moe_cache_coverage_evict_enabled() {
 // moe_cache_coverage_evict_enabled.
 static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache_pool & pool, int head) {
     struct cand_t { int slot; int redundancy; double align; double heat; };
-    cand_t cands[MOE_CACHE_EVICT_WINDOW];
+    // Candidates from BOTH segments. The heat-only scan walks probation alone,
+    // so every candidate is a fresh one-off admission with near-identical
+    // redundancy and the coverage ranking has nothing to discriminate - which
+    // is why ranking probation-only did not reproduce the offline +6.18pp. The
+    // simulation's pool was the whole resident set, hot experts included, and
+    // telling those apart is where coverage earns its gain.
+    //
+    // This DELIBERATELY makes protected slots evictable, which weakens LFRU's
+    // guarantee that a proven-hot expert stays resident. That is the trade the
+    // coverage objective asks for: it gives up hit rate to keep a viable
+    // stand-in reachable. Off by default, behind COVERAGE_EVICT.
+    cand_t cands[2 * MOE_CACHE_EVICT_WINDOW];
     int n = 0;
-    for (int c = head; c >= 0 && n < MOE_CACHE_EVICT_WINDOW; c = pool.slots[c].next) {
-        if (pool.slots[c].readers > 0) {
-            continue;
-        }
-        const moe_cache_slot & slot = pool.slots[c];
-        int redundancy = 0;
-        const auto pit = device.partners.find(slot.key);
-        if (pit != device.partners.end()) {
-            for (int32_t other : pit->second) {
-                if (pool.map.find(moe_cache_key{slot.key.tensor, other}) != pool.map.end()) {
-                    redundancy++;
+    const int heads[2] = { head, pool.protected_head };
+    for (int h = 0; h < 2; h++) {
+        int taken = 0;
+        for (int c = heads[h]; c >= 0 && taken < MOE_CACHE_EVICT_WINDOW; c = pool.slots[c].next) {
+            if (pool.slots[c].readers > 0) {
+                continue;
+            }
+            taken++;
+            const moe_cache_slot & slot = pool.slots[c];
+            int redundancy = 0;
+            const auto pit = device.partners.find(slot.key);
+            if (pit != device.partners.end()) {
+                for (int32_t other : pit->second) {
+                    if (pool.map.find(moe_cache_key{slot.key.tensor, other}) != pool.map.end()) {
+                        redundancy++;
+                    }
                 }
             }
-        }
-        double align = 0.0;
-        if (device.req_dir_valid) {
-            const auto ait = device.atlas.find(slot.key);
-            if (ait != device.atlas.end()) {
-                const double mx = device.req_dir_x, my = device.req_dir_y;
-                const double m = std::sqrt(mx*mx + my*my);
-                const double cl = std::sqrt((double)ait->second.x*ait->second.x +
-                                            (double)ait->second.y*ait->second.y);
-                if (m > 1e-9 && cl > 1e-9) {
-                    align = (ait->second.x*mx + ait->second.y*my) / (m*cl);
+            double align = 0.0;
+            if (device.req_dir_valid) {
+                const auto ait = device.atlas.find(slot.key);
+                if (ait != device.atlas.end()) {
+                    const double mx = device.req_dir_x, my = device.req_dir_y;
+                    const double m = std::sqrt(mx*mx + my*my);
+                    const double cl = std::sqrt((double)ait->second.x*ait->second.x +
+                                                (double)ait->second.y*ait->second.y);
+                    if (m > 1e-9 && cl > 1e-9) {
+                        align = (ait->second.x*mx + ait->second.y*my) / (m*cl);
+                    }
                 }
             }
+            cands[n++] = { c, redundancy, align, moe_cache_weighted_heat(device, slot) };
         }
-        cands[n++] = { c, redundancy, align, moe_cache_weighted_heat(device, slot) };
     }
     if (n == 0) {
         return -1;
     }
-    double total[MOE_CACHE_EVICT_WINDOW] = {};
-    int order[MOE_CACHE_EVICT_WINDOW];
+    double total[2 * MOE_CACHE_EVICT_WINDOW] = {};
+    int order[2 * MOE_CACHE_EVICT_WINDOW];
     // most redundant first (weight 1.0)
     for (int i = 0; i < n; i++) order[i] = i;
     std::sort(order, order + n, [&](int a, int b){ return cands[a].redundancy > cands[b].redundancy; });
