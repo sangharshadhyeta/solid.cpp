@@ -6302,6 +6302,23 @@ static int moe_cache_dispatch(
         return 0;
     }
 
+    // GGML_CUDA_MOE_CACHE_DISPATCH_DELAY_US=N: artificial delay right at
+    // dispatch entry, before any real work. Tests directly whether merely
+    // SLOWING this window (the way compute-sanitizer's per-launch
+    // instrumentation does, incidentally, as a side effect of what it's
+    // actually checking) reproduces corruption on its own - a fast,
+    // controlled way to test a timing-dependent theory without the hours of
+    // sanitizer/TSan overhead.
+    {
+        static const long delay_us = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_DISPATCH_DELAY_US");
+            return e ? atol(e) : 0;
+        }();
+        if (delay_us > 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+        }
+    }
+
     moe_cache_session & session = *node->session;
     moe_cache_device & device = *node->device;
     moe_cache_pool & pool = *node->pool;
