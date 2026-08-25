@@ -1117,6 +1117,28 @@ Also excluded under a VALID control (`--moe-cache N`, not the env var):
 - fill/dispatch race: the fill does `cudaStreamSynchronize` before marking the
   slot valid, and `serial_fill` defaults true with a single worker
 
+**Fill logging + VRAM canary: the copy is provably correct.**
+`GGML_CUDA_MOE_CACHE_LOG_FILLS=1` logs every fill's slab range, destination and
+size; `GGML_CUDA_MOE_CACHE_CANARY=1` allocates a 1 MiB 0xA5-filled buffer right
+after each slab and re-checks it after every completed fill.
+
+```
+CANARY armed: slab=0x7f8e05600000..0x7f8e1f010000 (729 slots x 589824 B)
+FILL #0 pool=0 slot=0/729 dst=0x7f8e05600000 dst_end=0x7f8e05690000
+        bytes=589824 stride=589824 in-bounds
+out-of-bounds fills: 0        canary corruptions: 0        trigger: DEGEN
+```
+
+Every fill is in-bounds, the canary is untouched, and the output still
+corrupts. So the H2D copy writes exactly where it should, with the right size,
+and does not overrun. **Memory overrun is excluded.**
+
+Combined with `FAIL=dispatch` still corrupting (the cache never runs a kernel,
+never serves a row), the remaining surface is very small: pin/unpin bookkeeping,
+the slot state machine, and whatever the CPU dispatch path does differently
+when `moe_cache_node` is non-NULL - notably the dispatch-failure restore of hit
+rows into `matrix_rows`.
+
 Checked and NOT the cause: the fill copy overruns its slot. `job.bytes` is
 carried from the node while the destination stride is `pool->expert_size`, and
 nothing validated they agree - a real missing check, now added and logging
