@@ -1394,6 +1394,41 @@ still corrupts); and row routing (NO_HITS still corrupts).
 **Required**: admissions. `FAIL=insert` is the only cache-enabled configuration
 that is clean.
 
+### 2026-08-25: two more hypotheses built, instrumented and FALSIFIED
+
+**Runtime allocation in the fill worker** (`GGML_CUDA_MOE_CACHE_NO_RT_ALLOC=1`).
+The worker lazily ran `cudaStreamCreate` / `cudaMallocHost` / `cudaFreeHost` -
+all device-wide synchronizing - on a background thread *during decode*,
+concurrently with the main thread's capture and dispatch. It was the only
+channel reached by every corrupting arm and short-circuited by `FAIL=insert`,
+the sole clean one. The flag preallocates stream and a 64 MiB pinned stage at
+worker startup and never allocates again. Verified active
+(`[moe-cache] NO_RT_ALLOC stream=preallocated stage=64 MiB`). **Still DEGEN**,
+byte-identical to control (uniq=0.0017).
+
+**The CPU-side host_ptr redirect** (`GGML_CUDA_MOE_CACHE_NO_HOST_PTR=1`).
+`ggml_compute_forward_mul_mat_id` redirects CPU expert reads to a cache-owned
+host copy. This is the one cache-touched path that SKIP_COPY (device-only),
+FAIL=dispatch (GPU kernel) and NO_HITS (GPU row routing) all leave running, and
+it is gated on admission. **Still DEGEN.**
+
+**Ruled out by reading, not testing**: the persisted selection history
+(`GGML_CUDA_MOE_CACHE_HISTORY` is opt-in, unset, no file on disk - so it is not
+a cross-restart carrier); host promotion's `MADV_DONTNEED` on source pages
+(`moe_cache_host_budget_bytes()` returns 0 by default, so promotion never runs).
+
+**Method fix.** Arms now probe `simple` BEFORE the trigger. Every arm's
+`simple-BEFORE` is clean, which establishes that each fresh server is born
+clean and that **the poisoning does not survive a process restart** - only
+within a server's lifetime. Earlier A/B arms were therefore not contaminated by
+a preceding degenerate arm, but the check is now permanent.
+
+**The sharpened contradiction.** Admissions are necessary, yet *no consumer of
+the cached data matters*: not the device copy, not GPU dispatch, not GPU row
+routing, not the CPU redirect, not runtime allocation. Whatever breaks is in
+the bookkeeping or state machine that admission drives, not in the bytes it
+moves or in anything that reads them.
+
 **Remaining surface**: whatever differs between `llama-server` and
 `llama-perplexity` in how they drive `llama_decode` around an admitting cache. (atlas warming, moe-cache
 as a whole, OOM/VRAM, scratch-capacity overrun, multi-activation mapping). The
