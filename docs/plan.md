@@ -2273,3 +2273,26 @@ specifically under REAL multi-sequence concurrent load (not warmup, not
 sequential) - the TSan report analyzed so far was largely from warmup and a
 single sequential trigger run, never from genuine concurrent decode traffic
 hitting the shared wdata buffer this reproducer implicates directly.
+
+## Kernel-level finding: one confirmed NVRM page-table allocation failure
+
+`dmesg` shows a genuine NVIDIA driver-level fault during this session's heavy
+testing: `[24863.131786] NVRM: failed to allocate page table!` - corresponding
+to wall-clock 2026-08-25 18:41:39, during the earlier VRAM-exhaustion /
+TSan / compute-sanitizer testing window (not correlated with the later
+concurrent-reproducer runs, which happened after 23:00 the same day).
+
+This is a real, driver-level allocation failure, not an application bug -
+worth keeping in mind since a failed page-table allocation for ANY GPU
+context sharing this device (ours or otherwise) could plausibly leave that
+context in a state where later kernels read garbage without any bug in our
+own code. Not established as the cause of the reproducible corruption above
+(no timestamp correlation with the concurrent reproducer's actual failures),
+but a genuine anomaly this investigation hasn't otherwise explained.
+
+Separately: a felt ~1s system-wide input freeze (mouse/keyboard) during the
+4-way concurrent reproducer left no corresponding kernel-log entry. Most
+likely explanation is mundane GPU command-queue contention between our
+compute workload and the desktop compositor sharing one physical GPU under
+heavy concurrent load - a real side effect of the load, not necessarily
+evidence of the same mechanism as the corruption itself.
