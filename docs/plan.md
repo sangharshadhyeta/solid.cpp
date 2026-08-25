@@ -1498,6 +1498,51 @@ Untested refinement: WEIGHTED rank-sum, with coverage weighted above atlas and
 score to reflect their individual strengths, which keeps every gradient while
 respecting that they are not equally informative.
 
+## Signal weighting and orthogonality — the eviction recipe (2026-08-25)
+
+A flat 3-way rank-sum lets coverage be outvoted 2:1 by atlas and score, which
+both measure an INDIVIDUAL expert's worth, while coverage is the only one
+measuring STRUCTURE. Weighting coverage equal to their sum is better:
+
+| weighting (cov, atl, scr) | no candidate | retained | vs LRU |
+|---|---|---|---|
+| 1, 1, 1 (flat sum) | 13.35% | 84.26% | +5.96pp |
+| **1, 0.5, 0.5** (coverage = atlas+score) | **13.06%** | **84.47%** | **+6.18pp** |
+| 3, 1, 1 | 13.33% | 84.02% | +5.73pp |
+| 4, 1, 1 | 13.73% | 83.51% | +5.21pp |
+| 1, 0.5, 0 (drop score) | 13.50% | 83.53% | +5.23pp |
+| 1, 0, 0.5 (drop atlas) | 13.47% | 84.07% | +5.77pp |
+
+Over-weighting coverage past parity HURTS, so this is not "coverage matters
+most" - the balance between structure and individual worth is what matters.
+
+### The three signals are near-ORTHOGONAL
+
+Spearman rank correlation measured on the actual candidate pools they rank
+(n=64,890 pools):
+
+```
+cov~atl   -0.0611      cov~scr   +0.1139      atl~scr   -0.0210
+```
+
+Coverage and atlas are essentially independent, and no pair exceeds |0.11|.
+They measure three different things: **structure** (will the neighbourhood
+survive an eviction), **direction** (where is the request heading), and
+**realised value** (what has this expert been worth lately).
+
+That orthogonality explains the combination results - every pair beats its
+members and the triple beats every pair - and it is why summing recovers more
+than any hierarchy. A correction to an earlier inference in this session:
+the ablation gap (dropping atlas costs -0.41pp, dropping score -0.95pp) was
+read as atlas being redundant with coverage. It is not. At that scale those are
+interaction effects, not evidence of overlap.
+
+**Current best recipe**: LRU narrows a 32-candidate sample to its M=8 stalest,
+then evict by rank-sum with weights coverage 1.0, atlas 0.5, score 0.5.
++6.18pp retained gate mass at 1.2% residency, no-candidate 17.69% -> 13.06%.
+Simulation only; needs a second trace set and more seeds before it justifies
+C++ work.
+
 ## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
 
 Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
