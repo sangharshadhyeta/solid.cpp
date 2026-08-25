@@ -1538,10 +1538,18 @@ static void * incr_ptr_aligned(void ** p, size_t size, size_t align) {
 // the damage became visible; the first node whose *input* is already NaN tells
 // us where it entered, because that input is the previous layer's output.
 static void moe_cache_nan_probe(const char * name, const struct ggml_tensor * src1) {
-    static int on = -1;
+    // A plain `static int` written by whichever thread gets here first (as
+    // this used to be) races every other thread's read of it under the C
+    // memory model - benign in practice since every thread computes the same
+    // value from the same env var, but real UB. _Atomic with acquire/release
+    // makes the redundant-first-computation race defined instead of merely
+    // harmless.
+    static _Atomic int on_cache = -1;
+    int on = atomic_load_explicit(&on_cache, memory_order_acquire);
     if (on == -1) {
         const char * e = getenv("GGML_CUDA_MOE_CACHE_NAN_PROBE");
         on = (e && atoi(e) != 0) ? 1 : 0;
+        atomic_store_explicit(&on_cache, on, memory_order_release);
     }
     if (!on || src1->type != GGML_TYPE_F32) {
         return;
@@ -1567,10 +1575,12 @@ static void moe_cache_nan_probe(const char * name, const struct ggml_tensor * sr
 }
 
 static bool moe_cache_max_tokens_ok(int64_t n_tokens) {
-    static int limit = -2;
+    static _Atomic int limit_cache = -2;
+    int limit = atomic_load_explicit(&limit_cache, memory_order_acquire);
     if (limit == -2) {
         const char * e = getenv("GGML_CUDA_MOE_CACHE_MAX_TOKENS");
         limit = e ? atoi(e) : 0;
+        atomic_store_explicit(&limit_cache, limit, memory_order_release);
     }
     return limit <= 0 || n_tokens <= (int64_t) limit;
 }
@@ -1826,10 +1836,19 @@ static void ggml_compute_forward_mul_mat_id(
         // on an expert having been admitted - which is the single necessary
         // condition for the corruption.
         if (ggml_moe_cache.host_ptr) {
-            static int no_host_ptr = -1;
+            // A plain `static int` written by whichever thread gets here
+            // first (as this used to be) races every other thread's read of
+            // it under the C memory model - benign in practice since every
+            // thread computes the same value from the same env var, but real
+            // UB, caught auditing this exact function for a different bug.
+            // _Atomic with acquire/release makes the redundant-first-write
+            // race defined instead of merely harmless.
+            static _Atomic int no_host_ptr_cache = -1;
+            int no_host_ptr = atomic_load_explicit(&no_host_ptr_cache, memory_order_acquire);
             if (no_host_ptr < 0) {
                 const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_HOST_PTR");
                 no_host_ptr = (e && atoi(e) != 0) ? 1 : 0;
+                atomic_store_explicit(&no_host_ptr_cache, no_host_ptr, memory_order_release);
             }
             if (!no_host_ptr) {
                 const void * cached = ggml_moe_cache.host_ptr(src0->data, (int) cur_a);
