@@ -716,6 +716,42 @@ struct moe_cache_node {
     bool dispatched = false;
 };
 
+// GGML_CUDA_MOE_CACHE_LOCK_TRACE=1: a TSan run flagged "double lock of a
+// mutex" with moe_cache_plan's session.mu acquisition on the stack, reached
+// during model-load warmup via common_context_can_seq_rm. All frames from
+// the mutex constructor down to moe_cache_plan collapsed to one binary
+// offset in the report (inlining), so the "which line exactly" detail isn't
+// trustworthy - but a real same-thread double-lock on a non-recursive
+// std::mutex should self-deadlock, which contradicts the server loading
+// successfully and serving correctly afterward. This directly tests same-
+// thread reentrancy into the two session.mu critical sections the stack
+// implicates (begin() and plan()), independent of exactly which frame TSan
+// attributed it to - if either is entered while this thread already holds
+// one, it logs loudly before the real lock() call, so it is visible even if
+// the underlying mutex behavior turns out to mask the reentrancy.
+static thread_local int g_moe_cache_session_mu_depth = 0;
+struct moe_cache_lock_trace_guard {
+    const char * where;
+    bool active;
+    moe_cache_lock_trace_guard(const char * w) : where(w), active(false) {
+        if (!getenv("GGML_CUDA_MOE_CACHE_LOCK_TRACE")) {
+            return;
+        }
+        active = true;
+        if (g_moe_cache_session_mu_depth > 0) {
+            fprintf(stderr, "[moe-cache] LOCK REENTRANCY at %s: this thread already holds "
+                    "session.mu (depth=%d)\n", where, g_moe_cache_session_mu_depth);
+            fflush(stderr);
+        }
+        g_moe_cache_session_mu_depth++;
+    }
+    ~moe_cache_lock_trace_guard() {
+        if (active) {
+            g_moe_cache_session_mu_depth--;
+        }
+    }
+};
+
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
@@ -5578,6 +5614,7 @@ static int moe_cache_plan(
     // block after the demand-fill queue below.
     bool group_evicted_this_call = false;
 
+    moe_cache_lock_trace_guard lock_trace("plan");
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping) {
         return 0;
