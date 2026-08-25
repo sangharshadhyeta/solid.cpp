@@ -1067,7 +1067,77 @@ Reference points on the same test: probe atlas 0.7116, spectral discovered
 89.69%. Rankings held throughout, but earlier absolute simulation figures are
 pessimistic.
 
-## CRITICAL: moe-cache corrupts output — PRE-EXISTING, still open (2026-08-25)
+## CORRUPTION — ROOT CAUSE LOCALISED (2026-08-25)
+
+### It IS moe-cache, and it requires ADMISSIONS
+
+Controlled, offload pinned at `-ncmoe 30` so only the cache varies:
+
+| config | VRAM free | simple | trigger |
+|---|---|---|---|
+| `--moe-cache off` | 4,840 MiB | clean | **clean** |
+| `--moe-cache 256` | 4,634 MiB | clean | DEGEN |
+| `--moe-cache 512` | 4,326 MiB | clean | DEGEN |
+
+**A 256 MiB cache with 4.6 GB free still corrupts, so it is NOT memory
+pressure.** Upstream master with the same `-ncmoe 30` is clean (7,045 MiB used,
+4,856 free), and our fork with the cache off matches it exactly (7,061 / 4,840,
+clean). The fault is the cache code path at any size.
+
+**It requires admissions**, which is the tightest handle yet:
+
+```
+cache 512, defaults            simple=clean  trigger=DEGEN
+cache 512, SPEC_EVICT=off      simple=clean  trigger=DEGEN
+cache 512, ADMIT_AFTER=255     simple=clean  trigger=clean   <- no admissions
+cache 512, INSERTS=1           simple=clean  trigger=DEGEN
+```
+
+`ADMIT_AFTER=255` effectively forbids admission and is CLEAN. So corruption
+happens when experts are WRITTEN INTO the cache, not when they are read - which
+is why every read-side verifier (slot contents, slot->expert mapping, row
+accounting, batched-vs-single kernel, dispatch-time re-check) came back clean.
+Admissions into a small pool also force evictions, so eviction racing with
+in-flight use is the leading remaining candidate.
+
+Checked and NOT the cause: the fill copy overruns its slot. `job.bytes` is
+carried from the node while the destination stride is `pool->expert_size`, and
+nothing validated they agree - a real missing check, now added and logging
+loudly - but it never fires, so the copy is in bounds.
+
+### WHY THIS INVESTIGATION TOOK SO LONG - a methodology failure
+
+`--moe-cache auto` on the command line calls `setenv(..., 1)` with OVERWRITE,
+and also `unset_env_var("GGML_CUDA_MOE_CACHE_BUDGET_MB")`:
+
+```
+GGML_CUDA_MOE_CACHE=0  PLUS  --moe-cache auto   ->  VRAM 11,743 MiB (cache ON)
+```
+
+Every "cache off" control that also passed `--moe-cache auto` was silently
+running WITH the cache. That invalidated the graph test, the spec-eviction
+test, and made the controlled matrix look like it had "drifted" hours later. It
+had not - the controls were fake. It also explains why `BUDGET_MB` appeared
+broken: the flag wipes it. The correct API is `--moe-cache N`.
+
+**Rule going forward: verify the control is actually a control.** Assert the
+expected VRAM footprint or `slots_used` before trusting any arm.
+
+### Hypotheses tested and rejected along the way
+
+atlas warming; moe-cache wholesale (wrongly retracted, see above); OOM/VRAM
+pressure; scratch-capacity overrun; multi-activation mmv mapping; CUDA-graph
+capture collision (rejected twice - once invalidly, once with a valid control);
+speculative eviction; fill-copy overrun. Also confirmed model-independent:
+gemma-4-26B degenerates identically, emitting `<unused49>` where Ornith emits
+`/` - both are just whatever token wins on degenerate logits.
+
+### Known-good configuration
+
+`--moe-cache off` - verified clean on the reproducer, 44 t/s, 3.5 GB headroom.
+Costs ~21% throughput versus a working cache.
+
+## SUPERSEDED - earlier narrative: moe-cache corrupts output — PRE-EXISTING, still open (2026-08-25)
 
 **Deterministic reproducer**: `--moe-cache auto`, any context size, prompt
 "Work through this step by step: a train leaves A at 60mph, another leaves B
