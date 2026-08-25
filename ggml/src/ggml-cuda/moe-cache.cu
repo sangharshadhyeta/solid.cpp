@@ -2804,6 +2804,46 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // expert) purely so the following copy can start from pinned memory -
             // which cancels most of what pinning is worth. Registering the tensor
             // once removes the copy: 506 us -> 303 us per expert.
+            // GGML_CUDA_MOE_CACHE_WEIGHT_GUARD=1: the model weights are supposed
+            // to be immutable for the life of the process. Hash each expert's
+            // source bytes here - the one place we already touch every one of
+            // them - and compare against the hash taken the last time this same
+            // expert was admitted. A mismatch means something mutated the model
+            // mapping under us, which is the only hypothesis that explains BOTH
+            // "admissions are necessary" AND "no consumer of the cached data
+            // matters": if the source weights are damaged, every reader is wrong,
+            // GPU or CPU, cached or uncached. It also explains why the poisoning
+            // is permanent within a process and cleared only by a restart, which
+            // re-maps the file.
+            {
+                static const bool guard = [] {
+                    const char * e = getenv("GGML_CUDA_MOE_CACHE_WEIGHT_GUARD");
+                    return e && atoi(e) != 0;
+                }();
+                if (guard && job.source && job.bytes) {
+                    uint64_t h = 1469598103934665603ull;
+                    const unsigned char * p = (const unsigned char *) job.source;
+                    for (size_t i = 0; i < job.bytes; i++) {
+                        h ^= p[i];
+                        h *= 1099511628211ull;
+                    }
+                    const uint64_t id = ((uint64_t) (uintptr_t) job.source) ^ (job.bytes * 2654435761ull);
+                    static std::mutex gmu;
+                    static std::unordered_map<uint64_t, uint64_t> seen;
+                    std::lock_guard<std::mutex> glock(gmu);
+                    auto it = seen.find(id);
+                    if (it == seen.end()) {
+                        seen.emplace(id, h);
+                    } else if (it->second != h) {
+                        fprintf(stderr,
+                                "[moe-cache] WEIGHT MUTATED src=%p bytes=%zu was=%016llx now=%016llx\n",
+                                job.source, job.bytes,
+                                (unsigned long long) it->second, (unsigned long long) h);
+                        fflush(stderr);
+                        it->second = h;
+                    }
+                }
+            }
             bool direct = false;
             {
                 static std::atomic<int> once{0};
