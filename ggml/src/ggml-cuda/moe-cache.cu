@@ -2909,9 +2909,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     moe_cache_device::cpu_residency & res = it->second;
                     const void * base = req.first;
                     const int    exp  = req.second;
-                    lock.unlock();
+                    // Held under session->mu for its whole body, including the
+                    // victim search that walks device.residency: that map is
+                    // mutated (via operator[]) by plan() on the decode thread
+                    // under the same lock, and an unlocked full-container
+                    // iteration racing an insert is undefined behavior, not
+                    // just a stale-read risk - it can corrupt the map's own
+                    // bucket structure. This path is dormant unless
+                    // GGML_CUDA_MOE_CACHE_HOST_MB is set, so holding the lock
+                    // for the malloc/memcpy/madvise too costs nothing today;
+                    // correctness matters more than an optimization for code
+                    // that never runs by default.
                     moe_cache_host_promote_locked_free(*device, res, base, exp, esz);
-                    lock.lock();
                 }
                 continue;
             }
@@ -3530,7 +3539,6 @@ static bool moe_cache_allocate_pool(
     if (shape.expert_size == 0 || shape.n_tensors <= 0 || shape.n_expert <= 0) {
         return false;
     }
-    shape.finished = true;
 
     int64_t max_entries = shape.n_tensors;
     if (max_entries > INT_MAX / shape.n_expert) {
@@ -3665,6 +3673,16 @@ static bool moe_cache_allocate_pool(
             device.physical, shape.pool, ggml_type_name((ggml_type)shape.wtype),
             shape.expert_size >> 10, slot_count, allocated >> 20);
 
+    // Marked finished only here, on success - not unconditionally at entry.
+    // Every early `return false` above (insufficient budget, slot_count<64,
+    // worker start failure) used to also mark it finished, which permanently
+    // stuck this shape: a later, bigger tensor of the exact same shape could
+    // never re-trigger allocation, since moe_cache_discover_pool only resets
+    // `finished` when a shape is being seen for the very first time. That
+    // tensor's layer would then just never get cached for the rest of the
+    // process, silently. Leaving it false lets moe_cache_build_pending retry
+    // on the next call, same as if this shape had never been attempted.
+    shape.finished = true;
     return true;
 }
 
@@ -5756,6 +5774,36 @@ static int moe_cache_plan(
         auto found = pool.map.find(key);
         if (found != pool.map.end()) {
             moe_cache_slot & slot = pool.slots[found->second];
+            // The substitution path below already bounded its pins[] write
+            // (checks node->n_pins < ceiling before pushing); this one used
+            // to increment slot.readers and push to pins[] in the wrong
+            // order, so an overflow left the reader count bumped with
+            // nothing recorded to release it - a permanent pin leak - and
+            // still handed the caller a slot_indices entry pointing at a
+            // slot that was never actually pinned, which the caller could
+            // then read after it gets evicted/refilled for someone else.
+            // Checked first now, before any of that happens: on overflow the
+            // row degrades to an ordinary miss rather than a half-served
+            // hit. Currently unreachable - n_ids is capped at
+            // GGML_MOE_CACHE_MAX_BATCH_ROWS at moe_cache_plan's entry and
+            // n_pins increments at most once per id, so n_pins can never
+            // exceed n_ids - but worth being correct if that cap ever
+            // loosens.
+            if (slot.state == moe_cache_slot_state::valid &&
+                node->n_pins >= GGML_MOE_CACHE_MAX_BATCH_ROWS) {
+                static std::atomic<int> once{0};
+                if (once.fetch_add(1) == 0) {
+                    fprintf(stderr,
+                            "[moe-cache] PIN OVERFLOW n_pins=%d ceiling=%d n_ids=%d "
+                            "n_tokens=%lld - hit not pinned\n",
+                            node->n_pins, GGML_MOE_CACHE_MAX_BATCH_ROWS,
+                            (int) n_ids, (long long) node->n_tokens);
+                    fflush(stderr);
+                }
+                device.misses++;
+                device.rank_misses[rank_bucket]++;
+                continue;
+            }
             if (slot.state == moe_cache_slot_state::valid) {
                 slot.readers++;
                 slot.heat = std::min(MOE_CACHE_HEAT_MAX, slot.heat + MOE_CACHE_HEAT_STEP);
@@ -5766,6 +5814,7 @@ static int moe_cache_plan(
                 // from eviction churn. Heat then decides how long that
                 // protection actually lasts, at the next decay sweep.
                 moe_cache_promote_to_protected(device, pool, found->second);
+                node->pins[node->n_pins++] = {found->second};
                 // GGML_CUDA_MOE_CACHE_NO_HITS=1: do every bit of accounting a
                 // hit normally does (heat, promotion, pin, counters) but never
                 // report the hit to the caller, so ggml-cpu.c routes the row
@@ -5776,26 +5825,6 @@ static int moe_cache_plan(
                     const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_HITS");
                     return e && atoi(e) != 0;
                 }();
-                // The substitution path below already bounds this write; this one
-                // did not. pins[] is followed in the struct by n_pins, planned and
-                // dispatched, so an overflow clobbers its own count and the
-                // dispatch flags before running off the end - permanent damage to
-                // a long-lived node, which is exactly the observed failure: garbage
-                // for the life of the process, weights intact, cleared only by a
-                // restart, and reachable only once experts are being admitted.
-                if (node->n_pins >= GGML_MOE_CACHE_MAX_BATCH_ROWS) {
-                    static std::atomic<int> once{0};
-                    if (once.fetch_add(1) == 0) {
-                        fprintf(stderr,
-                                "[moe-cache] PIN OVERFLOW n_pins=%d ceiling=%d n_ids=%d "
-                                "n_tokens=%lld - hit not pinned\n",
-                                node->n_pins, GGML_MOE_CACHE_MAX_BATCH_ROWS,
-                                (int) n_ids, (long long) node->n_tokens);
-                        fflush(stderr);
-                    }
-                } else {
-                    node->pins[node->n_pins++] = {found->second};
-                }
                 if (!no_hits) {
                     slot_indices[index] = found->second;
                 }
@@ -7020,9 +7049,19 @@ static void moe_cache_host_retire(moe_cache_device & device, void * block, size_
     }
 }
 
-// Hot path, called per expert per MoE node from CPU compute threads. Lock-free
-// by construction: the only mutable state read is one atomic offset, published
-// after its contents are written.
+// Hot path, called per expert per MoE node from CPU compute threads. The
+// atomic host_slot offset itself is lock-free by construction (published via
+// release, read via acquire) - but reaching it requires a `.find()` on
+// device.residency, which plan() mutates (via operator[], which can rehash)
+// under session->mu on the decode thread. Reading the map under a DIFFERENT
+// lock (g_registry_mu only guards session/device list membership, not each
+// session's own map) let that find() race a concurrent insert - undefined
+// behavior on the map's bucket structure, not just a staleness risk, and the
+// exact shape of "CPU compute reads a garbage pointer as expert weight
+// bytes" this cache exists to avoid. Each session's own residency map is now
+// read under that session's own session->mu, matching every other access to
+// it. Only taken when this feature is active (the budget==0 fast path above
+// returns before any lock), so the default-off case stays lock-free.
 static const void * moe_cache_host_ptr(const void * host_base, int expert) {
     if (moe_cache_host_budget_bytes() == 0 ||
         g_session_count.load(std::memory_order_acquire) <= 0 || expert < 0) {
@@ -7030,6 +7069,7 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
     }
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
     for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
         for (const auto & device_ptr : session->devices) {
             auto it = device_ptr->residency.find(host_base);
             if (it == device_ptr->residency.end()) {
