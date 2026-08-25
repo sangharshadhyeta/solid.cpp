@@ -1193,9 +1193,25 @@ graphs ON  (default), cache on : DEGEN DEGEN DEGEN
 graphs OFF, cache on           : DEGEN DEGEN DEGEN
 ```
 
-`GGML_CUDA_DISABLE_GRAPHS=1` changes nothing. Rejected.
+```
+graphs OFF, cache off (CONTROL) : DEGEN DEGEN DEGEN
+```
 
-**Six hypotheses have now been tested and rejected** (atlas warming, moe-cache
+**THE CONTROL ALSO DEGENERATED, so this test proves nothing** - not the
+hypothesis, not its rejection. Cache-off was clean 18/18 in the controlled
+matrix earlier the same day and fails 3/3 here, so the machine or build state
+has drifted between the two and the graph arms cannot be interpreted.
+
+The hypothesis is therefore UNTESTED, not rejected. Re-running it requires
+first re-establishing that cache-off is clean on the current build - i.e.
+re-validating the control before trusting any arm.
+
+That drift is itself the most important open fact: **the reproducer's
+dependence on cache state is no longer stable**, which undermines the
+controlled matrix's central finding (auto 9/18 vs off 0/18). Everything
+downstream of that matrix needs re-confirmation.
+
+**Five hypotheses have been tested and rejected; the sixth is untested (broken control)** (atlas warming, moe-cache
 as a whole, OOM/VRAM, scratch-capacity overrun, multi-activation mapping). The
 bug is real, deterministic, and still unexplained.
 
