@@ -1421,6 +1421,39 @@ no readback. **To finish this measurement the cache needs to report residency
 from a non-server binary** (a stderr summary at exit would do), or the server
 route, which is blocked by the corruption bug.
 
+## The six eviction signals RETESTED — two of the verdicts were wrong (2026-08-25)
+
+The six signals were each tested as a WHOLE policy at 18.5% residency. The
+coverage result proved both choices can hide a real signal (redundancy: -18pp
+as a whole policy, +4.2pp as a tie-break, and only at low residency). Retested
+in the tie-break shape (LRU narrows a 32-sample to its M=8 stalest, the signal
+breaks that tie) at 1.2% residency, scored on retained gate mass:
+
+| signal | hit | no candidate | retained | vs pure LRU |
+|---|---|---|---|---|
+| (pure LRU) | 39.70% | 17.69% | 78.30% | - |
+| **coverage** | 36.89% | 14.48% | 82.48% | **+4.18pp** |
+| **atlas** | 39.39% | 16.61% | 79.46% | **+1.17pp** |
+| **router score** | 36.20% | 17.78% | 79.01% | **+0.71pp** |
+| co-activation | 39.79% | 19.40% | 76.24% | -2.06pp |
+| frequency | 38.25% | 20.04% | 75.58% | -2.72pp |
+
+**The atlas and router score verdicts were wrong.** Both were reported as
+failures - the atlas as losing even to random - and both are positive in the
+correct shape and regime. Co-activation and frequency remain negative, so those
+two verdicts stand.
+
+The methodological lesson, now demonstrated three times (anti-co-firing,
+coverage, and these two): **a signal's value depends on the shape it is used in
+and the regime it is measured at.** Testing a signal as a whole policy at high
+residency is close to a worst case for it - recency dominates when the cache is
+large, and any signal given full control fights it. Future signal tests must
+report shape and residency alongside the result.
+
+Untested and now the obvious next step: **combinations** - coverage as primary
+tie-break with atlas or router score as a secondary, since the three positive
+signals may be capturing different structure.
+
 ## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
 
 Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
