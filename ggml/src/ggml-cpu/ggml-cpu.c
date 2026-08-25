@@ -1911,6 +1911,39 @@ static void ggml_compute_forward_mul_mat_id(
     }
 
     if (ith == 0 && moe_cache_node) {
+        // GGML_CUDA_MOE_CACHE_COLLECT_BOUNDS=1: a TSan run reported
+        // moe_cache_collect's memcpy destination as "zero (deleted)" - the
+        // language TSan uses for an address whose owning object's lifetime
+        // has ended, not its usual phrasing for two unrelated allocations
+        // sharing a recycled virtual address. That's ambiguous from the
+        // trace alone: ggml's compute-buffer allocator legitimately reuses
+        // addresses across separate graph executions (warmup's buffer, once
+        // freed, can be handed back out to a later real decode's buffer),
+        // which can look the same in a TSan report without being a bug.
+        // This checks the actual claim directly: every moe_cache_rows[]
+        // pointer this call is about to memcpy into must fall inside dst's
+        // OWN live backend buffer, checked fresh against the CURRENT
+        // buffer's base/size right before the write - not against a
+        // historical trace. Outside those bounds is unambiguous: writing
+        // through a stale pointer into memory dst no longer owns.
+        if (getenv("GGML_CUDA_MOE_CACHE_COLLECT_BOUNDS")) {
+            ggml_backend_buffer_t dst_buffer = dst->view_src ? dst->view_src->buffer : dst->buffer;
+            if (dst_buffer) {
+                const char * base = (const char *) ggml_backend_buffer_get_base(dst_buffer);
+                const size_t size = ggml_backend_buffer_get_size(dst_buffer);
+                static _Atomic int reported = 0;
+                for (int i = 0; i < moe_cache_n_hits; i++) {
+                    const char * p = (const char *) moe_cache_rows[i];
+                    const size_t need = (size_t) ne0 * sizeof(float);
+                    const bool in_bounds = p >= base && (size_t)(p - base) + need <= size;
+                    if (!in_bounds && atomic_fetch_add_explicit(&reported, 1, memory_order_relaxed) < 20) {
+                        fprintf(stderr, "[moe-cache] COLLECT OOB row=%d ptr=%p dst_buffer=[%p,%p) "
+                                "need=%zu\n", i, (void *) p, (void *) base, (void *) (base + size), need);
+                        fflush(stderr);
+                    }
+                }
+            }
+        }
         if (!ggml_moe_cache.collect(moe_cache_node, moe_cache_n_hits, moe_cache_rows, ne0)) {
             const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
             const size_t row_size = ggml_row_size(vec_dot_type, ne10);
