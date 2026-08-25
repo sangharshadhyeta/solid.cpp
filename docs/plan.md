@@ -1067,6 +1067,30 @@ Reference points on the same test: probe atlas 0.7116, spectral discovered
 89.69%. Rankings held throughout, but earlier absolute simulation figures are
 pessimistic.
 
+## THE SPEED AND THE CORRUPTION ARE THE SAME MECHANISM (2026-08-25)
+
+Measured, 4 prompts per arm, conservative detector:
+
+| config | tok/s | degenerate |
+|---|---|---|
+| `--moe-cache off` (safe) | 44.4 | 0/4 |
+| cache 3072, `ADMIT_AFTER=32` | **64.6** | **3/4** |
+| cache 3072, `ADMIT_AFTER=128` | 59.4 | 3/4 |
+| cache 3072, `ADMIT_AFTER=255` | 43.0 | 0/4 |
+
+**There is no middle ground.** Throttling admissions trades speed back linearly
+until "no admissions", which performs the same as disabling the cache. The
+~65 tok/s this deployment used to see was the CORRUPTING configuration - the
+throughput and the fault come from the same mechanism, so no setting today
+delivers 65 tok/s cleanly.
+
+Not fixed elsewhere either: thecodacus's fork does not contain this cache (its
+two optimisations are host pinning and expert prefetch, both excluded here),
+upstream PR #26824 is open with only a "freeze swapping during multi-slot
+batches" mitigation and no root cause, and the one upstream commit that looked
+relevant - `sched: reintroduce less synchronizations during split compute
+(#20793)` - is already reverted in our tree (`86b94708f`).
+
 ## CORRUPTION — ROOT CAUSE LOCALISED (2026-08-25)
 
 ### It IS moe-cache, and it requires ADMISSIONS
