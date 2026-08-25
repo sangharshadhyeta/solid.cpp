@@ -2607,6 +2607,74 @@ static uint64_t moe_cache_weight_hash(const void * src, size_t bytes) {
 // goes DEGEN, which is exactly what the per-slot probe showed. Walks every
 // live session's every pool; heavier than the weight-guard sweep, so kept
 // on its own flag and only run from the same idle tick.
+// GGML_CUDA_MOE_CACHE_SLOT_NAN_SWEEP=1: full-tensor BYTE comparison of every
+// VALID slot's device content against its host source - not a sampled
+// 3-window compare (VERIFY_SLOTS, already 0 mismatches, but a corrupted
+// region outside its 3x2KB windows would be invisible to it). Byte compare,
+// not float reinterpretation: expert weights are block-quantized (Q4_K etc),
+// not IEEE floats, so scanning them as float[] for NaN is meaningless -
+// caught that mistake before trusting its 100%-bad result, which was purely
+// quantized bit patterns coincidentally decoding as non-finite floats, not
+// corruption. Heavy - copies every resident slot back to host every idle
+// tick - debug-only.
+static void moe_cache_slot_nan_sweep() {
+    static const bool on = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SLOT_NAN_SWEEP");
+        return e && atoi(e) != 0;
+    }();
+    if (!on) {
+        return;
+    }
+    static std::atomic<int> reported{0};
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            ggml_cuda_set_device(device_ptr->physical);
+            for (const auto & pool_ptr : device_ptr->pools) {
+                moe_cache_pool & pool = *pool_ptr;
+                if (!pool.slab || pool.expert_size == 0) {
+                    continue;
+                }
+                std::vector<char> buf(pool.expert_size);
+                int scanned = 0, bad_slots = 0;
+                for (int i = 0; i < pool.n_slots; i++) {
+                    const moe_cache_slot & slot = pool.slots[i];
+                    if (slot.state != moe_cache_slot_state::valid || !slot.key.tensor) {
+                        continue;
+                    }
+                    scanned++;
+                    if (cudaMemcpy(buf.data(), pool.slab + (size_t) i * pool.expert_size,
+                                   pool.expert_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
+                        continue;
+                    }
+                    const char * host = (const char *) slot.key.tensor +
+                            (size_t) slot.key.expert * pool.expert_size;
+                    if (memcmp(buf.data(), host, pool.expert_size) != 0) {
+                        size_t first = 0;
+                        while (first < buf.size() && buf[first] == host[first]) first++;
+                        size_t diffs = 0;
+                        for (size_t j = 0; j < buf.size(); j++) {
+                            if (buf[j] != host[j]) diffs++;
+                        }
+                        bad_slots++;
+                        if (reported.fetch_add(1) < 20) {
+                            fprintf(stderr, "[moe-cache] SLOT BYTE MISMATCH slot=%d expert=%d "
+                                    "tensor=%p diffs=%zu/%zu first_byte_offset=%zu\n",
+                                    i, slot.key.expert, slot.key.tensor,
+                                    diffs, pool.expert_size, first);
+                        }
+                    }
+                }
+                fprintf(stderr, "[moe-cache] SLOT BYTE SWEEP pool slots=%d scanned=%d bad_slots=%d\n",
+                        pool.n_slots, scanned, bad_slots);
+            }
+        }
+    }
+    fflush(stderr);
+}
+
+
 static void moe_cache_map_audit() {
     static const bool on = [] {
         const char * e = getenv("GGML_CUDA_MOE_CACHE_MAP_AUDIT");
@@ -2659,6 +2727,7 @@ static void moe_cache_map_audit() {
 
 static void moe_cache_weight_guard_sweep() {
     moe_cache_map_audit();
+    moe_cache_slot_nan_sweep();
     if (!moe_cache_weight_guard_on()) {
         return;
     }
