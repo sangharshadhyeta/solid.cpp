@@ -1351,6 +1351,42 @@ of each active group resident, rather than the k hottest individuals.
 4. Scale validation: 4,713 units here, low cells only 28-117 slots. Whether a
    750B model's hot core stays this compact is untested.
 
+## Embedding implementation fixed — and why probes beat co-occurrence (2026-08-25)
+
+The learned embedding scored AUC 0.4900 on held-out link prediction while a
+trivial common-neighbours count scored 0.6530. That was an implementation
+failure, now corrected by dropping SGNS and representing each expert directly
+by its row of co-firing counts:
+
+| representation | AUC |
+|---|---|
+| co-occurrence rows, cosine (**the fix**) | **0.6345** |
+| + truncated SVD to 16 / 32 / 64 dims | 0.6072 / 0.6126 / 0.6212 |
+| + PPMI weighting | 0.5996 |
+| common neighbours (trivial baseline) | 0.6530 |
+| previous SGNS embedding | 0.4900 |
+| **probe atlas (9 categories)** | **0.7116** |
+
+Two findings beyond the fix:
+
+**Dimensionality reduction actively hurts.** SVD to 64 dims loses ground and
+PPMI - the textbook weighting for co-occurrence - is worse still. The signal is
+in the full high-dimensional pattern; there is no low-dimensional manifold to
+recover. This is why the spectral discovered atlas was never going to work.
+
+**Yet 9 probe dimensions beat 256 co-occurrence dimensions.** So the problem is
+not dimensionality - it is what the dimensions measure. Probes measure a
+FUNCTIONAL property (what causes this expert to activate); co-occurrence
+measures a CORRELATIONAL one (what happens to fire alongside it). For
+predicting FUTURE co-firing the functional property generalises and the
+correlational one memorises.
+
+That now explains every discovered-atlas result in this document: spectral
+(0.5761), incremental SGNS (0.4823-0.4900), and raw co-occurrence rows (0.6345)
+have all lost to the probe atlas (0.7116). Four independent methods, one
+verdict - and the verdict is about the SIGNAL, not the method. Keeping the
+hand-written probes is the better-supported position.
+
 ## Coverage-oriented eviction — FIRST policy to beat LRU (2026-08-25)
 
 Predicted by DESIGN ARGUMENT section 4: six signals had failed as eviction
