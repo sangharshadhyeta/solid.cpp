@@ -17,6 +17,7 @@
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <unordered_map>
 
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
@@ -2302,7 +2303,7 @@ void llama_kv_cache::state_write_meta(llama_io_write_i & io, const cell_ranges_t
             io.write(&pos,      sizeof(pos));
             io.write(&n_seq_id, sizeof(n_seq_id));
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 const llama_kv_cell_ext ext = cells.ext_get(i);
                 io.write(&ext, sizeof(ext));
             }
@@ -2439,12 +2440,17 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
                 return false;
             }
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
 
-                ubatch.pos[i + ubatch.n_tokens]   = ext.y;
-                ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                if (hparams.n_pos_per_embd() > 1) {
+                    ubatch.pos[i + ubatch.n_tokens]   = ext.y;
+                    ubatch.pos[i + ubatch.n_tokens*2] = ext.x;
+                }
+
+                // apply_ubatch() below restores ext.tok from the ubatch tokens
+                ubatch.token[i] = ext.tok;
             }
 
             // read the sequence id, but directly discard it - we will use dest_seq_id instead
@@ -2491,7 +2497,8 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
             }
         }
 
-        // TODO: we cannot yet restore llama_kv_cell_ext as the apply_ubatch() does not support it yet
+        // note: apply_ubatch() rebuilds llama_kv_cell_ext from the ubatch
+        //       only ext.tok and the M-RoPE 2D position round-trip through it
         //       see: https://github.com/ggml-org/llama.cpp/pull/16825#issuecomment-3460868350
         apply_ubatch(sinfo, ubatch);
 
@@ -2529,7 +2536,7 @@ bool llama_kv_cache::state_read_meta(llama_io_read_i & io, uint32_t strm, uint32
 
             cells.pos_set(i, pos);
 
-            if (hparams.n_pos_per_embd() > 1) {
+            if (has_cell_ext()) {
                 llama_kv_cell_ext ext;
                 io.read(&ext, sizeof(ext));
                 cells.ext_set(i, ext);
@@ -2887,4 +2894,8 @@ void llama_kv_cache_context::set_input_k_rot(ggml_tensor * dst) const {
 
 void llama_kv_cache_context::set_input_v_rot(ggml_tensor * dst) const {
     kv->set_input_v_rot(dst);
+}
+
+void llama_kv_cache_context::get_prev_tokens(const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
+    kv->get_prev_tokens(ubatch, n, res);
 }
