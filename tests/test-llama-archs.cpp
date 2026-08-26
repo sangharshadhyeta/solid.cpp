@@ -145,7 +145,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
     ms.add_kv(LLM_KV_FULL_ATTENTION_INTERVAL, uint32_t(2));
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
-            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR) {
+            arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
@@ -170,6 +171,23 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
+        if (arch == LLM_ARCH_DOTS3NOTE) {
+            // SWA layers reuse the same MLA geometry as the full layers in this fixture
+            ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK_SWA,     uint32_t(512));
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,       uint32_t(576));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,     uint32_t(512));
+            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA_SWA,   uint32_t(192));
+            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA_SWA, uint32_t(128));
+            ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,             10000.0f);
+            // indexer on the full-attention layers (inverse of the swa pattern)
+            std::vector<uint32_t> indexer_types;
+            indexer_types.reserve(n_layer);
+            for (uint32_t il = 0; il < n_layer; il++) {
+                indexer_types.push_back(il % 2 ? 0 : 1);
+            }
+            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
+        }
+    } else if (arch == LLM_ARCH_GLM5NEXT) {
     } else if (arch == LLM_ARCH_MINIMAX_M3) {
         // partial rotary: n_rot must not exceed the indexer key length (64)
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
@@ -370,6 +388,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_PADDLEOCR:
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5NEXT:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
@@ -431,6 +451,10 @@ static bool arch_supported(const llm_arch arch) {
         return false;
     }
     if (arch == LLM_ARCH_DEEPSEEK4) {
+        return false;
+    }
+
+    if (arch == LLM_ARCH_GLM5NEXT) {
         return false;
     }
 
