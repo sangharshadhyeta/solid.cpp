@@ -33,6 +33,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <climits>
 #include <condition_variable>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -41,6 +42,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <memory>
 #include <mutex>
 #include <new>
+#include <random>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -199,6 +201,14 @@ struct moe_cache_pool {
     int protected_tail = -1;
     int protected_count = 0; // capped at n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100 - see moe_cache_promote_to_protected
     long long fills_since_decay = 0;
+    // Slow-moving reference scale for this pool's own heat magnitudes -
+    // updated on every heat step and halved alongside moe_cache_pool_decay,
+    // so it stays proportional without a separate full-pool scan. Lets the
+    // align-protect boost's cap be "a fraction of what heat actually looks
+    // like in this pool right now" instead of a fraction of the theoretical
+    // MOE_CACHE_HEAT_MAX ceiling, which a real pool rarely gets near - see
+    // moe_cache_weighted_heat.
+    double heat_scale_ema = 4.0; // seeded at MOE_CACHE_HEAT_STEP - avoids a 0-scale window before the first real step
 };
 
 struct moe_cache_shape {
@@ -360,6 +370,23 @@ struct moe_cache_warm_request {
     float req_dir_y = 0.0f;
 };
 
+// Stage A of the live-activation predictor (docs/plan.md): one real
+// (hidden-state, actually-selected-experts) example, captured at the
+// EXISTING mul_mat_id dispatch hook - by the time this fires the router's
+// decision (ids) is already made, so this trains a predictor for FUTURE
+// dispatches, it cannot change this one. `acts` is a COPY (the source
+// tensor's data is not guaranteed to outlive this dispatch call once the
+// hot path moves on), one token only per request - see moe_cache_train's
+// comment for why sampling one token per dispatch is enough.
+struct moe_cache_train_request {
+    const void * host_base = nullptr;
+    int64_t n_expert = 0;
+    int pool_index = -1;
+    size_t expert_size = 0;
+    std::vector<float> acts;      // hidden_dim floats, this token's input
+    std::vector<int32_t> ids;     // n_ids_per_token selected experts, this token's label
+};
+
 struct moe_cache_device {
     explicit moe_cache_device(int physical) : physical(physical) {}
 
@@ -370,6 +397,10 @@ struct moe_cache_device {
     std::vector<std::unique_ptr<moe_cache_pool>> pools;
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
+    // host_base -> stable tensor name, for cross-restart persistence keying
+    // (see moe_cache_begin's assignment site and moe_cache_predictor_save/
+    // _load). host_base itself is a fresh pointer every process restart.
+    std::unordered_map<const void *, std::string> tensor_names;
 
     // Step 0 of Atlas-driven cache warming (see ggml_moe_cache.set_atlas) -
     // each expert's measured topic-affinity position, and a live, decaying
@@ -391,6 +422,62 @@ struct moe_cache_device {
     // one entry by moe_cache_atlas_warm_enqueue - see the comment there for
     // why dropping, not queueing, is right when the worker is behind.
     std::deque<moe_cache_warm_request> warm_queue;
+    // Stage A live-activation predictor: same "bounded to one, drop rather
+    // than queue" shape as warm_queue above, and the same reason - a stale
+    // training example is not wrong to skip, and letting requests pile up
+    // would mean the worker falls further behind under load instead of
+    // recovering. GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1, off by default.
+    std::deque<moe_cache_train_request> train_queue;
+    // One flat row-major (n_expert x hidden_dim) weight matrix per tensor,
+    // lazily sized on that tensor's first training example (hidden_dim isn't
+    // known before then). Logistic-regression-style online updates only -
+    // see moe_cache_train_service. Bias-free by design for this first cut:
+    // mean-centering the input would need a running mean, which is one more
+    // thing that can be wrong before this mechanism has proven the basic
+    // shape works at all.
+    std::unordered_map<const void *, std::vector<float>> predictor_weights;
+    // Set once per tensor, from that tensor's first training example's own
+    // acts.size() (raw activation width + MOE_CACHE_TRAIN_CONTEXT_DIMS).
+    // Genuinely PER-TENSOR, not a single model-wide scalar: ffn_gate_exps/
+    // ffn_up_exps operate on the residual stream's hidden size, but
+    // ffn_down_exps operates on the FFN's intermediate width, a different
+    // (usually larger) dimension - caught empirically (2026-08-29) when a
+    // single shared scalar corrupted the persisted file's per-tensor
+    // n_expert reconstruction (w.size()/hidden_dim came out wrong for every
+    // tensor using the wrong tensor's width). Needed at save time to
+    // recover n_expert from a flat weight vector's own length, since
+    // n_expert isn't otherwise stored per-tensor on the device.
+    std::unordered_map<const void *, int64_t> predictor_hidden_dim;
+    long long predictor_steps = 0;
+    // Sampled, cheap-to-compute running accuracy: was the predictor's single
+    // top-scoring expert actually IN the real selected set for that step?
+    // Same purpose as the atlas confidence-evidence pattern elsewhere in
+    // this file - visible, live proof the mechanism is or is not learning
+    // anything, not just silent weight updates nobody can verify.
+    long long predictor_top1_hits = 0;
+    // Self-tuning outcome evidence for predictor-driven ADMISSION
+    // specifically (distinct from predictor_top1_hits above, which measures
+    // prediction accuracy, not whether admitting on that prediction actually
+    // paid off) - same (for, against) Bayesian-prior shape as the atlas's
+    // own atlas_align_evidence_for/against, so the predictor's own
+    // aggressiveness can scale off its measured real payoff instead of a
+    // hand-tuned constant, the same way align_protect_strength already
+    // does. predictor_admitted tracks which (tensor,expert) keys are
+    // currently believed resident because predictor warming put them there
+    // - a hit on one is "for" evidence, an eviction of one that was never
+    // hit is "against" - see moe_cache_predictor_admit_confidence and its
+    // recording sites.
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> predictor_admitted;
+    double predictor_admit_evidence_for = 1.0;
+    double predictor_admit_evidence_against = 1.0;
+    // Cross-restart persistence staging (see moe_cache_predictor_load_file/
+    // _save). Loaded once, lazily, on this device's first training example -
+    // name-keyed (host_base is not stable across restarts) flat weight
+    // vectors read from GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE, consulted
+    // whenever a tensor is trained for the first time this process instead
+    // of zero-initializing it.
+    std::unordered_map<std::string, std::vector<float>> predictor_loaded_by_name;
+    bool predictor_state_load_attempted = false;
     // Track 1.5 measurement (GGML_CUDA_MOE_CACHE_ATLAS_WARM_TIMING=1): how
     // long the warming block costs *on the dispatch path* specifically.
     // That is the quantity this track is about, and tok/s cannot resolve it
@@ -403,9 +490,79 @@ struct moe_cache_device {
     float req_dir_x = 0.0f;
     float req_dir_y = 0.0f;
     bool  req_dir_valid = false;
+    // Real routing decisions folded into req_dir since it became valid.
+    // req_dir SNAPS to a single expert's raw atlas position on the very
+    // first update (see the update site) - one noisy sample, not yet an
+    // average of anything. Admission gates on this reaching a minimum count
+    // (moe_cache_atlas_warm_min_samples) before acting, so it cannot spend
+    // a fresh session's scarce initial free-slot budget on a prediction
+    // built from a single data point; the EMA itself still starts tracking
+    // immediately, since observation alone is free and harmless.
+    uint32_t req_dir_updates = 0;
     // Rate limit for the warming scan below - same clock spec_evict already
     // uses (device.collect_calls), so this doesn't need its own timer.
     long long atlas_warm_last_calls = -1;
+    // Burst detection: req_dir_x/y as of the last warm-throttle check, so
+    // each check measures how far the centroid moved SINCE then (a running
+    // step-wise distance, not distance from a fixed origin - this is what
+    // lets sustained real movement accumulate past the threshold while small
+    // noise/jitter between checks does not). See moe_cache_atlas_burst_check.
+    float atlas_burst_ref_x = 0.0f;
+    float atlas_burst_ref_y = 0.0f;
+    bool  atlas_burst_ref_valid = false;
+    // Small, deduped, most-recent-first record of tensors moe_cache_plan has
+    // actually been called for - not a generic tensor->pool resolver (this
+    // cache has none), just enough to let a detected burst warm several
+    // DISTINCT tensors (a real topic shift needs correction across many
+    // layers, not the one tensor whichever plan() call happened to trip the
+    // throttle) using pool/size info the calling code already had in hand
+    // when each of those tensors was planned. pool_index only, never a raw
+    // pool*, so it's re-resolved through device.pools at use time - same
+    // defensive re-validation moe_cache_atlas_warm_service already uses.
+    struct atlas_recent_tensor {
+        int pool_index; const void * host_base; size_t expert_size; int64_t n_expert;
+    };
+    std::deque<atlas_recent_tensor> atlas_recent_tensors;
+    // Persisted between throttle checks so the interval used to schedule the
+    // NEXT check can reflect what the LAST check found - the check itself
+    // only runs once per interval, so this is what lets a detected burst
+    // shorten its own follow-up interval instead of only speeding up
+    // starting from the next steady-interval boundary.
+    bool atlas_bursting = false;
+    // Continuous burst confidence in [0,1], replacing the discrete
+    // atlas_bursting bool as the thing rank_k/admit_k/interval actually key
+    // off of - a hard 0.25-distance threshold snaps steady<->burst budgets
+    // right at the boundary, which can flip every other check for a
+    // centroid drifting near the edge. This ramps toward 1 on a threshold
+    // crossing and decays otherwise, so the budgets interpolate instead of
+    // discontinuing (see moe_cache_atlas_burst_confidence).
+    float atlas_burst_confidence = 0.0f;
+
+    // Holt's linear trend (double exponential smoothing): req_dir_x/y above
+    // is the "level" term (already an EMA); these are the "trend" term - an
+    // EMA of the level's own per-update delta, i.e. a smoothed estimate of
+    // which way and how fast the live topic centroid is currently moving.
+    // level + horizon*trend is a genuine forward extrapolation, not just a
+    // lagging average of where routing already went - see
+    // moe_cache_atlas_lookahead, the thing that makes ranking answer "where
+    // is this heading" instead of only "where has this been".
+    float req_vel_x = 0.0f;
+    float req_vel_y = 0.0f;
+
+    // Evidence pool for the align-protect boost's confidence-weighted
+    // strength (Kalman-gain style: the multiplier's real-world influence is
+    // computed from this session's own measured track record, not a fixed
+    // hand-picked constant). Two independent streams feed the same (for,
+    // against) pair - see moe_cache_atlas_align_confidence for how each is
+    // recorded: outcome evidence (did an aligned, boosted slot actually get
+    // reused before eviction, or evicted without ever being reused) and
+    // shadow evidence (collected for free during every real eviction scan:
+    // did the boost change which slot got picked, or did plain unboosted
+    // LFRU already agree). Bayesian (1,1) prior so confidence starts at 0.5
+    // of the configured ceiling before any evidence exists, not 0 or the
+    // full ceiling.
+    double atlas_align_evidence_for = 1.0;
+    double atlas_align_evidence_against = 1.0;
 
     // Track 1 step 4a (docs/plan.md): within-layer co-activation - which
     // experts get selected *together* in the same real routing decision,
@@ -493,6 +650,13 @@ struct moe_cache_device {
     // but not noise-chasing signal), not yet independently measured. Revisit
     // once step 1 (an actual warming action) needs a real tuned value.
     static constexpr float MOE_CACHE_ATLAS_DECAY = 0.15f;
+    // Trend (Holt's linear smoothing) decay - deliberately slower than the
+    // level's own 0.15, since a per-update delta is a second-order quantity
+    // and noisier than the level itself; over-reacting to it would make the
+    // lookahead point whip around on single-update jitter instead of
+    // tracking a real sustained direction of movement. See req_vel_x/y and
+    // moe_cache_atlas_lookahead.
+    static constexpr float MOE_CACHE_ATLAS_TREND_DECAY = 0.08f;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     // Per-CPU-resident-tensor last-use tracking, for the MADV_COLD sweep. An
     // expert that is neither in the VRAM cache nor recently selected is pure
@@ -1126,6 +1290,15 @@ static void moe_cache_pool_decay(moe_cache_pool & pool) {
     for (moe_cache_slot & slot : pool.slots) {
         slot.heat >>= 1;
     }
+    pool.heat_scale_ema *= 0.5;
+}
+
+// Cheap per-hit nudge of the pool's own heat-scale reference (see the
+// struct comment on heat_scale_ema) - called from every real heat step
+// instead of scanning the pool, so the reference tracks live activity
+// between decay sweeps without adding an O(pool size) cost to the hot path.
+static void moe_cache_pool_note_heat_step(moe_cache_pool & pool, uint32_t new_heat) {
+    pool.heat_scale_ema += 0.02 * ((double) new_heat - pool.heat_scale_ema);
 }
 
 // Colibri's "25%-plus-4" hysteresis: candidate `b` only replaces the
@@ -1277,8 +1450,213 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
 // Removed after the third A/B round settled it - see docs/plan.md for the
 // full three-way comparison and the honest reporting of both reversals.
 
-static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_slot & slot) {
-    return (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
+// Whether topic alignment protects a slot from eviction. Reintroduced after
+// the removal above, but NOT the same mechanism: this is boost-only (a
+// resident slot's effective heat can only go UP when it aligns with the
+// live topic direction, never down for one that doesn't - misaligned/
+// unmeasured slots score exactly as they always did) and, critically, the
+// thing it was found to interfere with - moe_cache_atlas_warm's OWN
+// eviction rights - no longer exists (see moe_cache_atlas_admit: reverted
+// to free-slot-only after a real, measured regression, docs/plan.md). That
+// specific interference is now structurally impossible; this reintroduces
+// the "protect what's aligned" half in isolation, never both halves at
+// once the way the removed version did.
+
+// #5: Holt's linear trend forecast. req_dir_x/y is the "level" term - a
+// lagging EMA of where routing has actually been - and req_vel_x/y (updated
+// alongside it, see the update site) is the "trend" term - an EMA of the
+// level's own per-update delta, i.e. which way and how fast the centroid is
+// currently moving. level + horizon*trend genuinely extrapolates forward
+// instead of only describing recent history, which is the whole point:
+// ranking against the plain level is "where has this been", not "where is
+// this heading". Magnitude does not matter to any consumer of this - both
+// moe_cache_atlas_rank and moe_cache_atlas_align_score only ever use it
+// through a cosine similarity, which normalizes magnitude away - only the
+// direction the horizon bends it toward does.
+static bool moe_cache_atlas_lookahead_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_LOOKAHEAD");
+        return !env || atoi(env) != 0; // on by default - see docs/plan.md
+    }();
+    return enabled;
+}
+static float moe_cache_atlas_lookahead_horizon() {
+    static const float v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_LOOKAHEAD_HORIZON");
+        const float f = env ? (float) atof(env) : 3.0f;
+        return f < 0.0f ? 0.0f : f;
+    }();
+    return v;
+}
+static void moe_cache_atlas_lookahead(const moe_cache_device & device, float & lx, float & ly) {
+    lx = device.req_dir_x;
+    ly = device.req_dir_y;
+    if (moe_cache_atlas_lookahead_enabled()) {
+        const float horizon = moe_cache_atlas_lookahead_horizon();
+        lx += horizon * device.req_vel_x;
+        ly += horizon * device.req_vel_y;
+    }
+}
+
+static bool moe_cache_atlas_align_protect_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT");
+        return !env || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static float moe_cache_atlas_align_protect_strength() {
+    static const float v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT_STRENGTH");
+        const float f = env ? (float) atof(env) : 3.0f;
+        return f < 0.0f ? 0.0f : f;
+    }();
+    return v;
+}
+
+// Same cosine-similarity-times-specialization formula moe_cache_atlas_rank
+// uses to pick admission candidates, evaluated for one specific resident
+// slot instead of ranked across a whole tensor's candidates. Self-contained
+// (no forward declarations needed) since everything it touches - the atlas
+// row lookup, req_dir - is already a plain struct member by this point in
+// the file. Returns 0 for "no signal" (atlas disabled, no req_dir yet, no
+// measured position for this expert, or genuinely unaligned) - the boost
+// this feeds is multiplicative from a floor of 1.0, so 0 means no protection
+// at all, never a penalty.
+static float moe_cache_atlas_align_score(const moe_cache_device & device, const moe_cache_key & key) {
+    if (!device.req_dir_valid || !key.tensor || key.expert < 0) {
+        return 0.0f;
+    }
+    const auto it = device.atlas_by_tensor.find(key.tensor);
+    if (it == device.atlas_by_tensor.end() || !it->second || it->second->empty()) {
+        return 0.0f;
+    }
+    // atlas_row is a flat vector (moe_cache_atlas_rank iterates it the same
+    // way), not a map - linear scan, bounded by one tensor's atlas entries.
+    // Reached from reactive eviction (every real victim pick) and, sampled,
+    // from the hit path (moe_cache_atlas_align_note_hit) - the eviction
+    // caller is naturally rare; the hit caller samples explicitly so this
+    // stays a small, occasional cost rather than landing on every hit.
+    const moe_cache_atlas_cell * cellp = nullptr;
+    for (const auto & [e, c] : *it->second) {
+        if (e == key.expert) {
+            cellp = &c;
+            break;
+        }
+    }
+    if (!cellp) {
+        return 0.0f;
+    }
+    const auto & cell = *cellp;
+    float rx, ry;
+    moe_cache_atlas_lookahead(device, rx, ry);
+    const float rmag = std::sqrt(rx * rx + ry * ry);
+    const float cmag = std::sqrt(cell.x * cell.x + cell.y * cell.y);
+    if (rmag < 1e-6f || cmag < 1e-6f) {
+        return 0.0f;
+    }
+    // Not JUST for eviction anymore - see moe_cache_atlas_align_note_hit,
+    // which now also calls this (sampled) from the real hit path to gather
+    // outcome evidence. Still a small, bounded linear scan either way.
+    const float score = ((cell.x * rx + cell.y * ry) / (cmag * rmag)) * cell.spec;
+    return score > 0.0f ? score : 0.0f;
+}
+
+// #1 outcome evidence "for": a real hit on a currently atlas-aligned key -
+// something the boost currently favours turned out to actually be reused.
+// Sampled (1 in 16), not called on every hit - hits are the hottest path in
+// this whole file, and align_score's linear scan is not free enough to pay
+// on all of them just to gather confidence evidence.
+static void moe_cache_atlas_align_note_hit(moe_cache_device & device, const moe_cache_key & key) {
+    if (!moe_cache_atlas_align_protect_enabled()) {
+        return;
+    }
+    static std::atomic<uint64_t> n{0};
+    if ((n.fetch_add(1, std::memory_order_relaxed) & 0xF) != 0) {
+        return;
+    }
+    if (moe_cache_atlas_align_score(device, key) > 0.0f) {
+        device.atlas_align_evidence_for += 1.0;
+    }
+}
+
+// #1: Kalman-gain-style confidence, computed from this session's own
+// measured evidence rather than a fixed constant. atlas_align_protect_
+// strength() below is now the CEILING; this scales it down when the boost
+// has not been earning its keep and lets it approach the ceiling as
+// evidence accumulates in its favour. (1,1) prior => 0.5 with no evidence.
+static double moe_cache_atlas_align_confidence(const moe_cache_device & device) {
+    const double f = device.atlas_align_evidence_for;
+    const double a = device.atlas_align_evidence_against;
+    return f / (f + a);
+}
+
+static float moe_cache_atlas_align_protect_strength_effective(const moe_cache_device & device) {
+    return moe_cache_atlas_align_protect_strength() * (float) moe_cache_atlas_align_confidence(device);
+}
+
+// #2: how much of the pool's own current heat scale the align-protect boost
+// is allowed to ADD, at most. See moe_cache_weighted_heat for why this is
+// additive-and-capped rather than the multiplicative form it replaces.
+static double moe_cache_atlas_align_protect_cap_fraction() {
+    static const double v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT_CAP");
+        const double f = env ? atof(env) : 0.5;
+        return f < 0.0 ? 0.0 : f;
+    }();
+    return v;
+}
+
+// out_base, if non-null, receives the plain (no-atlas) score - callers that
+// need to compare "what would plain LFRU have picked" against "what did the
+// boost actually pick" (moe_cache_pick_coldest_unpinned's shadow evidence)
+// get it for free instead of recomputing cost_tier_weight a second time.
+//
+// cap_ref selects what the cap is a fraction OF. Default (-1) falls back to
+// pool.heat_scale_ema, a slow, pool-wide EMA - fine for moe_cache_pick_by_
+// coverage, whose combination is rank-based anyway (bounded distortion by
+// construction), but WRONG for a direct-magnitude comparison: heat_scale_ema
+// is seeded low and only grows a little per hit, so for the entire span of
+// a fresh session it stays near its seed - measured directly (2026-08-29):
+// still ~4-8 after 30 evidence samples (~480 real hits). A magnitude-
+// comparing caller (moe_cache_pick_coldest_unpinned, moe_cache_promote_to_
+// protected) needs the cap to track the CURRENT competition, not a slowly-
+// converging session-wide average, so those pass the local eviction
+// window's own max base heat instead - instantaneous, no convergence lag,
+// and exactly the scale the comparison is actually being made against.
+//
+// Additive-and-capped, not multiplicative: `w *= 1 + align*strength` scales
+// whatever heat a slot already has, including near-zero - a barely-warmed
+// atlas-aligned slot could outrank a genuinely hot, unaligned one purely
+// because the multiplier had so little to work with that the distortion was
+// invisible at the low end. Adding a bounded amount instead means the boost
+// can tip a close call between similarly-warm candidates but can never
+// manufacture rank-winning "heat" out of nothing.
+static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_pool & pool,
+        const moe_cache_slot & slot, double * out_base = nullptr, double cap_ref = -1.0) {
+    const double base = (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
+    if (out_base) {
+        *out_base = base;
+    }
+    if (!moe_cache_atlas_align_protect_enabled()) {
+        return base;
+    }
+    const float align = moe_cache_atlas_align_score(device, slot.key);
+    if (align <= 0.0f) {
+        return base;
+    }
+    const double strength = (double) moe_cache_atlas_align_protect_strength_effective(device);
+    // cap_ref, when supplied, is already a base score (heat*tier_weight) -
+    // value-units-comparable as-is. The heat_scale_ema fallback is raw heat,
+    // not value units, so it still needs this slot's own tier weight to
+    // land in the same units base is in.
+    const double cap = cap_ref >= 0.0
+        ? moe_cache_atlas_align_protect_cap_fraction() * cap_ref
+        : moe_cache_atlas_align_protect_cap_fraction() * pool.heat_scale_ema *
+              moe_cache_cost_tier_weight(device, slot.key);
+    const double bias = std::min((double) align * strength * (double) MOE_CACHE_HEAT_STEP, cap);
+    return base + std::max(0.0, bias);
 }
 
 // protected_ is capped at half the pool - the structural fix for the
@@ -1375,7 +1753,7 @@ static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache
                     }
                 }
             }
-            cands[n++] = { c, redundancy, align, moe_cache_weighted_heat(device, slot) };
+            cands[n++] = { c, redundancy, align, moe_cache_weighted_heat(device, pool, slot) };
         }
     }
     if (n == 0) {
@@ -1414,22 +1792,86 @@ static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache
     return cands[best].slot;
 }
 
-static int moe_cache_pick_coldest_unpinned(const moe_cache_device & device, moe_cache_pool & pool, int head) {
+static int moe_cache_pick_coldest_unpinned(moe_cache_device & device, moe_cache_pool & pool, int head) {
     if (moe_cache_coverage_evict_enabled()) {
         return moe_cache_pick_by_coverage(device, pool, head);
     }
-    int best = -1;
-    double best_score = 0.0;
+    // Two passes: the align-protect cap needs to know THIS window's own max
+    // base heat before it can bound anything (see moe_cache_weighted_heat's
+    // cap_ref) - pass 1 gathers plain base heat (no atlas lookup, cheap) and
+    // the window max; pass 2 scores each candidate against that max instead
+    // of the slow pool-wide heat_scale_ema, so the cap tracks the actual
+    // current competition instead of lagging a session behind it.
+    int cand[MOE_CACHE_EVICT_WINDOW];
+    double cand_base[MOE_CACHE_EVICT_WINDOW];
+    int n = 0;
+    double window_max_base = 0.0;
     int candidate = head;
     for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
         if (pool.slots[candidate].readers > 0) {
             continue;
         }
         seen++;
-        const double score = moe_cache_weighted_heat(device, pool.slots[candidate]);
+        const double base = (double) pool.slots[candidate].heat * moe_cache_cost_tier_weight(device, pool.slots[candidate].key);
+        cand[n] = candidate;
+        cand_base[n] = base;
+        if (base > window_max_base) {
+            window_max_base = base;
+        }
+        n++;
+    }
+    if (n == 0) {
+        return -1;
+    }
+    int best = -1;
+    double best_score = 0.0;
+    // #3 shadow evidence: the same window's plain (unboosted) pick, tracked
+    // alongside the real one for free - see the evidence update below.
+    int plain_best = -1;
+    double plain_best_score = 0.0;
+    for (int i = 0; i < n; i++) {
+        const double score = moe_cache_weighted_heat(device, pool, pool.slots[cand[i]], nullptr, window_max_base);
         if (best < 0 || moe_cache_colder_enough(best_score, score)) {
-            best = candidate;
+            best = cand[i];
             best_score = score;
+        }
+        if (plain_best < 0 || moe_cache_colder_enough(plain_best_score, cand_base[i])) {
+            plain_best = cand[i];
+            plain_best_score = cand_base[i];
+        }
+    }
+    if (best >= 0 && moe_cache_atlas_align_protect_enabled()) {
+        // #1 outcome evidence "against": the winner, whatever it is, is
+        // about to actually be evicted - if it was aligned enough to have
+        // been boosted, the boost did not save it from this.
+        const float align = moe_cache_atlas_align_score(device, pool.slots[best].key);
+        if (align > 0.0f) {
+            device.atlas_align_evidence_against += 1.0;
+        }
+        // #3 shadow evidence: did the boost change the outcome versus plain
+        // heat/cost-tier scoring alone, in the same window? Agreement is
+        // free confirmation the boost isn't fighting the base mechanism;
+        // disagreement isn't yet known-good or known-bad, so it counts as
+        // mild "against" until outcome evidence resolves it - the same
+        // conservative-by-default posture the free-slot-only admission
+        // redesign already settled on.
+        if (plain_best == best) {
+            device.atlas_align_evidence_for += 0.25;
+        } else {
+            device.atlas_align_evidence_against += 0.25;
+        }
+    }
+    // Predictor admission outcome evidence: the winner is about to be
+    // evicted - if it is still in predictor_admitted, it was never hit even
+    // once since predictor warming put it here (a real hit already resolved
+    // and erased it - moe_cache_predictor_note_hit), so this admission did
+    // not pay off. The set only ever holds keys still awaiting their first
+    // outcome, one way or the other.
+    if (best >= 0 && !device.predictor_admitted.empty()) {
+        const auto pit = device.predictor_admitted.find(pool.slots[best].key);
+        if (pit != device.predictor_admitted.end()) {
+            device.predictor_admit_evidence_against += 1.0;
+            device.predictor_admitted.erase(pit);
         }
     }
     return best;
@@ -1439,13 +1881,28 @@ static void moe_cache_promote_to_protected(const moe_cache_device & device, moe_
     moe_cache_segment_remove(pool, index);
     const int cap = std::max(1, pool.n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100);
     if (pool.protected_count >= cap && pool.protected_head >= 0) {
-        int demote = pool.protected_head;
-        double demote_score = moe_cache_weighted_heat(device, pool.slots[demote]);
-        int candidate = pool.slots[demote].next;
-        for (int seen = 1; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next, seen++) {
-            const double score = moe_cache_weighted_heat(device, pool.slots[candidate]);
+        // Same two-pass window-local cap reference as
+        // moe_cache_pick_coldest_unpinned - see that function's comment.
+        int cand[MOE_CACHE_EVICT_WINDOW];
+        double cand_base[MOE_CACHE_EVICT_WINDOW];
+        int n = 0;
+        double window_max_base = 0.0;
+        int candidate = pool.protected_head;
+        for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next, seen++) {
+            const double base = (double) pool.slots[candidate].heat * moe_cache_cost_tier_weight(device, pool.slots[candidate].key);
+            cand[n] = candidate;
+            cand_base[n] = base;
+            if (base > window_max_base) {
+                window_max_base = base;
+            }
+            n++;
+        }
+        int demote = cand[0];
+        double demote_score = moe_cache_weighted_heat(device, pool, pool.slots[demote], nullptr, window_max_base);
+        for (int i = 1; i < n; i++) {
+            const double score = moe_cache_weighted_heat(device, pool, pool.slots[cand[i]], nullptr, window_max_base);
             if (moe_cache_colder_enough(demote_score, score)) {
-                demote = candidate;
+                demote = cand[i];
                 demote_score = score;
             }
         }
@@ -2708,6 +3165,10 @@ static bool moe_cache_atlas_warm_service(
         moe_cache_session * session, moe_cache_device * device,
         std::unique_lock<std::mutex> & lock);
 
+// Stage A live-activation predictor: defined further down alongside the
+// rest of the predictor code, declared here for the same reason as above.
+static void moe_cache_train_service(moe_cache_device & device);
+
 // GGML_CUDA_MOE_CACHE_NO_RT_ALLOC=1: create the fill stream and the pinned
 // staging buffer ONCE, here at worker startup, and never allocate again for
 // the life of the thread. cudaMallocHost/cudaFreeHost/cudaStreamCreate are
@@ -3079,6 +3540,26 @@ static bool moe_cache_explicit_read(const void * source, size_t bytes, void * ds
 #endif
 }
 
+// Defined further down (with the rest of the host-page-release code),
+// declared here because the fill worker is the thread that runs it for the
+// main VRAM admission path - see the call site below for why.
+static void moe_cache_release_source_pages(const void * base, size_t offset, size_t bytes);
+
+// On by default: releasing an expert's mmap'd host pages right after VRAM
+// admission is provably safe (the copy that read them has already
+// completed and synced by the point this runs - see the call site) and
+// closes a real gap where the same bytes could sit resident in both the OS
+// page cache and VRAM until the kernel got around to reclaiming them under
+// pressure. Opt-out knob kept anyway, matching this file's convention of
+// making every non-trivial behavior toggleable even once it is trusted.
+static bool moe_cache_release_fill_source_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_RELEASE_FILL_SOURCE");
+        return !env || atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -3190,6 +3671,14 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (moe_cache_atlas_warm_service(session, device, lock)) {
                     session->cv.notify_all();
                 }
+                continue;
+            }
+
+            // Stage A live-activation predictor: cheap (a handful of dot
+            // products), so unlike the atlas scan above this does not need
+            // the lock released - see moe_cache_train_service.
+            if (!device->dead.load() && !device->train_queue.empty()) {
+                moe_cache_train_service(*device);
                 continue;
             }
 
@@ -3509,6 +3998,32 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     slot.generation == job.generation && slot.key == job.key) {
                     if (error == cudaSuccess) {
                         slot.state = moe_cache_slot_state::valid;
+                        // Now that VRAM holds its own copy, the mmap'd host
+                        // pages behind it are redundant - the exact reasoning
+                        // moe_cache_release_source_pages already applies for
+                        // the separate host-hot-expert-buffer promotion path.
+                        // This is the main fill path (both reactive-miss and
+                        // atlas-warm admissions funnel through here via
+                        // device.queue), which never had the equivalent call:
+                        // without it, an expert's bytes can sit resident in
+                        // both the OS page cache AND VRAM simultaneously until
+                        // the kernel gets around to reclaiming them under
+                        // pressure (or the periodic cold-sweep catches it once
+                        // dormant - see moe_cache_cold_sweep, which explicitly
+                        // excludes VRAM-resident experts from its own pass,
+                        // since ITS job is prioritising among non-resident
+                        // ones, not cleaning up after residency). Safe to call
+                        // unconditionally here: the copy that just read these
+                        // bytes has already completed and synced (we are past
+                        // every copy branch above, all of which end in either
+                        // cudaStreamSynchronize or a synchronous cudaMemcpy),
+                        // and MADV_DONTNEED on a clean file-backed mapping
+                        // only drops cached pages - the virtual mapping stays
+                        // valid and re-faults from disk if ever needed again,
+                        // never corrupts or invalidates anything.
+                        if (job.source && job.bytes && moe_cache_release_fill_source_enabled()) {
+                            moe_cache_release_source_pages(job.source, 0, job.bytes);
+                        }
                         if (pool && pool->canary) {
                             static std::atomic<int> creport{0};
                             std::vector<char> back(pool->canary_bytes);
@@ -4972,6 +5487,13 @@ static void * moe_cache_begin(
             return nullptr;
         }
         pool = selected->pools[pool_index].get();
+        // Stable identity for cross-restart persistence (predictor weights,
+        // see moe_cache_predictor_save/_load): host_base is a raw pointer,
+        // a fresh, different address every process restart, so it cannot be
+        // the persisted key - the tensor's own name (e.g.
+        // "blk.5.ffn_gate_exps.weight") is stable across restarts of the
+        // same model and is exactly what's available here.
+        selected->tensor_names[host_base] = name;
         moe_cache_session::active_source * source = nullptr;
         try {
             source = &session->active_sources[host_base];
@@ -5396,6 +5918,29 @@ static bool moe_cache_substitute_enabled() {
     return enabled;
 }
 
+// Draft/fallback split by the missed expert's own router rank (2026-08-29):
+// this dispatch path has no access to the router's actual probability
+// values (same GPU-only limitation as the "full-probs oracle" comparison
+// elsewhere in this file - ffn_moe_probs never reaches the CPU side), but
+// rank position IS available and is a real, already-measured proxy for how
+// much a miss costs: rank 0 misses 20% of the time vs. rank 7's 44%, and
+// ranks 4-7 carry only 32% of the total gate mass between them. Below this
+// floor (the router's most-confident, most-consequential picks), a miss
+// always pays the exact CPU fallback cost rather than accept an
+// approximation; at or above it (picks the router itself weighted least),
+// the cheap resident stand-in is used - the "draft" only ever substitutes
+// for output that barely moves the result either way. Default 0: no
+// gating, every miss may substitute, matching the pre-existing behavior
+// until this is actually measured.
+static int moe_cache_substitute_min_rank() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
+        const int n = env ? atoi(env) : 0;
+        return n < 0 ? 0 : n;
+    }();
+    return v;
+}
+
 // How many resident candidates the stand-in search may examine. The offline
 // cost model put the useful window near 64; beyond that the scan cost on the
 // dispatch path outweighs what a better stand-in is worth.
@@ -5561,8 +6106,17 @@ struct moe_cache_atlas_cand { int32_t expert; float score; };
 // have. Noted rather than hidden: the topic-switch result in docs/plan.md
 // was measured with the old scan and would need re-validating if this ever
 // goes on by default.
-static constexpr int MOE_CACHE_ATLAS_RANK_K  = 4;
-static constexpr int MOE_CACHE_ATLAS_ADMIT_K = 2;
+// Array bounds only now (see moe_cache_atlas_warm_rank_k/admit_k below for
+// the actual runtime values, which are <= these). Widened from the original
+// 4/2 after the multi-round topic-switch benchmark (docs/plan.md) showed
+// that budget cannot move enough of the cache per firing to matter: after a
+// real topic switch, reactive demand-driven admission (immediate, no
+// throttle) finishes reshaping the cache before a 2-candidate warming pass
+// makes a dent, so the "chance-level map performs identically to a real
+// map" finding was budget-starved, not evidence the ranking signal itself
+// is worthless.
+static constexpr int MOE_CACHE_ATLAS_RANK_K  = 32;
+static constexpr int MOE_CACHE_ATLAS_ADMIT_K = 16;
 
 // The expensive half. Pure: reads only the (immutable, shared_ptr-held)
 // atlas row and the request direction snapshot it is handed, writes only
@@ -5634,66 +6188,48 @@ static int moe_cache_atlas_rank(
 static bool moe_cache_atlas_admit(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
         const void * host_base, size_t expert_size,
-        const moe_cache_atlas_cand * best, int n_best) {
-    // A/B'd on 2026-08-23 restricted to free-slot-only admission: flat,
-    // no effect either way on tok/s or hit rate (58.61 vs 58.46 tok/s,
-    // 92.05% vs 91.85% hit rate, 3 interleaved rounds). Root cause found
-    // afterward, not guessed: pool.free_slots means "never used since this
-    // pool was allocated", not "currently unoccupied" - it empties
-    // permanently within the first few tokens of any real run, so
-    // free-slot-only warming had almost no window to ever act, which is
-    // why it couldn't show an effect either direction. Fixed here by
-    // letting it evict too, on the same real bounded-window mechanism
-    // moe_cache_pick_coldest_unpinned already provides everything else
-    // (speculative eviction, cross-depth agreement) - but disciplined the
-    // same way cross-depth-agreement earned its own eviction rights:
-    // capped to ONE eviction per warming pass (not per candidate), and
-    // gated on a real confidence floor, not merely "score > 0" (barely
-    // aligned still passed that). Never touches protected_ - only
-    // probation, same rule every other eviction path here follows.
-    // Two knobs, both env-overridable so the conservative default and a
-    // deliberately looser "speculative" variant can be A/B'd against each
-    // other directly - the same conservative-vs-permissive comparison
-    // GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE's agree-vs-any already made for
-    // router-lookahead eviction, applied here to this separate mechanism
-    // (this cache's eviction paths are independent per the SPEC_EVICT_MODE
-    // work - fixing/tuning one does not change another's behavior, and
-    // isolated variables stay isolated here too).
-    static const float evict_min_score = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_MIN");
-        const float v = env ? (float) atof(env) : 0.6f;
-        return v < 0.0f ? 0.0f : v;
-    }();
-    static const int evict_cap = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_CAP");
-        const int v = env ? atoi(env) : 1;
-        return v < 0 ? 0 : v;
-    }();
-    int evictions_this_pass = 0;
+        const moe_cache_atlas_cand * best, int n_best,
+        int admit_k, int evict_cap_override) {
+    // Free-slot-only, deliberately, and permanently - this is a SUGGESTION,
+    // not a mandate. An eviction-capable version of this was built and
+    // measured (2026-08-23 through the multi-round burst-mode benchmark,
+    // docs/plan.md): the free-slot-only design was originally found "flat,
+    // no effect either way" because pool.free_slots empties permanently
+    // within the first few tokens of any real run, so eviction rights were
+    // added to give it more room to act. That was the wrong fix. The
+    // reactive/demand-driven admission path's own eviction is always
+    // justified - it evicts to satisfy a request that just actually
+    // happened. This path's "eviction" would sacrifice something the
+    // reactive system already decided was worth keeping, to make room for a
+    // PREDICTION - and when the prediction is wrong (or the evicted expert
+    // is asked for again two tokens later, which the multi-switch benchmark
+    // showed happens constantly), that is a real, direct loss, not a
+    // neutral bet. Measured directly: widening the eviction budget for a
+    // detected burst (up to 6 evictions/pass, vs. the original cap of 1)
+    // made a real regression six times worse (post-switch hit rate delta
+    // vs. no warming: -0.31pp thin-eviction -> -6.55pp wide-eviction, warm
+    // losing on every single request across all 4 rounds) - unambiguous
+    // confirmation that the eviction path itself, not its budget, was the
+    // problem. Reverted to free-slot-only permanently; the wider
+    // candidate pool, burst-triggered frequency, and multi-tensor sweep
+    // added alongside the (now-removed) eviction rights are kept, since
+    // none of those can ever actively hurt - they only mean more chances to
+    // fill a slot that is ALREADY free, never a chance to take one away.
     int admitted = 0;
     bool woke = false;
-    for (int i = 0; i < n_best && admitted < MOE_CACHE_ATLAS_ADMIT_K; i++) {
+    admit_k = admit_k > 0 ? std::min(admit_k, MOE_CACHE_ATLAS_ADMIT_K) : MOE_CACHE_ATLAS_ADMIT_K;
+    (void) evict_cap_override; // no longer used - kept in the signature so callers need no further changes
+    for (int i = 0; i < n_best && admitted < admit_k; i++) {
         const int32_t expert = best[i].expert;
         const moe_cache_key key{host_base, expert};
         if (pool.map.find(key) != pool.map.end()) {
             continue; // already resident or in flight - the only residency check now, see MOE_CACHE_ATLAS_RANK_K
         }
-        int slot_index = -1;
-        if (!pool.free_slots.empty()) {
-            slot_index = pool.free_slots.back();
-            pool.free_slots.pop_back();
-        } else if (evictions_this_pass < evict_cap && best[i].score >= evict_min_score) {
-            const int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
-            if (candidate < 0) {
-                break; // probation has nothing to sacrifice - stop, not just skip this candidate
-            }
-            moe_cache_slot_reset(pool, candidate, false);
-            slot_index = candidate;
-            device.evictions++;
-            evictions_this_pass++;
-        } else {
-            break; // no free slot, and either this pass's eviction budget is spent or score too weak to earn it
+        if (pool.free_slots.empty()) {
+            break; // nothing free right now - a suggestion with nowhere to land is a no-op, not a reason to evict
         }
+        const int slot_index = pool.free_slots.back();
+        pool.free_slots.pop_back();
         moe_cache_slot & slot = pool.slots[slot_index];
         slot.key = key;
         slot.generation++;
@@ -5734,29 +6270,257 @@ static bool moe_cache_atlas_warm_legacy_rank_enabled() {
     return enabled;
 }
 
+// Burst-mode budget knobs. Steady-state values match the original
+// conservative design (verified flat-to-good there, no reason to change);
+// burst values are what actually fire once a topic shift is detected - see
+// moe_cache_atlas_req_dir_shifted below for the detector. All separately
+// env-overridable so steady/burst can be tuned independently, same as every
+// other A/B knob in this file.
+// #4: all four budget knobs below used to key off a discrete bursting bool,
+// which could flip every other throttle check for a centroid oscillating
+// right at the distance threshold (steady and burst budgets are ~6x apart,
+// so that flip is not a rounding error). They now take the continuous
+// atlas_burst_confidence in [0,1] (see moe_cache_atlas_burst_check) and
+// interpolate - gain scheduling, not a switch - so a centroid hovering near
+// the boundary gets a budget that hovers too, instead of alternating
+// between the two extremes.
+static float moe_cache_atlas_burst_confidence_clamp(float c) {
+    return c < 0.0f ? 0.0f : (c > 1.0f ? 1.0f : c);
+}
+static int moe_cache_atlas_rank_k(float confidence) {
+    static const int steady = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_RANK_K");
+        const int v = e ? atoi(e) : 4;
+        return v > 0 ? std::min(v, MOE_CACHE_ATLAS_RANK_K) : 4;
+    }();
+    static const int burst = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_RANK_K");
+        const int v = e ? atoi(e) : 24;
+        return v > 0 ? std::min(v, MOE_CACHE_ATLAS_RANK_K) : 24;
+    }();
+    confidence = moe_cache_atlas_burst_confidence_clamp(confidence);
+    return steady + (int) std::lround((double) (burst - steady) * confidence);
+}
+static int moe_cache_atlas_admit_k(float confidence) {
+    static const int steady = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_ADMIT_K");
+        const int v = e ? atoi(e) : 2;
+        return v > 0 ? std::min(v, MOE_CACHE_ATLAS_ADMIT_K) : 2;
+    }();
+    static const int burst = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_ADMIT_K");
+        const int v = e ? atoi(e) : 12;
+        return v > 0 ? std::min(v, MOE_CACHE_ATLAS_ADMIT_K) : 12;
+    }();
+    confidence = moe_cache_atlas_burst_confidence_clamp(confidence);
+    return steady + (int) std::lround((double) (burst - steady) * confidence);
+}
+static int moe_cache_atlas_evict_cap(float confidence) {
+    confidence = moe_cache_atlas_burst_confidence_clamp(confidence);
+    if (confidence <= 0.0f) {
+        return -1; // no override - moe_cache_atlas_admit falls back to GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_CAP
+    }
+    static const int burst = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_EVICT_CAP");
+        const int v = e ? atoi(e) : 6;
+        return v < 0 ? 0 : v;
+    }();
+    return (int) std::lround((double) burst * confidence);
+}
+
+// Cold-start guard for burst detection specifically - separate from, and a
+// much higher bar than, moe_cache_atlas_warm_min_samples (which only gates
+// plain admission). Root-caused empirically (2026-08-29, ablation): a fresh
+// req_dir doesn't just start noisy, it keeps SWINGING for a while as its EMA
+// settles toward a representative direction - real, sustained movement, not
+// a single bad sample, so the plain min-samples gate does not catch it. Each
+// swing past the burst threshold during that settling window used to read as
+// a genuine topic shift and fire the widened multi-tensor sweep, competing
+// with real first-time demand for the scarcest free-slot budget a session
+// ever has. Isolated by disabling burst alone (GGML_CUDA_MOE_CACHE_ATLAS_
+// WARM_BURST_THRESHOLD=999): req0 hit rate on a fresh session went from
+// 0.5816 (burst enabled, defaults) to 0.7157 (burst disabled) against a
+// 0.7259 true baseline - almost the entire regression was burst firing on
+// convergence noise, not the align-protect mechanism it was first blamed on.
+static uint32_t moe_cache_atlas_burst_min_samples() {
+    static const uint32_t n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_MIN_SAMPLES");
+        const int v = e ? atoi(e) : 64;
+        return (uint32_t) (v > 0 ? v : 64);
+    }();
+    return n;
+}
+
+// Euclidean distance the live req_dir centroid has moved since the
+// reference point saved at the last throttle check, in the atlas's own
+// [-1,1]x[-1,1]-ish coordinate space. Updates the reference unconditionally
+// (this is a step-wise "since last check" measurement, not "since session
+// start"). A crossing ramps device.atlas_burst_confidence up (fast - a real
+// shift deserves an immediate response); every non-crossing check decays it
+// back down (slower, so a couple of quiet checks right after a shift don't
+// immediately snap budgets back to steady). Returns confidence >= 0.5 for
+// callers that still need a plain yes/no for a structural branch (sync
+// multi-tensor sweep vs. the async single-tensor hint queue) - that
+// threshold is now the entry/exit point of a smoothed signal instead of the
+// raw instantaneous distance, which is what actually kills the flip-flop.
+// First call after req_dir becomes valid always reports non-bursting
+// (nothing to compare against yet), and no crossing is ever honoured before
+// moe_cache_atlas_burst_min_samples updates have accumulated (the reference
+// point still tracks throughout, so detection resumes cleanly once past it,
+// comparing against a recent point rather than a stale pre-convergence one).
+static bool moe_cache_atlas_burst_check(moe_cache_device & device) {
+    static const float threshold = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_THRESHOLD");
+        const float v = e ? (float) atof(e) : 0.25f;
+        return v < 0.0f ? 0.0f : v;
+    }();
+    static const float ramp_up = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_CONF_RAMP");
+        const float v = e ? (float) atof(e) : 0.6f;
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }();
+    static const float decay = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_CONF_DECAY");
+        const float v = e ? (float) atof(e) : 0.65f;
+        return v < 0.0f ? 0.0f : (v > 1.0f ? 1.0f : v);
+    }();
+    if (!device.req_dir_valid) {
+        return false;
+    }
+    const bool converged = device.req_dir_updates >= moe_cache_atlas_burst_min_samples();
+    if (device.atlas_burst_ref_valid) {
+        const float dx = device.req_dir_x - device.atlas_burst_ref_x;
+        const float dy = device.req_dir_y - device.atlas_burst_ref_y;
+        const bool crossed = converged && std::sqrt(dx * dx + dy * dy) >= threshold;
+        if (crossed) {
+            device.atlas_burst_confidence += ramp_up * (1.0f - device.atlas_burst_confidence);
+        } else {
+            device.atlas_burst_confidence *= decay;
+        }
+    }
+    device.atlas_burst_ref_x = device.req_dir_x;
+    device.atlas_burst_ref_y = device.req_dir_y;
+    device.atlas_burst_ref_valid = true;
+    return device.atlas_burst_confidence >= 0.5f;
+}
+
+// How many plan() calls between throttle checks - steady is the original
+// 64; burst is far shorter so a detected shift gets several corrective
+// passes in quick succession instead of waiting out the same interval that
+// was sized for "nothing is changing". Interpolated by confidence like the
+// other three budgets above.
+static long long moe_cache_atlas_warm_interval(float confidence) {
+    static const long long steady = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_INTERVAL");
+        const long long v = e ? atoll(e) : 64;
+        return v > 0 ? v : 64;
+    }();
+    static const long long burst = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_INTERVAL");
+        const long long v = e ? atoll(e) : 4;
+        return v > 0 ? v : 4;
+    }();
+    confidence = moe_cache_atlas_burst_confidence_clamp(confidence);
+    return steady + (long long) std::lround((double) (burst - steady) * confidence);
+}
+
+// How many DISTINCT tensors get a warming pass in one burst firing (steady
+// mode only ever does the one tensor node happens to be on - a real topic
+// shift needs correction across many layers at once, not one every 64
+// calls). Bounded and capped by how many tensors the atlas actually covers.
+static int moe_cache_atlas_burst_tensor_sweep() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_TENSORS");
+        const int v = e ? atoi(e) : 8;
+        return v > 0 ? v : 8;
+    }();
+    return n;
+}
+
+// req_dir_valid flips true on the FIRST atlas-covered routing decision, at
+// which point req_dir_x/y is that one expert's raw atlas position, not yet
+// an average of anything - the EMA (decay=0.15) only starts pulling it
+// toward a representative direction over the next several updates. Acting
+// on admission that early means competing for the limited, non-refilling
+// free_slots budget on a single noisy sample. Gate warming until the EMA
+// has had a real chance to converge.
+static uint32_t moe_cache_atlas_warm_min_samples() {
+    static const uint32_t n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_MIN_SAMPLES");
+        const int v = e ? atoi(e) : 8;
+        return (uint32_t) (v > 0 ? v : 8);
+    }();
+    return n;
+}
+
 // Synchronous path (GGML_CUDA_MOE_CACHE_ATLAS_WARM_ASYNC=0, the default
 // until the split is measured): both halves inline on the dispatch thread,
 // session lock held throughout, exactly as before Track 1.5.
+// Congestion-avoidance dampener for burst's widened admission budget: only
+// safe to spend when the pool actually has free capacity to spare. Free
+// slots are the scarcest resource a fresh, still-filling pool has - every
+// real first-time routing decision needs one, and they never refill except
+// at pool creation (reactive eviction's moe_cache_slot_reset calls never
+// add back to free_slots). Root-caused empirically (2026-08-29): gating
+// burst on req_dir history alone (moe_cache_atlas_burst_min_samples) was
+// necessary but not sufficient - burst kept firing throughout an entire
+// cold-fill request, not just at the very start, because the actual
+// determinant of whether a burst can be spent safely is how much free-slot
+// headroom is left RIGHT NOW in THIS pool, not how long req_dir has been
+// tracking on the device as a whole. Below the floor fraction, confidence
+// scales toward 0 (falls back to steady's already-small budget); at or
+// above it, full confidence passes through unchanged - the same back-off-
+// under-contention shape AIMD uses, applied to admission instead of a
+// send window.
+static float moe_cache_atlas_burst_headroom_floor() {
+    static const float v = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_HEADROOM_FLOOR");
+        // 0.15 measured near-useless (real pool sizes are in the thousands
+        // of slots; one request's cold fill never gets that scarce) - 0.95
+        // measured best in single-shot req0 ablation (2026-08-29), 1.0
+        // measured statistically indistinguishable from it (noise, not a
+        // further gain). Effectively "dampen unless the pool is still
+        // almost entirely untouched."
+        const float f = e ? (float) atof(e) : 0.95f;
+        return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    }();
+    return v;
+}
+static float moe_cache_atlas_burst_headroom_scale(const moe_cache_pool & pool) {
+    const float floor = moe_cache_atlas_burst_headroom_floor();
+    if (floor <= 0.0f || pool.n_slots <= 0) {
+        return 1.0f;
+    }
+    const float free_frac = (float) pool.free_slots.size() / (float) pool.n_slots;
+    return free_frac >= floor ? 1.0f : std::max(0.0f, free_frac / floor);
+}
+
 static bool moe_cache_atlas_warm(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
-        const void * host_base, size_t expert_size, int64_t n_expert) {
-    if (!device.req_dir_valid || n_expert <= 0) {
+        const void * host_base, size_t expert_size, int64_t n_expert,
+        float burst_confidence = 0.0f) {
+    if (!device.req_dir_valid || n_expert <= 0 || device.req_dir_updates < moe_cache_atlas_warm_min_samples()) {
         return false;
     }
     const auto it = device.atlas_by_tensor.find(host_base);
     if (it == device.atlas_by_tensor.end() || !it->second || it->second->empty()) {
         return false;
     }
+    burst_confidence *= moe_cache_atlas_burst_headroom_scale(pool);
     const bool legacy = moe_cache_atlas_warm_legacy_rank_enabled();
+    const int rank_k = moe_cache_atlas_rank_k(burst_confidence);
+    float lx, ly;
+    moe_cache_atlas_lookahead(device, lx, ly);
     moe_cache_atlas_cand best[MOE_CACHE_ATLAS_RANK_K];
     const int n_best = moe_cache_atlas_rank(
-            *it->second, device.req_dir_x, device.req_dir_y, n_expert,
-            best, legacy ? MOE_CACHE_ATLAS_ADMIT_K : MOE_CACHE_ATLAS_RANK_K,
+            *it->second, lx, ly, n_expert,
+            best, legacy ? moe_cache_atlas_admit_k(burst_confidence) : rank_k,
             legacy ? &pool : nullptr, host_base);
     if (n_best <= 0) {
         return false;
     }
-    return moe_cache_atlas_admit(device, pool, pool_index, host_base, expert_size, best, n_best);
+    return moe_cache_atlas_admit(device, pool, pool_index, host_base, expert_size, best, n_best,
+            moe_cache_atlas_admit_k(burst_confidence), moe_cache_atlas_evict_cap(burst_confidence));
 }
 
 // Opt-in, and read once - see device.warm_path_ns for what it measures and
@@ -5785,7 +6549,7 @@ static bool moe_cache_atlas_warm_async_enabled() {
 static bool moe_cache_atlas_warm_enqueue(
         moe_cache_device & device, int pool_index,
         const void * host_base, size_t expert_size, int64_t n_expert) {
-    if (!device.req_dir_valid || n_expert <= 0) {
+    if (!device.req_dir_valid || n_expert <= 0 || device.req_dir_updates < moe_cache_atlas_warm_min_samples()) {
         return false;
     }
     const auto it = device.atlas_by_tensor.find(host_base);
@@ -5800,9 +6564,11 @@ static bool moe_cache_atlas_warm_enqueue(
     if (!device.warm_queue.empty()) {
         return false;
     }
+    float lx, ly;
+    moe_cache_atlas_lookahead(device, lx, ly);
     device.warm_queue.push_back({
             it->second, pool_index, host_base, expert_size, n_expert,
-            device.req_dir_x, device.req_dir_y});
+            lx, ly});
     return true;
 }
 
@@ -5853,8 +6619,543 @@ static bool moe_cache_atlas_warm_service(
     if (!pool || !pool->slab || pool->expert_size != req.expert_size) {
         return false;
     }
+    // Async path never participates in burst mode (see the sync call site's
+    // comment - the one-deep hint queue has no room for a sweep's worth of
+    // requests, and ASYNC is off by default anyway) - always steady budget.
     return moe_cache_atlas_admit(*device, *pool, req.pool_index,
-            req.host_base, req.expert_size, best, n_best);
+            req.host_base, req.expert_size, best, n_best,
+            moe_cache_atlas_admit_k(0.0f), moe_cache_atlas_evict_cap(0.0f));
+}
+
+// Stage A live-activation predictor (docs/plan.md, 2026-08-29): everything
+// tried so far to discover expert relationships from HISTORICAL data
+// (spectral graph embedding, incremental SGNS) lost decisively to the
+// hand-labeled probe atlas on held-out link-prediction AUC (0.57/0.49 vs
+// 0.71) - confirmed by web research to be a known, general result: a
+// FUNCTIONAL signal (what causes an expert to activate) generalizes to
+// future decisions better than a CORRELATIONAL one (what happened to fire
+// alongside it), and recent (2025) MoE literature has moved past graph
+// embeddings entirely to lightweight linear predictors trained directly on
+// the model's own live hidden-state activations, reporting 93-97% next-
+// expert accuracy. This is that: a predictor trained on the same tensor
+// mul_mat_id already reads for the real fill/hit decision, not a separate
+// offline artifact.
+//
+// Genuinely a two-stage build. This is Stage A only: the (activation, real
+// ids) training PAIR is captured at the existing dispatch hook, but by the
+// time that hook fires the router's decision for THIS token is already
+// made - training happens here, but nothing here can influence what this
+// token's own dispatch does. Stage B (a hook earlier in the graph, before
+// the router's own gate matmul, so a prediction is available in time to
+// influence admission) is a separate, larger change to graph construction
+// (llama-graph.cpp) and is not part of this pass.
+static bool moe_cache_train_predictor_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+static float moe_cache_train_lr() {
+    static const float v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_LR");
+        const float f = env ? (float) atof(env) : 0.01f;
+        return f > 0.0f ? f : 0.01f;
+    }();
+    return v;
+}
+static int moe_cache_train_negs() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_NEGS");
+        const int n = env ? atoi(env) : 4;
+        return n > 0 ? n : 4;
+    }();
+    return v;
+}
+
+// Warming knobs, deliberately named and shaped like the atlas's steady-state
+// RANK_K/ADMIT_K (moe_cache_atlas_rank_k/admit_k) rather than reusing them -
+// this is a materially stronger signal (40%+ measured top-1 accuracy vs.
+// ~3% chance, see moe_cache_train_service) so it earns its own tuning space
+// instead of inheriting budgets sized for the much weaker cosine-similarity
+// signal.
+static int moe_cache_train_rank_k() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_RANK_K");
+        const int n = env ? atoi(env) : 8;
+        return n > 0 ? std::min(n, MOE_CACHE_ATLAS_RANK_K) : 8;
+    }();
+    return v;
+}
+static int moe_cache_train_admit_k() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_ADMIT_K");
+        const int n = env ? atoi(env) : 4;
+        return n > 0 ? std::min(n, MOE_CACHE_ATLAS_ADMIT_K) : 4;
+    }();
+    return v;
+}
+// Hard floor on free slots, not a rate limit: warm at full speed as long as
+// a pool's free_slots stays above this fraction of its own n_slots, stop
+// entirely once it does not. Training itself (the SGD update) stays on
+// every step regardless, cheap and always safe - only the admission side is
+// gated. free_slots never refill during normal operation
+// (moe_cache_slot_reset's reactive-eviction callers always pass
+// add_to_free=false), so this directly caps the TOTAL cumulative amount of
+// a session's free-slot budget predictor-warming can ever consume,
+// independent of how often it fires - a step-count interval only bounds
+// firing RATE, and two earlier attempts at that (a per-call interval, then
+// a per-firing admit_k scaled by absolute free-slot headroom) both measured
+// as barely moving the prefetch count (7,388-7,436 unthrottled) because
+// with pools of thousands of slots neither ever actually bound until very
+// late. A floor on the pool's OWN remaining budget does not have that
+// problem: above it, nothing is throttled at all; below it, warming stops
+// completely, permanently, for the rest of the session.
+static float moe_cache_train_warm_slot_floor_frac() {
+    static const float v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_WARM_FLOOR");
+        const float f = env ? (float) atof(env) : 0.5f;
+        return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
+    }();
+    return v;
+}
+
+// Feed the atlas's live context signal (req_dir) into the predictor's OWN
+// input features, rather than hand-blending the atlas's and predictor's
+// scores after the fact outside the model. req_dir is the same [-1,1]-ish
+// 2D live-topic-direction centroid moe_cache_atlas_rank already ranks
+// against (device.req_dir_x/y, decaying EMA of real routing decisions) -
+// appended once per token to the captured hidden-state vector (see
+// moe_cache_train below), so it becomes part of what EVERY expert's row of
+// W learns to weigh, end to end, via the exact same online SGD already
+// training on the raw activations. This lets the model discover its own
+// relationship between "where the live topic is trending" and "which
+// experts that favours" - the atlas's own cosine-similarity ranking makes
+// that relationship by hand; this lets gradient descent find it instead,
+// and fuses it with the raw activation signal in whatever proportion the
+// data actually supports, rather than a fixed or manually-scheduled weight.
+static constexpr int64_t MOE_CACHE_TRAIN_CONTEXT_DIMS = 2; // req_dir_x, req_dir_y
+
+// Self-tuning: how well predictor-driven admission has actually paid off,
+// measured from real outcomes (device.predictor_admit_evidence_for/against)
+// rather than guessed - same Bayesian-ratio shape as
+// moe_cache_atlas_align_confidence. Used to scale admit_k in the warming
+// block below, the same way that confidence scales align_protect_strength:
+// starts at 0.5 (no evidence yet), climbs toward 1 as admitted content
+// proves itself reused, falls toward 0 if it is mostly getting evicted
+// unused - no hand-tuned constant governs how aggressive predictor warming
+// is, its own measured track record does.
+static double moe_cache_predictor_admit_confidence(const moe_cache_device & device) {
+    const double f = device.predictor_admit_evidence_for;
+    const double a = device.predictor_admit_evidence_against;
+    return f / (f + a);
+}
+
+// Hit-time "for" evidence: called from the real hit path (moe_cache_plan,
+// same site moe_cache_atlas_align_note_hit already samples) - a hit on a
+// key predictor warming believes it admitted means that admission actually
+// got used. Resolved and ERASED on the first hit, not left for further
+// hits to keep counting - the verdict ("this paid off") is already settled,
+// and leaving it in the set would let the SAME admission also count as
+// "against" later when it eventually gets evicted (everything resident
+// eventually is), double-counting one outcome as both good and bad.
+static void moe_cache_predictor_note_hit(moe_cache_device & device, const moe_cache_key & key) {
+    if (!moe_cache_train_predictor_enabled() || device.predictor_admitted.empty()) {
+        return;
+    }
+    const auto it = device.predictor_admitted.find(key);
+    if (it != device.predictor_admitted.end()) {
+        device.predictor_admit_evidence_for += 1.0;
+        device.predictor_admitted.erase(it);
+    }
+}
+
+// Cross-restart persistence. No default path - opt-in, since this writes a
+// file, and every prior mechanism this session that touched disk (the atlas
+// file, the trace files) was an explicit, named path, never an implicit
+// default location. Answers "shouldn't the confidence floor be decided by
+// the system only" (2026-08-29): the (1,1) evidence prior is unavoidable
+// before ANY evidence exists, but with this, that only happens once, ever,
+// on this file's very first run - every later restart resumes from what was
+// actually measured, not a fresh guess.
+static const char * moe_cache_predictor_state_path() {
+    return getenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE");
+}
+static long long moe_cache_predictor_save_interval() {
+    static const long long v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_SAVE_INTERVAL");
+        const long long n = env ? atoll(env) : 2000;
+        return n > 0 ? n : 2000;
+    }();
+    return v;
+}
+
+static constexpr uint32_t MOE_CACHE_PREDICTOR_STATE_MAGIC = 0x4D435031u; // "MCP1"
+
+// Loaded once, lazily, on this device's first training example - see
+// device.predictor_state_load_attempted. Populates predictor_loaded_by_name
+// (consulted per-tensor as each is first trained, since host_base is not
+// yet known for tensors not yet seen this run) and the global evidence/step
+// counters directly (those are not per-tensor, safe to apply immediately).
+static void moe_cache_predictor_load_file(moe_cache_device & device) {
+    device.predictor_state_load_attempted = true;
+    const char * path = moe_cache_predictor_state_path();
+    if (!path) {
+        return;
+    }
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        return; // no prior state yet - first run, or a fresh path - not an error
+    }
+    uint32_t magic = 0;
+    f.read((char *) &magic, sizeof(magic));
+    if (!f || magic != MOE_CACHE_PREDICTOR_STATE_MAGIC) {
+        MOE_CACHE_LOG("[moe-cache] predictor state file '%s' unreadable or wrong format - ignoring\n", path);
+        return;
+    }
+    uint32_t n_tensors = 0;
+    f.read((char *) &n_tensors, sizeof(n_tensors));
+    for (uint32_t t = 0; f && t < n_tensors; t++) {
+        uint32_t name_len = 0;
+        f.read((char *) &name_len, sizeof(name_len));
+        if (!f || name_len > (1u << 20)) { // sanity ceiling, not a real limit
+            return;
+        }
+        std::string name(name_len, '\0');
+        f.read(name.data(), name_len);
+        uint32_t n_expert = 0, hidden_dim = 0;
+        f.read((char *) &n_expert, sizeof(n_expert));
+        f.read((char *) &hidden_dim, sizeof(hidden_dim));
+        if (!f) {
+            return;
+        }
+        const size_t count = (size_t) n_expert * (size_t) hidden_dim;
+        std::vector<float> w(count);
+        if (count > 0) {
+            f.read((char *) w.data(), count * sizeof(float));
+        }
+        if (!f) {
+            return;
+        }
+        device.predictor_loaded_by_name[name] = std::move(w);
+    }
+    f.read((char *) &device.predictor_admit_evidence_for, sizeof(double));
+    f.read((char *) &device.predictor_admit_evidence_against, sizeof(double));
+    f.read((char *) &device.predictor_steps, sizeof(long long));
+    f.read((char *) &device.predictor_top1_hits, sizeof(long long));
+    if (!f) {
+        // Per-tensor weights loaded fine above; only the trailing scalars
+        // are suspect - leave evidence at its safe (1,1) prior rather than
+        // trust a partially-read value.
+        device.predictor_admit_evidence_for = 1.0;
+        device.predictor_admit_evidence_against = 1.0;
+    }
+    MOE_CACHE_LOG("[moe-cache] predictor state resumed from '%s': %u tensors, "
+            "admit_confidence=%.3f, %lld prior steps\n",
+            path, n_tensors, moe_cache_predictor_admit_confidence(device), device.predictor_steps);
+}
+
+// Called periodically (moe_cache_predictor_save_interval steps), not only
+// at shutdown - this session's own testing kills servers with SIGKILL
+// routinely (pkill, not a graceful stop), which a save-on-destroy design
+// would simply never reach. Overwrites the whole file each time: simple,
+// and the file only ever holds one process's state at a time by design (see
+// the single-writer caveat below) so there is nothing to merge.
+static void moe_cache_predictor_save(const moe_cache_device & device) {
+    const char * path = moe_cache_predictor_state_path();
+    if (!path) {
+        return;
+    }
+    const std::string tmp_path = std::string(path) + ".tmp";
+    std::ofstream f(tmp_path, std::ios::binary | std::ios::trunc);
+    if (!f) {
+        return;
+    }
+    uint32_t magic = MOE_CACHE_PREDICTOR_STATE_MAGIC;
+    f.write((const char *) &magic, sizeof(magic));
+    // A tensor is writable only with BOTH a known stable name and a known
+    // per-tensor hidden_dim (see that field's comment - ffn_down_exps and
+    // ffn_gate_exps/up_exps genuinely differ here, so there is no
+    // model-wide fallback to use if a specific tensor's is missing) - the
+    // counting and writing loops below must use the exact same condition,
+    // or the file's declared n_tensors will not match what is actually
+    // written and every read after the mismatch point misparses.
+    auto writable = [&](const void * host_base) {
+        return device.tensor_names.count(host_base) && device.predictor_hidden_dim.count(host_base);
+    };
+    uint32_t n_tensors = 0;
+    for (const auto & [host_base, w] : device.predictor_weights) {
+        if (writable(host_base)) {
+            n_tensors++;
+        }
+    }
+    f.write((const char *) &n_tensors, sizeof(n_tensors));
+    for (const auto & [host_base, w] : device.predictor_weights) {
+        if (!writable(host_base)) {
+            continue; // no stable name or no known hidden_dim - cannot be resumed later, skip rather than write an orphan
+        }
+        const std::string & name = device.tensor_names.at(host_base);
+        const uint32_t name_len = (uint32_t) name.size();
+        f.write((const char *) &name_len, sizeof(name_len));
+        f.write(name.data(), name_len);
+        const uint32_t hidden_dim = (uint32_t) device.predictor_hidden_dim.at(host_base);
+        const uint32_t n_expert = hidden_dim > 0 ? (uint32_t) (w.size() / hidden_dim) : 0;
+        f.write((const char *) &n_expert, sizeof(n_expert));
+        f.write((const char *) &hidden_dim, sizeof(hidden_dim));
+        if (!w.empty()) {
+            f.write((const char *) w.data(), w.size() * sizeof(float));
+        }
+    }
+    f.write((const char *) &device.predictor_admit_evidence_for, sizeof(double));
+    f.write((const char *) &device.predictor_admit_evidence_against, sizeof(double));
+    f.write((const char *) &device.predictor_steps, sizeof(long long));
+    f.write((const char *) &device.predictor_top1_hits, sizeof(long long));
+    f.close();
+    if (!f) {
+        return;
+    }
+    // Atomic-ish swap: rename is atomic on the same filesystem, so a reader
+    // (the next process's load, or a concurrent inspection) never sees a
+    // half-written file - the failure mode this session's own corruption
+    // investigation spent weeks on was exactly this class of thing
+    // elsewhere in the codebase, worth avoiding here on the first attempt.
+    std::rename(tmp_path.c_str(), path);
+}
+
+// Worker side: one online logistic-regression step per queued example -
+// positives are the real selected experts (push their score up toward this
+// token's actual activation), negatives are a small random same-tensor
+// sample (push unrelated experts' scores down) - same shape as
+// moe-incremental-atlas.py's SGNS training, now on the real mechanistic
+// signal instead of a co-activation graph proxy, and cheap enough (a
+// handful of dot products) to run under the session lock rather than
+// needing it released like the atlas scan above.
+static void moe_cache_train_service(moe_cache_device & device) {
+    if (device.train_queue.empty()) {
+        return;
+    }
+    const moe_cache_train_request req = std::move(device.train_queue.front());
+    device.train_queue.pop_front();
+    const int64_t hidden_dim = (int64_t) req.acts.size();
+    if (hidden_dim <= 0 || req.n_expert <= 0 || req.ids.empty()) {
+        return;
+    }
+    device.predictor_hidden_dim[req.host_base] = hidden_dim;
+    if (!device.predictor_state_load_attempted) {
+        moe_cache_predictor_load_file(device);
+    }
+    std::vector<float> & W = device.predictor_weights[req.host_base];
+    const size_t need = (size_t) req.n_expert * (size_t) hidden_dim;
+    if (W.size() != need) {
+        // Tensor's first training example this process, or n_expert/
+        // hidden_dim changed (a different model loaded into the same
+        // process) - consult persisted state (name-keyed, since host_base
+        // is not stable across restarts) before falling back to zero.
+        // Zero-initialized logistic regression is still a fine starting
+        // point when nothing was persisted; nothing here depends on
+        // symmetry-breaking randomness.
+        bool restored = false;
+        const auto nit = device.tensor_names.find(req.host_base);
+        if (nit != device.tensor_names.end()) {
+            const auto lit = device.predictor_loaded_by_name.find(nit->second);
+            if (lit != device.predictor_loaded_by_name.end() && lit->second.size() == need) {
+                W = lit->second;
+                restored = true;
+            }
+        }
+        if (!restored) {
+            W.assign(need, 0.0f);
+        }
+    }
+    const float * h = req.acts.data();
+    const float lr = moe_cache_train_lr();
+    auto sgd_step = [&](int32_t e, float label) {
+        if (e < 0 || e >= req.n_expert) {
+            return;
+        }
+        float * w = W.data() + (size_t) e * (size_t) hidden_dim;
+        double score = 0.0;
+        for (int64_t d = 0; d < hidden_dim; d++) {
+            score += (double) w[d] * (double) h[d];
+        }
+        const double sig = 1.0 / (1.0 + std::exp(-std::max(-30.0, std::min(30.0, score))));
+        const float grad = (float) ((double) label - sig) * lr;
+        for (int64_t d = 0; d < hidden_dim; d++) {
+            w[d] += grad * h[d];
+        }
+        return;
+    };
+    // Live accuracy sample: does the predictor's single highest-scoring
+    // expert (BEFORE this step's update, so it is judged on what it knew
+    // going in) actually land in the real selected set?
+    {
+        int32_t best_e = -1;
+        double best_score = -1e300;
+        for (int32_t e = 0; e < req.n_expert; e++) {
+            const float * w = W.data() + (size_t) e * (size_t) hidden_dim;
+            double score = 0.0;
+            for (int64_t d = 0; d < hidden_dim; d++) {
+                score += (double) w[d] * (double) h[d];
+            }
+            if (score > best_score) {
+                best_score = score;
+                best_e = e;
+            }
+        }
+        if (best_e >= 0 && std::find(req.ids.begin(), req.ids.end(), best_e) != req.ids.end()) {
+            device.predictor_top1_hits++;
+        }
+    }
+    for (int32_t e : req.ids) {
+        sgd_step(e, 1.0f);
+    }
+    static thread_local std::mt19937 rng(0xC0FFEE);
+    std::uniform_int_distribution<int32_t> dist(0, (int32_t) req.n_expert - 1);
+    const int negs = moe_cache_train_negs();
+    for (int i = 0; i < negs; i++) {
+        int32_t e = dist(rng);
+        if (std::find(req.ids.begin(), req.ids.end(), e) == req.ids.end()) {
+            sgd_step(e, 0.0f);
+        }
+    }
+    // Warming: rank every expert by the (just-updated) predictor score and
+    // hand the top few to the SAME free-slot-only admission function the
+    // atlas uses (moe_cache_atlas_admit) - no new admission logic, this
+    // reuses every safety property already proven there (suggestion-only,
+    // never evicts, no-op when nothing is free). req.pool_index/expert_size
+    // were captured at enqueue time (moe_cache_train, dispatch thread); both
+    // are re-validated here since this runs later, on the worker.
+    //
+    // Gated on the pool's OWN remaining free-slot budget, not a firing-rate
+    // interval - see moe_cache_train_warm_slot_floor_frac for why a hard
+    // floor is the right shape here (two rate-based attempts, a step-count
+    // interval and a per-firing size cap, both measured as barely moving
+    // anything against pools of thousands of slots).
+    if (req.pool_index >= 0 && (size_t) req.pool_index < device.pools.size()) {
+        moe_cache_pool * pool = device.pools[req.pool_index].get();
+        if (pool && pool->slab && pool->expert_size == req.expert_size &&
+            pool->n_slots > 0 &&
+            pool->free_slots.size() > (size_t) (pool->n_slots * moe_cache_train_warm_slot_floor_frac())) {
+            const int rank_k = moe_cache_train_rank_k();
+            moe_cache_atlas_cand cands[MOE_CACHE_ATLAS_RANK_K];
+            int n_cands = 0;
+            for (int32_t e = 0; e < (int32_t) req.n_expert; e++) {
+                const float * w = W.data() + (size_t) e * (size_t) hidden_dim;
+                double score = 0.0;
+                for (int64_t d = 0; d < hidden_dim; d++) {
+                    score += (double) w[d] * (double) h[d];
+                }
+                if (score <= 0.0) {
+                    continue; // only warm candidates the predictor actually favours
+                }
+                const moe_cache_atlas_cand cand{e, (float) score};
+                if (n_cands < rank_k) {
+                    cands[n_cands++] = cand;
+                    std::sort(cands, cands + n_cands, [](const moe_cache_atlas_cand & a, const moe_cache_atlas_cand & b) { return a.score > b.score; });
+                } else if (cand.score > cands[rank_k - 1].score) {
+                    cands[rank_k - 1] = cand;
+                    std::sort(cands, cands + rank_k, [](const moe_cache_atlas_cand & a, const moe_cache_atlas_cand & b) { return a.score > b.score; });
+                }
+            }
+            if (n_cands > 0) {
+                // Self-tuning admit_k: scaled by predictor_admit_confidence
+                // (measured real payoff - see that function's comment),
+                // never below 1 so a confidence still settling from its 0.5
+                // prior isn't silently zeroed out.
+                const double confidence = moe_cache_predictor_admit_confidence(device);
+                const int admit_k = std::max(1, (int) std::lround((double) moe_cache_train_admit_k() * confidence));
+                // Residency BEFORE admitting, so the after-check below can
+                // tell "this call just admitted it" apart from "it was
+                // already resident" (moe_cache_atlas_admit silently skips
+                // already-resident candidates) - attributing an
+                // already-resident key's eventual eviction to predictor
+                // warming would be a real mislabel, not just noise.
+                bool was_resident[MOE_CACHE_ATLAS_RANK_K];
+                for (int i = 0; i < n_cands; i++) {
+                    was_resident[i] = pool->map.find(moe_cache_key{req.host_base, cands[i].expert}) != pool->map.end();
+                }
+                moe_cache_atlas_admit(device, *pool, req.pool_index, req.host_base, req.expert_size,
+                        cands, n_cands, admit_k, -1);
+                for (int i = 0; i < n_cands && i < admit_k; i++) {
+                    if (was_resident[i]) {
+                        continue;
+                    }
+                    const moe_cache_key key{req.host_base, cands[i].expert};
+                    if (pool->map.find(key) != pool->map.end()) {
+                        device.predictor_admitted.insert(key);
+                    }
+                }
+            }
+        }
+    }
+
+    device.predictor_steps++;
+    if (getenv("MOE_CACHE_DEBUG_GATE") && device.predictor_steps % 2000 == 0) {
+        fprintf(stderr, "[predictor-dbg] steps=%lld top1_acc=%.4f (chance ~= %.4f) "
+                "admit_confidence=%.3f (for=%.1f against=%.1f, tracked=%zu)\n",
+                device.predictor_steps,
+                (double) device.predictor_top1_hits / (double) device.predictor_steps,
+                (double) 8 /* typical top-k */ / (double) req.n_expert,
+                moe_cache_predictor_admit_confidence(device),
+                device.predictor_admit_evidence_for, device.predictor_admit_evidence_against,
+                device.predictor_admitted.size());
+    }
+    // Periodic, not save-on-shutdown-only - see moe_cache_predictor_save's
+    // comment for why (this session's own testing kills servers with
+    // SIGKILL routinely).
+    if (moe_cache_predictor_state_path() && device.predictor_steps % moe_cache_predictor_save_interval() == 0) {
+        moe_cache_predictor_save(device);
+    }
+}
+
+// Entry point: called from the existing mul_mat_id dispatch hook (Stage A
+// wiring, ggml-cpu.c) with the router's ALREADY-made decision - see the
+// Stage A comment above moe_cache_train_predictor_enabled for what this
+// can and cannot influence. Copies exactly one token (the first in this
+// batch) into the bounded train_queue - see that field's comment for why
+// bounded-and-dropping, not queued, is correct here, same as warm_queue.
+static void moe_cache_train(
+        void * opaque, const int32_t * ids, int n_ids_per_token, int n_tokens,
+        const float * acts, size_t act_stride, int64_t hidden_dim) {
+    if (!moe_cache_train_predictor_enabled()) {
+        return;
+    }
+    moe_cache_node * node = (moe_cache_node *) opaque;
+    if (!node || !node->device || !ids || !acts || n_ids_per_token <= 0 ||
+        n_tokens <= 0 || hidden_dim <= 0 || node->n_expert <= 0) {
+        return;
+    }
+    moe_cache_device & device = *node->device;
+    std::lock_guard<std::mutex> lock(node->session->mu);
+    if (node->session->stopping || device.dead.load()) {
+        return;
+    }
+    if (!device.train_queue.empty()) {
+        return; // one deep, drop rather than fall behind - see the field comment
+    }
+    moe_cache_train_request req;
+    req.host_base = node->host_base;
+    req.n_expert = node->n_expert;
+    req.pool_index = node->pool_index;
+    req.expert_size = node->expert_size;
+    req.acts.assign(acts, acts + hidden_dim); // token 0 only; act_stride unused when sampling just the first row
+    // Append the live context signal (see MOE_CACHE_TRAIN_CONTEXT_DIMS's
+    // comment) - lookahead-adjusted the same way the atlas's own ranking
+    // uses it, so both mechanisms condition on the identical live-direction
+    // estimate. 0,0 (the same value req_dir starts at before validity)
+    // when nothing is known yet - a neutral input, not a wrong one.
+    {
+        float rx = 0.0f, ry = 0.0f;
+        if (device.req_dir_valid) {
+            moe_cache_atlas_lookahead(device, rx, ry);
+        }
+        req.acts.push_back(rx);
+        req.acts.push_back(ry);
+    }
+    req.ids.assign(ids, ids + n_ids_per_token);
+    (void) act_stride;
+    (void) n_tokens;
+    device.train_queue.push_back(std::move(req));
 }
 
 // Pick a resident stand-in for `missed`, or -1. Walks this tensor's resident
@@ -6162,15 +7463,31 @@ static int moe_cache_plan(
                     device.req_dir_x = cell.x;
                     device.req_dir_y = cell.y;
                     device.req_dir_valid = true;
+                    // No prior level to take a delta against yet - trend
+                    // starts at zero (no movement assumed) rather than a
+                    // spurious jump from the origin.
                 } else {
+                    const float prev_x = device.req_dir_x, prev_y = device.req_dir_y;
                     device.req_dir_x += moe_cache_device::MOE_CACHE_ATLAS_DECAY * (cell.x - device.req_dir_x);
                     device.req_dir_y += moe_cache_device::MOE_CACHE_ATLAS_DECAY * (cell.y - device.req_dir_y);
+                    // Holt's trend update: EMA of the level's own step, i.e.
+                    // how fast and which way the centroid is currently
+                    // drifting - see moe_cache_atlas_lookahead.
+                    const float step_x = device.req_dir_x - prev_x;
+                    const float step_y = device.req_dir_y - prev_y;
+                    device.req_vel_x += moe_cache_device::MOE_CACHE_ATLAS_TREND_DECAY * (step_x - device.req_vel_x);
+                    device.req_vel_y += moe_cache_device::MOE_CACHE_ATLAS_TREND_DECAY * (step_y - device.req_vel_y);
                 }
+                device.req_dir_updates++;
                 if (getenv("MOE_CACHE_DEBUG_GATE")) {
                     static std::atomic<long long> n{0};
                     if (++n % 200 == 0) {
-                        fprintf(stderr, "[atlas-dbg] req_dir=(%.3f,%.3f) last_expert=(%.3f,%.3f) spec=%.3f\n",
-                                device.req_dir_x, device.req_dir_y, cell.x, cell.y, cell.spec);
+                        fprintf(stderr, "[atlas-dbg] req_dir=(%.3f,%.3f) vel=(%.4f,%.4f) last_expert=(%.3f,%.3f) spec=%.3f "
+                                "evidence_for=%.1f evidence_against=%.1f confidence=%.3f heat_scale_ema=%.2f\n",
+                                device.req_dir_x, device.req_dir_y, device.req_vel_x, device.req_vel_y,
+                                cell.x, cell.y, cell.spec,
+                                device.atlas_align_evidence_for, device.atlas_align_evidence_against,
+                                moe_cache_atlas_align_confidence(device), pool.heat_scale_ema);
                     }
                 }
             }
@@ -6212,6 +7529,9 @@ static int moe_cache_plan(
             if (slot.state == moe_cache_slot_state::valid) {
                 slot.readers++;
                 slot.heat = std::min(MOE_CACHE_HEAT_MAX, slot.heat + MOE_CACHE_HEAT_STEP);
+                moe_cache_pool_note_heat_step(pool, slot.heat);
+                moe_cache_atlas_align_note_hit(device, key);
+                moe_cache_predictor_note_hit(device, key);
                 // Any real hit, from either segment, promotes to (or
                 // refreshes within) protected_ - a resident slot being
                 // requested again is exactly the "genuinely hot, not just
@@ -6268,6 +7588,7 @@ static int moe_cache_plan(
         // used and therefore the only ones ever kept - the confirmation-drift
         // trap docs/plan.md already names for the dynamic atlas.
         if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
+            rank_bucket >= moe_cache_substitute_min_rank() &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
             // Rank-based by default; the co-activation scan stays available
             // for A/B via GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT=1.
@@ -6287,6 +7608,7 @@ static int moe_cache_plan(
                 // the router and must not claim eviction protection on the
                 // strength of standing in.
                 ssl.heat = std::min(MOE_CACHE_HEAT_MAX, ssl.heat + MOE_CACHE_HEAT_STEP);
+                moe_cache_pool_note_heat_step(pool, ssl.heat);
                 node->pins[node->n_pins++] = {sub, ssl.generation};
                 slot_indices[index] = sub;
                 device.substitutions++;
@@ -6625,41 +7947,126 @@ static int moe_cache_plan(
         device.last_top_expert_valid = true;
     }
 
-    // Track 1 step 3: Atlas-driven warming, rate-limited to once every 64
-    // plan() calls (device.nodes, unconditionally incremented once per call
-    // just below - deliberately not plan_epoch, whose own increment above
-    // is conditional on cold-sweep being enabled) so ranking a tensor's
-    // whole atlas-covered candidate set never runs on every single token -
-    // see moe_cache_atlas_warm's own comment for why this is prefetch-only
-    // and off by default.
-    if (moe_cache_atlas_warm_enabled() &&
-        (long long) device.nodes - device.atlas_warm_last_calls >= 64) {
-        device.atlas_warm_last_calls = (long long) device.nodes;
-        // Track 1.5: with ASYNC on, all this path does is hand the worker a
-        // hint (a hash lookup and a push_back); the cosine scan and the
-        // admission both happen there, off the thread that has to issue the
-        // next GPU op. Either way the worker still has to be woken - for the
-        // fills the sync path just queued, or for the ranking pass the async
-        // path just deferred to it.
-        const bool timing = moe_cache_atlas_warm_timing_enabled();
-        const auto warm_t0 = timing ? std::chrono::steady_clock::now()
-                                    : std::chrono::steady_clock::time_point{};
-        const bool queued = moe_cache_atlas_warm_async_enabled()
-            ? moe_cache_atlas_warm_enqueue(device, node->pool_index, node->host_base, node->expert_size, node->n_expert)
-            : moe_cache_atlas_warm(device, pool, node->pool_index, node->host_base, node->expert_size, node->n_expert);
-        if (timing) {
-            device.warm_path_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - warm_t0).count();
-            if (++device.warm_path_calls % 256 == 0) {
-                fprintf(stderr, "[atlas-warm] %s: %.1f us avg on the dispatch path (%lld calls)\n",
-                        moe_cache_atlas_warm_async_enabled() ? "async" : "sync",
-                        (double) device.warm_path_ns / (double) device.warm_path_calls / 1000.0,
-                        device.warm_path_calls);
-                fflush(stderr);
+    // Track 1 step 3: Atlas-driven warming. Rate-limited to once every
+    // atlas_warm_interval() plan() calls (device.nodes, unconditionally
+    // incremented once per call just below - deliberately not plan_epoch,
+    // whose own increment above is conditional on cold-sweep being enabled)
+    // so ranking a tensor's whole atlas-covered candidate set never runs on
+    // every single token by default - see moe_cache_atlas_warm's own comment
+    // for why this is prefetch-only and off by default.
+    //
+    // Burst extension: the interval, per-firing admit/evict budget, and how
+    // many distinct tensors get a pass are all widened together once
+    // moe_cache_atlas_burst_check reports the live req_dir centroid has
+    // moved a real distance since the last check - i.e. an actual topic
+    // shift in progress, not steady-state noise. Steady-state behavior
+    // (interval=64, one tensor, small budget) is unchanged from the
+    // original design, which measured flat-to-good there; the multi-round
+    // multi-switch benchmark that motivated this found the ORIGINAL burst
+    // response (2 admits, 1 eviction, one tensor, still throttled to every
+    // 64 calls) too thin to beat reactive demand-driven admission to the
+    // punch - this widens exactly that response without touching
+    // steady-state at all.
+    if (moe_cache_atlas_warm_enabled()) {
+        // Record this call's tensor into the recent-tensor ring
+        // unconditionally (cheap - a linear dedup scan over a capped-size
+        // deque, no allocation once warmed up), so a burst detected on ANY
+        // later call has real pool/size info for whichever OTHER tensors
+        // were planned recently, not just whichever one trips the throttle.
+        {
+            auto & recent = device.atlas_recent_tensors;
+            for (auto it = recent.begin(); it != recent.end(); ++it) {
+                if (it->host_base == node->host_base) {
+                    recent.erase(it);
+                    break;
+                }
+            }
+            recent.push_front({node->pool_index, node->host_base, node->expert_size, node->n_expert});
+            static const size_t max_recent = (size_t) std::max(8, moe_cache_atlas_burst_tensor_sweep() * 2);
+            while (recent.size() > max_recent) {
+                recent.pop_back();
             }
         }
-        if (queued) {
-            wake_worker = true;
+
+        const long long interval = moe_cache_atlas_warm_interval(device.atlas_burst_confidence);
+        if ((long long) device.nodes - device.atlas_warm_last_calls >= interval) {
+            device.atlas_warm_last_calls = (long long) device.nodes;
+            const bool bursting = moe_cache_atlas_burst_check(device);
+            if (bursting != device.atlas_bursting && getenv("MOE_CACHE_DEBUG_GATE")) {
+                fprintf(stderr, "[atlas-burst] %s at node=%lld req_dir=(%.3f,%.3f) recent_tensors=%zu\n",
+                        bursting ? "ENTER burst" : "exit burst",
+                        (long long) device.nodes, device.req_dir_x, device.req_dir_y,
+                        device.atlas_recent_tensors.size());
+                fflush(stderr);
+            }
+            device.atlas_bursting = bursting;
+
+            // Track 1.5: with ASYNC on, all this path does is hand the worker a
+            // hint (a hash lookup and a push_back); the cosine scan and the
+            // admission both happen there, off the thread that has to issue the
+            // next GPU op. Either way the worker still has to be woken - for the
+            // fills the sync path just queued, or for the ranking pass the async
+            // path just deferred to it. Bursting always takes the sync,
+            // multi-tensor path - the async single-tensor hint queue (one
+            // deep, by design) has no room to carry a whole sweep's worth of
+            // requests, and async is off by default anyway.
+            const bool timing = moe_cache_atlas_warm_timing_enabled();
+            const auto warm_t0 = timing ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
+            bool queued = false;
+            if (bursting) {
+                int swept = 0;
+                // Scale how many DISTINCT tensors get swept by the same
+                // headroom dampener moe_cache_atlas_warm applies to each
+                // individual call's own admit/rank budget - without this,
+                // a dampened per-tensor budget still got spent 8 separate
+                // times (once per swept tensor), which is most of why the
+                // per-call dampening alone (2026-08-29 ablation) only
+                // partly closed the cold-start regression: 8 small draws
+                // add up to roughly the same total damage one big draw
+                // does. Keyed off `pool` (the tensor that actually
+                // triggered this check), same as the confidence already
+                // is - the other swept tensors' own pools get their own
+                // per-call dampening inside moe_cache_atlas_warm regardless.
+                const float sweep_confidence = moe_cache_atlas_burst_confidence_clamp(
+                        device.atlas_burst_confidence * moe_cache_atlas_burst_headroom_scale(pool));
+                const int sweep_max = moe_cache_atlas_burst_tensor_sweep();
+                const int sweep_cap = 1 + (int) std::lround((double) (sweep_max - 1) * sweep_confidence);
+                for (const auto & rt : device.atlas_recent_tensors) {
+                    if (swept >= sweep_cap) {
+                        break;
+                    }
+                    if (rt.pool_index < 0 || (size_t) rt.pool_index >= device.pools.size()) {
+                        continue; // pools are append-only, but re-check anyway - see moe_cache_atlas_warm_service
+                    }
+                    moe_cache_pool * rt_pool = device.pools[rt.pool_index].get();
+                    if (!rt_pool || !rt_pool->slab) {
+                        continue;
+                    }
+                    if (moe_cache_atlas_warm(device, *rt_pool, rt.pool_index, rt.host_base, rt.expert_size, rt.n_expert, device.atlas_burst_confidence)) {
+                        queued = true;
+                    }
+                    swept++;
+                }
+            } else {
+                queued = moe_cache_atlas_warm_async_enabled()
+                    ? moe_cache_atlas_warm_enqueue(device, node->pool_index, node->host_base, node->expert_size, node->n_expert)
+                    : moe_cache_atlas_warm(device, pool, node->pool_index, node->host_base, node->expert_size, node->n_expert, device.atlas_burst_confidence);
+            }
+            if (timing) {
+                device.warm_path_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - warm_t0).count();
+                if (++device.warm_path_calls % 256 == 0) {
+                    fprintf(stderr, "[atlas-warm] %s: %.1f us avg on the dispatch path (%lld calls)\n",
+                            moe_cache_atlas_warm_async_enabled() ? "async" : "sync",
+                            (double) device.warm_path_ns / (double) device.warm_path_calls / 1000.0,
+                            device.warm_path_calls);
+                    fflush(stderr);
+                }
+            }
+            if (queued) {
+                wake_worker = true;
+            }
         }
     }
 
@@ -8208,6 +9615,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_leave = moe_cache_session_leave;
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
+    ggml_moe_cache.train = moe_cache_train;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;

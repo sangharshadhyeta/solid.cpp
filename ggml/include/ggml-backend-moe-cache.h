@@ -102,6 +102,20 @@ struct ggml_moe_cache_api {
     // dispatch subsequently succeeds.
     int (*plan)(void * node, const int32_t * ids, int n_ids, int32_t * slot_idx);
 
+    // Optional, off by default (NULL when the predictor is disabled - the
+    // caller must null-check before calling, same convention as every other
+    // slot here). Free (input, label) training pair for a live linear
+    // predictor: `acts` is the row-major hidden-state input this node's
+    // router decision was actually computed from (ids IS the label, already
+    // known by this point - this trains the predictor for FUTURE dispatches,
+    // it cannot change what this node itself does), one row per token,
+    // `act_stride` bytes between rows, `hidden_dim` floats per row. Only the
+    // first token of the batch is sampled per call - see moe_cache_train's
+    // comment for why one example per dispatch is enough and cheap is safer
+    // than complete on this specific hot path.
+    void (*train)(void * node, const int32_t * ids, int n_ids_per_token, int n_tokens,
+                  const float * acts, size_t act_stride, int64_t hidden_dim);
+
     // Dispatch all planned hit rows. Returns 1 only after the complete GPU
     // operation has been accepted. On 0, the caller must restore every row to
     // the normal CPU mapping before worker threads start.
