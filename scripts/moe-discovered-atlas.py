@@ -28,19 +28,27 @@ import json, sys, argparse
 from collections import defaultdict
 import numpy as np
 
-TOPICS = ['code', 'math', 'history', 'medicine']
 K = 8
 
 
-def load_traces(prefix='traces/deep-', topics=TOPICS, keep=K):
-    """Returns per-topic lists of (layer, [expert ids]) in decode order."""
+def load_traces(paths, keep=K):
+    """Returns per-file lists of (layer, [expert ids]) in decode order.
+
+    Was hardcoded to the 4-topic traces/deep-*.txt set (28,800 decisions) -
+    the trace files actually used for the 31.6x-data rebuild that got the
+    spectral method to its real measured ceiling (moe-link-prediction.py,
+    AUC 0.5706-0.5761 on 909,480 pooled decisions) are traces/big-*.txt (12
+    topics). The on-disk expert-atlas-discovered.json this script produces
+    was never regenerated from that larger set - --traces makes that
+    explicit instead of silently defaulting to the smaller one.
+    """
     out = {}
-    for t in topics:
+    for p in paths:
         seq = []
-        for line in open(f"{prefix}{t}.txt"):
-            p = line.split()
-            seq.append((int(p[0]), [int(x.split(':')[0]) for x in p[2:2 + keep]]))
-        out[t] = seq
+        for line in open(p):
+            f = line.split()
+            seq.append((int(f[0]), [int(x.split(':')[0]) for x in f[2:2 + keep]]))
+        out[p] = seq
     return out
 
 
@@ -109,11 +117,12 @@ def embed(nodes, edges, dims=8, iters=12, seed=0):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument('--traces', nargs='+', required=True)
     ap.add_argument('--out', default='/mnt/nvme/models/ornith/expert-atlas-discovered.json')
     ap.add_argument('--dims', type=int, default=8)
     a = ap.parse_args()
 
-    streams = load_traces()
+    streams = load_traces(a.traces)
     nodes, edges = build_graph(streams)
     print(f"graph: {len(nodes)} nodes, {len(edges)} edges", file=sys.stderr)
     emb, vals, deg = embed(nodes, edges, dims=a.dims)

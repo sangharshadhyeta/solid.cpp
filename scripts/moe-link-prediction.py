@@ -89,12 +89,25 @@ def auc(pos, neg):
     return (ranks[lab == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
 
 
+def load_incremental(path):
+    """Load a moe-incremental-atlas.py .npz - same (layer,expert)->index keying
+    as embed_from's `nodes`, so it drops into the same score() closure below."""
+    z = np.load(path, allow_pickle=True)
+    nodes = {tuple(int(x) for x in k): int(v) for k, v in zip(z['keys'], z['vals'])}
+    emb = z['emb']
+    emb = emb / (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
+    steps = int(z['steps']) if 'steps' in z.files else -1
+    return nodes, emb, steps
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--traces', nargs='+', required=True)
     ap.add_argument('--atlas', default='/mnt/nvme/models/ornith/expert-atlas-v2.json')
     ap.add_argument('--dims', type=int, default=16)
     ap.add_argument('--samples', type=int, default=200000)
+    ap.add_argument('--incremental', default=None,
+                     help='score a moe-incremental-atlas.py .npz state file too')
     a = ap.parse_args()
 
     seq = load_pooled(a.traces)
@@ -143,12 +156,20 @@ def main():
             neg.append(k)
     print(f"\nheld-out pairs UNSEEN in training: positives {len(pos):,}  negatives {len(neg):,}")
 
+    inc_nodes, E_inc = {}, None
+    if a.incremental:
+        inc_nodes, E_inc, inc_steps = load_incremental(a.incremental)
+        print(f"\nincremental atlas: {a.incremental}  ({len(inc_nodes):,} nodes, {inc_steps:,} total steps)")
+
     def score(pairs, how):
         out = []
         for (il, x, y) in pairs:
             if how == 'disc':
                 i, j = nodes.get((il, x)), nodes.get((il, y))
                 out.append(float(E[i] @ E[j]) if i is not None and j is not None else 0.0)
+            elif how == 'incr':
+                i, j = inc_nodes.get((il, x)), inc_nodes.get((il, y))
+                out.append(float(E_inc[i] @ E_inc[j]) if i is not None and j is not None else 0.0)
             elif how == 'probe':
                 u, v = hv.get((il, x)), hv.get((il, y))
                 out.append(float(u @ v) if u is not None and v is not None else 0.0)
@@ -157,9 +178,12 @@ def main():
         return np.array(out)
 
     print(f"\n{'method':<28} {'AUC':>7}   (0.500 = no better than chance)")
-    for label, how in (("popularity (control)", 'pop'),
-                       ("probe atlas (9 cats)", 'probe'),
-                       ("DISCOVERED co-activation", 'disc')):
+    methods = [("popularity (control)", 'pop'),
+               ("probe atlas (9 cats)", 'probe'),
+               ("DISCOVERED co-activation (spectral)", 'disc')]
+    if a.incremental:
+        methods.append(("INCREMENTAL co-activation (SGNS)", 'incr'))
+    for label, how in methods:
         print(f"  {label:<26} {auc(score(pos, how), score(neg, how)):.4f}")
 
 
