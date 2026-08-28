@@ -381,6 +381,17 @@ extern "C" {
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
 
+        // data type for recurrent-architecture state (Gated DeltaNet/KDA/Mamba-style
+        // linear-attention layers, mHC, etc.) - fixed-size per sequence, unlike the
+        // KV cache. Defaults to GGML_TYPE_F32 (unchanged prior behavior); F16 roughly
+        // halves this state's host/device footprint (real concurrency win when many
+        // sequences are batched, since each holds its own copy) for a perplexity cost
+        // in the low hundredths reported upstream - not verified against every
+        // architecture that uses this memory type, so treat non-default values here
+        // as experimental the same way type_k/type_v already are. [EXPERIMENTAL]
+        enum ggml_type type_r; // data type for recurrent state R
+        enum ggml_type type_s; // data type for recurrent state S
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
