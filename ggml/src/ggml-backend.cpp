@@ -1807,11 +1807,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
     std::vector<ggml_bitset_t> used_ids;
-    // Whether used_ids has any bit left after the LFRU pass below cleared the
-    // rows it served device-to-device - persists across inputs/splits that
-    // reuse the same ids_tensor, same as used_ids itself (only recomputed
-    // when the ids_tensor actually changes). Starts true so the very first
-    // use, before ids_tensor is ever set, doesn't wrongly skip.
+    // Per-input-tensor copy of used_ids with the LFRU-hit rows cleared. This
+    // must NOT be conflated with used_ids itself: used_ids is pure routing
+    // info (which experts this ids_tensor selects) and is legitimately
+    // shared across every weight tensor that reuses the same ids_tensor -
+    // gate_exps, up_exps and down_exps within one MoE layer all pass the
+    // exact same `selected_experts` tensor (see llm_graph_context::build_moe_ffn),
+    // so they hit the same ids_tensor object here. LFRU residency, in
+    // contrast, is keyed by (host_base, expert) - i.e. per WEIGHT TENSOR,
+    // not per ids_tensor - so an expert cached for gate_exps says nothing
+    // about whether it's cached for up_exps or down_exps. copy_ids is
+    // therefore rebuilt from used_ids and re-scanned against the LFRU cache
+    // for every input, even when ids_tensor is unchanged; only the routing
+    // decode into used_ids itself stays gated on the ids_tensor changing.
+    std::vector<ggml_bitset_t> copy_ids;
+    // Whether copy_ids has any bit left after the LFRU pass below cleared the
+    // rows it served device-to-device. Recomputed for every input (see
+    // copy_ids above). Starts true so the very first use, before ids_tensor
+    // is ever set, doesn't wrongly skip.
     bool any_h2d_needed = true;
     // Scratch for the batched LFRU query below - reused across inputs/splits
     // rather than allocated per call.
@@ -1932,50 +1945,54 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         }
 
                         prev_ids_tensor = ids_tensor;
+                    }
 
-                        // LFRU upgrade: an expert already resident in the decode-time
-                        // GPU cache for this same weight tensor doesn't need this H2D
-                        // at all - skip it here (device-to-device instead, no PCIe
-                        // cost) so the contiguous-run grouping below only ever builds
-                        // runs out of genuinely missing rows. Recomputed alongside
-                        // used_ids (only when the ids tensor actually changed, same
-                        // as that computation) since LFRU residency, like used_ids
-                        // itself, is only meaningful per-ids-tensor, not per-copy.
-                        // Batched rather than one call per expert: a real batch (121
-                        // experts hit in a single warm-cache prefill, measured) would
-                        // otherwise pay a cudaLaunchHostFunc dispatch per hit for no
-                        // reason, since every hit in this pass becomes releasable at
-                        // the same real time anyway.
-                        if (ggml_moe_cache.moe_lfru_copy_experts) {
-                            lfru_candidate_ids.clear();
-                            for (int64_t e = 0; e < n_expert; e++) {
-                                if (ggml_bitset_get(used_ids.data(), e)) {
-                                    lfru_candidate_ids.push_back((int32_t) e);
-                                }
+                    // copy_ids starts as a fresh copy of the routing bitmask for
+                    // THIS input's weight tensor. This must be redone for every
+                    // input, not just when ids_tensor changes: gate_exps, up_exps
+                    // and down_exps within one MoE layer all share the same
+                    // ids_tensor (same `selected_experts`, see build_moe_ffn), but
+                    // LFRU residency is keyed by (host_base, expert) - i.e. per
+                    // weight tensor - so a hit against gate_exps says nothing about
+                    // up_exps or down_exps. Reusing used_ids' cleared bits across
+                    // those tensors previously left some rows neither D2D- nor
+                    // H2D-copied (real corruption bug, root-caused and fixed here).
+                    copy_ids = used_ids;
+
+                    // LFRU upgrade: an expert already resident in the decode-time
+                    // GPU cache for this same weight tensor doesn't need this H2D
+                    // at all - skip it here (device-to-device instead, no PCIe
+                    // cost) so the contiguous-run grouping below only ever builds
+                    // runs out of genuinely missing rows. Batched rather than one
+                    // call per expert: a real batch (121 experts hit in a single
+                    // warm-cache prefill, measured) would otherwise pay a
+                    // cudaLaunchHostFunc dispatch per hit for no reason, since
+                    // every hit in this pass becomes releasable at the same real
+                    // time anyway.
+                    if (ggml_moe_cache.moe_lfru_copy_experts) {
+                        lfru_candidate_ids.clear();
+                        for (int64_t e = 0; e < n_expert; e++) {
+                            if (ggml_bitset_get(copy_ids.data(), e)) {
+                                lfru_candidate_ids.push_back((int32_t) e);
                             }
-                            if (!lfru_candidate_ids.empty()) {
-                                lfru_hit_mask.assign(lfru_candidate_ids.size(), 0);
-                                ggml_moe_cache.moe_lfru_copy_experts(
-                                        input->data, expert_size, lfru_candidate_ids.data(),
-                                        (int) lfru_candidate_ids.size(), input_cpy->data,
-                                        lfru_hit_mask.data(), split_backend);
-                                for (size_t ci = 0; ci < lfru_candidate_ids.size(); ci++) {
-                                    if (lfru_hit_mask[ci]) {
-                                        ggml_bitset_clear(used_ids.data(), lfru_candidate_ids[ci]);
-                                    }
+                        }
+                        if (!lfru_candidate_ids.empty()) {
+                            lfru_hit_mask.assign(lfru_candidate_ids.size(), 0);
+                            ggml_moe_cache.moe_lfru_copy_experts(
+                                    input->data, expert_size, lfru_candidate_ids.data(),
+                                    (int) lfru_candidate_ids.size(), input_cpy->data,
+                                    lfru_hit_mask.data(), split_backend);
+                            for (size_t ci = 0; ci < lfru_candidate_ids.size(); ci++) {
+                                if (lfru_hit_mask[ci]) {
+                                    ggml_bitset_clear(copy_ids.data(), lfru_candidate_ids[ci]);
                                 }
                             }
                         }
-                        // Every used row may have been served D2D above - remember
-                        // that for this ids_tensor so a later copy of the SAME split
-                        // input (another node/input reusing it - see the != check
-                        // above) doesn't have to redo the LFRU scan, and so the
-                        // run-finder below (which assumes at least one set bit) can
-                        // be skipped cleanly instead of scanning past the end.
-                        any_h2d_needed = false;
-                        for (int64_t e = 0; e < n_expert && !any_h2d_needed; e++) {
-                            any_h2d_needed = ggml_bitset_get(used_ids.data(), e);
-                        }
+                    }
+                    // Every used row for this input may have been served D2D above.
+                    any_h2d_needed = false;
+                    for (int64_t e = 0; e < n_expert && !any_h2d_needed; e++) {
+                        any_h2d_needed = ggml_bitset_get(copy_ids.data(), e);
                     }
 
                     if (!any_h2d_needed) {
@@ -2005,14 +2022,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     };
 
                     int id = 0;
-                    while (!ggml_bitset_get(used_ids.data(), id)) {
+                    while (!ggml_bitset_get(copy_ids.data(), id)) {
                         id++;
                     }
                     int32_t first_id = id;
                     int32_t last_id = first_id;
 
                     for (++id; id < n_expert; ++id) {
-                        if (!ggml_bitset_get(used_ids.data(), id)) {
+                        if (!ggml_bitset_get(copy_ids.data(), id)) {
                             continue;
                         }
 
