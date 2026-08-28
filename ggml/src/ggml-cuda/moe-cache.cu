@@ -28,6 +28,7 @@ void ggml_moe_cache_register(const void * owner) {
 #if defined(__linux__)
 #include <sys/mman.h>
 #include <unistd.h>
+#include <fcntl.h>
 #endif
 #include <climits>
 #include <condition_variable>
@@ -2917,6 +2918,167 @@ static void moe_cache_weight_guard_sweep() {
     fflush(stderr);
 }
 
+#if defined(__linux__)
+// PROTOTYPE, opt-in via GGML_CUDA_MOE_CACHE_EXPLICIT_READ=1: -ncmoe/moe-cache's
+// CPU-resident expert weights are mmap'd PROT_READ straight from the GGUF
+// (see llama-model-loader.cpp). A cold fill's cudaMemcpyAsync/memcpy touches
+// those pages for the first time during the copy itself, which means the
+// kernel demand-pages them in one 4KB page at a time with no idea a whole
+// multi-hundred-KB expert is about to be read in one shot - no readahead
+// matched to the actual access size, no chance to overlap the read with
+// anything else. TurboFieldfare (a from-scratch Metal/Swift MoE-on-SSD
+// runtime, unrelated project, same underlying problem) measured this exact
+// gap on macOS: mmap demand-paging ran at 0.5 tok/s where one explicit read()
+// sized to the whole expert hit ~4-6. This tests whether the same gap is
+// real here: resolve which file backs a given mmap'd address (via
+// /proc/self/maps, since moe-cache only ever sees a raw pointer - the model
+// loader doesn't hand it an fd) and pread() the expert's bytes in one call
+// into the existing pinned staging buffer, instead of letting the H2D copy's
+// own memory access fault pages in one at a time. Falls back to the normal
+// path on any resolution or read failure - this cannot change what bytes
+// end up in the cache, only how they get read, so it has no correctness
+// implications beyond "did the read succeed."
+struct moe_cache_file_backing {
+    const char * map_start = nullptr;
+    const char * map_end = nullptr;
+    size_t file_offset_at_map_start = 0;
+    int fd = -1;
+};
+
+static std::mutex g_file_backing_mu;
+// Small (one entry per mmap'd GGUF shard actually touched by moe-cache, i.e.
+// single digits to low tens) - linear scan is fine, this only runs once per
+// unique mapping, not once per fill.
+static std::vector<moe_cache_file_backing> g_file_backings;
+
+static const moe_cache_file_backing * moe_cache_resolve_file_backing(const void * addr) {
+    std::lock_guard<std::mutex> lock(g_file_backing_mu);
+    for (const auto & b : g_file_backings) {
+        if ((const char *) addr >= b.map_start && (const char *) addr < b.map_end) {
+            return &b;
+        }
+    }
+    FILE * maps = fopen("/proc/self/maps", "r");
+    if (!maps) {
+        return nullptr;
+    }
+    moe_cache_file_backing found;
+    bool resolved = false;
+    char line[1024];
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long long start = 0, end = 0, offset = 0;
+        int path_off = 0;
+        // "start-end perms offset dev inode  path" - %n captures the byte
+        // offset right before the path field so leading pad spaces (the
+        // inode column is left-padded) can be skipped without over-trimming
+        // a path that starts with a space (theoretical, not a real concern
+        // for a GGUF file path, but %n keeps this exact rather than assumed).
+        if (sscanf(line, "%llx-%llx %*s %llx %*x:%*x %*u%n", &start, &end, &offset, &path_off) != 3) {
+            continue;
+        }
+        if ((unsigned long long)(uintptr_t) addr < start || (unsigned long long)(uintptr_t) addr >= end) {
+            continue;
+        }
+        const char * p = line + path_off;
+        while (*p == ' ') p++;
+        const size_t plen = strlen(p);
+        if (plen == 0 || p[0] != '/') {
+            break; // anonymous/non-file mapping containing addr - can't pread this
+        }
+        char path[768];
+        size_t n = plen < sizeof(path) - 1 ? plen : sizeof(path) - 1;
+        memcpy(path, p, n);
+        path[n] = '\0';
+        if (n > 0 && path[n - 1] == '\n') {
+            path[n - 1] = '\0';
+        }
+        const int fd = open(path, O_RDONLY);
+        if (fd < 0) {
+            break;
+        }
+        found.map_start = (const char *) (uintptr_t) start;
+        found.map_end   = (const char *) (uintptr_t) end;
+        found.file_offset_at_map_start = (size_t) offset;
+        found.fd = fd;
+        resolved = true;
+        break;
+    }
+    fclose(maps);
+    if (!resolved) {
+        return nullptr;
+    }
+    g_file_backings.push_back(found);
+    return &g_file_backings.back();
+}
+
+// Reads job.bytes starting at job.source into dst via one explicit pread(),
+// using the file backing resolved above. Returns false (dst left untouched)
+// on any resolution failure, fd issue, or short/partial read - the caller
+// falls back to the normal mmap-touching path in that case.
+static bool moe_cache_explicit_read_impl(const void * source, size_t bytes, void * dst) {
+    static std::atomic<long long> hits{0}, misses{0};
+    const bool log = getenv("GGML_CUDA_MOE_CACHE_EXPLICIT_READ_LOG") != nullptr;
+    if (!source || !bytes || !dst) {
+        return false;
+    }
+    const moe_cache_file_backing * backing = moe_cache_resolve_file_backing(source);
+    if (!backing || backing->fd < 0) {
+        const long long m = misses.fetch_add(1) + 1;
+        if (log && m <= 20) {
+            fprintf(stderr, "[moe-cache] EXPLICIT_READ miss (resolve failed) src=%p bytes=%zu cum_miss=%lld\n",
+                    source, bytes, m);
+        }
+        return false;
+    }
+    const size_t local_off = (const char *) source - backing->map_start;
+    const off_t file_off = (off_t) (backing->file_offset_at_map_start + local_off);
+    size_t done = 0;
+    // Loop rather than assume one pread() covers the whole request - a short
+    // read (signal interruption, or simply the kernel's own discretion) is
+    // valid POSIX behaviour, not an error, for a regular file.
+    while (done < bytes) {
+        const ssize_t got = pread(backing->fd, (char *) dst + done, bytes - done, file_off + (off_t) done);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            const long long m = misses.fetch_add(1) + 1;
+            if (log && m <= 20) {
+                fprintf(stderr, "[moe-cache] EXPLICIT_READ miss (pread errno=%d) src=%p bytes=%zu cum_miss=%lld\n",
+                        errno, source, bytes, m);
+            }
+            return false;
+        }
+        if (got == 0) {
+            const long long m = misses.fetch_add(1) + 1;
+            if (log && m <= 20) {
+                fprintf(stderr, "[moe-cache] EXPLICIT_READ miss (short read) src=%p bytes=%zu cum_miss=%lld\n",
+                        source, bytes, m);
+            }
+            return false; // unexpected EOF - shorter file than the mapping implied
+        }
+        done += (size_t) got;
+    }
+    const long long h = hits.fetch_add(1) + 1;
+    if (log && (h <= 20 || h % 200 == 0)) {
+        fprintf(stderr, "[moe-cache] EXPLICIT_READ hit src=%p bytes=%zu file_off=%lld cum_hit=%lld cum_miss=%lld\n",
+                source, bytes, (long long) file_off, h, misses.load());
+    }
+    return true;
+}
+#endif // defined(__linux__)
+
+// Unconditional wrapper so the fill worker's copy-path branch doesn't need
+// its own #ifdef - a no-op (always "not available, fall back") off Linux.
+static bool moe_cache_explicit_read(const void * source, size_t bytes, void * dst) {
+#if defined(__linux__)
+    return moe_cache_explicit_read_impl(source, bytes, dst);
+#else
+    (void) source; (void) bytes; (void) dst;
+    return false;
+#endif
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
@@ -3076,6 +3238,21 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         cudaError_t error = cudaSuccess;
         ggml_cuda_set_device(device->physical);
+
+        // DIAGNOSTIC, opt-in via GGML_CUDA_MOE_CACHE_FILL_TIMING_LOG=1: breaks
+        // down where a single fill's wall time actually goes (copy+sync vs.
+        // canary readback vs. everything else) - added to get real evidence
+        // before considering batching multiple fills' copies onto one shared
+        // sync (a real correctness-risk change: device->inflight_source/bytes
+        // is a single-range tracker moe_cache_invalidate_session blocks on to
+        // avoid racing a fill against memory being freed - batching would
+        // need it to track a range per in-flight item, not one).
+        static const bool fill_timing_log = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_FILL_TIMING_LOG");
+            return e && atoi(e) != 0;
+        }();
+        const double t_job_start = fill_timing_log ? moe_cache_wall_clock() : 0.0;
+        double t_copy_done = 0.0, t_canary_done = 0.0;
 
         if (device->dead.load() || moe_cache_fail(*session, "insert")) {
             error = cudaErrorUnknown;
@@ -3276,11 +3453,31 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 const char * e = getenv("GGML_CUDA_MOE_CACHE_SKIP_COPY");
                 return e && atoi(e) != 0;
             }();
+            // PROTOTYPE, off by default: GGML_CUDA_MOE_CACHE_EXPLICIT_READ=1 -
+            // see moe_cache_explicit_read above for the full rationale. Placed
+            // after `direct`, never before it: a hostreg'd region is already
+            // guaranteed resident (cudaHostRegister forces and pins every
+            // covered page at registration time), so there is no mmap-fault
+            // cost left for an explicit read to save there. moe_cache_explicit_read
+            // itself returns false on any resolution/read failure, which
+            // falls straight through to the ordinary staged-memcpy branch
+            // below with nothing extra to unwind.
+            static const bool explicit_read_enabled = [] {
+                const char * e = getenv("GGML_CUDA_MOE_CACHE_EXPLICIT_READ");
+                return e && atoi(e) != 0;
+            }();
             if (error == cudaSuccess && skip_copy) {
                 // bookkeeping only - fall through with error==cudaSuccess
             } else if (error == cudaSuccess && direct) {
                 error = cudaMemcpyAsync(
                         destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
+                if (error == cudaSuccess) {
+                    error = cudaStreamSynchronize(stream);
+                }
+            } else if (error == cudaSuccess && explicit_read_enabled && stage && stage_capacity >= job.bytes &&
+                       moe_cache_explicit_read(job.source, job.bytes, stage)) {
+                error = cudaMemcpyAsync(
+                        destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
@@ -3295,6 +3492,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 error = cudaMemcpy(
                         destination, job.source, job.bytes, cudaMemcpyHostToDevice);
             }
+        }
+        if (fill_timing_log) {
+            t_copy_done = moe_cache_wall_clock();
         }
 
         {
@@ -3324,6 +3524,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                                             job.slot, bad, pool->canary_bytes, first);
                                 }
                             }
+                        }
+                        if (fill_timing_log) {
+                            t_canary_done = moe_cache_wall_clock();
                         }
                         // Fresh admission - starts in probation regardless
                         // of how many pre-admission misses it took to get
@@ -3361,6 +3564,21 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 }
             }
             session->idle_cv.notify_all();
+        }
+
+        if (fill_timing_log) {
+            const double t_finalize_done = moe_cache_wall_clock();
+            static std::atomic<int> logged{0};
+            const int n = logged.fetch_add(1);
+            if (n < 40 || n % 500 == 0) {
+                fprintf(stderr, "[moe-cache] FILL_TIMING bytes=%zu copy_ms=%.3f canary_ms=%.3f "
+                        "finalize_ms=%.3f total_ms=%.3f\n",
+                        job.bytes,
+                        (t_copy_done - t_job_start) * 1000.0,
+                        t_canary_done > 0.0 ? (t_canary_done - t_copy_done) * 1000.0 : 0.0,
+                        (t_finalize_done - (t_canary_done > 0.0 ? t_canary_done : t_copy_done)) * 1000.0,
+                        (t_finalize_done - t_job_start) * 1000.0);
+            }
         }
 
         if (error != cudaSuccess) {
