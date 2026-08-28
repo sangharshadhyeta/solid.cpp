@@ -2432,6 +2432,28 @@ bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out
     return true;
 }
 
+bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols) {
+    out_rows = 0;
+    out_cols = 0;
+    if (!ggml_moe_cache.get_substitute_map) {
+        return false;
+    }
+    int rows = 0, cols = 0;
+    ggml_moe_cache.get_substitute_map(nullptr, 0, &rows, &cols);
+    if (rows <= 0 || cols <= 0) {
+        return false;
+    }
+    const size_t need = ((size_t) rows * (size_t) cols + 7) / 8;
+    out_bits.assign(need, 0);
+    if (!ggml_moe_cache.get_substitute_map(out_bits.data(), (int) out_bits.size(), &rows, &cols)) {
+        out_bits.clear();
+        return false;
+    }
+    out_rows = rows;
+    out_cols = cols;
+    return true;
+}
+
 bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
     out = common_moe_cache_summary{};
     if (!ggml_moe_cache.get_summary) {

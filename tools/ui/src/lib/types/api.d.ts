@@ -199,6 +199,13 @@ export interface ApiExpertMapStats {
 	avg_heat?: number;
 	allocated_mib?: number;
 	budget_mib?: number;
+	/** Real router-rank misses served by a resident stand-in
+	 * (GGML_CUDA_MOE_CACHE_SUBSTITUTE) instead of CPU fallback - not folded
+	 * into `hits`/`misses` above (a substitution is a miss that was made
+	 * cheap, not a hit). declined = a substitution was attempted but no
+	 * resident stand-in existed. */
+	substitutions?: number;
+	substitute_declined?: number;
 	/** Track 1 step 0/1 (docs/plan.md): live, decaying centroid of where the
 	 * current request is trending in the same (x,y) topic-affinity space
 	 * the atlas cells below use. Absent until at least one atlas-covered
@@ -267,6 +274,12 @@ export interface ApiExpertMapResponse {
 	cols: number;
 	map: string;
 	hits: string;
+	/** Bitset (1 bit/cell, same shape as `map`) of cells that served as a
+	 * resident substitution stand-in since the last poll - read-and-cleared
+	 * server-side, so unlike `hits` this needs no client-side diffing.
+	 * Empty string when the provider has nothing to report (older builds,
+	 * or a mid-poll shape mismatch) - treat as "no substitutions this poll". */
+	substitutions: string;
 	seq: number;
 	stats: ApiExpertMapStats;
 	atlas?: ApiExpertAtlas;

@@ -970,6 +970,13 @@ bool tty_can_use_colors();
 // backend wasn't built with moe-cache support at all.
 bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out_rows, int & out_cols);
 
+// Which (layer,expert) cells served as a resident substitution stand-in
+// since the last call - a bitset, 1 bit/cell, same rows/cols shape as
+// common_moe_cache_get_expert_map above. READ-AND-CLEARED server-side:
+// correct for exactly one poller. Returns false under the same conditions
+// as get_expert_map.
+bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols);
+
 // Aggregate moe-cache health, for the Brain view's stats panel. Mirrors
 // ggml_moe_cache_summary (see ggml-backend-moe-cache.h) one field at a
 // time rather than exposing that C struct directly, so this header
