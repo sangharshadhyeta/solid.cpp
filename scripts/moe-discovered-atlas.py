@@ -123,8 +123,45 @@ def main():
     # "how often was this expert used at all", which the heat counters already
     # track. The informative axes start at 1.
     xy = emb[:, 1:3]
-    scale = np.abs(xy).max() or 1.0
-    xy = xy / scale
+
+    # Raw eigenvector magnitudes are heavy-tailed (median magnitude ~0.1x the
+    # max here), so dividing by the single largest point crushes most of the
+    # disc into an unreadable dot at the centre - measured directly: half of
+    # all cells landed within 10% of the max radius.
+    #
+    # First attempt kept each point's angle and rank-transformed only the
+    # radius (magnitude), which fixed the crush but created a "wheel" of
+    # spokes: many experts share similar (dim1, dim2) angles (real graph
+    # clusters), so stretching those clusters out by radius alone turns each
+    # one into a radial line instead of a filled region. Rank-normalising x
+    # and y INDEPENDENTLY instead (quantile normalisation to a uniform
+    # marginal on each axis) fills the square/disc by area without imposing
+    # that artificial polar structure - a point's relative order along each
+    # axis is preserved, its exact radius/angle from the raw eigenvectors is
+    # not, which is the right trade for a readable scatter.
+    def rank_normalize(v):
+        order = np.argsort(v)
+        rank = np.empty_like(order, dtype=np.float64)
+        rank[order] = np.arange(len(v))
+        return 2.0 * (rank + 0.5) / len(v) - 1.0  # -> uniform on (-1, 1)
+
+    sq = np.stack([rank_normalize(xy[:, 0]), rank_normalize(xy[:, 1])], axis=1)
+
+    # rank_normalize fills a SQUARE [-1,1]x[-1,1], but the UI draws a CIRCLE -
+    # corner points (magnitude up to sqrt(2)) landed outside it. Shirley-Chiu
+    # concentric map: a standard, closed-form square->disc transform that
+    # takes a uniform-in-square point to a uniform-in-disc point, so every
+    # point ends up inside the circle without re-introducing the crushed- or
+    # wheel-shaped artifacts of the earlier attempts.
+    sx, sy = sq[:, 0], sq[:, 1]
+    r = np.where(np.abs(sx) > np.abs(sy), sx, sy)
+    theta = np.where(
+        np.abs(sx) > np.abs(sy),
+        (np.pi / 4) * np.divide(sy, sx, out=np.zeros_like(sy), where=sx != 0),
+        (np.pi / 2) - (np.pi / 4) * np.divide(sx, sy, out=np.zeros_like(sx), where=sy != 0),
+    )
+    xy = np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1)
+    xy[(sx == 0) & (sy == 0)] = 0.0
 
     cells = []
     for (l, e), i in nodes.items():
