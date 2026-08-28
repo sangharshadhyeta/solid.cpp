@@ -1568,8 +1568,25 @@ static void moe_cache_nan_probe(const char * name, const struct ggml_tensor * sr
         }
     }
     if (bad > 0 && reported++ < 12) {
-        fprintf(stderr, "[moe-cache] NAN INPUT step=%lld node=%s bad=%lld/%lld first=%lld\n",
-                my, name, (long long) bad, (long long) n, (long long) first);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        const double wall = (double) ts.tv_sec + (double) ts.tv_nsec / 1e9;
+        // Tests whether this is the SAME physical buffer poisoned across
+        // separate requests (a persistent, never-refreshed ggml compute
+        // buffer that only a fresh graph reservation clears) versus a
+        // different address each time. src1 is always part of ggml's own
+        // buffer system by construction - moe-cache only ever allocates
+        // weight cache slots, never activation tensors - so ptr/base/size
+        // here identify which of ggml's own reserved regions is affected,
+        // not whether moe-cache or ggml owns it (that answer is always
+        // "ggml", trivially).
+        ggml_backend_buffer_t buf = src1->view_src ? src1->view_src->buffer : src1->buffer;
+        const void * base = buf ? ggml_backend_buffer_get_base(buf) : NULL;
+        const size_t size = buf ? ggml_backend_buffer_get_size(buf) : 0;
+        fprintf(stderr, "[t=%.3f] [moe-cache] NAN INPUT step=%lld node=%s bad=%lld/%lld first=%lld "
+                "ptr=%p buf=[%p,%p) size=%zu\n",
+                wall, my, name, (long long) bad, (long long) n, (long long) first,
+                (void *) src1->data, base, (const char *) base + size, size);
         fflush(stderr);
     }
 }
