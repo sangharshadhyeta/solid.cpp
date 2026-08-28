@@ -5503,7 +5503,12 @@ void server_routes::init_routes() {
             return res;
         }
 
-        int top_n = json_value(body, "top_n", (int)documents.size());
+        // Clamp client-supplied top_n to a valid range: format_response_rerank does
+        // elements.resize(std::min(top_n, (int)elements.size())), and a negative
+        // top_n (e.g. -1) would make that std::min pick the negative value, which
+        // resize() then implicitly converts to a huge size_t - std::length_error /
+        // an attempted multi-exabyte allocation on an ordinary rerank request.
+        int top_n = std::max(0, json_value(body, "top_n", (int)documents.size()));
 
         // create and queue the task
         json responses = json::array();
