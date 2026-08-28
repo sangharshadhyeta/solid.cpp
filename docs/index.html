@@ -439,6 +439,10 @@ that only publishes wins is the thing this project exists not to be.</p>
 <tr><td>moe-cache prefill double-buffer, measured at last <span class="note">(<code>GGML_CUDA_MOE_PREFILL_BUFFER</code> &mdash; the mechanism the D2D path rides on. Never benchmarked before: the +12.7% above belongs to a <em>different</em> flag, <code>GGML_SCHED_PREFETCH_EXPERTS</code>. Gemma-4 is the only architecture that registers prefill successors, so it is the only place this can run at all; pp2048, 3 rounds, near-zero variance)</span></td><td class="num">953.00 tok/s</td><td class="num">905.35 tok/s</td><td class="num delta-neg">-5.0%</td><td><span class="tag tag-solid">refuted</span></td></tr>
 <tr><td>Silent corruption under copy failure <span class="note">(a failed prefill copy still published its slot, so the consumer read the previous tensor's bytes as expert weights &mdash; fluent-looking garbage, clean logs. Fixed, then <em>proven</em> with deterministic fault injection rather than assumed)</span></td><td class="num">122 prefill hits, garbage out</td><td class="num">19 hits, correct out, loud disable</td><td class="num delta-pos">fixed + validated</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Low draft-acceptance warning <span class="note">(Ornith-1.5-35B's built-in MTP head drafts at 0.19 acceptance and runs ~2&times; <em>slower</em> than no speculation, with nothing in the output saying why; Gemma with a matched draft model reaches 0.65&ndash;0.74 on the same build)</span></td><td class="num">silent 2&times; slowdown</td><td class="num">warns once, names the cause</td><td class="num delta-pos">diagnosable</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Stale LFRU hit-mask corruption <span class="note">(root cause of a garbled, repeated-character output bug: the scheduler's device-to-device cache-hit bitmask was computed once per routing decision and reused across <code>gate_exps</code>/<code>up_exps</code>/<code>down_exps</code>, but LFRU residency is tracked per weight tensor &mdash; a bit cleared because an expert was cached for <code>gate_exps</code> got wrongly treated as "already copied" for the other two, leaving their row neither device- nor host-copied. Bisected to the exact introducing commit, root-caused via direct code reading rather than trusting the symptom, fixed by separating the routing bitmask from a per-tensor copy mask)</span></td><td class="num">corrupts reliably, 2nd of 2 sequential prompts</td><td class="num">verified clean across repeated varied prompts</td><td class="num delta-pos">fixed, root cause</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Sentinel expert-id (&minus;1) handling <span class="note">(a skipped-slot sentinel id triggered an assert in the sparse H2D copy path and, separately, an off-by-one in the CUDA compaction kernel's row-position tally, plus an out-of-bounds channel read in the vector matmul kernel &mdash; all three fixed to skip the sentinel rather than assume every id is a real expert)</span></td><td class="num">assert / OOB risk</td><td class="num">sentinel skipped correctly</td><td class="num delta-pos">fixed</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Recurrent-state dtype, Gated DeltaNet/KDA <span class="note">(new <code>-ctr</code>/<code>-cts</code> flags, mirroring <code>-ctk</code>/<code>-ctv</code> &mdash; F32 was hardcoded with no override anywhere in the loader. f16 needed a real fix underneath it: <code>ggml_cuda_op_scale</code> had no F16 kernel at all and asserted on first decode, now templated over F32/f16 like this codebase's other elementwise CUDA ops. Verified: buffer halves, output stays coherent, default F32 path unaffected)</span></td><td class="num">62.81 MiB (f32)</td><td class="num">31.41 MiB (f16)</td><td class="num delta-pos">-50%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Explicit <code>pread()</code> for cold expert fetch <span class="note">(tested whether replacing mmap page-fault demand-paging with one explicit read sized to the whole expert would help, per a comparable macOS SSD-streaming project's 8&times; finding &mdash; it doesn't transfer here: real fills measured at 0.133ms average, 53 fills summing to 7.1ms against a ~700ms request, so fill mechanics were never the bottleneck this hardware/workload pair. Kept as a working, opt-in, zero-cost-when-unset code path; not made default)</span></td><td class="num">750.4ms</td><td class="num">729.3ms</td><td class="num">within run-to-run noise</td><td><span class="tag tag-solid">no gain here</span></td></tr>
 </tbody>
 </table>
 </div>
@@ -558,6 +562,29 @@ more than one of the fixes on this page.</p>
 <p>An explicit <code>-c</code> request too large for VRAM used to abort the whole process - upstream's <code>--fit</code>
 only auto-adjusts <em>unset</em> arguments. Now searches by doubling from a safe floor and lands on the real,
 measured context that fits instead - see <a href="#brain-atlas">above</a> for how this one was actually found.</p>
+</div>
+<div class="card">
+<h3>Stale LFRU hit-mask corruption, root-caused</h3>
+<p>Chased a garbled, repeated-character output bug across an extended session — every sanitizer clean, every
+moe-cache-internal mechanism individually ruled out by direct fault injection. Git-bisected to the exact
+introducing commit, then found it by reading the code, not by trusting what a comment claimed: the scheduler's
+device-to-device cache-hit bitmask is computed once per routing decision and legitimately shared across
+<code>gate_exps</code>/<code>up_exps</code>/<code>down_exps</code> (they share one routing tensor), but LFRU
+residency is tracked per weight tensor — a bit cleared because an expert was cached for <code>gate_exps</code>
+got reused as "already copied" for the other two, which have independent cache contents. That left the row
+neither device- nor host-copied: garbage GPU memory read straight into the matmul as expert weights. Fix
+separates the routing bitmask (legitimately shared) from a fresh per-tensor copy mask (rescanned every input).
+Verified clean across repeated, varied, sequential prompts on the exact config that corrupted reliably before.</p>
+</div>
+<div class="card">
+<h3>Recurrent-state dtype: <code>-ctr</code>/<code>-cts</code></h3>
+<p>Gated DeltaNet/KDA's per-sequence recurrent state was hardcoded F32 everywhere in the loader, with zero
+override — unlike K/V cache, which has had <code>-ctk</code>/<code>-ctv</code> for years. New flags mirror that
+exact pattern; f16 halves the state's footprint (62.81 &rarr; 31.41 MiB on a 40-layer GDN model) for a real
+concurrency win on memory-constrained cards. Needed a real fix underneath it, not just a config path:
+<code>ggml_cuda_op_scale</code> had no F16 kernel at all and asserted on the first decode step, so it's now
+templated over F32/f16 like this codebase's other elementwise CUDA ops (<code>clamp.cu</code> et al.). Default
+stays F32, unchanged; f16 verified coherent, correct output.</p>
 </div>
 </div>
 </section>
