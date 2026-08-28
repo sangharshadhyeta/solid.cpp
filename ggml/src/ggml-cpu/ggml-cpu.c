@@ -1736,6 +1736,10 @@ static void ggml_compute_forward_mul_mat_id(
                     }
                 }
                 ggml_moe_cache.plan(moe_cache_node, expert_ids, (int)(n_ids * ids->ne[1]), moe_cache_slot_idx);
+                if (ggml_moe_cache.train && src1_cont) {
+                    ggml_moe_cache.train(moe_cache_node, expert_ids, n_ids, (int) ids->ne[1],
+                                          (const float *) src1->data, nb11, ne10);
+                }
             }
         }
 

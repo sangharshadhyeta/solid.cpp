@@ -2170,9 +2170,24 @@ alternative signal only has to break a tie.
 8. Fix the embedding implementation: a trivial common-neighbours baseline
    scores AUC 0.653, the learned embedding 0.490. It should at least match the
    baseline.
-9. Integrate a mechanism that actually CONSUMES the atlas. Warming touches ~2%
-   of fills, which is why a chance-level map and a 0.71 map perform identically
-   on 8099 - no integrated atlas comparison means anything until this exists.
+9. **[substantially addressed, 2026-08-29]** Integrate a mechanism that
+   actually CONSUMES the atlas. Warming touches ~2% of fills, which is why a
+   chance-level map and a 0.71 map perform identically on 8099 - no
+   integrated atlas comparison means anything until this exists.
+   The "Atlas warming, second pass" section below is that mechanism: free-
+   slot-only admission ranked by cosine-similarity to a live req_dir
+   centroid, burst-widened rank/admit budgets and multi-tensor sweep on a
+   detected topic shift, and eviction-side protective weighting
+   (moe_cache_weighted_heat) so resident atlas-aligned content resists
+   getting evicted without ever being forced. Live /experts stats mid-session
+   this pass: prefetches=4178, admission_skips=69201 against
+   hits=248992/misses=86600 - roughly 22% of decisions touched the atlas
+   path, not 2%. What item 9 actually asked for (an integrated comparison
+   that means something) is the multi-round topic-switch benchmark this
+   whole section reports, not a separate deliverable - there is no further
+   "integration" step left to build; what remains is whether the integrated
+   mechanism's real effect is a clear win (still open, see the confidence-
+   weighting/lookahead pass below).
 
 **Open research**
 10. Coverage-oriented eviction - maximise "some viable stand-in is always
@@ -2192,6 +2207,100 @@ alternative signal only has to break a tie.
 From the original table, marked "to be discussed" and not designed further:
 embedding + output head weights, compute/activation scratch buffers, CUDA
 graph capture state.
+
+## Scoping the three "open, no proposal" VRAM consumers (2026-08-28)
+
+Goal restated precisely, since it shapes which of these are worth building:
+the model's footprint stays on NVMe - that's accepted, by design, for any
+model whose total size exceeds this hardware's RAM+VRAM. The win condition
+is *decode speed* approaching what a dense model sized to the *active*
+parameter count would give, not shrinking what has to exist on disk. That
+reframing matters below: a component is only a good tiering candidate if it
+has the same property moe-cache exploits for experts - real, exploitable
+per-token *sparsity* (most of it unused on any given step) plus content that
+is *static* across steps (worth caching, not regenerated every time). Not
+all three items share both properties equally.
+
+**1. Embedding + output head weights - split into two, only one is a real candidate.**
+- *Input embedding table* (`vocab_size x n_embd`, e.g. 154,880 x 4096 for
+  glm5next): genuinely the same shape of problem as expert weights. A batch
+  only ever touches as many rows as there are tokens in it - a handful, out
+  of a 150k+-row table - and a real conversation's actual vocabulary is
+  heavily skewed (this codebase already proved the skew is real and
+  exploitable: FR-Spec-style draft-vocab trimming, already shipped for the
+  MTP drafter's output projection, is the same insight applied one
+  component over). **Real, scoped candidate**: an LFRU row-cache for the
+  embedding table, mechanically identical to moe-cache's per-expert-row
+  cache - key by row index instead of `(tensor, expert)`, evict by the same
+  heat/segment logic, admit on miss. Expected win is small in absolute VRAM
+  (the whole table is ~1.2 GiB at f32, sub-300 MiB even unquantized-ish at
+  low bit-widths) but the *access pattern* match to moe-cache's existing
+  machinery is close enough that this is mostly wiring, not new design -
+  cheapest of the three to build.
+- *Output head / LM head* (same shape, `n_embd x vocab_size`, used the
+  other direction): **not the same shape of problem**. Standard sampling
+  needs a logit for every vocabulary entry every step - the matmul is
+  dense, not sparse, by construction (this is exactly why FR-Spec-style
+  trimming for the drafter's own head required accepting a bounded vocab
+  subset and measuring the real throughput-vs-VRAM trade rather than
+  getting the win for free - see `docs/index.html`, "FR-Spec draft-vocab
+  trim... -26%"). Tiering this the moe-cache way would mean recomputing
+  which vocabulary rows are "hot" doesn't help, since ALL rows are read
+  every step regardless of recent history. The only way to make this
+  sparse is to change what gets computed (a restricted/approximate output
+  projection), which is a sampling-behavior decision, not a caching one -
+  out of scope for "the same tiered regime", genuinely a different project.
+  Given its size is comparable to the embedding table, defaulting to fully
+  VRAM-resident (no tiering) is the correct baseline unless VRAM pressure
+  specifically forces the question.
+
+**2. Compute/activation scratch buffers - does not fit the cache model at all.**
+moe-cache's LFRU works because expert weights are the same bytes on every
+hit - a slot holds one expert's data indefinitely until evicted, and a hit
+means "the bytes I need are already here." Scratch/activation buffers
+(`d_act`, `d_act_q8`, `d_out` in moe-cache.cu; the scheduler's own reserved
+compute buffer, e.g. "441.00 MiB" logged this session) are overwritten
+every layer, every token - there is no stable content to hit or miss on,
+so "cache hit rate" isn't a meaningful concept here at all. The real lever
+for this component is a completely different kind of optimization:
+*right-sizing and reuse*, not tiering - e.g. whether sequential layers can
+share one scratch region (only one layer computes at a time) instead of
+each layer reserving its own, or whether the scheduler's worst-case
+reservation is looser than the real steady-state need. Smaller expected
+win than the other two (this is working memory, not multi-gigabyte
+weight data), and it needs its own investigation into the scheduler's
+buffer-reuse logic - **recommend deprioritizing this one**; it was grouped
+with the other two by association ("also consumes VRAM"), not because it
+shares moe-cache's actual mechanism.
+
+**3. CUDA graph capture state - a real, different-shaped candidate; already half-cached by construction.**
+A captured CUDA graph *is* already a cache entry, structurally - captured
+once per distinct graph topology/shape, replayed cheaply thereafter
+("graphs reused = 98" in this session's server logs is literally a hit
+counter). The open question isn't "should this be cached" (it already is,
+implicitly, for the lifetime of the process) but **"should it be bounded
+and evictable"**: if a server sees many distinct batch shapes over its
+lifetime (varying ubatch sizes, concurrency levels, speculative-decode
+draft widths), each distinct shape accumulates its own captured graph
+object, and nothing currently bounds how many accumulate or reclaims a
+graph for a shape that stopped recurring. This *does* fit the moe-cache
+shape reasonably well: key by graph topology signature instead of
+`(tensor, expert)`, heat/recency-track hits the same way, evict the
+coldest captured graph under memory pressure rather than never evicting.
+**Real, scoped candidate**, but lower urgency than the embedding cache
+unless a concrete case of unbounded graph-object growth is actually
+observed on real traffic - worth a measurement pass (how many distinct
+shapes does a real workload actually produce, and how much VRAM does that
+accumulate to) before assuming eviction is needed at all.
+
+**Net scoping verdict**: of the three, the embedding-row LFRU cache is the
+strongest, cheapest, most directly analogous win - build that one first if
+this track gets picked up. CUDA graph capture eviction is real but should
+be measured (not assumed necessary) before building. Compute/activation
+scratch buffers should be re-scoped as a buffer-reuse investigation, not
+carried forward as a "tiered cache" item - it doesn't fit the model.
+Output head weights are explicitly descoped from tiering; any future win
+there is a sampling-side project, not a caching one.
 
 ## Already closed out (adjacent work, same session)
 
@@ -3222,3 +3331,146 @@ re-ran the standard reproducer (two sequential different-content prompts,
 No corruption observed across any of these varied, sequential, real-routing
 requests on the fixed build. The fix is applied but **not committed** -
 left as an uncommitted change in the working tree pending review.
+
+## Atlas warming, second pass (2026-08-29): from actively harmful to safe, still short of a win
+
+Item #9 from the pending-work queue ("integrate a mechanism that actually
+CONSUMES the atlas") revisited with a proper multi-round, multi-switch
+benchmark, since the only prior evidence for Track 1's atlas warming
+(`docs/plan.md`, Track 1 step 3 and its follow-ons) was a single-pivot test
+and a steady-state one - neither matches real dynamic usage. New harness:
+`atlas_topic_switch_bench.py` - 6 sequential topic pivots drawn from the
+atlas's own measured categories (code -> medicine -> law -> creative ->
+science -> history), 4 rounds per arm, hit rate measured per-request via
+`/experts`' hit/miss counters (not cumulative session average - the delta
+across each individual request, isolating the post-switch effect the
+original single-pivot test measured). All four numbers below are the
+post-switch (requests 1-5, excluding the non-switch first request) pooled
+hit-rate delta against a matching no-warming baseline, same methodology
+throughout so they are directly comparable.
+
+**1. Thin eviction (the shipped design going into this session, admission's
+own eviction capped at 1/pass): -0.31pp.** Warm never won requests 0, 1, or
+4 across all 4 rounds - a small but real, consistent regression, not noise.
+
+**2. Wide eviction ("burst mode" - shorter check interval, bigger
+admit/evict budget, multi-tensor sweep on a detected topic shift, admit's
+own eviction cap widened to 6/pass during a burst): -6.55pp - six times
+worse, warm losing on literally every single request across all 4 rounds
+(0/4 wins everywhere).** This was the pivotal result. The user diagnosed
+the mechanism from first principles before this number existed: atlas
+admission's eviction path sacrifices a currently-resident, reactively-
+admitted expert to make room for a *predicted* one, and unlike the reactive
+path's own eviction (always justified - it satisfies a request that just
+actually happened), a wrong prediction is a real, direct loss. Widening the
+eviction budget only gave that mechanism more chances to make a bad trade,
+which is exactly what the data shows.
+
+**Root cause, confirmed in code, not just data**: `moe_cache_slot_reset`
+takes an `add_to_free` flag. The reactive/demand-driven admission path
+(normal cache misses) calls it with `add_to_free=false` on every eviction -
+the freed slot is reused immediately in place, never returned to
+`pool.free_slots`. That list is populated once at pool creation and
+essentially never again during normal operation. Atlas admission's own
+"free-slot-only" fallback (the pre-eviction-fix original design, and the
+first fix attempted this pass) therefore has almost no room to ever act
+after the first few tokens of any real run - which is exactly why it had
+previously measured "flat, no effect either way" and why eviction rights
+were added to it in the first place. Reverting to free-slot-only alone
+would trade "actively harmful" for "provably safe but likely near-inert" -
+correct, but not the fix that delivers a real win.
+
+**3. Free-slot-only, no eviction at all: not separately measured.** The
+code-level reasoning above was trusted rather than spending another full
+benchmark cycle confirming a predictable near-zero result; moved directly
+to the actual fix instead. (An `atlas_bench_results_FREESLOT_ONLY.json`
+file exists in the scratch directory from this pass, but it is a
+leftover duplicate of the wide-eviction result, not a genuine measurement -
+noted here so it is not mistaken for real data later.)
+
+**4. The actual fix - separate "whose eviction" from "eviction at all"**:
+the reactive path evicts constantly anyway, for real reasons. The
+principled integration point (already identified but abandoned once
+before, in a much earlier pass of this same investigation - see the
+"eviction-weighting" removal note still in the code history) is to let the
+atlas influence *which* slot the reactive path sacrifices when it was
+evicting regardless, never to trigger a new eviction event on its own. The
+earlier attempt at this was reverted specifically because it interfered
+with atlas admission's *own* eviction rights ("admission ends up fighting
+itself") - a confound that no longer exists once admission's own eviction
+is removed entirely. Implemented as `moe_cache_atlas_align_score` (the same
+cosine-similarity-times-specialization score `moe_cache_atlas_rank` already
+computes for admission candidates, evaluated against whatever is currently
+resident instead), folded into `moe_cache_weighted_heat` as a strictly
+boost-only multiplier: `heat *= 1 + align_score * strength` where
+`align_score` is clamped to >= 0. A resident slot's effective heat can only
+go *up* when it is topically aligned with the live request direction, never
+down for one that is not - unmeasured or misaligned slots score exactly as
+they always did. This cannot make eviction target selection worse than
+baseline by construction, only ever protect a slot that would otherwise
+have been picked.
+
+Combined with everything kept from the burst-mode work (wider admission
+candidate pool, burst-triggered check frequency, multi-tensor sweep - none
+of which can hurt either, since they only mean more chances to fill a
+genuinely free slot, never a chance to take one away) and a separate fix
+found along the way (the main VRAM fill path - both reactive and
+atlas-triggered admissions - never released an expert's now-redundant mmap'd
+host pages after copying it to VRAM; only a different, off-by-default
+host-hot-buffer mechanism had the equivalent call. Added
+`moe_cache_release_source_pages` to the shared fill-completion path,
+provably safe to call unconditionally there since the copy that read those
+bytes has already completed and synced by that point).
+
+**Result, same benchmark, same methodology: post-switch pooled delta
+-0.35pp, warm won 0/4 rounds on the pooled per-round average - but the
+per-round numbers are now close (off: 0.8039/0.8041/0.8041/0.8030, warm:
+0.7973/0.8017/0.7991/0.8028 - round 4 is within noise of tied), and
+individual requests are mixed rather than uniformly losing: law (request 2)
+is a real win, 3/4 rounds, +0.40pp; the first request (request 0, not
+actually a topic switch - included as a sanity check, not part of the
+post-switch average) shows a striking -9.09pp, 0/4, worth investigating
+separately since it may indicate the protection boost is acting on noisy,
+not-yet-stabilized `req_dir` readings very early in a session before the
+centroid has had time to settle.**
+
+**Honest verdict**: the eviction-weighting redesign achieves the safety
+property it was built for - no longer actively harmful, unlike both prior
+designs this session (-0.31pp and -6.55pp) - but does not yet deliver the
+consistent positive win the 95%+ hit-rate goal needs. It has landed at
+roughly the same small-negative magnitude as the very first, simplest
+design tested, just via a mechanism now understood to be safe rather than
+one proven destructive. Not shipped as default. Plausible next steps, none
+attempted yet: tune `GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT_STRENGTH`
+(default 3.0) higher, since the current boost may simply be too weak to
+meaningfully shift real eviction outcomes; investigate the request-0
+anomaly specifically, since a fix there might flip more than just that one
+request; or accept that a purely protective, no-new-churn mechanism has an
+intrinsically low ceiling and pair it with something that can proactively
+seed new content without eviction risk (e.g. the cross-run frequency-
+persistence idea sketched but not built this session, which needs no
+eviction at all - it only competes for the free-slot budget already used
+during the natural startup window).
+
+**Shipped mechanism and its full knob set** (all in
+`ggml/src/ggml-cuda/moe-cache.cu`), for reproducibility:
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM` (off by default) - the master switch.
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM_RANK_K` / `_ADMIT_K` (steady-state
+  candidate pool / admit count, default 4 / 2) and their
+  `_BURST_RANK_K` / `_BURST_ADMIT_K` counterparts (default 24 / 12).
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM_INTERVAL` / `_BURST_INTERVAL` (plan()
+  calls between throttle checks, default 64 / 4).
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_THRESHOLD` (req_dir movement
+  distance that counts as a detected shift, default 0.25).
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM_BURST_TENSORS` (distinct tensors swept
+  per burst firing, default 8).
+- `GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT` (on by default once
+  `ATLAS_WARM` is on) / `_STRENGTH` (default 3.0) - the eviction-weighting
+  boost.
+- `GGML_CUDA_MOE_CACHE_RELEASE_FILL_SOURCE` (on by default, independent of
+  atlas warming entirely - applies to every fill) - the host-page-release
+  fix.
+- `GGML_CUDA_MOE_CACHE_ATLAS_WARM_EVICT_MIN` / `_EVICT_CAP` remain in the
+  source as dead parameters (the eviction path they configured was
+  removed) - kept only so `evict_cap_override`'s call sites did not need
+  signature changes; harmless, do not affect behavior.
