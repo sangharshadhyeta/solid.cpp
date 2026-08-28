@@ -39,6 +39,10 @@ static __global__ void mul_mat_vec_f(
         sample_dst = ids ? 0                                                   : blockIdx.z;
     }
 
+    if (ids && channel_x < 0) {
+        return; // skipped slot (expert id -1); using it as a channel index would be an OOB read
+    }
+
     const int sample_x    = fastdiv((uint32_t) sample_dst, sample_ratio);
     const int sample_y    = sample_dst;
 
