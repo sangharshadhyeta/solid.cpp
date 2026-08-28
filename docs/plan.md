@@ -2296,3 +2296,929 @@ likely explanation is mundane GPU command-queue contention between our
 compute workload and the desktop compositor sharing one physical GPU under
 heavy concurrent load - a real side effect of the load, not necessarily
 evidence of the same mechanism as the corruption itself.
+
+## New session (2026-08-26): the scratch-buffer guard instrumentation had its own bug
+
+Picked up with the uncommitted working tree already carrying the next round of
+instrumentation from the prior session: per-slot guard bytes in the weight
+slab, poison-on-growth for the dispatch scratch buffers (`d_act`, `d_act_q8`,
+`d_out`), a slot `generation` counter for `GGML_CUDA_MOE_CACHE_GEN_CHECK`, and
+an always-on circuit breaker that rejects non-finite `collect()` output and
+forces the existing CPU fallback.
+
+**First run of the 4-way concurrent reproducer (cache 512, `-ncmoe 30`,
+`--parallel 4`, 500 tokens x4) fired 20 "SCRATCH GUARD BREACH" warnings** -
+looked at first like the smoking gun the prior session was chasing. It
+wasn't: the guard check assumed the bytes right after a dispatch call's
+`used` size are always still-canary, but the canary is only laid down once,
+at buffer (re)growth, not before every dispatch. These scratch buffers are
+reused across calls with varying `n_hits`, so a smaller call following a
+larger one leaves the PRIOR call's real, legitimately-written data sitting
+past its own `used` boundary - not canary. The check was flagging that
+leftover data as a false "breach." All 20 breaches were this false positive
+(0 real per-slot `GUARD BREACH`, 0 `OUTPUT REJECTED` non-finite hits in that
+run) - output came back clean 4/4 only because the false breach still forces
+`ok=false`, which still correctly triggers the (already-safe) CPU fallback.
+
+**Fixed**: added a high-water-mark per scratch buffer (`device.d_act_hwm`,
+`act_q8_hwm`, `d_out_hwm`), reset to 0 on regrowth, and gated the guard check
+on `used >= hwm` - i.e. only checkable when a call reaches a fresh deepest
+point since the last growth, the one case where the region past `used` is
+provably still pristine canary. `ggml/src/ggml-cuda/moe-cache.cu` around the
+`device.d_act` etc. struct fields and in `moe_cache_dispatch`/`moe_cache_collect`.
+
+**Re-ran with the fix**: two full 4-way concurrent bursts (8 completions,
+500 tokens each) - 0 scratch breaches, 0 real slot breaches, 0 non-finite
+rejections, all 8 outputs clean. Also ran 4 sequential single-prompt
+64-token generations AND one full 4-way concurrent 300-token burst under
+`compute-sanitizer --tool memcheck` (the tool that reproduced corruption with
+zero concurrency in the prior session) - sequential runs came back clean with
+zero memcheck violations; the concurrent-under-memcheck run was still in
+progress as of this note (memcheck's per-kernel instrumentation makes it very
+slow - each run takes minutes instead of seconds). This is NOT yet strong
+enough evidence to call the underlying corruption fixed - the original bug
+was already known to be intermittent and this session has not yet reproduced
+it even once post-fix, sequential or concurrent, sanitized or not, which is
+consistent with either "actually fixed" or "still there but not hit yet."
+
+**Also gated the new guard-check instrumentation behind
+`GGML_CUDA_MOE_CACHE_GUARD_CHECK`** (on by default for now): the per-slot and
+per-scratch-buffer guard sampling costs `n_hits + 3` extra `cudaMemcpyAsync`
+launches per `collect()` call - real per-call driver overhead on every MoE
+layer of every token, even though they share the existing stream sync. Worth
+paying while this bug is still being actively chased; not something a
+production hot path should carry once it's closed out. Set to `0` to disable
+both guard checks while keeping the (cheap, always-on) non-finite output
+rejection.
+
+**Code-review pass (requested, not bug-triggered)**: read through the slot
+state machine, pin/generation lifecycle, and `moe_cache_grow_device`'s
+free/realloc path looking for a structural bug independent of the reproducer.
+One real latent issue found, not (yet) implicated in the corruption:
+`moe_cache_slot_reset` (`moe-cache.cu:1557`) unconditionally zeroes
+`slot.readers` even when it's positive - the function's own comment already
+documents this as "the pin discipline breaking... invisible afterwards
+because the refcount is gone." `GGML_CUDA_MOE_CACHE_PIN_AUDIT=1` reported zero
+violations through a corrupting generation in the prior session, so normal
+eviction (`moe_cache_pick_coldest_unpinned`) never actually selects a
+pinned slot in practice - the bug is latent, not (so far) reachable. Left
+as a documented risk rather than changed, since hardening it (refuse to
+reset a slot with `readers > 0`, or assert) means deciding what every caller
+should do instead when eviction has no unpinned candidate, and that's a
+design call, not a one-line fix. Worth doing before shipping, not blocking
+right now.
+
+`moe_cache_grow_device`'s unconditional `cudaFree(*pointer)` on the old
+buffer (the `GGML_CUDA_MOE_CACHE_GROWTH_SYNC` flag that adds an explicit
+`cudaStreamSynchronize` first is opt-in, default off) looked suspicious on
+first read, but traced out as safe: `moe_cache_grow_device` is only called
+from `moe_cache_dispatch`, itself only reachable while `device.dispatch_mu` is
+held for a node's whole `begin()..end()` lifetime, and `collect()` always
+`cudaStreamSynchronize`s before that lock is released - so by the time the
+*next* dispatch's growth call runs, everything that could have been reading
+the old buffer is already provably finished. Also, plain `cudaFree` (as
+opposed to the stream-ordered `cudaFreeAsync`) is itself a synchronizing
+call in CUDA's runtime semantics. Not a bug; ruled out by tracing rather than
+by testing this time.
+
+### Broader review, fanned out (2026-08-26): two real bugs found and fixed elsewhere in the codebase
+
+User asked for a review of the whole codebase for bugs, not just ones tied to
+the corruption chase. Given the scale, fanned this out to four parallel
+review agents (ggml-cuda kernels, ggml-cpu core, `src/` llama core, server +
+common) rather than a serial read. Two came back with genuine, independently
+verified bugs; the other two (ggml-cpu core, `src/` llama core) found nothing
+they could back with a concrete trigger after real effort (see their reports
+if this needs re-litigating - both explicitly checked the highest-risk areas:
+threadpool/wsize sizing in ggml-cpu.c, VMM commit + host-pinning register/
+unregister rounding in llama-mmap.cpp/llama-kv-cache.cpp).
+
+**Fixed: `ggml-cuda/mmid.cu`, `mm_ids_helper`, lines 47 and 72 - a
+previously-fixed bug had regressed back in.** `nex_prev += expert_used <
+expert;` counts every expert index below the current one to find where this
+expert's compact-array slice starts - but `-1` (the "this slot is skipped"
+sentinel id, general ggml convention, ggml-cpu.c's own `mul_mat_id` already
+handles it by zeroing the dst row) satisfies `-1 < expert` for every
+non-negative `expert`, so a single skipped id inflates `nex_prev` for every
+expert block, opening a phantom unwritten region at the head of the compact
+`ids_src1`/`ids_dst` arrays that downstream MMQ/MMF quantize kernels then
+read as garbage row indices - an illegal memory access. This exact bug was
+already fixed once, in commit `e4ed3cdcf` (`expert_used >= 0 &&`), but a
+later upstream sync (`5839ba352`, "CUDA: dedup MoE gate/up activation
+quantization") silently reintroduced the file without that fix. Reapplied
+the same guard at both sites.
+
+Also confirmed while investigating this: that same sync dropped the ENTIRE
+feature the fix belonged to, not just the one guard - `d5b1a815c` ("id=-1
+skip support in CUDA mul_mat_id fast paths") added a
+`mm_ids_zero_skipped_rows` kernel (mmid.cu/mmid.cuh) plus call sites in
+mmq.cu, mmf.cu and mmvq.cu (including an early-return in `mul_mat_vec_q`/
+`mul_mat_vec_q_moe` on `id < 0`, since without it a skipped id is used
+directly as a channel index - an out-of-bounds read). None of that is in the
+tree any more (`grep mm_ids_zero_skipped_rows` across ggml-cuda/*.cu is
+empty). Left AS IS rather than reconstructing the whole feature: grepped the
+whole codebase for what would have to produce a `-1` id on the CUDA dispatch
+path (the "hot/cold expert pack split" the commit messages describe) and
+found nothing - no `expert_pack`/`hot_cold` identifiers anywhere outside one
+comment in moe-cache.cu, and `llama-graph.cpp`'s actual MoE routing
+(`ggml_argsort_top_k` on real logits) never emits `-1`. So the regression is
+real but currently unreachable; the `mm_ids_helper` bounds fix alone is
+correct, minimal, and safe to ship on its own. If the hot/cold pack feature
+is meant to come back, reconstructing `mm_ids_zero_skipped_rows` and its
+call sites is a separate, deliberate follow-up.
+
+**Fixed: `tools/server/server-context.cpp:5506`, rerank endpoint, unvalidated
+client `top_n`.** `int top_n = json_value(body, "top_n", ...)` took the
+client's JSON value with no lower-bound check, then
+`format_response_rerank` (`server-common.cpp:1420`) does
+`elements.resize(std::min(top_n, (int)elements.size()))` - a negative
+`top_n` (e.g. `"top_n": -1`) makes `std::min` pick the negative value, which
+`resize()` then implicitly converts to a huge `size_t`, throwing
+`std::length_error` or attempting a multi-exabyte allocation. Remotely
+triggerable: any `POST /rerank` or `/v1/rerank` request with a populated
+`documents`/`texts` array and a negative `top_n`. Fixed by clamping at the
+parse site: `std::max(0, json_value(...))`.
+
+Both fixes rebuilt clean (`ggml-cuda`, `server-context` targets).
+
+**Closing this session's corruption-reproduction attempts.** The 4-way
+concurrent 300-tokens-each burst under `compute-sanitizer --tool memcheck`
+(the same tool that reproduced corruption with zero concurrency in the prior
+session) finished: all 4 outputs clean (uniq_ratio 0.038-0.052, well above
+the ~0.02 corrupted threshold), 0 memcheck violations, 0 circuit-breaker
+triggers of any kind. Tally for this session, all post-guard-fix: 2x native
+4-way concurrent bursts (8 completions), 4x sequential single-prompt runs
+under memcheck, 1x 4-way concurrent run under memcheck (4 completions) - 16
+completions total, 0 corrupted, 0 sanitizer violations. This is evidence the
+fixed instrumentation + the two unrelated bugs fixed elsewhere did not
+obviously make things worse, and is consistent with (not proof of) the
+underlying race being fixed - the original bug was already known to be
+intermittent, and this session found and fixed a real bug in the
+*instrumentation* meant to catch it, not a confirmed fix to the corruption's
+own root cause. The mechanism remains formally unconfirmed. Recommend: watch
+for recurrence in normal use with `GGML_CUDA_MOE_CACHE_GEN_CHECK=1` and the
+guard checks left on; if it recurs, the fixed guards should now report
+real breaches instead of false ones.
+
+**Follow-up review pass, same "silently-reverted fix" pattern**: a second
+agent checked `fattn.cu`, `rope.cu`, `cpy.cu`, `softmax.cu`, `norm.cu`,
+`binbcast.cu`, `concat.cu`, `common.cuh` against every fix commit touching
+them in this fork's history - all six most plausible candidates (grid-size
+overflow guards, KQ-mask offset int64 casts, the cpy transpose double-buffer
+race fix, rope's non-contiguous stride fix, the block_reduce SMEM-reuse
+race fix) are still intact in the current tree. No second instance of the
+`mmid.cu`-style regression found in this scope.
+
+**Git-archaeology pass found three more instances of the exact same
+regression**, all lost in the same `5839ba352` ("CUDA: dedup MoE gate/up
+activation quantization") upstream-sync overwrite that dropped the mmid.cu
+fix. All three verified directly (read the original fix diff, confirmed the
+pre-fix pattern is what the current file has) and restored, rebuilt clean:
+
+- **`ggml-cuda/mmq.cu`** (fix `2fc72679d` + the earlier `e4ed3cdcf` sentinel-fill
+  it built on): the two `cudaMemsetAsync` calls that sentinel-fill
+  `ids_src1` (0xFF) and zero `ids_dst` before `mm_ids_helper` runs were both
+  gone - any -1 id left the compact arrays' unwritten tail holding pool
+  garbage, which the quantize/mm kernels would then read as a row index.
+  Restored both.
+- **`ggml-cuda/mmvf.cu`** (fix `a3f26d8b5`): the kernel-side
+  `if (ids && channel_x < 0) return;` guard in `mul_mat_vec_f` was gone - a
+  -1 id would be used directly as a channel index (OOB read) instead of
+  skipping the row. Restored the guard. Did NOT restore the fix's other half
+  (the host-side `ggml_cuda_launch_mm_ids_zero_skipped_rows` call that
+  pre-zeroes skipped rows for correctness) since that kernel itself is part
+  of the still-missing `d5b1a815c` feature (see above) - restoring the
+  memory-safety guard alone is enough to remove the OOB read; the dst row
+  for a skipped slot is just stale instead of zeroed, same tradeoff already
+  accepted for mmid.cu/mmvq.cu.
+- **`ggml-backend.cpp:1926`** (fix `8a14a58b3`,
+  `ggml_backend_sched_compute_splits`'s used-experts scan): had regressed
+  back to `GGML_ASSERT(id >= 0 && id < n_expert)` with no negative-id skip.
+  Unlike the CUDA kernel-side findings, this one is NOT gated behind the
+  fork's dead hot/cold-pack feature - it scans the same `ids` tensor that
+  `ggml-cpu.c`'s own `mul_mat_id` already treats -1 as a normal, expected
+  sentinel (upstream ggml convention, not fork-specific), so any path that
+  legitimately produces a -1 id and also goes through backend scheduling
+  would abort the whole process on this assert. Restored the `if (id < 0)
+  continue;` skip before the assert.
+
+All three rebuilt clean (`ggml-cuda`, `ggml` targets), then a full
+`llama-server` relink + smoke test (model load, one completion, one rerank
+request against a non-reranking server to confirm it still error-responds
+rather than crashing) passed. Total for this session: 5 real, independently
+verified bugs found and fixed (1 instrumentation false-positive, 1
+`mmid.cu` bounds regression, 1 rerank DoS, 2 more instances of the same
+mmid.cu-class regression in mmq.cu/mmvf.cu/ggml-backend.cpp), all outside
+the corruption bug's own root cause, which remains unconfirmed.
+
+## CORRUPTION — live reproduction, caught and localized in real time (2026-08-26, later)
+
+While running the substitution reasoning-benchmark (item 5, see below), the
+`--moe-cache 512 -ncmoe 30` server it was hitting degenerated to `////...`
+on essentially the FIRST request served after a fresh restart, deterministic
+on the same prompt every time re-tried. This is a far faster, simpler
+reproducer than anything found previously - a single non-concurrent
+`/completion` request, no compute-sanitizer needed, no accumulated churn.
+Investigated live against this exact reproducer with the tooling this
+session already built plus new instrumentation, all findings direct not
+inferred:
+
+**The circuit breaker fires but does not save the output.** Every rejected
+row gets recomputed on CPU (the existing fallback) and is *still* wrong -
+proof this is real data corruption, not a one-off kernel glitch the retry
+already covers.
+
+**Weight bytes are NOT mutated.** `GGML_CUDA_MOE_CACHE_WEIGHT_GUARD=1`
+re-hashed 3082 admitted experts' SOURCE bytes against their admission-time
+hash on this exact reproducer: 0 mutated, every sweep. Rules out "something
+overwrites the source weight file's mapped pages."
+
+**No fill-vs-pinned-read race.** `GGML_CUDA_MOE_CACHE_GEN_CHECK=1` (compares
+each pinned slot's generation counter before/after the mandatory
+post-dispatch sync) and `GGML_CUDA_MOE_CACHE_VERIFY_DISPATCH=1` (checks every
+slot is still `valid`/pinned at dispatch time): 0 violations, both, on this
+exact reproducer. Rules out the fill worker rewriting a slot out from under
+an in-flight read - the leading theory since early in this investigation.
+
+**The activation feeding the corrupted layer is already NaN going in - not
+the dot-product output, the INPUT.** `GGML_CUDA_MOE_CACHE_NAN_PROBE=1` (an
+existing check in `ggml-cpu.c` that had apparently never actually been
+enabled in this investigation - it was silently gated behind its own env var
+this whole time) shows `src1` for `blk.22.ffn_gate_exps`/`ffn_up_exps` is
+**100% NaN (8192/8192 or 2048/2048 elements, every run)**, first appearing at
+exactly layer 22, every earlier layer (0-21) clean. A first attempt at
+measuring this got a false "amax=0" reading - `std::max` silently ignores
+NaN comparisons (`NaN < x` is always false), so the original diagnostic was
+blind to the very thing it was trying to catch. Fixed by counting NaN
+elements explicitly rather than trusting `max`'s behavior around them
+(`ggml-cuda/moe-cache.cu`, the new `GGML_CUDA_MOE_CACHE_ACT_MAGNITUDE_LOG`
+debug knob). This rules out an FP16 quantizer-scale-overflow theory that
+looked promising for the same reason (checked: real activation magnitudes at
+clean layers 20-21 are single-digit, nowhere near overflow range) - the
+input isn't merely small or zero, it is NaN, before moe-cache's own
+quantizer ever touches it.
+
+**`--moe-cache off` is clean on the identical prompt** (confirms: this is
+still a real moe-cache-specific bug, not a pre-existing model/quantization
+defect that any -ncmoe config would hit) - the model correctly computes
+24-5=19 with the cache off. So something about the cache being ENABLED
+causes an EARLIER computation (attention or norm at layer 22, before its own
+FFN/MoE block - `ffn_gate_exps`'s `src1` is layer 22's POST-ATTENTION
+normed hidden state, not layer 21's FFN output directly) to already be NaN.
+No `OUTPUT REJECTED` fires for any layer below 22, so whatever moe-cache
+itself dispatches at layers 0-21 is fine - the corruption's true origin is
+somewhere in layer 22's own attention block or norm, upstream of any
+moe-cache dispatch for that layer, but only when moe-cache is active
+elsewhere in the process.
+
+**UPDATE, same session: by far the best reproducer found in either
+investigation session.** Chasing the "requires `llama-server`" finding
+further with bisection, in order of what was ruled out:
+
+- `GGML_CUDA_DISABLE_GRAPHS=1`: still corrupts. Not CUDA graphs (consistent
+  with the earlier graphs-on/off A/B in this same doc, now confirmed a third
+  way).
+- `--no-warmup`: the FIRST real request after startup is now clean (fixed
+  the "corrupts on request 1" framing above) - but this was a red herring
+  about warmup specifically, not a fix. See next point.
+- **The real trigger: exactly TWO sequential, non-concurrent requests, where
+  the second uses a DIFFERENT prompt than the first.** With `--no-warmup
+  --parallel 1` (single slot, zero multi-slot/unified-KV-cache complexity,
+  zero concurrency): request 1 (pencils word problem) clean, request 2 (a
+  *different* word problem, garden area) corrupts, every time, deterministic.
+  But sending the SAME prompt three times in a row on a fresh server stays
+  clean all three times (uniq_ratio identical across all three). So the
+  trigger isn't "any second generation" - it's specifically a *change* in
+  what's being generated, i.e. new/different expert routing demanding
+  admissions the first prompt's residency doesn't already cover. This is
+  the same "requires admission churn" shape the very first investigation
+  session already suspected, now pinned to an exact, tiny, two-request
+  recipe instead of needing sustained concurrent traffic or
+  compute-sanitizer's timing distortion to open the window. Warmup's
+  earlier-observed effect was just this same mechanism: warmup is itself an
+  initial (different-content) decode, making the first REAL request "request
+  2" relative to it - consistent, not a separate cause.
+- Multi-slot/unified-KV-cache machinery is NOT required: still corrupts
+  with `--parallel 1` (n_slots=1). Rules out slot-reuse/LCP-similarity
+  logic as the mechanism, despite superficially fitting ("different prompt
+  -> different KV reuse pattern").
+- Scheduler/graph rebuild is NOT involved: `sched_reserve()`'s "reserving
+  ..." log (which fires on every `ggml_backend_sched` teardown/rebuild -
+  see `llama-context.cpp`, `sched_need_reserve`) never appears between the
+  two requests. Rules out the moe-cache session take/adopt-across-rebuild
+  path (`ggml_backend_sched_take/adopt_moe_cache_session`) as the mechanism,
+  despite superficially fitting ("state carried across a rebuild boundary").
+- Full diagnostic stack (`GEN_CHECK`, `VERIFY_DISPATCH`, `WEIGHT_GUARD`,
+  `PIN_AUDIT`, `VERIFY_SLOTS`, `VERIFY_ROWS`, `MAP_AUDIT`) run together on
+  this exact 2-request reproducer: all silent except `NAN_PROBE` and the
+  existing circuit breaker. Every moe-cache-internal consistency check this
+  investigation has ever built says the cache's own bookkeeping is correct
+  at the moment of failure - again.
+- On this run `NAN_PROBE` caught it even earlier than before: `blk.1`
+  (the SECOND transformer layer), not `blk.22` - the exact failing layer
+  varies by run/prompt, but it's always the first MoE layer whose `src1`
+  gets checked after whatever actually broke, i.e. the true origin is
+  upstream of moe-cache's own dispatch call for that layer (that layer's own
+  attention/norm, or earlier), not in moe-cache's kernel math - reinforced,
+  not just repeated, by seeing it move.
+
+**Net position**: two full investigation sessions have now independently
+and exhaustively ruled out every piece of moe-cache's own bookkeeping (pin
+lifecycle, generation counters, slot state machine, weight-byte integrity,
+map injectivity, row accounting, dispatch-time slot validity) as the
+mechanism, while conclusively establishing (a) it requires moe-cache
+enabled, (b) it requires a real request whose expert routing differs from
+what's already resident (i.e. real admission/eviction churn, confirmed
+today down to a 2-request minimum), and (c) the actual corrupted value is
+the ACTIVATION flowing into an early MoE layer, not any weight or cache
+data. The most promising unexplored surface given this: whatever moe-cache
+code path runs *during eviction/admission itself* while a subsequent
+ubatch's attention/norm computation for an EARLY layer is proceeding
+concurrently on the main thread - i.e. the background fill worker doing
+real work (not just idling) at the same time the main thread is past
+layer 0/1's attention, before either side's own consistency checks would
+catch anything, since none of today's checks instrument attention or KV
+cache at all. Next session: extend `NAN_PROBE`-style checking (or the
+`common_debug_cb_user_data abort_on_nan` mechanism now built into
+`llama-eval-callback`, extended to also run TWO different prompts back to
+back rather than one, to get the same clean-CLI-tool control this session
+already established for the single-prompt case) into attention/KV-cache
+tensors specifically, to catch the corruption at its actual origin instead
+of one or more layers downstream of it.
+
+## BREAKTHROUGH, same session: reproduced in a single CLI process, exact op identified
+
+Did the "next step" above immediately rather than deferring it. Extended
+`examples/eval-callback` further: `run()` now takes a prompt string
+parameter, and after the first prompt's greedy generation loop, if
+`EVAL_CALLBACK_PROMPT2` is set, resets the KV cache for sequence 0
+(`llama_memory_seq_rm(mem, 0, 0, -1)`) and runs a second, different prompt
+through the identical `abort_on_nan` instrumentation, in the same process.
+
+**First attempt used `llama_memory_seq_rm(mem, -1, -1, -1)`** (wildcard
+"clear everything") and hit a DIFFERENT, unrelated crash:
+`GGML_ASSERT(cell.has_seq_id(seq_id)) failed` in
+`llama_memory_recurrent::find_slot` (`llama-memory-recurrent.cpp:575`). This
+model (`Ornith-1.5-35B`) turns out to be a **hybrid SSM/attention/MoE
+architecture** (Gated DeltaNet linear-attention layers with their own
+`llama_memory_recurrent` conv/SSM state cache, wrapped in
+`llama_memory_hybrid` alongside the normal attention KV cache -
+`cache_r_l0`/`cache_s_l0` per-layer state tensors, `GATED_DELTA_NET`/
+`SSM_CONV` ops) - not a plain transformer. The wildcard seq_rm doesn't
+correctly reset this recurrent component for this architecture; a real bug
+in its own right, separate from the one being chased, not investigated
+further this session (noted as pending-work-worthy below). Using the
+specific sequence id instead (`seq_rm(mem, 0, 0, -1)`, seq 0 for slot
+0 - what `llama-server` actually calls to release a slot between requests)
+avoided it cleanly.
+
+**With the correct reset, the bare CLI tool reproduces the corruption
+exactly**: prompt 1 (pencils) generates 40 clean greedy tokens, KV reset,
+prompt 2 (garden area) - and the process aborts with "encountered NaN"
+almost immediately, during PREFILL of the second prompt, not generation.
+Full single-process repro, zero server, zero HTTP, zero slot machinery,
+zero concurrency, zero compute-sanitizer.
+
+**The exact failing tensor, read directly off the callback trace**:
+`ffn_moe_down-0` - `blk.0.ffn_down_exps`'s `MUL_MAT_ID`, THE VERY FIRST MoE
+op of the very first transformer layer of the second prompt. Everything
+printed before it in that prompt's graph is clean (no premature abort,
+meaning every earlier tensor's sum was finite): the embedding lookup, the
+FULL Gated-DeltaNet linear-attention block (conv state read/update,
+`SSM_CONV`, `GATED_DELTA_NET`, ssm state read/update, gating, output
+projection, residual add), the post-attention norm, the router logits/
+softmax/argsort/top-k, `ffn_moe_gate-0`, `ffn_moe_up-0`, and
+`ffn_moe_swiglu-0` (the SwiGLU-combined gate*up product - i.e. `down`'s own
+input). **`ffn_moe_down-0`'s input (`ffn_moe_swiglu-0`) is verified clean
+and its weight (`blk.0.ffn_down_exps.weight`) is bytes this whole
+investigation has repeatedly verified never mutates** - yet its output is
+NaN. This is the most direct, unambiguous evidence yet that the defect is
+IN moe-cache's own dispatch/kernel path for this call, not something
+upstream feeding it bad data, and not attention/KV-cache/SSM-state related
+despite how promising that surface looked from the server-side symptoms.
+
+**Confirmed immediately (checked via `gguf-py`, `GGUFReader`) - this is the
+session's most actionable result: `blk.0.ffn_down_exps.weight` is
+`Q6_K`. `blk.0.ffn_gate_exps.weight` and `blk.0.ffn_up_exps.weight` (which
+dispatched cleanly, same call, same layer, same cache) are both `Q4_K`.**
+Standard for a `_M` quant mix (down-projections commonly get extra
+precision), and it means the failure isolates to the Q6_K-specific dispatch
+path - `vec_dot_q6_K_q8_1`, or something in how `moe_cache_allocate_pool`
+computes `slot_stride` for Q6_K's block layout (210 bytes/block, QK_K=256,
+vs Q4_K's 144 bytes/block - the `slot_stride` guard-rounding comment in
+`moe-cache.cu` explicitly calls out Q4_K's block size as the reasoning
+example; worth checking it was verified against Q6_K too, not just derived
+generically and assumed correct) - not the shared MMVQ machinery in
+general, and not moe-cache's dispatch/collect bookkeeping (identical for
+every wtype). This is a small, closed-off surface: one kernel
+(`vec_dot_q6_K_q8_1` / `vec_dot_q6_K_q8_1_impl_mmvq`, `vecdotq.cuh`) and one
+allocation-time calculation (`moe_cache_allocate_pool`'s `slot_stride`
+derivation, `moe-cache.cu`), both easy to re-check specifically for Q6_K's
+constants next session, with a reproducer that now takes seconds, not
+minutes, to re-run.
+
+**Important refinement, checked immediately after the type finding**: `down`
+isn't just a different quant type from `gate`/`up` - it's a **different,
+transposed SHAPE**: `ffn_down_exps.weight{512, 2048, 256, 1}` (n_in=512,
+n_out=2048) versus `ffn_gate_exps`/`ffn_up_exps.weight{2048, 512, 256, 1}`
+(n_in=2048, n_out=512) - down projects the 512-dim SwiGLU intermediate back
+to the 2048-dim residual stream, the reverse of what gate/up do. Different
+shape means a different `expert_size`, which means `moe_cache_find_pool`
+(keyed on `(expert_size, wtype)`) puts `down` in a **completely separate
+pool** from `gate`/`up`, with its own independent slot array, admission
+history, and `slot_stride`. `QI6_K`/`QR6_K` (both 32/2, from
+`ggml-common.h`) are structurally identical to `QI4_K`/`QR4_K`, so the
+q8_1-activation-block bookkeeping the kernel walks is not obviously
+type-sensitive - which weakens "Q6_K's kernel math itself" as the sole
+explanation and strengthens "whatever's specific to `down`'s pool" (its
+shape, or simply being a separate, independently-admitted pool from
+gate/up's) as at least as likely a culprit. Both quant type AND shape/pool
+identity differ for `down` versus the two tensors that dispatched cleanly
+in the same call - this session did not have time to isolate which (or
+both) actually matters; that is the concrete next step, e.g. testing
+against a hypothetical quant where down and gate/up share both type AND
+shape, or adding pool-identity/shape logging to the existing NAN_PROBE /
+OUTPUT REJECTED instrumentation.
+
+**Remaining testable next steps, none done yet this session (time
+constrained)**:
+1. Check `vec_dot_q6_K_q8_1_impl_mmvq` (`vecdotq.cuh`) line by line for
+   anything Q6_K-specific that could produce non-finite output from finite
+   inputs - a division, an unguarded scale multiply, an index computed
+   differently than Q4_K's equivalent. Cross-check against
+   `moe_cache_allocate_pool`'s `slot_stride` rounding
+   (`ggml_type_size(GGML_TYPE_Q6_K)` = 210, confirm the round-up-to-block
+   math and the `s02 = slot_stride_bytes / ts0` blocks-per-slot calculation
+   in `ggml_cuda_moe_cache_mmv` both come out exact, not off-by-a-partial-
+   block, for a 210-byte block size specifically.
+2. Instrument `moe_cache_dispatch`/`moe_cache_collect` specifically for
+   `ffn_down_exps` calls (or generically, print the `wtype`/`slot`/`pin`
+   details of the SPECIFIC row that goes non-finite) under this exact
+   2-prompt CLI reproducer - it's now cheap and fast to iterate on (single
+   process, sub-second to reach the failure, no model reload needed for
+   re-runs within the same process if the harness is extended to loop).
+3. Check whether the SAME set of slots/experts admitted during prompt 1's
+   `ffn_down_exps` dispatches are the ones read (cache HIT) during prompt
+   2's first `ffn_down_exps` call - i.e. whether this is specifically an
+   eviction/re-admission-driven slot, or a slot that was resident and
+   untouched since prompt 1 requesting a hit on already-stable data (the
+   two point at very different mechanisms: a slot mutating in a way none of
+   this session's or the prior session's checks catch, versus something
+   wrong in the admission path itself for this specific tensor/type).
+4. The `examples/eval-callback` two-prompt harness (kept in the tree, real
+   debugging capability) is currently hardcoded to a single greedy-decode
+   loop shape per prompt and exits on the first NaN - extending it to loop
+   N prompt-pairs without re-loading the model would make bisecting #1-3
+   above much faster than restarting the process each time.
+
+**Also surfaced, not yet investigated**: the `llama_memory_recurrent`
+wildcard-seq_rm assertion failure above is architecture-specific (hybrid
+SSM models) and separate from the moe-cache bug, but is itself a real crash
+on a documented, legal API call (`llama_memory_seq_rm(mem, -1, p0, p1)` is
+specified to match any sequence) - worth its own investigation and fix,
+just not this session's focus.
+
+## Attempted fixes, all tested against the fast CLI reproducer, all failed - and a major correction
+
+User asked to fix the bug rather than keep narrowing it. Given the
+"admission alone, no dispatch needed" evidence, tried closing the window by
+construction:
+
+- **`cudaDeviceSynchronize()` wrapped around the fill worker's H2D copy**
+  (before AND after, in `moe_cache_worker`, `moe-cache.cu`) - the direct
+  test of "this fill's real device traffic races something else running
+  concurrently on the main thread's own stream(s)." Rebuilt, re-ran the
+  2-prompt reproducer: **still corrupts**. Reverted (kept as a documented
+  negative result, not left in as dead-weight latency).
+- **`GGML_CUDA_MOE_CACHE_NO_RT_ALLOC=1`** (preallocates the fill worker's
+  stream and pinned staging buffer once at startup instead of lazily per-job
+  - rules out a stream-creation or `cudaMallocHost`/`cudaFreeHost`
+  reallocation mid-session as the timing culprit): **still corrupts**.
+- **`--moe-cache 64`** (much smaller budget, far less VRAM claimed than the
+  512 used throughout this investigation - a direct test of "moe-cache's
+  VRAM footprint shifts where some OTHER buffer gets placed, exposing a
+  latent bug elsewhere"): **still corrupts**.
+- **`GGML_CUDA_MOE_CACHE_NO_HOST_PTR=1`** (disables the separate CPU-side
+  "read from a cache-owned host copy instead of `src0->data` directly"
+  redirect in `ggml-cpu.c`, gated on `ggml_moe_cache.host_ptr` returning
+  non-null): **still corrupts**.
+
+**Major correction while investigating the fixes**: checked with
+`MOE_CACHE_DEBUG_GATE=1` whether `moe_cache_begin` is even CALLED for
+`blk.0.ffn_down_exps` on the second prompt's PREFILL (the call that
+actually goes non-finite, per the eval-callback trace) - **it is not**.
+It's called 40 times during prompt 1's greedy generation (once per
+decoded token, confirming this exact tensor genuinely is moe-cache-managed
+in general), but zero times for prompt 2's prefill step. The eligibility
+gate in `ggml-cpu.c` (`n_ids * ids->ne[1] <= MOE_CACHE_MAX_TOPK` and
+`moe_cache_max_tokens_ok(ids->ne[1])`) bypasses moe-cache entirely for
+any multi-token batch over its threshold - prefill of a ~52-59 token
+prompt in one ubatch crosses it, so **moe-cache's own begin/plan/dispatch/
+collect pipeline, its circuit breaker, and every one of this session's and
+the prior session's consistency checks are ALL simply not in the call
+path for the specific op that goes bad.** This retroactively explains why
+`OUTPUT REJECTED` never once fires for layer 0 in the full-diagnostic
+server run above despite the corruption being real and present there too.
+`NO_HOST_PTR` ruled out the one OTHER moe-cache touchpoint that runs
+regardless of the node/pipeline (the CPU-side host-copy redirect), so the
+actual failing computation, for this specific manifestation, is
+**completely standard, unmodified ggml `mul_mat_id` code - no moe-cache
+logic executes for it at all.**
+
+This means the defect is not "in" moe-cache's dispatch, admission, or
+bookkeeping code as such - it requires moe-cache to be ENABLED (config on
+vs off is the only lever that reliably separates clean from corrupt) but
+manifests through a call that never touches moe-cache's own code. The most
+coherent remaining explanation: moe-cache's mere presence - its VRAM
+allocation, its hooks into `ggml_backend_sched` (session take/adopt across
+reserves), or something about how it changes the graph/scheduler's
+behavior even for ops it declines to manage - perturbs something in a
+SEPARATE subsystem enough to expose a latent bug there. This model
+(`Ornith-1.5-35B`) is a hybrid SSM/attention/MoE architecture with its own
+`llama_memory_recurrent` state (`cache_r_l0`/`cache_s_l0` conv/SSM state,
+`GATED_DELTA_NET`/`SSM_CONV` ops) - a `llama_memory_recurrent` assertion
+crash was already found this session on a different code path (the
+wildcard `seq_rm`), making this subsystem a live suspect independent of
+that specific crash. Not yet tested: whether the same 2-prompt reproducer
+corrupts on a PLAIN (non-hybrid, non-SSM) MoE model with moe-cache enabled
+- if it doesn't, that would confirm the hybrid architecture itself is a
+necessary ingredient, not just this specific model being unlucky.
+
+A `compute-sanitizer --tool memcheck` run of this exact fast CLI reproducer
+was launched to look for a genuine out-of-bounds read/write directly,
+rather than continuing to guess at synchronization fixes - see the next
+entry for its result once it completes.
+
+## Cross-architecture test and first memcheck run
+
+**The 2-prompt CLI reproducer also corrupts `gemma-4-26B-A4B` (plain,
+non-hybrid, non-SSM transformer MoE, `--moe-cache 512`, no `-ncmoe`).**
+Rules out the hybrid SSM/GatedDeltaNet architecture as a necessary
+ingredient - this is a general moe-cache defect, not something specific to
+`Ornith`'s recurrent-memory subsystem. (Matches the much earlier session
+note that gemma-4 degenerates identically to Ornith, just emitting a
+different repeated token - now confirmed on the SAME fast, precise
+reproducer instead of the old slow one.)
+
+**First `compute-sanitizer --tool memcheck` run of the fast CLI reproducer**:
+706 errors - but every one of them is `cudaErrorNotSupported` on
+`cudaHostRegister`/`cudaGetLastError`, all originating from
+`ggml_backend_cuda_register_host_buffer` during MODEL LOADING
+(`llama_model_loader::load_all_data`), not during the 2-prompt generation
+window the bug lives in. This is `cudaHostRegister`'s well-known
+incompatibility with compute-sanitizer, not a real bug - `-ncmoe`
+CPU-resident expert regions get host-registered for faster H2D transfer
+regardless of moe-cache (a completely separate ggml-cuda mechanism,
+`GGML_CUDA_NO_PINNED` to disable, unrelated to moe-cache's own
+`hostreg_mb`/`GGML_CUDA_MOE_CACHE_HOSTREG_MB` which stayed at its default of
+0 throughout - the earlier "cudaHostRegister" log lines seen in normal runs
+of this session were from THIS mechanism, not moe-cache's, a correction to
+earlier framing in this doc). Re-running with `GGML_CUDA_NO_PINNED=1` to get
+a clean signal for the actual bug window - result below once it completes.
+
+**Second run, `GGML_CUDA_NO_PINNED=1`**: identical result, 706 errors, same
+breakdown - the env var didn't change anything (either not read fresh at
+the point that matters, or this specific `-ncmoe` host-registration path
+isn't gated by it the way assumed). Not chased further given the errors are
+unambiguously all from model loading regardless (same stack trace, same
+count, both runs) - genuinely orthogonal to the 2-prompt generation window
+the bug lives in.
+
+**Conclusion: compute-sanitizer's memcheck found ZERO memory-safety
+violations (no out-of-bounds read/write, no uninitialized read) during the
+actual bug window, across two full runs.** Combined with everything else
+ruled out this session (weight-byte mutation, pin/generation races, dispatch
+bookkeeping, the host_ptr redirect, fill-worker/main-thread device
+synchronization, runtime allocation timing, cache budget size, the SSM/
+hybrid architecture), this now looks less like a classic memory-safety bug
+memcheck's instrumentation is built to catch, and more like either (a) a
+pure logic defect - correct, in-bounds memory access, but the WRONG value
+used or computed (e.g. a stale-but-valid pointer, a size/shape mix-up that
+still lands in-bounds) - or (b) a genuine host-side race (a plain C++ data
+race between the fill worker thread and the main thread, which memcheck's
+GPU-memory-focused checks would not catch at all, unlike TSan). This
+session already tried the two most obvious "add more synchronization"
+mitigations (full device sync around the fill copy; eliminating runtime
+allocation) without effect, which argues against a simple GPU-stream-timing
+race specifically, but does not rule out a host-side data race outside
+GPU-memory instrumentation's view.
+
+Given the extent of this session's rule-outs, root cause is not pinned down
+to a specific fixable line. Asked the user directly how to proceed rather
+than shipping a fix that hasn't been verified to actually close the
+reproducer.
+
+## Ablation series: every specific admission/hit sub-mechanism individually ruled out
+
+User asked to keep investigating. Also checked the leloch/moe-cache* remote
+branches (this session's moe-cache.cu descends from `leloch/moe-cache`,
+itself a rename of an independent "EC3" rewrite) for a matching bug -
+`EC3_READINESS.md` documents two real, confirmed "silent numerical
+corruption" bugs, but both are specific to a GLU gate/up fusion optimization
+our code doesn't have at all (no analogous construct exists to patch); the
+other findings (OOM-abort hygiene, pool-ordering race) are either already
+handled differently in our code or not reachable in a single-model scenario.
+No transplantable fix came out of this - recorded for completeness, not
+pursued further.
+
+Went back to direct ablation on the fast CLI reproducer, using the
+env-var fault-injection points already built (`GGML_CUDA_MOE_CACHE_FAIL`)
+plus new ones added this session, individually disabling each specific
+mechanism in the admission/hit path to find which one is *necessary*:
+
+| Config | Result |
+|---|---|
+| `FAIL=insert` (admission entirely blocked, slot never leaves `copying`) | **clean** |
+| `FAIL=dispatch` (admission completes normally; GPU kernel never runs, CPU fallback used) | corrupts |
+| `FAIL=dispatch` + `SKIP_COPY` (now fixed to actually take effect on the real, default stage-buffer path, not just the never-taken hostreg path - see below) - admission bookkeeping completes, **zero bytes ever copied to the device slab** | corrupts |
+| + `GGML_CUDA_MOE_CACHE_NO_SEGMENT_PUSH=1` (new) - slot marked `valid` but never linked into the probation/protected eviction list | corrupts |
+| `GGML_CUDA_MOE_CACHE_NO_HITS=1` (pre-existing) - hit accounting (heat/promotion/pin) runs in full, but the hit is never reported to `ggml-cpu.c`, so that row takes the 100% ordinary compute path | corrupts |
+| + `GGML_CUDA_MOE_CACHE_NO_PROMOTE=1` (new) - on top of NO_HITS's full accounting, also skip `moe_cache_promote_to_protected` specifically, keeping `readers++`/heat/pins | corrupts |
+| `MOE_CACHE_ROW_AUDIT=1` during a corrupting run | **0 mismatches** - row accounting (matrix_rows/matrix_row_counts, including the dispatch-failure fallback path in `ggml-cpu.c`) provably balances even while corrupting |
+
+**Also found and fixed a real bug in this session's own instrumentation
+while doing this**: `GGML_CUDA_MOE_CACHE_SKIP_COPY=1` only ever guarded the
+`direct` (hostreg) copy branch - which fails to activate by default anyway
+(`cudaHostRegister` returns "already mapped", colliding with `-ncmoe`'s own
+unrelated host-buffer registration), so the flag silently had NO effect on
+any default-configuration run, including whenever it was referenced earlier
+in this investigation or the prior session. Fixed to guard all three copy
+branches uniformly (`moe-cache.cu`, the fill worker's copy dispatch).
+
+**Net result: every individually-testable sub-mechanism inside "admission
+reaches completion" - the real byte copy, the GPU dispatch/kernel, the
+eviction-list linkage, hit-promotion/segment demotion, and hit-row
+reporting to the CPU compute path - has now been ruled out on its own.**
+What's left common to every corrupting configuration and absent from the
+one clean configuration (`FAIL=insert`) is only: `slot.state` transitioning
+to `valid`, `device->demand_count.erase()`, `device->fills++`, and (on the
+hit side) `slot.readers++`/`slot.heat` incrementing and a pin being recorded
+- all trivial scalar/map operations that don't plausibly corrupt a tensor's
+values on their own, and none of which touch GPU memory or any tensor data
+at all. This pattern - many specific mechanisms ruled out, only trivial
+bookkeeping ops common to every failure - now reads less like "a specific
+line has a bug" and more like **admission reaching completion changes
+something incidental (timing, scheduling, or simply that non-trivial CPU
+work now happens on this thread at this point) that exposes a bug
+elsewhere entirely**, most plausibly in attention/KV-cache computation for
+the SAME token, given `NAN_PROBE` already showed the earliest-detectable
+NaN is in the activation feeding an early MoE layer - upstream of anything
+moe-cache itself computes, in every run this session pinned down a specific
+tensor for. Not yet tested: whether admission's CPU cost alone (no cache
+logic at all - just busy-spinning the fill worker thread for a comparable
+duration) reproduces it, which would be the direct test of "timing/
+scheduling perturbation" as the actual mechanism rather than anything in
+moe-cache's own code.
+
+**Follow-up: ThreadSanitizer run of the same reproducer** (a pre-existing
+`build-tsan` tree from the prior session, CUDA-enabled; built
+`llama-eval-callback` into it and ran the identical 2-prompt test). TSan
+instruments host/CPU code only, not GPU kernels, so it's the direct check
+for a host-side data race that memcheck's GPU-focused checks can't see -
+the leading remaining hypothesis after two clean memcheck runs.
+
+**137 warnings, none new or moe-cache-specific.** Triaged by stack trace:
+
+- **1 `moe_cache_plan` double-lock report** (`moe-cache.cu:5736`) - the
+  EXACT SAME finding already investigated and closed out in the prior
+  session (commit `933f8b625`, "close the TSan double-lock report - not a
+  real reentrancy bug"). Not new.
+- **136 generic `ggml`/`llama` infrastructure races**, zero of which
+  mention `moe_cache`/`moe-cache` anywhere in either thread's stack.
+  Overwhelmingly dominated by one pattern: `ggml_new_tensor_impl`
+  (`ggml.c:1808`, graph-build-time tensor metadata creation) racing
+  against a graph-COMPUTE-time read from a worker thread
+  (`ggml_compute_forward_mul_mat_id`, `quantize_row_q8_K_ref`,
+  `ggml_compute_forward_swiglu`, `dequantize_row_q4_K`,
+  `llama_kv_cache::set_input_kq_mask`, etc.) - i.e. ggml's own
+  build-then-compute handoff via its custom spin-wait threadpool barrier,
+  which `ggml_barrier()` already carries an explicit, deliberate TSan
+  accommodation for (`ggml-cpu.c`: "TSAN doesn't support standalone fence
+  yet, we use a dummy read-modify-write instead") - evidence this class of
+  false positive is known and only partially worked around, not evidence
+  of a real bug in each instance. None of these races involve anything
+  this investigation has touched (moe-cache, mmid.cu, mmq.cu, mmvf.cu,
+  ggml-backend.cpp), and the SAME pattern would presumably appear on ANY
+  ggml threadpool workload, cache-enabled or not - not selective for the
+  corrupting condition the way a real culprit would need to be.
+
+**Net result: two full compute-sanitizer memcheck runs (raw GPU memory
+safety) and one full ThreadSanitizer run (host-side data races) all came
+back clean of anything new or moe-cache-specific**, on the exact
+2-different-prompts CLI reproducer that deterministically corrupts the
+non-instrumented build every time. Combined with every other rule-out this
+session (weight-byte mutation, pin/generation races, dispatch bookkeeping,
+the host_ptr redirect, fill-worker/main-thread device synchronization,
+runtime allocation timing, cache budget size, non-hybrid-architecture
+generality via gemma-4), this investigation has now exhausted the tooling
+available to localize the defect mechanically. The corruption is real,
+deterministic, and moe-cache-dependent (`--moe-cache off` stays clean on
+every tested config) - but does not present as a memory-safety bug or a
+detectable data race under either sanitizer, on the fastest and most
+precise reproducer found across two full investigation sessions.
+
+**The single most important new finding: a plain CLI decode loop does NOT
+reproduce it.** Extended `examples/eval-callback` (kept in the tree - a
+genuinely useful capability it was missing) to (a) construct
+`common_debug_cb_user_data` with `abort_on_nan=true`, aborting at the first
+tensor anywhere in the graph whose value sums to NaN, printing every tensor
+name/op up to that point, and (b) actually generate tokens (greedy-decode
+loop) rather than the example's original single prefill-only `llama_decode`
+call - prefill alone was verified completely clean through every layer,
+0-39, output projection included, so the bug needs real decode-step
+generation to reach at all. Ran the IDENTICAL model, `-ngl 99 -c 4096
+--moe-cache 512 -ncmoe 30`, and prompt, for 40 greedy decode steps under
+this instrumentation: **zero NaN, zero abort, clean generation the whole
+way** (tokens decode to a plausible step-by-step answer). The exact same
+config that corrupts on request 1 of `llama-server`, every time, does not
+corrupt at all under a raw single-sequence CLI decode loop.
+
+**What this means**: the bug is not in moe-cache's data (weights, slots,
+pins - all directly verified clean) and not reachable via a bare
+`llama_decode` loop with the same cache config. It requires something
+`llama-server` specifically does: continuous-batching slot/KV-cache
+management, CUDA graph capture/replay (the server logs report thousands of
+"graphs reused" - `eval-callback`'s per-tensor `ggml_backend_tensor_get`
+readback almost certainly forces synchronous, non-graph execution, which
+would also incidentally fully serialize every op against the moe-cache
+background fill worker's own stream - a difference that could easily explain
+why a genuine race would vanish under it), or the request-warmup pass every
+server does before serving real traffic. This narrows the search from "the
+whole moe-cache subsystem" to "whatever `llama-server` does differently from
+a bare decode loop while a cache is active," which is a much smaller and
+more promising surface than anything mapped out so far. Not yet identified
+which specific difference is responsible - next step is bisecting the
+server's own decode path against the CLI's (starting with: does the server's
+warmup pass alone, with zero real requests after, already leave something in
+a bad state; and whether disabling CUDA graphs specifically in the SERVER
+context reproduces the eval-callback's clean result).
+
+(Historical note on the eval-callback finding above: the observation itself
+was correct - a bare CLI decode loop really doesn't reproduce it - but the
+inference drawn from it, that the bug required something specific to
+`llama-server`, was a red herring. The eval-callback tool's per-tensor
+readback (`ggml_backend_tensor_get` after every op, for the NaN-abort check)
+forces enough synchronous host/device round-tripping that it happens not to
+exercise the actual defective code path the same way. The real mechanism,
+below, fires unconditionally inside `ggml-backend.cpp`'s scheduler and has
+nothing to do with continuous batching, CUDA graphs, or server warmup.)
+
+---
+
+## ROOT CAUSE FOUND: the `////...` corruption, fully closed
+
+### Summary
+
+The corruption was a real, deterministic logic bug in
+`ggml_backend_sched_compute_splits` (`ggml/src/ggml-backend.cpp`) - not a
+memory-safety violation, not a data race, and not specific to moe-cache's
+own admission/eviction/pin logic (all of which were correctly exonerated
+over the course of this investigation). It required moe-cache's LFRU
+device-to-device (D2D) cache-hit path, added in commit `366fe539c`, to be
+genuinely active - which on this Ornith-1.5-35B model required an earlier
+fix (`a2d412e9`, lowering `min_expert_bytes` so Ornith's 840 KiB experts
+stop being silently rejected by a 1 MiB floor). Every clean result recorded
+earlier in this document at commits before `a2d412e9` was clean because the
+cache was **silently inert** on this model (zero experts ever registered),
+not because the code was correct - that inertness is itself worth fixing
+separately, since it can silently defeat the whole feature on any small-expert
+architecture without the operator ever finding out (the `a2d412e9` warning
+log addresses the "find out" half of that, at least).
+
+### The mechanism
+
+`ggml_backend_sched_compute_splits` uploads each MoE weight tensor
+(`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`) to the GPU by copying only
+the rows (experts) actually selected by that token batch's routing decision
+- a pre-existing optimization, not something this session added. To avoid
+re-decoding the routing tensor (`ids_tensor`, i.e. `selected_experts`) for
+every one of the three weight tensors in a layer, the function caches the
+decoded "which experts are used" bitmask (`used_ids`) and only recomputes it
+when `ids_tensor` changes - reasonable, since `gate_exps`, `up_exps` and
+`down_exps` all share the exact same `selected_experts` tensor object for a
+given layer/batch (see `llm_graph_context::build_moe_ffn` in
+`src/llama-graph.cpp`, which passes one `selected_experts` tensor into all
+three `build_lora_mm_id` calls).
+
+Commit `366fe539c` ("moe-cache: LFRU hit/miss D2D split for prefill...")
+added a genuine optimization on top of this: before falling back to a
+host-to-device (H2D) PCIe copy for a used expert row, check whether that
+expert is already resident in moe-cache's decode-time GPU pool and, if so,
+serve it via a cheap device-to-device (D2D) copy instead, clearing that
+expert's bit in `used_ids` so the H2D copy below skips it. This scan-and-clear
+was placed *inside* the same `if (ids_tensor != prev_ids_tensor)` block as
+the routing decode - i.e. it only runs when the ids tensor actually changes.
+
+That's the bug. LFRU pool residency is tracked **per weight tensor**
+(keyed by `(host_base, expert)`, where `host_base` is the specific tensor's
+own host pointer - `gate_exps`, `up_exps` and `down_exps` are three
+different arrays with three different `host_base` values and independently
+tracked cache contents). But `used_ids` and its LFRU-cleared bits were being
+reused **across** `gate_exps`, `up_exps` and `down_exps`, because all three
+share the same `ids_tensor` and the recompute (including the LFRU scan) was
+gated on `ids_tensor` alone. Concretely: if expert 5 happens to be
+D2D-cache-resident for `gate_exps` but not for `up_exps`, the code clears
+bit 5 while processing `gate_exps`, then - because `ids_tensor` hasn't
+changed - skips the LFRU rescan entirely while processing `up_exps` and just
+reuses the same, now-stale, bitmask. Expert 5's row in `up_exps`'s staging
+buffer is left with **neither** a D2D copy (the rescan that would have found
+it wasn't in `up_exps`'s pool never ran) **nor** an H2D copy (its bit was
+already cleared) - the GPU buffer for that row is whatever was there before,
+fed directly into `MUL_MAT_ID` as expert weight data. That's why the observed
+symptom was NaN/garbage activations at a specific layer rather than zeros:
+uninitialized/stale device memory, not a cleanly zeroed buffer.
+
+This also explains every property established earlier in this
+investigation:
+- **Needs moe-cache genuinely active + populated**: the LFRU D2D path is the
+  entire mechanism: no D2D hits, no stale-bit reuse, no bug.
+- **Needs the second of two sequential different-content prompts**: the bug
+  fires when the *set of experts D2D-hit-resident* differs between
+  `gate_exps` and `up_exps`/`down_exps` for the same routing decision -
+  which routing-dependent cache occupancy makes far more likely once the
+  cache has real, non-uniform history behind it (i.e. after a first prompt
+  has already run and populated the pool unevenly across the three tensors).
+- **Not architecture-specific**: this is generic MoE scheduling code in
+  `ggml-backend.cpp`, unrelated to Ornith's hybrid SSM design - matches the
+  earlier cross-architecture confirmation with gemma-4-26B-A4B.
+- **Clean under both sanitizers**: there is no unsynchronized memory access
+  here at all - every copy that *does* happen is correctly ordered and
+  pinned. The bug is a pure logic error (a copy that should have happened,
+  silently doesn't), which neither compute-sanitizer nor TSan has any way to
+  flag.
+- **Independent of cache size/eviction**: the conflation happens regardless
+  of how large the pool is or how often eviction runs - it only depends on
+  *which* tensor's residency state was scanned last for a shared ids_tensor.
+- **Not reproduced by the `eval-callback` CLI loop**: unrelated to this
+  mechanism - eval-callback's forced per-tensor synchronous readback happens
+  to interact with the scheduler's split/copy pipeline differently. Not
+  investigated further since the actual root cause was found by this point.
+
+### Bisection results (101-commit range, `64aa6a77c`..`5de4ff917`)
+
+| Position | Commit | Cache state on this model | Result |
+|---|---|---|---|
+| 0 | `64aa6a77c` | inert (min_expert_bytes=1MiB rejects Ornith's 840KiB experts) | CLEAN (uninformative - cache did nothing) |
+| 39 | `2a36936a6` | inert | CLEAN (uninformative) |
+| 47 | `2f41751d9` | inert | CLEAN (uninformative) |
+| 52 | `085ddad77` | inert | CLEAN (uninformative) |
+| **54** | **`a2d412e9`** | **genuinely active** (fixes min_expert_bytes 1MiB→256KiB) | **CLEAN** (first valid data point - cache works correctly here) |
+| **55** | **`366fe539c`** | genuinely active | **CORRUPT** (`////...`, uniq-char-ratio 0.01) - **introducing commit** |
+| 57 | `140869276` | genuinely active | CORRUPT |
+| 76 | `fcbee0e12` | genuinely active | CORRUPT |
+| 101 | `5de4ff917` | genuinely active | CORRUPT |
+
+The flip is exactly at commit `366fe539c2976c4cfe59efce248fa08d335bb861`,
+matching the mechanism identified by direct code reading above. Positions
+0/39/47/52 were re-examined and found to be false-clean (cache silently
+inert, not correctly-functioning) - only 54 onward are meaningful data
+points, and the flip from 54 (clean, active) to 55 (corrupt, active) is a
+real signal, not an artifact of cache inertness.
+
+### The fix
+
+Applied to `ggml/src/ggml-backend.cpp`, `ggml_backend_sched_compute_splits`
+(current code, evolved from the single-expert `moe_lfru_copy_expert` at the
+introducing commit to a batched `moe_lfru_copy_experts` API by the time this
+reached the tip of this branch - same underlying bug, same fix location).
+
+Separated the two conflated concerns:
+- `used_ids`: pure routing decode ("which experts does this ids_tensor
+  select"), legitimately shared across `gate_exps`/`up_exps`/`down_exps`
+  since they share the same `ids_tensor` - kept exactly as before, still
+  only recomputed when `ids_tensor` changes.
+- `copy_ids` (new): a fresh copy of `used_ids`, taken and re-scanned against
+  the LFRU cache for **every input tensor**, not just when `ids_tensor`
+  changes - because LFRU residency is per-weight-tensor and must be
+  rechecked independently for `gate_exps`, `up_exps`, and `down_exps` even
+  when they share a routing decision. The LFRU scan-and-clear,
+  `any_h2d_needed` computation, and the downstream contiguous-run H2D copy
+  loop all now operate on `copy_ids` instead of mutating `used_ids` in
+  place.
+
+This preserves the original optimization intent (routing is decoded once
+per `ids_tensor`, not once per weight tensor) while making the D2D-hit
+bookkeeping correctly scoped per weight tensor, which is what it actually
+needs to be.
+
+### Verification
+
+Rebuilt `llama-server` on the main working tree with the fix applied and
+re-ran the standard reproducer (two sequential different-content prompts,
+`-ngl 99 -c 4096 -ncmoe 30`, moe-cache genuinely active - confirmed via the
+`[moe-cache] first fill` log line):
+
+- Original 2-prompt reproducer (pencils / garden-area): clean, correct
+  arithmetic in both responses.
+- Two longer (n_predict 250), topically unrelated follow-ups (a short story;
+  a TCP vs UDP explanation) run sequentially after the first two: both fully
+  coherent, on-topic, no repeated-character corruption. (Note: the uniq-char-
+  ratio heuristic used throughout this investigation is not well-calibrated
+  for longer structured text - lower ratios here reflect normal prose/list
+  repetition, not corruption; verified by reading the actual response text.)
+- Three additional short sequential math prompts with varied numbers: all
+  arithmetically correct (117/3=39, 134/4=33.5, 151/5=30.2).
+
+No corruption observed across any of these varied, sequential, real-routing
+requests on the fixed build. The fix is applied but **not committed** -
+left as an uncommitted change in the working tree pending review.
