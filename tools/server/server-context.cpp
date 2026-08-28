@@ -4777,7 +4777,7 @@ void server_routes::init_routes() {
         std::vector<uint8_t> bytes;
         int rows = 0, cols = 0;
         if (!common_moe_cache_get_expert_map(bytes, rows, cols)) {
-            json body = {{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"seq", seq}, {"stats", stats}};
+            json body = {{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"substitutions", ""}, {"seq", seq}, {"stats", stats}};
             if (atlas_loaded) {
                 body["atlas"] = atlas_json;
             }
@@ -4817,7 +4817,25 @@ void server_routes::init_routes() {
             hits_hex.push_back(hex_digits[b & 0xf]);
         }
 
-        json body = {{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"seq", seq}, {"stats", stats}};
+        // Substitute overlay (Brain UI, yellow) - separate bitset, already
+        // read-and-cleared server-side by the provider, so no diffing
+        // needed here the way hits_hex above needs it. Shape mismatch
+        // against this poll's own rows/cols (a session appearing/growing
+        // mid-poll) is treated as "nothing to report" rather than risking
+        // a stale-shape bitset reaching the UI.
+        std::vector<uint8_t> sub_bits;
+        int sub_rows = 0, sub_cols = 0;
+        std::string sub_hex;
+        if (common_moe_cache_get_substitute_map(sub_bits, sub_rows, sub_cols) &&
+            sub_rows == rows && sub_cols == cols) {
+            sub_hex.reserve(sub_bits.size() * 2);
+            for (uint8_t b : sub_bits) {
+                sub_hex.push_back(hex_digits[b >> 4]);
+                sub_hex.push_back(hex_digits[b & 0xf]);
+            }
+        }
+
+        json body = {{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"substitutions", sub_hex}, {"seq", seq}, {"stats", stats}};
         if (atlas_loaded) {
             body["atlas"] = atlas_json;
         }

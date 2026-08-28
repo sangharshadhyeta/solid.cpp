@@ -28,6 +28,12 @@
 		[90, 155, 216], // warm / probation
 		[78, 214, 165] // hot / protected
 	];
+	// A resident expert dispatched as a stand-in for a different, missed
+	// expert (GGML_CUDA_MOE_CACHE_SUBSTITUTE) - distinct from a real hit
+	// (white pulse below), since the cell's OWN residency tier already says
+	// hot/warm/cold; this overlay answers a different question, "is this
+	// cell doing someone else's work right now".
+	const SUBSTITUTE_RGB: [number, number, number] = [234, 179, 8]; // yellow
 	const POLL_INTERVAL_MS = 1500;
 	const PULSE_DECAY = 0.94;
 	const ATLAS_POINT_R = 3.5;
@@ -81,6 +87,7 @@
 	} | null>(null);
 
 	let pulse: Float32Array | null = null;
+	let subPulse: Float32Array | null = null;
 	let lastSeq = 0;
 	let rafHandle = 0;
 	let pollHandle: ReturnType<typeof setInterval> | undefined;
@@ -131,6 +138,26 @@
 					}
 				}
 			}
+
+			// Read-and-cleared server-side (see ApiExpertMapResponse's doc
+			// comment) - no seq gate needed, every poll's bits are already
+			// "since the last poll" and safe to apply directly.
+			if (next.substitutions) {
+				const subBytes = hexToBytes(next.substitutions);
+				const n = rows * cols;
+
+				if (!subPulse || subPulse.length !== n) {
+					subPulse = new Float32Array(n);
+				}
+
+				for (let i = 0; i < n; i++) {
+					const byte = subBytes[i >> 3] ?? 0;
+
+					if (byte & (1 << (i & 7))) {
+						subPulse[i] = 1;
+					}
+				}
+			}
 		} catch {
 			probeErr = true;
 		}
@@ -171,6 +198,21 @@
 			rr += (255 - rr) * blend;
 			gg += (255 - gg) * blend;
 			bb += (255 - bb) * blend;
+		}
+
+		// Substitute overlay, applied after (and stronger than) the plain hit
+		// blend above so it reads clearly as its own event rather than being
+		// lost inside a cold/warm cell's low base luminance - a resident
+		// expert doing someone else's work is the rarer, more informative
+		// thing to notice.
+		const sp = subPulse && i < subPulse.length ? subPulse[i] : 0;
+
+		if (sp > 0.01) {
+			const [SR, SG, SB] = SUBSTITUTE_RGB;
+			const blend = Math.min(sp, 0.7);
+			rr += (SR - rr) * blend;
+			gg += (SG - gg) * blend;
+			bb += (SB - bb) * blend;
 		}
 
 		return [rr | 0, gg | 0, bb | 0, tier];
@@ -382,6 +424,17 @@
 			}
 		}
 
+		if (subPulse) {
+			for (let i = 0; i < subPulse.length; i++) {
+				if (subPulse[i] > 0.01) {
+					subPulse[i] *= PULSE_DECAY;
+					alive = true;
+				} else {
+					subPulse[i] = 0;
+				}
+			}
+		}
+
 		if (alive) {
 			rafHandle = requestAnimationFrame(draw);
 		}
@@ -544,6 +597,12 @@
 				<i class="inline-block size-2.5 rounded-full" style="background: #3a4750"></i>
 				cold {totals[0].toLocaleString()}
 			</span>
+			{#if stats.substitutions}
+				<span class="flex items-center gap-1.5">
+					<i class="inline-block size-2.5 rounded-full" style="background: #eab308"></i>
+					substitute {stats.substitutions.toLocaleString()}
+				</span>
+			{/if}
 			<span class="flex items-center gap-1">
 				<Flame class="size-3" />
 				brightness = recent hits

@@ -252,7 +252,9 @@ footer a{color:var(--muted);text-decoration:underline;}
 <p class="section-lede">Every feature on this page, enabled together. This is the exact command the numbers below
 were taken from &mdash; a 26B MoE model at 64k context on a single 12GB RTX 3060.</p>
 
-<pre><code>llama-server \
+<pre><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
+GGML_CUDA_MOE_CACHE_SUBSTITUTE=1 GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=4 \
+llama-server \
   -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
   -md mtp-gemma-4-26B-A4B-it-Q8_0.gguf \
   --spec-type draft-mtp -bs --jinja \
@@ -269,17 +271,22 @@ were taken from &mdash; a 26B MoE model at 64k context on a single 12GB RTX 3060
 <tbody>
 <tr><td><code>-c 65536</code></td><td>The context you want. Expert placement is derived <em>from</em> this &mdash; ask for more and the fork moves experts to CPU RAM to fit it, rather than silently shrinking your context. <strong>No <code>-ncmoe</code> needed:</strong> it resolved to 21 CPU layers on its own.</td></tr>
 <tr><td><code>--moe-cache auto</code></td><td>GPU-resident cache for the CPU-offloaded experts, LFRU eviction. 79% hit rate warm. Also enables router-lookahead prefetch, which predicts the next layer's experts and fetches them during the current layer's compute.</td></tr>
+<tr><td><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1</code></td><td>Live-activation predictor: a small linear layer per model, trained online on the real hidden state each routing decision came from, feeding the same free-slot-only warming path the atlas uses. Self-tuning (no rate constant to guess) and persists its learned weights across restarts. Measured separately, on Ornith-1.5-35B: +0.12pp hit rate, 3/4 rounds &mdash; see the proof table below, not part of this command's own gemma-4 numbers.</td></tr>
+<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in from the router's own other top-k picks instead of paying CPU fallback &mdash; gated to only the router's least-confident picks (rank&ge;4) so its most consequential choices always get exact compute. Measured separately, on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction) &mdash; see the proof table below.</td></tr>
 <tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
 <tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
 <tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
-<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view real measured topic positions (21&times;128 grid) instead of an arbitrary layout. Generate it once with <code>llama-expert-atlas</code>.</td></tr>
+<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view real measured topic positions (21&times;128 grid) instead of an arbitrary layout. Generate it once with <code>llama-expert-atlas</code>. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
 </tbody>
 </table>
 </div>
 
-<p class="note">Measured on that command: <strong>~64 tok/s</strong> generation warm (61.8&ndash;66.3 across runs), 4 concurrent slots.
+<p class="note">Measured on that command (predictor/substitute env vars not included in this specific run):
+<strong>~64 tok/s</strong> generation warm (61.8&ndash;66.3 across runs), 4 concurrent slots.
 The first request after startup runs nearer 35 tok/s and climbs as the expert cache fills &mdash; the steady-state
-number is the honest one to plan around, and the cold one is the honest one to expect.</p>
+number is the honest one to plan around, and the cold one is the honest one to expect. The predictor and
+substitute numbers above are real but come from a separate hardware/model pairing (Ornith-1.5-35B) - not yet
+re-measured on this exact gemma-4 command.</p>
 
 <p class="note">Two optional extras, deliberately not in the line above. <code>--cache-disk DIR</code> persists the
 prompt cache so a restart costs 271ms instead of 5.8s &mdash; but it writes prompt content to disk (owner-only,

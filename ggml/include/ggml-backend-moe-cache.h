@@ -163,6 +163,14 @@ struct ggml_moe_cache_api {
     // caller can retry with a bigger buffer). NULL-safe like get_stats.
     int (*get_expert_map)(uint8_t * out_bytes, int max_bytes, int * out_rows, int * out_cols);
 
+    // Which (layer,expert) cells served as a resident substitution stand-in
+    // SINCE THE LAST CALL - a bitset, 1 bit/cell, same rows/cols shape as
+    // get_expert_map. Unlike get_expert_map (a live snapshot, re-readable
+    // any time), this is READ-AND-CLEARED: correct for exactly one poller.
+    // NULL-safe, same failure/retry convention as get_expert_map (0 return
+    // with the real shape in out_rows/out_cols if out_bits is too small).
+    int (*get_substitute_map)(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols);
+
     // Debug only, NULL-safe: assert that each compacted hit row is about to be
     // served by a slot actually holding the expert that row asked for. The
     // slot CONTENTS have been verified correct, so a corruption that survives

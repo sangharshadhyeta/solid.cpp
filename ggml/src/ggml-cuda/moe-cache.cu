@@ -468,6 +468,10 @@ struct moe_cache_device {
     // hit is "against" - see moe_cache_predictor_admit_confidence and its
     // recording sites.
     std::unordered_set<moe_cache_key, moe_cache_key_hash> predictor_admitted;
+    // Brain UI substitute overlay (see moe_cache_get_substitute_map) - which
+    // (tensor,expert) keys served as a resident stand-in since the last
+    // poll. Read-and-cleared by that getter, not accumulated forever.
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> substituted_recently;
     double predictor_admit_evidence_for = 1.0;
     double predictor_admit_evidence_against = 1.0;
     // Cross-restart persistence staging (see moe_cache_predictor_load_file/
@@ -7612,6 +7616,12 @@ static int moe_cache_plan(
                 node->pins[node->n_pins++] = {sub, ssl.generation};
                 slot_indices[index] = sub;
                 device.substitutions++;
+                // For the Brain UI's substitute overlay (yellow) - see
+                // moe_cache_get_substitute_map. The SUBSTITUTE's own key
+                // (the expert actually doing the extra work), not the
+                // missed one - read-and-cleared by that getter, so this is
+                // "since last poll" event tracking, not a persistent flag.
+                device.substituted_recently.insert(ssl.key);
                 hits++;   // dispatchable row, though NOT counted in device.hits
             } else {
                 device.substitute_declined++;
@@ -8880,6 +8890,62 @@ static int moe_cache_get_expert_map(uint8_t * out_bytes, int max_bytes, int * ou
     return 0;
 }
 
+// Brain UI substitute overlay: which (layer,expert) cells served as a
+// resident stand-in since the last poll, as a BITSET (1 bit/cell, same
+// shape and hex-encoding convention the server already uses for its
+// diffed hit-bitmask). Unlike moe_cache_get_expert_map (a live snapshot,
+// re-readable any time with the same answer), substitution events are
+// READ-AND-CLEARED: each call reports what happened since the previous
+// call, then empties every device's substituted_recently set - correct
+// for exactly one poller, which is what the /experts handler is.
+static int moe_cache_get_substitute_map(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols) {
+    if (out_rows) *out_rows = 0;
+    if (out_cols) *out_cols = 0;
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->tensor_layer.empty() || session->n_expert_hint <= 0) {
+            continue;
+        }
+        int n_rows = 0;
+        for (const auto & kv : session->tensor_layer) {
+            n_rows = std::max(n_rows, kv.second + 1);
+        }
+        const int n_cols = (int) std::min<int64_t>(session->n_expert_hint, INT_MAX);
+        if (n_rows <= 0 || n_cols <= 0) {
+            continue;
+        }
+        const long long n_cells = (long long) n_rows * (long long) n_cols;
+        const long long need = (n_cells + 7) / 8;
+        if (need > max_bytes) {
+            // Same convention as get_expert_map: report the real shape so
+            // the caller can size a retry, write nothing out of bounds.
+            if (out_rows) *out_rows = n_rows;
+            if (out_cols) *out_cols = n_cols;
+            return 0;
+        }
+        std::fill(out_bits, out_bits + need, (uint8_t) 0);
+        for (auto & device_ptr : session->devices) {
+            for (const auto & key : device_ptr->substituted_recently) {
+                const auto rit = session->tensor_layer.find(key.tensor);
+                if (rit == session->tensor_layer.end() || key.expert < 0 || key.expert >= n_cols) {
+                    continue;
+                }
+                const long long i = (long long) rit->second * n_cols + key.expert;
+                out_bits[i >> 3] |= (uint8_t) (1u << (i & 7));
+            }
+            device_ptr->substituted_recently.clear();
+        }
+        if (out_rows) *out_rows = n_rows;
+        if (out_cols) *out_cols = n_cols;
+        return 1;
+    }
+    return 0;
+}
+
 // Aggregate cache health, summed across every currently-live session's
 // devices - the exact same fields moe_cache_log_stats() already computes
 // per device (MOE_CACHE_LOG), just returned instead of only logged. Used
@@ -9623,6 +9689,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
+    ggml_moe_cache.get_substitute_map = moe_cache_get_substitute_map;
     ggml_moe_cache.verify_rows    = moe_cache_verify_rows;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.set_atlas = moe_cache_set_atlas;
