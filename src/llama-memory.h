@@ -19,6 +19,10 @@ struct llama_memory_params {
     ggml_type type_k;
     ggml_type type_v;
 
+    // recurrent-architecture state (see llama_context_params::type_r/type_s)
+    ggml_type type_r;
+    ggml_type type_s;
+
     // use full-size SWA cache
     bool swa_full;
 

@@ -622,6 +622,12 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // Recurrent-architecture state (Gated DeltaNet/KDA/Mamba-style linear-attention
+    // layers) - see llama_context_params::type_r/type_s. F32 matches prior behavior;
+    // this has no effect on models that don't use this memory type.
+    ggml_type cache_type_r = GGML_TYPE_F32;
+    ggml_type cache_type_s = GGML_TYPE_F32;
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)
