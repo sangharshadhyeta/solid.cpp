@@ -157,6 +157,15 @@ struct moe_cache_slot {
 
 struct moe_cache_pool {
     size_t expert_size = 0;
+    // Physical distance between consecutive slots in `slab`, always
+    // >= expert_size. The gap (slot_stride - expert_size) is a per-slot
+    // guard region, pre-filled with a canary pattern and never legitimately
+    // written by anything - placement designed so that whatever the exact
+    // mechanism behind a read/write landing outside its own slot's bounds
+    // turns out to be, it lands in dead padding instead of a live
+    // neighbour's weights. Checked cheaply after every dispatch (see
+    // moe_cache_collect's guard scan) at zero extra sync cost.
+    size_t slot_stride = 0;
     int wtype = -1;
     char * slab = nullptr;
     int n_slots = 0;
@@ -564,6 +573,16 @@ struct moe_cache_device {
     size_t act_q8_cap = 0;
     float * d_out = nullptr;
     size_t d_out_cap = 0;
+    // High-water mark of bytes ever written since the buffer's last (re)growth,
+    // i.e. the deepest point at which the canary poison from growth is still
+    // guaranteed pristine. A dispatch that writes FEWER bytes than a prior
+    // dispatch since the last growth leaves real data (not canary) sitting in
+    // [this_call_used, hwm) - checking the guard there would flag that
+    // leftover real data as a "breach" even though nothing overran anything.
+    // Only checkable when this call's usage reaches a fresh high point.
+    size_t d_act_hwm = 0;
+    size_t act_q8_hwm = 0;
+    size_t d_out_hwm = 0;
     float * h_out = nullptr;
     size_t h_out_cap = 0;
 
@@ -685,6 +704,13 @@ struct moe_cache_session {
 
 struct moe_cache_pin {
     int slot = -1;
+    // slot.generation observed at pin time (readers++ in moe_cache_plan).
+    // Compared again in moe_cache_collect after the mandatory post-dispatch
+    // cudaStreamSynchronize there - free, since that sync already happens
+    // on every collect() call. A mismatch proves the fill worker rewrote
+    // this slot while it was supposedly protected by the pin (readers>0),
+    // i.e. the row was computed against weights that changed underneath it.
+    uint64_t generation = 0;
 };
 
 struct moe_cache_node {
@@ -714,6 +740,12 @@ struct moe_cache_node {
     int n_pins = 0;
     bool planned = false;
     bool dispatched = false;
+    // Exact byte extent this dispatch() call actually wrote into each
+    // scratch buffer - checked against the guard pattern right after it,
+    // in collect(). 0 means "not applicable" (e.g. dispatch never ran).
+    size_t act_bytes_used = 0;
+    size_t q8_bytes_used = 0;
+    size_t out_bytes_used = 0;
 };
 
 // GGML_CUDA_MOE_CACHE_LOCK_TRACE=1: a TSan run flagged "double lock of a
@@ -752,6 +784,12 @@ struct moe_cache_lock_trace_guard {
     }
 };
 
+// Wall-clock seconds since epoch, for correlating debug probe output against
+// external system samplers (GPU/CPU/RAM) on the same timeline.
+static double moe_cache_wall_clock() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
+
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
@@ -762,6 +800,14 @@ static std::atomic<int> g_session_count{0};
 // limit, not a conservative guess. Defined once, in ggml-backend-moe-cache.h, so the two
 // sides of this handshake can't drift apart.
 static constexpr int MOE_CACHE_MAX_BATCH_CEILING = GGML_MOE_CACHE_MAX_BATCH_ROWS;
+
+// Per-slot guard region in the slab: dead, canary-filled space between one
+// slot's real data and the next slot's real data. One page is generous
+// against any plausible overrun (a weight row here is a few hundred bytes)
+// while staying negligible against expert_size (hundreds of KiB), so the
+// placement cost is not something a budget has to account for precisely.
+static constexpr size_t MOE_CACHE_SLOT_GUARD_BYTES = 4096;
+static constexpr unsigned char MOE_CACHE_GUARD_PATTERN = 0xA5;
 
 // Live hint for max_batch's default, set by the caller (llama_context, via the
 // set_max_batch_hint vtable entry) to the real max concurrent sequence count
@@ -1670,6 +1716,14 @@ static bool moe_cache_grow_device(
     if (!moe_cache_cuda_ok(device, cudaMalloc(&fresh, requested), operation, false)) {
         return false;
     }
+    // Poison the whole allocation (async, on our own stream - the real write
+    // that follows is issued on the same stream right after this call
+    // returns, so stream ordering alone guarantees it lands first, no extra
+    // sync needed). Placement guard for these scratch buffers, same idea as
+    // the per-slot guard in the weight slab: whatever legitimately writes
+    // here only ever touches the bytes it asked for, so anything found
+    // outside that later is direct proof of an overrun, not an assumption.
+    cudaMemsetAsync(fresh, MOE_CACHE_GUARD_PATTERN, requested, device.compute_stream);
     if (*pointer) {
         // GGML_CUDA_MOE_CACHE_GROWTH_SYNC=1: synchronize our own compute_stream
         // before freeing the OLD scratch buffer, so any kernel/copy still
@@ -2051,7 +2105,7 @@ static bool moe_cache_moe_lfru_copy_expert(
             }
             moe_cache_slot & pslot = pool_ptr->slots[found->second];
             if (pslot.state == moe_cache_slot_state::valid) {
-                src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                 pslot.readers++;
                 release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
             }
@@ -2130,7 +2184,7 @@ static int moe_cache_moe_lfru_copy_experts(
                 }
                 moe_cache_slot & pslot = pool_ptr->slots[found->second];
                 if (pslot.state == moe_cache_slot_state::valid) {
-                    src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                    src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                     pslot.readers++;
                     release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
                 }
@@ -2249,7 +2303,7 @@ static bool moe_cache_prefill_copy_split(
                 }
                 moe_cache_slot & pslot = pool_ptr->slots[found->second];
                 if (pslot.state == moe_cache_slot_state::valid) {
-                    hit_src[(size_t) e] = pool_ptr->slab + (size_t) found->second * pool_ptr->expert_size;
+                    hit_src[(size_t) e] = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                     pslot.readers++;
                     release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
                 }
@@ -2740,7 +2794,7 @@ static void moe_cache_slot_nan_sweep() {
                         continue;
                     }
                     scanned++;
-                    if (cudaMemcpy(buf.data(), pool.slab + (size_t) i * pool.expert_size,
+                    if (cudaMemcpy(buf.data(), pool.slab + (size_t) i * pool.slot_stride,
                                    pool.expert_size, cudaMemcpyDeviceToHost) != cudaSuccess) {
                         continue;
                     }
@@ -3025,6 +3079,22 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         if (device->dead.load() || moe_cache_fail(*session, "insert")) {
             error = cudaErrorUnknown;
+            // TEMPORARY diagnostic (moe-cache corruption investigation):
+            // GGML_CUDA_MOE_CACHE_INSERT_FAIL_DELAY_US=N burns N microseconds
+            // right here, on the fill worker thread, doing NOTHING moe-cache-
+            // related (no state touched, admission still fully blocked same
+            // as plain FAIL=insert, which is the one clean configuration
+            // found this session) - the direct test of whether merely the
+            // WALL-CLOCK TIMING/scheduling a real fill would introduce, not
+            // any of its specific logic (every specific piece of which has
+            // been individually ruled out), is what exposes the corruption.
+            static const long delay_us = [] {
+                const char * e = getenv("GGML_CUDA_MOE_CACHE_INSERT_FAIL_DELAY_US");
+                return e ? atol(e) : 0;
+            }();
+            if (delay_us > 0) {
+                std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
+            }
         }
         if (error == cudaSuccess && !stream && !no_rt_alloc) {
             int least_priority = 0;
@@ -3061,7 +3131,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             if (job.pool >= 0 && job.pool < (int)device->pools.size()) {
                 pool = device->pools[job.pool].get();
                 if (pool->slab && job.slot >= 0 && job.slot < pool->n_slots) {
-                    destination = pool->slab + (size_t)job.slot * pool->expert_size;
+                    destination = pool->slab + (size_t)job.slot * pool->slot_stride;
                 }
             }
         }
@@ -3077,11 +3147,15 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
         // which corrupts whatever VRAM follows and is invisible to every
         // read-side check, because the slot it was asked about still reads
         // back correctly. Refuse the fill instead, loudly.
-        if (pool && getenv("GGML_CUDA_MOE_CACHE_LOG_FILLS")) {
+        static const bool log_fills = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_LOG_FILLS");
+            return e && atoi(e) != 0;
+        }();
+        if (pool && log_fills) {
             static std::atomic<int> nlog{0};
             const int k = nlog.fetch_add(1, std::memory_order_relaxed);
             if (k < 40) {
-                const char * slab_end = pool->slab + (size_t) pool->n_slots * pool->expert_size;
+                const char * slab_end = pool->slab + (size_t) pool->n_slots * pool->slot_stride;
                 const char * dst_end  = destination ? destination + job.bytes : nullptr;
                 fprintf(stderr, "[moe-cache] FILL #%d pool=%d slot=%d/%d slab=%p end=%p "
                         "dst=%p dst_end=%p bytes=%zu stride=%zu %s\n",
@@ -3181,18 +3255,31 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                              src + job.bytes <= it_reg->second.second;
                 }
             }
-            if (error == cudaSuccess && direct) {
-                // GGML_CUDA_MOE_CACHE_SKIP_COPY=1: keep every bit of bookkeeping
-                // (slot allocation, state machine, map/bitmask, pins) but never
-                // touch device memory. Combined with FAIL=dispatch the cached
-                // bytes are never read either, so if corruption SURVIVES this
-                // the fault is in the bookkeeping, and if it VANISHES the fault
-                // is the copy operation itself.
-                static const bool skip_copy = [] {
-                    const char * e = getenv("GGML_CUDA_MOE_CACHE_SKIP_COPY");
-                    return e && atoi(e) != 0;
-                }();
-                error = skip_copy ? cudaSuccess : cudaMemcpyAsync(
+            // TESTED AND REVERTED (docs/plan.md): a full cudaDeviceSynchronize()
+            // wrapped around this fill's H2D copy (draining the device before AND
+            // after) did NOT fix the single-CLI-process 2-prompt reproducer -
+            // ruling out "races the fill's H2D copy against other concurrent GPU
+            // stream activity" as the mechanism, at least in this form. Left as a
+            // negative result rather than kept as a no-op latency cost.
+            // GGML_CUDA_MOE_CACHE_SKIP_COPY=1: keep every bit of bookkeeping
+            // (slot allocation, state machine, map/bitmask, pins) but never
+            // touch device memory, on WHICHEVER of the three copy paths below
+            // would otherwise run - previously only guarded the "direct"
+            // (hostreg) branch, which cudaHostRegister fails to enter by
+            // default (collides with -ncmoe's own host-buffer registration,
+            // "already mapped"), so the flag silently had no effect on a
+            // default run. Combined with FAIL=dispatch the cached bytes are
+            // never read either, so if corruption SURVIVES this the fault is
+            // in the bookkeeping; if it VANISHES the fault is one of these
+            // copy operations.
+            static const bool skip_copy = [] {
+                const char * e = getenv("GGML_CUDA_MOE_CACHE_SKIP_COPY");
+                return e && atoi(e) != 0;
+            }();
+            if (error == cudaSuccess && skip_copy) {
+                // bookkeeping only - fall through with error==cudaSuccess
+            } else if (error == cudaSuccess && direct) {
+                error = cudaMemcpyAsync(
                         destination, job.source, job.bytes, cudaMemcpyHostToDevice, stream);
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
@@ -3243,10 +3330,27 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         // here (that's a different signal from "reused
                         // while resident", which is what earns protected_
                         // status - see moe_cache_segment_push_back).
-                        moe_cache_segment_push_back(*pool, job.slot, moe_cache_segment::probation);
+                        // TEMPORARY diagnostic (moe-cache corruption
+                        // investigation): GGML_CUDA_MOE_CACHE_NO_SEGMENT_PUSH=1
+                        // skips ONLY this linked-list insertion, isolating it
+                        // from state=valid/demand_count/fills - the one
+                        // difference identified so far between the FAIL=insert
+                        // (clean) and FAIL=dispatch+SKIP_COPY (corrupts) paths.
+                        static const bool no_segment_push = [] {
+                            const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_SEGMENT_PUSH");
+                            return e && atoi(e) != 0;
+                        }();
+                        if (!no_segment_push) {
+                            moe_cache_segment_push_back(*pool, job.slot, moe_cache_segment::probation);
+                        }
                         device->demand_count.erase(job.key);
                         device->fills++;
                         if (++pool->fills_since_decay >= MOE_CACHE_HEAT_DECAY_EVERY) {
+                            if (getenv("GGML_CUDA_MOE_CACHE_DECAY_LOG")) {
+                                fprintf(stderr, "[t=%.3f] [moe-cache] DECAY SWEEP total_fills=%lld\n",
+                                        moe_cache_wall_clock(), (long long) device->fills);
+                                fflush(stderr);
+                            }
                             moe_cache_pool_decay(*pool);
                             pool->fills_since_decay = 0;
                         }
@@ -3575,6 +3679,21 @@ static bool moe_cache_allocate_pool(
     if (shape.expert_size == 0 || shape.n_tensors <= 0 || shape.n_expert <= 0) {
         return false;
     }
+    if (shape.expert_size > std::numeric_limits<size_t>::max() - MOE_CACHE_SLOT_GUARD_BYTES) {
+        return false;
+    }
+    // The matvec kernel asserts slot_stride_bytes % type_size(wtype) == 0
+    // (it strides through the slab in whole quantization blocks) - a flat
+    // +MOE_CACHE_SLOT_GUARD_BYTES is not guaranteed to preserve that (e.g.
+    // Q4_K's 144-byte block does not divide 4096), so round the guarded
+    // stride up to the next block boundary rather than pick a fixed offset.
+    const size_t guard_type_size = ggml_type_size((ggml_type)shape.wtype);
+    if (guard_type_size == 0) {
+        return false;
+    }
+    const size_t guard_min = shape.expert_size + MOE_CACHE_SLOT_GUARD_BYTES;
+    const size_t slot_stride =
+        ((guard_min + guard_type_size - 1) / guard_type_size) * guard_type_size;
 
     int64_t max_entries = shape.n_tensors;
     if (max_entries > INT_MAX / shape.n_expert) {
@@ -3583,7 +3702,7 @@ static bool moe_cache_allocate_pool(
         max_entries *= shape.n_expert;
     }
 
-    size_t slots_by_budget = budget / shape.expert_size;
+    size_t slots_by_budget = budget / slot_stride;
     size_t slot_count = std::min<size_t>(slots_by_budget, (size_t)max_entries);
     const size_t type_size = ggml_type_size((ggml_type)shape.wtype);
     if (type_size == 0 || shape.expert_size % type_size != 0) {
@@ -3613,7 +3732,7 @@ static bool moe_cache_allocate_pool(
         if (moe_cache_fail(session, "slab")) {
             error = cudaErrorMemoryAllocation;
         } else {
-            error = cudaMalloc((void **)&slab, slot_count * shape.expert_size);
+            error = cudaMalloc((void **)&slab, slot_count * slot_stride);
         }
         if (error == cudaSuccess) {
             break;
@@ -3626,6 +3745,16 @@ static bool moe_cache_allocate_pool(
                 device.physical, shape.expert_size >> 10);
         return false;
     }
+    // Poison the whole slab with the guard pattern before anything real is
+    // written. The fill worker only ever overwrites the first expert_size
+    // bytes of each slot's slot_stride-sized region, so this pattern
+    // persists forever in the per-slot gaps unless something writes there
+    // that has no business doing so.
+    if (cudaMemset(slab, MOE_CACHE_GUARD_PATTERN, slot_count * slot_stride) != cudaSuccess) {
+        (void) cudaGetLastError();
+        cudaFree(slab);
+        return false;
+    }
 
     std::unique_ptr<moe_cache_pool> pool(new (std::nothrow) moe_cache_pool());
     if (!pool) {
@@ -3634,6 +3763,7 @@ static bool moe_cache_allocate_pool(
     }
     try {
         pool->expert_size = shape.expert_size;
+        pool->slot_stride = slot_stride;
         pool->wtype = shape.wtype;
         pool->slab = slab;
         pool->n_slots = (int)slot_count;
@@ -3644,9 +3774,10 @@ static bool moe_cache_allocate_pool(
                 std::vector<char> pattern(cb, (char)0xA5);
                 if (cudaMemcpy(canary, pattern.data(), cb, cudaMemcpyHostToDevice) == cudaSuccess) {
                     pool->canary = canary; pool->canary_bytes = cb;
-                    fprintf(stderr, "[moe-cache] CANARY armed: slab=%p..%p (%zu slots x %zu B) canary=%p+%zu\n",
-                            (void*)slab, (void*)(slab + slot_count*shape.expert_size),
-                            slot_count, shape.expert_size, (void*)canary, cb);
+                    fprintf(stderr, "[moe-cache] CANARY armed: slab=%p..%p (%zu slots x %zu B, "
+                            "stride %zu B) canary=%p+%zu\n",
+                            (void*)slab, (void*)(slab + slot_count*slot_stride),
+                            slot_count, shape.expert_size, slot_stride, (void*)canary, cb);
                 } else {
                     cudaFree(canary);
                 }
@@ -3665,7 +3796,7 @@ static bool moe_cache_allocate_pool(
     }
 
     shape.pool = (int)device.pools.size() - 1;
-    const size_t allocated = slot_count * shape.expert_size;
+    const size_t allocated = slot_count * slot_stride;
     device.allocated_bytes += allocated;
     if (getenv("MOE_CACHE_DEBUG_GATE")) {
         fprintf(stderr, "[moe-cache-pool-dbg] pool CREATED: expert_size=%zu slot_count=%zu allocated=%zu budget=%zu\n",
@@ -4632,6 +4763,18 @@ static void * moe_cache_begin(
         source->bytes = std::max(source->bytes, tensor_size);
         source->references++;
         session->active_nodes++;
+        if (getenv("GGML_CUDA_MOE_CACHE_CONCURRENCY_LOG")) {
+            static std::atomic<int> hwm{0};
+            int cur = session->active_nodes;
+            int prev = hwm.load();
+            while (cur > prev && !hwm.compare_exchange_weak(prev, cur)) {}
+            if (cur > 1) {
+                fprintf(stderr, "[moe-cache] CONCURRENT active_nodes=%d hwm=%d tid=%zu\n",
+                        cur, hwm.load(),
+                        std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                fflush(stderr);
+            }
+        }
     }
 
     moe_cache_device & device = *selected;
@@ -4650,6 +4793,13 @@ static void * moe_cache_begin(
         return nullptr;
     }
     if (!dispatch_lock.owns_lock() || device.dead.load()) {
+        if (getenv("GGML_CUDA_MOE_CACHE_CONCURRENCY_LOG") && !dispatch_lock.owns_lock()) {
+            static std::atomic<long long> contended{0};
+            fprintf(stderr, "[moe-cache] DISPATCH_MU CONTENDED count=%lld tid=%zu\n",
+                    (long long) ++contended,
+                    std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            fflush(stderr);
+        }
         std::lock_guard<std::mutex> lock(session->mu);
         auto source = session->active_sources.find(host_base);
         if (source != session->active_sources.end() && --source->second.references == 0) {
@@ -5083,7 +5233,7 @@ static void moe_cache_verify_slot(const moe_cache_pool & pool, int slot_index,
     const size_t offsets[3] = { 0, (pool.expert_size / 2) & ~size_t(15),
                                 pool.expert_size > win ? pool.expert_size - win : 0 };
     const char * host = (const char *) key.tensor + (size_t) key.expert * pool.expert_size;
-    const char * dev  = pool.slab + (size_t) slot_index * pool.expert_size;
+    const char * dev  = pool.slab + (size_t) slot_index * pool.slot_stride;
     std::vector<char> buf(win);
     ggml_cuda_set_device(device_id);
     for (int w = 0; w < 3; w++) {
@@ -5703,8 +5853,8 @@ static int moe_cache_plan(
             }
             static std::atomic<int> flipped{0};
             if (identity && flipped.fetch_add(1) < 12) {
-                fprintf(stderr, "[moe-cache] IDENTITY ROUTING layer=%d top_k=%d n_tokens=%lld\n",
-                        node->layer, k, (long long) node->n_tokens);
+                fprintf(stderr, "[t=%.3f] [moe-cache] IDENTITY ROUTING layer=%d top_k=%d n_tokens=%lld\n",
+                        moe_cache_wall_clock(), node->layer, k, (long long) node->n_tokens);
                 static std::atomic<int> dumped{0};
                 if (dumped.fetch_add(1) == 0) {
                     std::lock_guard<std::mutex> rlock(ring_mu);
@@ -5732,9 +5882,9 @@ static int moe_cache_plan(
                     }
                 }
             }
-            fprintf(stderr, "[moe-cache] WIDTH layer=%d n_tokens=%lld n_ids=%d "
+            fprintf(stderr, "[t=%.3f] [moe-cache] WIDTH layer=%d n_tokens=%lld n_ids=%d "
                     "top_k=%d distinct=%d/%d\n",
-                    node->layer, (long long) node->n_tokens, (int) n_ids,
+                    moe_cache_wall_clock(), node->layer, (long long) node->n_tokens, (int) n_ids,
                     node->n_tokens > 0 ? (int) (n_ids / node->n_tokens) : -1,
                     distinct, node->n_expert);
             fflush(stderr);
@@ -5850,8 +6000,21 @@ static int moe_cache_plan(
                 // a one-off admission" signal that earns real protection
                 // from eviction churn. Heat then decides how long that
                 // protection actually lasts, at the next decay sweep.
-                moe_cache_promote_to_protected(device, pool, found->second);
-                node->pins[node->n_pins++] = {found->second};
+                // TEMPORARY diagnostic (moe-cache corruption investigation):
+                // GGML_CUDA_MOE_CACHE_NO_PROMOTE=1 skips ONLY the segment
+                // promotion on a hit, keeping readers++/heat/pins - isolates
+                // moe_cache_promote_to_protected specifically, the last
+                // remaining candidate after admission's copy, dispatch,
+                // segment-push, and row-accounting were all individually
+                // ruled out by direct testing.
+                static const bool no_promote = [] {
+                    const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_PROMOTE");
+                    return e && atoi(e) != 0;
+                }();
+                if (!no_promote) {
+                    moe_cache_promote_to_protected(device, pool, found->second);
+                }
+                node->pins[node->n_pins++] = {found->second, slot.generation};
                 // GGML_CUDA_MOE_CACHE_NO_HITS=1: do every bit of accounting a
                 // hit normally does (heat, promotion, pin, counters) but never
                 // report the hit to the caller, so ggml-cpu.c routes the row
@@ -5906,7 +6069,7 @@ static int moe_cache_plan(
                 // the router and must not claim eviction protection on the
                 // strength of standing in.
                 ssl.heat = std::min(MOE_CACHE_HEAT_MAX, ssl.heat + MOE_CACHE_HEAT_STEP);
-                node->pins[node->n_pins++] = {sub};
+                node->pins[node->n_pins++] = {sub, ssl.generation};
                 slot_indices[index] = sub;
                 device.substitutions++;
                 hits++;   // dispatchable row, though NOT counted in device.hits
@@ -6381,6 +6544,9 @@ static int moe_cache_dispatch(
     const size_t q8_bytes =
         (size_t)activation_rows * (padded_n_in / QK8_1) * sizeof(block_q8_1);
     const size_t out_bytes = (size_t)n_hits * n_out * sizeof(float);
+    node->act_bytes_used = act_bytes;
+    node->q8_bytes_used = q8_bytes;
+    node->out_bytes_used = out_bytes;
 
     const size_t desired_caps[] = {
         moe_cache_growth_capacity(device.d_ids_cap, ids_bytes),
@@ -6406,6 +6572,10 @@ static int moe_cache_dispatch(
         }
     }
 
+    const size_t d_act_cap_before   = device.d_act_cap;
+    const size_t act_q8_cap_before  = device.act_q8_cap;
+    const size_t d_out_cap_before   = device.d_out_cap;
+
     if (!moe_cache_grow_host(device, (void **)&device.h_ids, device.h_ids_cap,
                              ids_bytes, "ids host allocation") ||
         !moe_cache_grow_device(device, (void **)&device.d_ids, device.d_ids_cap,
@@ -6425,6 +6595,19 @@ static int moe_cache_dispatch(
         device.dead.store(true);
         return 0;
     }
+    // A (re)growth repoisons the WHOLE buffer with canary (moe_cache_grow_device),
+    // so the high-water mark of real-data bytes written resets to 0 along with it -
+    // otherwise the guard below would compare against a stale hwm from before the
+    // realloc and treat freshly-poisoned canary bytes as unreachable "checkable" ones.
+    if (device.d_act_cap != d_act_cap_before) {
+        device.d_act_hwm = 0;
+    }
+    if (device.act_q8_cap != act_q8_cap_before) {
+        device.act_q8_hwm = 0;
+    }
+    if (device.d_out_cap != d_out_cap_before) {
+        device.d_out_hwm = 0;
+    }
 
     for (int index = 0; index < n_hits; index++) {
         device.h_ids[index] = slot_indices[index];
@@ -6432,6 +6615,46 @@ static int moe_cache_dispatch(
     for (int index = 0; index < activation_rows; index++) {
         memcpy(device.h_act + (size_t)index * n_in,
                act_rows[shared_activation ? 0 : index], n_in * sizeof(float));
+    }
+
+    if (getenv("GGML_CUDA_MOE_CACHE_ACT_MAGNITUDE_LOG")) {
+        static std::atomic<int> logged{0};
+        float amax = 0.0f;
+        size_t nan_count = 0, zero_count = 0;
+        const size_t total = (size_t)activation_rows * n_in;
+        for (size_t i = 0; i < total; i++) {
+            const float v = device.h_act[i];
+            if (std::isnan(v)) { nan_count++; continue; }
+            if (v == 0.0f) { zero_count++; }
+            // std::max silently ignores NaN (NaN < x is always false), so NaN
+            // values were previously invisible here - counted separately above,
+            // excluded from amax explicitly rather than relying on max's NaN
+            // behaviour to do the right thing by accident.
+            amax = std::max(amax, std::fabs(v));
+        }
+        if (nan_count > 0) {
+            fprintf(stderr, "[moe-cache] ACT MAGNITUDE layer=%d NaN in activation itself: "
+                    "%zu/%zu elements are NaN (not the dot-product output - the INPUT)\n",
+                    node->layer, nan_count, total);
+            fflush(stderr);
+        }
+        // FP16 max finite magnitude ~65504; the GPU's q8_1 quantizer stores its
+        // per-block scale (amax/127) as a half, so any block whose amax alone
+        // already exceeds ~65504*127 turns that scale into +Inf when cast down -
+        // check the raw activation magnitude here, upstream of any quantization,
+        // against that threshold directly.
+        if (amax > 60000.0f && logged.fetch_add(1) < 20) {
+            fprintf(stderr, "[moe-cache] ACT MAGNITUDE layer=%d amax=%g n_hits=%d "
+                    "activation_rows=%d n_in=%lld (fp16 quantizer scale overflow risk above ~65504*127)\n",
+                    node->layer, (double) amax, n_hits, activation_rows, (long long) n_in);
+            fflush(stderr);
+        } else if (node->layer >= 20) {
+            static std::atomic<int> quiet{0};
+            if (quiet.fetch_add(1) < 40) {
+                fprintf(stderr, "[moe-cache] ACT MAGNITUDE layer=%d amax=%g zero_count=%zu/%zu nan_count=%zu (sample)\n",
+                        node->layer, (double) amax, zero_count, total, nan_count);
+            }
+        }
     }
 
     (void)cudaGetLastError();
@@ -6455,7 +6678,7 @@ static int moe_cache_dispatch(
         ggml_cuda_moe_cache_mmv(
                 pool.slab, (ggml_type)wtype, (const char *)device.d_act_q8,
                 device.d_ids, device.d_out, n_in, n_out, pool.n_slots,
-                (int64_t)pool.expert_size, n_hits, activation_rows,
+                (int64_t)pool.slot_stride, n_hits, activation_rows,
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
@@ -6511,7 +6734,7 @@ static int moe_cache_dispatch(
                 ggml_cuda_moe_cache_mmv(
                         pool.slab, (ggml_type)wtype, act_i,
                         device.d_ids + i, d_ref + (size_t) i * n_out,
-                        n_in, n_out, pool.n_slots, (int64_t)pool.expert_size,
+                        n_in, n_out, pool.n_slots, (int64_t)pool.slot_stride,
                         /*n_hits=*/1, /*act_rows=*/1, device.compute_stream);
             }
             cudaMemcpyAsync(batched.data(), device.d_out, batched.size()*sizeof(float),
@@ -6576,6 +6799,79 @@ static int moe_cache_collect(
                 device.h_out, device.d_out, bytes,
                 cudaMemcpyDeviceToHost, device.compute_stream), "output download", true);
     }
+
+    // Sample each pinned slot's guard region (the dead, canary-filled gap
+    // right after its real expert_size bytes) into host memory, batched
+    // onto the same stream/sync as the output download above - one extra
+    // async copy, no extra sync. Checked after the sync below. A mismatch
+    // here is direct, physical proof that something wrote past this slot's
+    // own bounds during this dispatch, independent of whatever the exact
+    // mechanism turns out to be.
+    static constexpr size_t GUARD_SAMPLE_BYTES = 64;
+    // Costs n_hits+3 extra cudaMemcpyAsync launches per collect() call (real
+    // per-call driver overhead, even though they share the existing sync) -
+    // was worth it while this session was actively chasing the `////...`
+    // corruption bug (root-caused and fixed in ggml-backend.cpp - see
+    // docs/plan.md), not something a production hot path should pay by
+    // default now that it's closed. GGML_CUDA_MOE_CACHE_GUARD_CHECK=1
+    // re-enables both this and the scratch-buffer guard below, e.g. to rule
+    // out an out-of-bounds write as the cause of some future regression.
+    static const bool guard_check_enabled = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_GUARD_CHECK");
+        return e && atoi(e) != 0;
+    }();
+    std::vector<char> guard_sample;
+    const moe_cache_pool * gpool = node->pool;
+    const bool guard_checkable = guard_check_enabled && ok && gpool && gpool->slab &&
+        gpool->slot_stride > gpool->expert_size &&
+        (gpool->slot_stride - gpool->expert_size) >= GUARD_SAMPLE_BYTES;
+    if (guard_checkable) {
+        guard_sample.resize((size_t) n_hits * GUARD_SAMPLE_BYTES);
+        for (int index = 0; index < n_hits; index++) {
+            const moe_cache_pin & pin = node->pins[index];
+            if (pin.slot < 0 || pin.slot >= gpool->n_slots) {
+                continue;
+            }
+            const char * guard_src = gpool->slab +
+                (size_t) pin.slot * gpool->slot_stride + gpool->expert_size;
+            cudaMemcpyAsync(guard_sample.data() + (size_t) index * GUARD_SAMPLE_BYTES,
+                    guard_src, GUARD_SAMPLE_BYTES, cudaMemcpyDeviceToHost, device.compute_stream);
+        }
+    }
+
+    // Same idea for the scratch buffers quantization and the matvec kernel
+    // actually write into (d_act, d_act_q8, d_out) - these are grown via
+    // moe_cache_grow_device, which poisons the whole allocation on every
+    // (re)growth. But growth is amortised: most dispatches reuse an
+    // already-large-enough buffer without regrowing it, and successive calls'
+    // `used` sizes vary with n_hits - so bytes beyond THIS call's `used` are
+    // only guaranteed to still be pristine canary if this call reached at
+    // least as deep as every call since the last growth (tracked in
+    // device.*_hwm). Otherwise that region holds a PRIOR call's real,
+    // legitimately-written data, not canary - flagging it would be a false
+    // "breach" against leftover data that nothing overran.
+    char scratch_guard[3][GUARD_SAMPLE_BYTES];
+    bool scratch_guard_checkable[3] = {false, false, false};
+    if (ok && guard_check_enabled) {
+        struct { const char * base; size_t used; size_t cap; size_t * hwm; } bufs[3] = {
+            { (const char *) device.d_act,    node->act_bytes_used, device.d_act_cap,  &device.d_act_hwm },
+            { (const char *) device.d_act_q8, node->q8_bytes_used,  device.act_q8_cap, &device.act_q8_hwm },
+            { (const char *) device.d_out,    node->out_bytes_used, device.d_out_cap,  &device.d_out_hwm },
+        };
+        for (int b = 0; b < 3; b++) {
+            const bool at_high_water = bufs[b].used >= *bufs[b].hwm;
+            if (bufs[b].used > *bufs[b].hwm) {
+                *bufs[b].hwm = bufs[b].used;
+            }
+            if (at_high_water && bufs[b].base && bufs[b].used > 0 &&
+                bufs[b].used + GUARD_SAMPLE_BYTES <= bufs[b].cap) {
+                scratch_guard_checkable[b] = true;
+                cudaMemcpyAsync(scratch_guard[b], bufs[b].base + bufs[b].used,
+                        GUARD_SAMPLE_BYTES, cudaMemcpyDeviceToHost, device.compute_stream);
+            }
+        }
+    }
+
     if (ok) {
         ok = moe_cache_cuda_ok(
                 device, cudaStreamSynchronize(device.compute_stream),
@@ -6584,6 +6880,86 @@ static int moe_cache_collect(
         cudaStreamSynchronize(device.compute_stream);
     }
     node->dispatched = false;
+
+    if (guard_checkable && ok) {
+        static std::atomic<int> greported{0};
+        for (int index = 0; index < n_hits; index++) {
+            const moe_cache_pin & pin = node->pins[index];
+            if (pin.slot < 0 || pin.slot >= gpool->n_slots) {
+                continue;
+            }
+            const char * sample = guard_sample.data() + (size_t) index * GUARD_SAMPLE_BYTES;
+            for (size_t b = 0; b < GUARD_SAMPLE_BYTES; b++) {
+                if ((unsigned char) sample[b] != MOE_CACHE_GUARD_PATTERN) {
+                    if (greported.fetch_add(1) < 20) {
+                        fprintf(stderr, "[moe-cache] GUARD BREACH slot=%d layer=%d byte_offset=+%zu "
+                                "expected=0x%02x actual=0x%02x - something wrote past this slot's "
+                                "own bounds\n",
+                                pin.slot, node->layer, b,
+                                (unsigned) MOE_CACHE_GUARD_PATTERN, (unsigned char) sample[b]);
+                        fflush(stderr);
+                    }
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (ok) {
+        static const char * const scratch_names[3] = { "d_act", "d_act_q8", "d_out" };
+        static std::atomic<int> sreported{0};
+        for (int b = 0; b < 3; b++) {
+            if (!scratch_guard_checkable[b]) {
+                continue;
+            }
+            for (size_t i = 0; i < GUARD_SAMPLE_BYTES; i++) {
+                if ((unsigned char) scratch_guard[b][i] != MOE_CACHE_GUARD_PATTERN) {
+                    if (sreported.fetch_add(1) < 20) {
+                        fprintf(stderr, "[moe-cache] SCRATCH GUARD BREACH buf=%s layer=%d "
+                                "byte_offset=+%zu expected=0x%02x actual=0x%02x - something wrote "
+                                "past this call's own scratch usage\n",
+                                scratch_names[b], node->layer, i,
+                                (unsigned) MOE_CACHE_GUARD_PATTERN, (unsigned char) scratch_guard[b][i]);
+                        fflush(stderr);
+                    }
+                    ok = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    // GGML_CUDA_MOE_CACHE_GEN_CHECK=1: prove or rule out the race the
+    // fill-worker-vs-pinned-read comment in moe_cache_dispatch warns about,
+    // at zero extra sync cost - the cudaStreamSynchronize above already
+    // happened unconditionally, so by the time we get here the matvec kernel
+    // has already read every pinned slot's weights; comparing generation now
+    // just checks whether the fill worker rewrote a slot out from under a
+    // reader that plan() believed was protected by readers>0.
+    static const bool gen_check = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_GEN_CHECK");
+        return e && atoi(e) != 0;
+    }();
+    if (ok && gen_check) {
+        std::lock_guard<std::mutex> lock(session.mu);
+        static std::atomic<int> reported{0};
+        for (int index = 0; index < n_hits; index++) {
+            const moe_cache_pin & pin = node->pins[index];
+            if (pin.slot < 0 || pin.slot >= node->pool->n_slots) {
+                continue;
+            }
+            const moe_cache_slot & slot = node->pool->slots[pin.slot];
+            if (slot.generation != pin.generation && reported.fetch_add(1) < 20) {
+                fprintf(stderr, "[moe-cache] GENERATION MISMATCH row=%d/%d slot=%d "
+                        "pinned_gen=%llu now_gen=%llu readers=%d\n",
+                        index, n_hits, pin.slot,
+                        (unsigned long long) pin.generation,
+                        (unsigned long long) slot.generation, slot.readers);
+                fflush(stderr);
+            }
+        }
+    }
 
     if (ok) {
         for (int index = 0; index < n_hits; index++) {
@@ -6760,7 +7136,7 @@ static size_t moe_cache_trim_session(
     size_t freed = 0;
     for (const auto & pool_ptr : selected->pools) {
         if (pool_ptr->slab) {
-            freed += (size_t)pool_ptr->n_slots * pool_ptr->expert_size;
+            freed += (size_t)pool_ptr->n_slots * pool_ptr->slot_stride;
         }
     }
     freed += selected->d_out_cap + selected->d_act_cap +
