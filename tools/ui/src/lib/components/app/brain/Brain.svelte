@@ -158,10 +158,19 @@
 
 		const p = pulse && i < pulse.length ? pulse[i] : 0;
 
+		// Capped, not the raw pulse value: during active generation, hits land
+		// fast enough that pulse never gets its ~1.2s of uninterrupted decay to
+		// fade, so every live cell sat pinned near p=1 - blending all the way to
+		// pure white (255,255,255) regardless of tier - for the whole time
+		// requests were running, and only revealed the real tier colour once
+		// traffic stopped and pulse finally decayed. Capping the blend means a
+		// fresh hit still visibly brightens a cell, but never fully erases the
+		// hot/warm/cold hue underneath it, live or idle.
 		if (p > 0.01) {
-			rr += (255 - rr) * p;
-			gg += (255 - gg) * p;
-			bb += (255 - bb) * p;
+			const blend = Math.min(p, 0.45);
+			rr += (255 - rr) * blend;
+			gg += (255 - gg) * blend;
+			bb += (255 - bb) * blend;
 		}
 
 		return [rr | 0, gg | 0, bb | 0, tier];
@@ -200,7 +209,9 @@
 
 		ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-		const cx = canvas.width / 2;
+		// Shifted left of true centre so the disc's right edge clears the Grid
+		// panel, which is pinned bottom-right over this same canvas.
+		const cx = canvas.width / 2 - canvas.width * 0.08;
 		const cy = canvas.height / 2;
 		const radius = Math.max(40, Math.min(canvas.width, canvas.height) / 2 - 48);
 
