@@ -36,6 +36,12 @@
 	const SUBSTITUTE_RGB: [number, number, number] = [234, 179, 8]; // yellow
 	const POLL_INTERVAL_MS = 1500;
 	const PULSE_DECAY = 0.94;
+	// Substitutions fire far more often than plain hits (they're gated to the
+	// router's low-confidence tail, but that tail is still most of the miss
+	// traffic) - decaying at the same rate as hits left the grid permanently
+	// yellow-tinted under load instead of reading as a distinct, momentary
+	// event.
+	const SUB_PULSE_DECAY = 0.8;
 	const ATLAS_POINT_R = 3.5;
 	const PIP_W = 220;
 	const PIP_H = 130;
@@ -209,7 +215,7 @@
 
 		if (sp > 0.01) {
 			const [SR, SG, SB] = SUBSTITUTE_RGB;
-			const blend = Math.min(sp, 0.7);
+			const blend = Math.min(sp, 0.5);
 			rr += (SR - rr) * blend;
 			gg += (SG - gg) * blend;
 			bb += (SB - bb) * blend;
@@ -427,7 +433,7 @@
 		if (subPulse) {
 			for (let i = 0; i < subPulse.length; i++) {
 				if (subPulse[i] > 0.01) {
-					subPulse[i] *= PULSE_DECAY;
+					subPulse[i] *= SUB_PULSE_DECAY;
 					alive = true;
 				} else {
 					subPulse[i] = 0;
@@ -598,9 +604,15 @@
 				cold {totals[0].toLocaleString()}
 			</span>
 			{#if stats.substitutions}
-				<span class="flex items-center gap-1.5">
+				<span
+					class="flex items-center gap-1.5"
+					title="{stats.substitutions.toLocaleString()} substitutions since server start"
+				>
 					<i class="inline-block size-2.5 rounded-full" style="background: #eab308"></i>
-					substitute {stats.substitutions.toLocaleString()}
+					substitute {(
+						(100 * stats.substitutions) /
+						Math.max(1, (stats.hits ?? 0) + (stats.misses ?? 0))
+					).toFixed(1)}%
 				</span>
 			{/if}
 			<span class="flex items-center gap-1">
