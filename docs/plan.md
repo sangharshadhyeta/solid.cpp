@@ -3474,3 +3474,47 @@ during the natural startup window).
   source as dead parameters (the eviction path they configured was
   removed) - kept only so `evict_cap_override`'s call sites did not need
   signature changes; harmless, do not affect behavior.
+
+## Substitution's rank-gated draft/fallback split - VALIDATED, 4/4 rounds (2026-08-29)
+
+Substitution (`GGML_CUDA_MOE_CACHE_SUBSTITUTE`) existed and was measured
+(perplexity, router-score) but had never actually been turned on in a live
+server this session, and never with the multi-round tok/s methodology
+everything else here uses - it doesn't move hit rate at all
+(`device.misses` increments unconditionally before the substitution check
+even runs), so hit-rate benchmarks were never going to show its effect.
+
+Added a draft/fallback split, gated by the missed expert's own router rank
+(`GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK`): this dispatch path has no
+access to the router's real probability values (same GPU-only limitation
+the "full-probs oracle" comparison elsewhere in this doc already
+documents), but rank position is a real, already-measured proxy for a
+miss's cost - rank 0 misses 20% of the time vs rank 7's 44%, and ranks 4-7
+carry only 32% of the total gate mass. Below the configured floor (the
+router's most-confident picks), a miss always pays exact CPU fallback;
+at or above it, the cheap resident stand-in serves it - the speculative-
+decoding "draft, verify by cost estimate, fall back" shape, using rank as
+the cost estimate since real probabilities aren't reachable here.
+
+**Result, multi-round topic-switch benchmark (tok/s, not hit rate - see
+above for why), temperature 0, 4 rounds/arm, `MIN_RANK=4`:**
+
+| | off | substitute | delta |
+|---|---|---|---|
+| overall | 55.12 tok/s | 59.59 tok/s | **+8.11%** |
+| round 1 | 53.11 | 57.09 | +7.50% |
+| round 2 | 54.12 | 61.15 | +12.98% |
+| round 3 | 56.80 | 60.34 | +6.23% |
+| round 4 | 56.43 | 59.78 | +5.92% |
+
+**4/4 rounds won, every one of the six topics individually faster**
+(+1.47% to +16.08%), hit rate confirmed unchanged (0.766 vs 0.767 in the
+correctness pass) - this is a clean, consistent, multi-round-validated
+speed win, not a single noisy sample. Quality cost not independently
+re-measured this pass; relies on the existing perplexity bound (+0.47%,
+docs/plan.md, "Substitution" row) and the router-score proxy (0.0386 vs a
+0.0379 theoretical oracle) - both already argue the router-rank method's
+approximation cost is small, but the reasoning-benchmark check (item #5,
+one prior run each, 79.2% vs 62.5%, surprising and unvalidated) still
+needs more rounds before quality can be called settled, separate from this
+speed result.
