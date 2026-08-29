@@ -261,7 +261,7 @@ llama-server \
   --moe-cache auto \
   -c 65536 \
   -ctk q8_0 -ctv q8_0 \
-  --expert-atlas-file expert-atlas.json \
+  --expert-atlas-file expert-atlas-evolve.json \
   --host 0.0.0.0 --port 8080</code></pre>
 
 <div class="tablewrap">
@@ -276,7 +276,7 @@ llama-server \
 <tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
 <tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
 <tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
-<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view real measured topic positions (21&times;128 grid) instead of an arbitrary layout. Generate it once with <code>llama-expert-atlas</code>. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
+<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view expert positions instead of an arbitrary layout. Use the discovered/evolving atlas from <code>scripts/moe-atlas-evolve.py</code> (co-activation-derived, persists and settles further with more traffic) rather than the static 9-topic-probe atlas from <code>llama-expert-atlas</code> &mdash; same file format, either works, but the discovered one is what the Brain view's layout was actually designed around. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
 </tbody>
 </table>
 </div>
@@ -662,41 +662,28 @@ the running server — see <a href="#brain-atlas">above</a>.</p>
 </div>
 <div class="card">
 <h3>Expert-prefetch + host-pinning</h3>
-<p>Overlaps an offloaded expert's weight upload with the previous expert's compute instead of blocking on it, plus
-lifetime host-page pinning for <code>-ncmoe</code>'s repeated CPU→GPU copies. +36.0% prefill, measured on our own
-hardware — ported from <a href="https://github.com/thecodacus/llama.cpp">thecodacus</a>.</p>
+<p>Overlaps an offloaded expert's weight upload with the previous expert's compute, plus lifetime host-page pinning
+for <code>-ncmoe</code>'s CPU→GPU copies. +36.0% prefill — ported from
+<a href="https://github.com/thecodacus/llama.cpp">thecodacus</a>.</p>
 </div>
 <div class="card">
 <h3>LFRU-aware prefill hit/miss split</h3>
-<p>The prefetch upload above now checks per-expert residency against the same GPU-resident cache decode already
-fills: a resident expert is copied device-to-device (no PCIe cost) instead of re-fetched from host memory, and
-only genuine misses still cross PCIe, batched into contiguous runs same as before. Design taken from
-<a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>'s hit/miss split, re-derived against our own
-cache rather than porting its kernels. 65 real device-to-device hits measured in a warm-then-continue test; zero
-regression on a cold cache (950.52 vs. 951.77 tok/s baseline, pp2048).</p>
+<p>Prefetch now checks per-expert residency against the cache decode already fills: a resident expert copies
+device-to-device instead of re-fetching from host memory. Design from
+<a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>, re-derived against our own cache — zero
+regression on a cold cache.</p>
 </div>
 <div class="card">
 <h3>Cost-aware (GreedyDual-Size) eviction tiebreak</h3>
-<p>Eviction within a bounded recency window now weighs heat by an NVMe-vs-RAM cost tier — an expert this process
-itself cold-swept off the page cache (<code>MADV_DONTNEED</code>) is weighted as expensive to bring back, an
-mlock'd or recently-selected one is not, so a hotter-but-cheap slot can still lose to a colder-but-expensive
-one. Isolated A/B against plain heat: noise-neutral under normal load (56.5 vs. 56.4 tok/s), because
-memory pressure severe enough to trigger real cold-sweeps is rare in that regime — this is a correctness/
-robustness fix for the pressure case, not a throughput win. Does not by itself rescue the original
-(single-guess) speculative eviction policy — see the cross-depth-agreement fix below for what actually did.
-NVMe tier weight reuses this fork's own measured 5.8&times; NVMe migration number rather than a fresh guess.</p>
+<p>Eviction now weighs heat by an NVMe-vs-RAM cost tier, so a hotter-but-cheap slot can lose to a
+colder-but-expensive one. A correctness fix for real memory pressure, not a throughput win — noise-neutral under
+normal load.</p>
 </div>
 <div class="card">
 <h3>Cross-depth-agreement speculative eviction (<code>SPEC_EVICT_MODE=agree</code>, default)</h3>
-<p>The original policy (<code>any</code>) let any single router-lookahead guess evict a probation slot — refuted
-three times over (see table): the harm was eviction <em>frequency</em>, not target quality. <code>agree</code>
-only permits an eviction when a <em>closer, strictly more accurate</em> depth's prediction confirms what a
-farther depth already guessed — real corroboration, tracked per-candidate depth end to end, not just "seen
-twice". Fixes the regression this had at depth&ge;3 and holds flat through depth 4; swept further out of
-curiosity and found the always-on speculative-fill path itself (not eviction policy) causes a real cliff past
-depth 4, so the model builders' depth cap stays at 3. Default now (was off) — inert unless
-<code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH&gt;=2</code> is also set, verified bit-identical to the old default at
-depth=1 (56.57 vs. 56.33 tok/s). Full sweep data and the cliff root-cause in the working log.</p>
+<p>Only lets a closer, more accurate depth's prediction confirm a farther depth's guess before evicting — fixes
+the regression the old <code>any</code> policy had at depth&ge;3. Default now, inert unless
+<code>GGML_CUDA_MOE_LOOKAHEAD_DEPTH&gt;=2</code> is set.</p>
 </div>
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
@@ -812,7 +799,7 @@ upstream-only and won't have them. Full guide either way in
 
 <div class="grid" style="margin-top:1.75rem">
 <a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama cli"><div class="d">VLM session with <code>llama cli</code></div></a>
-<a class="card" href="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e"><img src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" alt="Built-in web UI against llama serve"><div class="d">Built-in web UI against <code>llama serve</code></div></a>
+<a class="card" href="brain.png"><img src="brain.png" alt="Brain view: live expert atlas and moe-cache placement stats"><div class="d">Brain view - live expert atlas and <code>moe-cache</code> placement</div></a>
 </div>
 </section>
 

@@ -35,13 +35,17 @@
 	// cell doing someone else's work right now".
 	const SUBSTITUTE_RGB: [number, number, number] = [234, 179, 8]; // yellow
 	const POLL_INTERVAL_MS = 1500;
-	const PULSE_DECAY = 0.94;
+	// Full fade takes ~1.6s at 60fps (0.01^(1/96)) - just past POLL_INTERVAL_MS
+	// (1.5s) below, so a cell that keeps firing every poll never quite goes
+	// dark before the next flash reignites it (continuous pulsing), while a
+	// one-off flash still fully fades before the next unrelated poll lands.
+	const PULSE_DECAY = 0.953;
 	// Substitutions fire far more often than plain hits (they're gated to the
 	// router's low-confidence tail, but that tail is still most of the miss
 	// traffic) - decaying at the same rate as hits left the grid permanently
 	// yellow-tinted under load instead of reading as a distinct, momentary
 	// event.
-	const SUB_PULSE_DECAY = 0.8;
+	const SUB_PULSE_DECAY = 0.65;
 	const ATLAS_POINT_R = 3.5;
 	const PIP_W = 220;
 	const PIP_H = 130;
@@ -94,6 +98,19 @@
 
 	let pulse: Float32Array | null = null;
 	let subPulse: Float32Array | null = null;
+	// Live-eased position per cell (index = layer*cols+expert, same indexing
+	// as pulse/subPulse/neuronConcentration), in the same normalised [-1,1]
+	// atlas space as cell.x/cell.y. Currently-firing cells (pulse > 0) get
+	// pulled toward the pulse-weighted centroid of every other cell firing
+	// this frame - actually co-firing together, not just "recently hit" -
+	// and eased back to their atlas base position once they go idle. Only a
+	// handful of cells are ever mid-ease at once (everything else is already
+	// sitting exactly on its target), so this stays cheap despite iterating
+	// all cells every frame.
+	let liveXY: Map<number, { x: number; y: number }> | null = null;
+	let positionsSettling = false;
+	const POSITION_EASE = 0.06;
+	const POSITION_EPS = 0.0004;
 	// Live snapshot (not read-and-cleared, not pulsed/decayed like pulse/
 	// subPulse above) of per-cell neuron dead-fraction, from
 	// next.neuron_concentration - -1 for "no data", 0-1 otherwise. Directly
@@ -198,7 +215,15 @@
 		const tier = byte >> 6;
 		const heat = byte & 63;
 		const [R, G, B] = TIER_RGB[tier] ?? TIER_RGB[0];
-		const lum = 0.35 + 0.65 * Math.min(heat / 24, 1);
+		// Brightness reflects the expert's own live neuron activity (1 - dead
+		// fraction) rather than how often the router picked it - two experts
+		// selected equally often can differ a lot in how much of themselves
+		// they actually use per firing, and that is the more informative
+		// signal. Falls back to the selection-heat proxy when no neuron data
+		// exists for this cell yet (server hasn't collected it, or it's cold).
+		const nc = neuronConcentration && i < neuronConcentration.length ? neuronConcentration[i] : -1;
+		const activity = nc >= 0 ? 1 - nc : Math.min(heat / 24, 1);
+		const lum = 0.35 + 0.65 * activity;
 
 		let rr = R * lum;
 		let gg = G * lum;
@@ -208,17 +233,20 @@
 
 		// Capped, not the raw pulse value: during active generation, hits land
 		// fast enough that pulse never gets its ~1.2s of uninterrupted decay to
-		// fade, so every live cell sat pinned near p=1 - blending all the way to
-		// pure white (255,255,255) regardless of tier - for the whole time
-		// requests were running, and only revealed the real tier colour once
-		// traffic stopped and pulse finally decayed. Capping the blend means a
-		// fresh hit still visibly brightens a cell, but never fully erases the
-		// hot/warm/cold hue underneath it, live or idle.
+		// fade, so every live cell sat pinned near p=1 for the whole time
+		// requests were running. Flashes toward a brightened version of the
+		// cell's OWN tier hue, not white - a white flash erases the hot/warm
+		// distinction the tier colour exists to show; brightening the same hue
+		// keeps green reading as green and blue as blue, just lit up.
 		if (p > 0.01) {
 			const blend = Math.min(p, 0.45);
-			rr += (255 - rr) * blend;
-			gg += (255 - gg) * blend;
-			bb += (255 - bb) * blend;
+			const boost = 1.6;
+			const tr = Math.min(255, R * boost);
+			const tg = Math.min(255, G * boost);
+			const tb = Math.min(255, B * boost);
+			rr += (tr - rr) * blend;
+			gg += (tg - gg) * blend;
+			bb += (tb - bb) * blend;
 		}
 
 		// Substitute overlay, applied after (and stronger than) the plain hit
@@ -329,24 +357,7 @@
 				continue;
 			}
 
-			let r = ATLAS_POINT_R + 1 + cell.spec * 2.5;
-
-			// Neuron concentration overlay: shrink the dot for experts with a
-			// high dead-neuron fraction (highly compressible - most of their
-			// neurons contribute almost nothing), leave it untouched when
-			// there's no data (-1) or the expert is genuinely dense (near 0).
-			// A separate visual channel from color deliberately - color
-			// already carries tier + substitute state, and cramming a third
-			// signal into hue/saturation would make all three hard to read
-			// at once. Floor at 0.4x so a highly-concentrated expert's dot
-			// never disappears entirely.
-			if (neuronConcentration) {
-				const idx = cell.layer * cols + cell.expert;
-				const deadFrac = neuronConcentration[idx];
-				if (deadFrac !== undefined && deadFrac >= 0) {
-					r *= Math.max(0.4, 1 - deadFrac * 0.6);
-				}
-			}
+			const r = ATLAS_POINT_R + 1 + cell.spec * 2.5;
 
 			ctx.beginPath();
 			ctx.arc(px, py, r, 0, 2 * Math.PI);
@@ -473,7 +484,7 @@
 			}
 		}
 
-		if (alive) {
+		if (alive || positionsSettling) {
 			rafHandle = requestAnimationFrame(draw);
 		}
 	}
@@ -649,11 +660,11 @@
 			{/if}
 			<span class="flex items-center gap-1">
 				<Flame class="size-3" />
-				brightness = recent hits
+				brightness = live neuron activity
 			</span>
 			{#if neuronConcentration}
-				<span class="flex items-center gap-1" title="smaller dot = more of this expert's neurons contribute almost nothing (GGML_CUDA_MOE_CACHE_NEURON_HEAT)">
-					size = neuron concentration
+				<span class="flex items-center gap-1" title="brighter = more of this expert's neurons are actually contributing right now, dimmer = more sit near-dead (GGML_CUDA_MOE_CACHE_NEURON_HEAT)">
+					(falls back to selection heat where neuron data isn't collected yet)
 				</span>
 			{/if}
 		</div>

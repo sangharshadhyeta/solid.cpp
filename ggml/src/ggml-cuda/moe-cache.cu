@@ -980,6 +980,18 @@ struct moe_cache_session {
     // admission, never overrides a live eviction or routing decision.
     std::unordered_map<uint64_t, uint32_t> history;
     bool history_loaded = false;
+    // Co-activation graph carried across process restarts, exactly like
+    // `history` above and for the same reason: device.co_activation starts
+    // empty every launch, so writing it out unmerged made each run OVERWRITE
+    // the previous run's graph with only its own session's observations. The
+    // evolving atlas is supposed to accumulate - a graph that silently resets
+    // on restart cannot evolve, it can only ever describe the last session.
+    // Keyed by packed (layer_a, expert_a, layer_b, expert_b) rather than by
+    // moe_cache_edge, because tensor pointers are fresh addresses every launch
+    // and cannot be a stable cross-run identity (the same reason the predictor
+    // persists by tensor NAME rather than pointer).
+    std::unordered_map<uint64_t, uint64_t> coact_history;
+    bool coact_loaded = false;
     std::chrono::steady_clock::time_point last_history_save{};
 
     std::mutex mu;
@@ -3202,7 +3214,7 @@ static void moe_cache_host_promote_locked_free(
 static size_t moe_cache_host_budget_bytes();
 static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
-static void moe_cache_coact_save(const moe_cache_session & session, const moe_cache_device & device);
+static void moe_cache_coact_save(moe_cache_session & session, const moe_cache_device & device);
 
 // Host RAM this process may pin for hot CPU-resident experts.
 //
@@ -4397,10 +4409,17 @@ static int moe_cache_find_pool(
 // its slot survives): re-ranking a resident key from the same
 // ever-growing heat vector would not change the answer anyway, since heat
 // only accumulates and never resets per key.
+// DEFAULT ON. Measured +8.1% tok/s at matched placement and warm-up, with
+// 50% VRAM saved on every converted expert, and correctness verified across
+// multi-topic multi-turn conversation. Set GGML_CUDA_MOE_CACHE_NEURON_REDUCE=0
+// to turn it off.
+//
+// Depends on neuron heat being collected (it is the signal this selects on),
+// so moe_cache_neuron_heat_enabled() defaults on for the same reason.
 static bool moe_cache_neuron_reduce_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
-        return env && atoi(env) != 0;
+        return env ? atoi(env) != 0 : true;
     }();
     return enabled;
 }
@@ -4638,20 +4657,45 @@ static void moe_cache_history_save(moe_cache_session & session, const moe_cache_
 // versioned shape as the history file above, for the same reason: a crash
 // mid-save must not leave a half-written graph that the next run silently
 // folds in as real observations.
-static void moe_cache_coact_save(const moe_cache_session & session, const moe_cache_device & device) {
+static void moe_cache_coact_save(moe_cache_session & session, const moe_cache_device & device) {
     static const char * path = getenv("GGML_CUDA_MOE_CACHE_COACT_FILE");
-    if (!path || device.co_activation.empty()) {
+    if (!path) {
         return;
     }
-    const std::string tmp = std::string(path) + ".tmp";
-    {
-        std::ofstream f(tmp, std::ios::trunc);
-        if (!f) {
-            return;
+    // Load once, so this run ADDS to whatever previous runs recorded instead
+    // of replacing it (see session.coact_history).
+    if (!session.coact_loaded) {
+        session.coact_loaded = true;
+        std::ifstream in(path);
+        if (in) {
+            std::string tag; int version = 0;
+            if ((in >> tag >> version) && tag == "moe-cache-coact" && version >= 2) {
+                int la, ea, lb, eb; unsigned long long w;
+                while (in >> la >> ea >> lb >> eb >> w) {
+                    const uint64_t key = ((uint64_t)(uint32_t) la << 48) | ((uint64_t)(uint32_t) ea << 32) |
+                                         ((uint64_t)(uint32_t) lb << 16) | (uint64_t)(uint32_t) eb;
+                    session.coact_history[key] += w;
+                }
+            }
         }
-        f << "moe-cache-coact 1\n";
-        size_t written = 0;
-        for (const auto & [edge, count] : device.co_activation) {
+    }
+
+    // BOTH edge sets, and the cross-layer one is not optional. Within-layer
+    // edges alone leave every layer as its own disconnected component, and a
+    // normalised adjacency's eigenvalue 1 then has multiplicity equal to the
+    // component count - so the consumer's eigengap heuristic sees N trivial
+    // 1.0 eigenvalues and picks an axis count out of pure degeneracy rather
+    // than real structure. Confirmed the hard way: a first version of this
+    // exported only device.co_activation, and the atlas built from it had its
+    // top 12 eigenvalues all exactly 1.0. scripts/moe-atlas-evolve.py's own
+    // fold_in() ties the graph together with a cross-layer edge for precisely
+    // this reason; co_activation_cross_layer is that same signal, already
+    // measured live, so it must be written alongside.
+    const std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> * maps[2] = {
+        &device.co_activation, &device.co_activation_cross_layer
+    };
+    for (int m = 0; m < 2; m++) {
+        for (const auto & [edge, count] : *maps[m]) {
             const auto la = session.tensor_layer.find(edge.from.tensor);
             const auto lb = session.tensor_layer.find(edge.to.tensor);
             // A tensor with no known layer cannot be placed in the graph's
@@ -4660,11 +4704,32 @@ static void moe_cache_coact_save(const moe_cache_session & session, const moe_ca
             if (la == session.tensor_layer.end() || lb == session.tensor_layer.end()) {
                 continue;
             }
-            f << la->second << " " << edge.from.expert << " "
-              << lb->second << " " << edge.to.expert << " " << count << "\n";
-            written++;
+            if (edge.from.expert < 0 || edge.to.expert < 0) {
+                continue;
+            }
+            const uint64_t key = ((uint64_t)(uint32_t) la->second << 48) |
+                                 ((uint64_t)(uint32_t) edge.from.expert << 32) |
+                                 ((uint64_t)(uint32_t) lb->second << 16) |
+                                 (uint64_t)(uint32_t) edge.to.expert;
+            session.coact_history[key] += count;
         }
-        if (!f || written == 0) {
+    }
+    if (session.coact_history.empty()) {
+        return;
+    }
+
+    const std::string tmp = std::string(path) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) {
+            return;
+        }
+        f << "moe-cache-coact 2\n";
+        for (const auto & [key, w] : session.coact_history) {
+            f << (uint32_t)((key >> 48) & 0xffff) << " " << (uint32_t)((key >> 32) & 0xffff) << " "
+              << (uint32_t)((key >> 16) & 0xffff) << " " << (uint32_t)(key & 0xffff) << " " << w << "\n";
+        }
+        if (!f) {
             f.close();
             std::remove(tmp.c_str());
             return;
@@ -6912,10 +6977,16 @@ static bool moe_cache_partner_index_enabled() {
 // 20%, and ranks 4-7 carry only 32% of the gate mass), so the substituted
 // weight is small. Whether the output damage is acceptable is a question for
 // perplexity, which has NOT been run yet.
+// DEFAULT ON. Measured +8.11% tok/s, winning 4 of 4 rounds on Ornith-1.5-35B,
+// with hit rate unchanged (it cannot move that metric by construction - it
+// serves a resident stand-in instead of paying CPU fallback, rather than
+// making the miss into a hit). Rank-gated by moe_cache_substitute_min_rank()
+// so the router's most confident picks always get exact compute.
+// GGML_CUDA_MOE_CACHE_SUBSTITUTE=0 turns it off.
 static bool moe_cache_substitute_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");
-        return env && atoi(env) != 0;
+        return env ? atoi(env) != 0 : true;
     }();
     return enabled;
 }
@@ -6925,10 +6996,17 @@ static bool moe_cache_substitute_enabled() {
 // this costs no new sync/kernel. Off by default because it is not read by
 // anything yet - this is step one (measure) of a two-step build, not the
 // full mechanism.
+// DEFAULT ON. Purely observational (accumulates |value| per neuron over data
+// moe_cache_collect has already downloaded and validated - no new kernel, no
+// new sync) and it is the signal reduced-width serving selects on, so it has
+// to be collected for that to work at all. Its own cost was measured and the
+// two regressions it caused were fixed (a dedicated mutex rather than
+// session.mu; the expensive report moved off the hot path entirely).
+// GGML_CUDA_MOE_CACHE_NEURON_HEAT=0 turns it off.
 static bool moe_cache_neuron_heat_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_HEAT");
-        return env && atoi(env) != 0;
+        return env ? atoi(env) != 0 : true;
     }();
     return enabled;
 }
@@ -6949,8 +7027,14 @@ static bool moe_cache_neuron_heat_enabled() {
 // until this is actually measured.
 static int moe_cache_substitute_min_rank() {
     static const int v = [] {
+        // Default 4, not 0: the measured +8.11% win was taken WITH this
+        // gate, and it is the gate that makes substitution safe to enable
+        // by default - only the router's least-confident picks (rank >= 4)
+        // may be served by a stand-in, so its most consequential choices
+        // always get exact compute. Ungated substitution was never the
+        // configuration that won 4/4 rounds. 0 restores ungated behaviour.
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
-        const int n = env ? atoi(env) : 0;
+        const int n = env ? atoi(env) : 4;
         return n < 0 ? 0 : n;
     }();
     return v;
