@@ -2265,9 +2265,9 @@ alternative signal only has to break a tie.
     Re-running with today's substitution mechanism now.
 12. Reuse-distance prediction - the 17pp Belady gap. Six signals have failed;
     none of them addresses the actual quantity.
-11. **[still open, corrected 2026-08-29 - do not trust the previous note]**
-    Persist co-activation across runs like `session.history`, for cold
-    start. Confirmed via the real code (`moe_cache_predictor_save`,
+11. **[closed, built 2026-08-29 - see "Co-activation persistence shipped"
+    below]** Persist co-activation across runs like `session.history`, for
+    cold start. Confirmed via the real code (`moe_cache_predictor_save`,
     `moe-cache.cu:6868-6927`, read in full): no persistence exists for
     `device.co_activation` today - that part holds.
     An earlier version of this note additionally claimed co-activation
@@ -4250,3 +4250,133 @@ into placement (fewer CPU layers, less CPU work). Nothing does this: the
 fit logic still sizes everything as though every expert costs full width.
 Reduction currently makes the cache cheaper without ever telling the
 placement decision that it did.
+
+## Co-activation persistence shipped, and the discovered atlas's layer-chain bug found and fixed (2026-08-29, later session)
+
+Closes item 11 of the pending queue above (persist co-activation across
+restarts). Separately, chasing a visual complaint about the discovered
+atlas's layout ("arranged like spokes on a wheel, not fluid") led to a real
+structural bug in how the co-activation graph is built, not just a display
+issue.
+
+### Co-activation persistence - built
+
+`moe_cache_coact_save` (`moe-cache.cu`) previously overwrote
+`GGML_CUDA_MOE_CACHE_COACT_FILE` from `device.co_activation` fresh every
+save, unmerged - since `device.co_activation` starts empty every process
+launch, each run's file only ever described that session, never
+accumulated. Fixed: a new `session.coact_history` map, loaded once (format
+bumped to `moe-cache-coact 2`) and added to on every save, keyed by packed
+`(layer_a, expert_a, layer_b, expert_b)` rather than by `moe_cache_edge`
+(tensor pointers aren't stable across restarts, same reason the predictor
+persists by tensor name). Both `device.co_activation` (within-layer) and
+`device.co_activation_cross_layer` are written now, not just the former -
+the cross-layer signal is required for the consumer
+(`scripts/moe-atlas-evolve.py`) to keep the graph connected at all (see
+below).
+
+### The atlas layout bug: cross-layer edges were a rigid chain, not real topic structure
+
+Diagnosis: `corr(layer, x) = 0.63` in the discovered atlas's 2D output,
+and per-layer angle spread of σ≈0.01-0.05 rad while the mean angle marched
+steadily layer to layer - every expert in a layer sat on almost the same
+ray, one spoke per layer. Root cause in `scripts/moe-atlas-evolve.py`'s
+`fold_in`: cross-layer edges only ever linked layer L's top-1 pick to layer
+L+1's top-1 pick, one edge per token step, always to the immediately next
+layer. That makes each layer a tightly-connected clique (from within-layer
+co-firing) joined to its neighbours by a single narrow bottleneck edge - a
+chain of clusters. Spectral embeddings of that exact shape produce leading
+eigenvectors that are low-frequency waves along the chain ("which layer am
+I in"), regardless of edge weight - confirmed weight was NOT the cause:
+within-layer edges carried 28x more total weight than cross-layer (25.4M
+vs 0.9M) and were still dominated by the layer-chain topology, because the
+effect is structural (which edges bridge clusters), not magnitude-based.
+
+Fix: cross-layer edges now link a token's top-1 pick at EVERY layer it
+touched to its top-1 pick at every OTHER layer that same token touched
+(all pairs within a token's routing path, not just adjacent-layer), via
+token-id grouping (`load_traces`/`fold_in`, batches detected by layer
+number decreasing). Regenerating from the 12 real trace files
+(`traces/big-*.txt`, 909,480 decisions - `traces/big-progress.txt` turned
+out to be a line-count manifest, not trace data, and had to be excluded)
+produced a materially different, healthier eigenvalue spectrum: top 12
+magnitudes went from near-degenerate (0.9996, 0.9996, 0.9983, ...,
+symptomatic of the chain fragmentation) to a real dropoff (1.0, 0.6941,
+0.6825, 0.666, ...). Post-fix `corr(layer, x)` = -0.08, `corr(layer, y)` =
+-0.04 - essentially gone.
+
+Also added: explicit per-layer mean-centering of the raw embedding before
+the disc mapping, stripping whatever layer-correlated residual is left
+(the Grid panel already shows layer directly, so the atlas encoding it
+again is redundant even after the topology fix).
+
+### Positioning rule changed to match the old fixed-9-topic atlas's "pull," generalized
+
+Requested directly: the discovered atlas should position experts by the
+same weighted-combination-of-topic-anchors rule the old fixed-9-category
+atlas used (`ec1354bc1`'s "an expert's position is the convex combination
+of its category anchors weighted by cats[]"), but with neither the topic
+count fixed at 9 nor the anchor positions preset - and by design the
+discovered axis count is meant to vary run to run as the graph accumulates
+more data (the eigengap heuristic re-decides k from the eigenvalue
+spectrum every run, per the module's own docstring), not stay fixed the
+way the old atlas's 9 preset categories did.
+
+Implemented as reciprocal averaging: topic anchors for however many axes k
+the eigengap heuristic picked this run start on an equal-angle circle
+(same mechanism the old fixed atlas used, generalized to k instead of 9),
+then get refined over two passes - each topic's anchor moves to the
+weighted centroid of the experts that load on it (weight = squared
+loading, direction doesn't matter for a spatial pull), and each expert's
+position is the weighted combination of the (now-refined) topic anchors.
+Topics whose experts overlap drift toward each other; topics with nothing
+in common drift apart - unlike the old preset categories, which sat at
+their initial angle forever regardless of what the data said. This is a
+static, offline computation baked into the regenerated atlas JSON on each
+`moe-atlas-evolve.py` run, not a client-side animation - an earlier
+attempt at literal per-frame client-side movement (nudging currently-
+firing points toward a live pulse-weighted centroid, eased frame to frame)
+was tried and explicitly rejected as the wrong shape ("should not be
+rendering and showing movement like animation").
+
+### Brain view polish, same session
+
+- Hit-flash (`Brain.svelte`) previously blended toward pure white
+  regardless of tier, discarding the hot/warm distinction during any
+  active traffic; now blends toward a brightened version of the cell's
+  OWN tier hue instead, so green stays green and blue stays blue, just
+  lit up.
+- Cell brightness now reflects live neuron activity
+  (`neuron_concentration`, 1 - dead fraction) instead of raw selection
+  heat, falling back to heat where no neuron data has been collected yet
+  for that cell - requested directly, on the reasoning that two equally-
+  often-selected experts can differ a lot in how much of themselves they
+  actually use per firing.
+- Pulse decay retimed from ~1.2s to ~1.6s full fade (`PULSE_DECAY`
+  0.94 -> 0.953) - just past `POLL_INTERVAL_MS` (1.5s), so a cell that
+  keeps firing every poll never quite goes dark before the next flash
+  reignites it, while a one-off flash still fully fades before an
+  unrelated later poll.
+- `docs/index.html`'s "run it the way it was measured" command now points
+  `--expert-atlas-file` at the discovered/evolving atlas
+  (`expert-atlas-evolve.json`) instead of the static 9-probe file - the
+  Brain view's `atlas.discovered` rendering path existed since
+  `8e177c436` but nothing in the documented startup command ever fed it,
+  so every session that followed the docs got the static fallback layout
+  regardless of what the UI code actually supported.
+
+### Still open
+
+- Whether the reciprocal-averaging topic-anchor layout reads as
+  meaningfully more "fluid"/topic-clustered in practice, beyond fixing
+  the spokes artifact and the layer correlation number, is a subjective
+  call - not measured beyond the diagnostic stats above.
+- The full-pairwise-per-token cross-layer edge construction is more
+  expensive to fold than the old single-chain-edge version (bounded by
+  distinct layer pairs per token, not measured precisely) - fine at the
+  current trace volume (909K decisions, well under a minute), not
+  stress-tested at larger trace sets.
+- A live per-frame movement mechanic was built, tried, and reverted this
+  session (see above) - if genuine live responsiveness to firing
+  patterns is wanted later, the static topic-anchor approach here is not
+  that; it only changes what the static layout looks like.
