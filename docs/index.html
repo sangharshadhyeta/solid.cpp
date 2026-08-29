@@ -497,6 +497,100 @@ until you go looking.</p>
 </div>
 </section>
 
+<section id="sparse-activation">
+<div class="eyebrow">Below the expert: individual neurons</div>
+<h2>Sparse activation: not every neuron in a hot expert earns its VRAM</h2>
+<p class="section-lede">Caching decides <em>which experts</em> live in GPU memory. But an expert is not
+atomic &mdash; inside one, some neurons carry almost all the signal and others contribute essentially nothing.
+This fork measures that directly, per expert, and serves the ones that matter at reduced width.</p>
+
+<p>The measurement came first, and it changed the design twice. Concentration is scored by
+<strong>value</strong>, not rank: &ldquo;top 25% of neurons&rdquo; picks a fixed cutoff regardless of what
+that expert's distribution actually looks like, so instead each neuron is compared against a threshold
+relative to <em>its own expert's</em> maximum, and the resulting count falls out as an observation rather
+than an input. Dead-neuron fraction is anchored on the <strong>median</strong>, not the mean &mdash; these
+distributions are skewed enough (max/mean ratios of 120&ndash;270&times; measured) that the mean is not a
+trustworthy reference.</p>
+
+<table>
+<colgroup><col style="width:40%"><col style="width:60%"></colgroup>
+<thead><tr><th>What was measured</th><th>Result</th></tr></thead>
+<tbody>
+<tr><td>Neurons clearing 25% of their expert's own max</td><td>hold ~81% of that expert's total activation mass</td></tr>
+<tr><td>Per-expert width needed for 90% coverage</td><td>bimodal &mdash; median ~83%, but a real minority need as little as <strong>6&ndash;7%</strong></td></tr>
+<tr><td>Shared index set across a layer's experts</td><td>retains only <strong>55.9%</strong> of mass &mdash; proof the selection must be genuinely per-expert, not one set reused</td></tr>
+<tr><td>Per-layer miss rate vs. concentration</td><td><strong>decoupled</strong> (12.1&ndash;16.0%, flat) &mdash; today's cost is uniform precisely because nothing yet exploits concentration</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">An early read of the per-layer medians said layer 0 was uniquely concentrated
+(30.9% dead neurons vs ~0% everywhere else) and the mechanism was nearly scoped to that one layer. Checking at
+the individual-expert level instead found <strong>17 more outlier experts scattered across layers 1, 2, 3, 4,
+37 and 39</strong>, some on large sample counts. The layer median had been hiding a real per-expert effect that
+exists everywhere, just unevenly. The shipped mechanism is layer-agnostic because of that check, not despite it.</p>
+
+<p>Converted experts are served from a second, narrower cache pool: gate/up only
+(<code>down_exps</code>'s row axis is an output dimension, where dropping rows would delete real outputs rather
+than approximate sparsity), the chosen rows gathered once at fill time, and a small CUDA kernel scattering the
+computed values back into their correct positions in an otherwise-zeroed row. The CPU path never learns any of
+this exists. Measured <strong>50% VRAM saved on every converted expert</strong>, and the reduced pool evicts
+under the same heat-driven LFRU policy as the primary one, so it keeps tracking whichever experts are currently
+hot instead of freezing at whoever converted first.</p>
+
+<div class="callout">
+<p><strong>What building this actually caught &mdash; three times, and only by measuring:</strong> every one of
+these looked correct on inspection. <strong>(1)</strong> Taking the cache's core lock on every hit cost
+<strong>16% throughput</strong> (35.56 &rarr; 29.89 tok/s) &mdash; the exact regression shape an earlier
+dedicated mutex already existed to prevent, reintroduced. <strong>(2)</strong> A full session decided
+<strong>20,201 conversions and placed zero of them</strong>: greedy pool admission consumed the entire budget
+first, so the reduced pool never had room to exist &mdash; pure overhead, no benefit, completely silent.
+<strong>(3)</strong> Reduction was being applied to <code>down_exps</code>, which the design explicitly
+excludes; the restriction had been written down but never coded. The fix for (2) then failed twice more on its
+own, each time visible only in the pool table: reserving a flat slice starved a whole primary pool out of
+existence and dropped hit rate 31.3% &rarr; 23.1%, costing far more than it saved.</p>
+</div>
+</section>
+
+<section id="placement-margin">
+<div class="eyebrow">Where the throughput actually was</div>
+<h2>The safety margin that was quietly costing 30%</h2>
+<p class="section-lede">Chasing why the neuron work only bought 8%, the utilization numbers said something
+else was wrong: <strong>CPU at ~5.4 of 12 cores, GPU at 41%, and ~3 GB of a 12 GB card unused.</strong>
+Neither resource saturated means the bottleneck is serialization, not capacity.</p>
+
+<p>Placement reserves <code>3 &times; --fit-target</code> of VRAM before deciding anything, and that
+reservation silently <em>raises</em> a requested <code>-ncmoe</code> until the context fits. With the 1024 MiB
+default that is 3 GiB held back &mdash; and it invalidated an entire sweep before being noticed: requesting 22,
+16 and 10 CPU layers all produced identical memory use and near-identical throughput, because all three were
+being raised to 27. The log line saying so had been there the whole time.</p>
+
+<table>
+<colgroup><col style="width:22%"><col style="width:26%"><col style="width:26%"><col style="width:26%"></colgroup>
+<thead><tr><th>--fit-target</th><th>Effective CPU layers</th><th>tok/s</th><th>GPU memory used</th></tr></thead>
+<tbody>
+<tr><td>1024 (default)</td><td>27</td><td>47.32</td><td>8951 MiB</td></tr>
+<tr><td>640</td><td>24</td><td>50.37</td><td>10307 MiB</td></tr>
+<tr><td>448</td><td>23</td><td>51.61</td><td>10741 MiB</td></tr>
+<tr><td><strong>320</strong></td><td><strong>22</strong></td><td><strong>52.85</strong></td><td>11237 MiB</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem"><strong>+11.7% from the margin alone</strong> (~+30% against the starting
+configuration), every candidate passing its correctness check, on Ornith-1.5-35B. The margin cannot simply be
+deleted &mdash; it covers allocation that happens after the fit probe can see it, and removing it reproduced a
+hard context collapse &mdash; so the honest answer is to measure it per machine rather than ship a constant.</p>
+
+<div class="callout">
+<p><strong>And the tightened margin is not universally good, which is the entire argument for calibrating it.</strong>
+On gemma-4-26B the result inverts: the default margin scored <strong>71.86 tok/s</strong> while every tightened
+value scored ~50. Opposite of Ornith. Any single constant would have been wrong for one of the two models no
+matter which was chosen. <code>--moe-calibrate</code> now searches this dimension and records it alongside
+placement, threads and cache size &mdash; and the first real run of that new search promptly exposed a bug in
+itself, comparing candidates against a baseline measured under a different cache size and nearly shipping a 29%
+regression as a &ldquo;calibrated optimum&rdquo;. Caught by reading the numbers it printed, fixed, re-run.</p>
+</div>
+</section>
+
 <section>
 <div class="eyebrow">What's different from upstream</div>
 <h2>Every fix, one card each</h2>

@@ -559,6 +559,33 @@ no numbers, nothing in `docs/index.html`. It needs no code at all, only the
 GPU - and the same 8099 occupancy blocking the Track 1.5 A/B blocks it too.
 Track 2 is therefore *descoped*, not *done*.
 
+**MEASURED, 2026-08-29 - Track 2 is now actually done.** Ran the (a)-vs-(b)
+comparison: auto placement (default `-fit`, no `-ncmoe`) vs forced full
+offload (`-ncmoe 41`, every MoE layer), Ornith-1.5-35B, same topic-switch
+6-prompt sequence and 4-round methodology as every other benchmark this
+session, `-c 4096` both arms, only the placement flag differs.
+
+| | auto (default) | full (`-ncmoe 41`) |
+|---|---|---|
+| avg tok/s (n=24) | **53.96** | 32.82 |
+| avg hit rate (n=24) | 70.15% | **86.76%** |
+
+Full offload gets a real, consistent +16.6pp hit rate - and is 39% *slower*
+in actual throughput, every round, no exceptions. This inverts what the
+Nemotron 3.5 counter-example above seemed to suggest, because that number
+was hit-rate-only and never measured tok/s: forcing every layer through
+moe-cache's dispatch path costs more in aggregate overhead than the better
+hit rate saves. Visible directly in the per-request log: `full`'s tok/s
+degrades over the course of each round (42->50->36->32->22->19, round 1)
+as the larger pool keeps churning through admissions; `auto`'s stays
+stable-to-improving (44->50->56->60->59->61) - the smaller pool converges
+fast and stays converged.
+
+**Verdict: the existing default (auto/minimum-fit placement) is correct
+and should stay the default.** No code change needed - this closes Track 2
+with a confirmed "no change required," not a regression to fix. Raw
+results: `track2_bench_results.json` in this session's scratchpad.
+
 ## Track 3 — "True MoE" emulation
 
 Newest addition, **not yet scoped**. Needs a clarifying conversation before
@@ -2151,9 +2178,37 @@ alternative signal only has to break a tie.
    is trustworthy and the cache cannot be relied on.
 
 **Invalidated, need re-running with the degeneration guard**
-2. Admission A/B (-7.6% for removing the gate) - the empirical basis for
-   "racing to fill is the wrong move".
-3. Atlas warming A/B (+0.27 tok/s, "neutral").
+2. **[re-measured, 2026-08-29 - the original result does not hold]**
+   Admission A/B (-7.6% for removing the gate) - the empirical basis for
+   "racing to fill is the wrong move". Re-ran clean with the corruption
+   bug fixed: `GGML_CUDA_MOE_CACHE_ADMIT_AFTER=1` (no gate, admit on first
+   demand) vs default (`admit_after=2`, gated), same topic-switch 6-prompt
+   x4-round methodology.
+
+   | | gated (default) | no_gate (`ADMIT_AFTER=1`) |
+   |---|---|---|
+   | avg tok/s (n=24) | 55.43 | 54.78 |
+   | avg hit rate (n=24) | 79.36% | 79.46% |
+
+   The gap is now ~1%, within noise - the original -7.6% does not
+   reproduce. Very likely the original number was itself contaminated by
+   the corruption bug's presence at measurement time, not a coincidence
+   that the empirical basis for "racing to fill is the wrong move"
+   disappears on exactly the number measured before the bug was found.
+   The gate is neither clearly harmful nor clearly helpful now - both
+   arms statistically indistinguishable here. Consequence for item 4: its
+   fill-cost model calibration input is confirmed unreliable, not just
+   theoretically provisional.
+3. **[closed/superseded, 2026-08-29]** Atlas warming A/B (+0.27 tok/s,
+   "neutral"). Not just re-run but thoroughly re-investigated this session
+   with a proper multi-round, multi-switch harness - see "Atlas warming,
+   second pass" below. Current honest verdict: -0.35pp post-switch pooled
+   (roughly neutral, individual requests mixed - one real win, one
+   striking regression under investigation), safe (no longer actively
+   harmful, unlike two intermediate designs measured at -0.31pp and
+   -6.55pp along the way) but not yet a consistent win. The old
+   "+0.27 tok/s neutral" number is obsolete, not just unconfirmed -
+   superseded by a materially different, more rigorous measurement.
 4. Fill-cost model - calibrated from those arms, so every simulation ranking
    that used it is provisional.
 
@@ -2193,14 +2248,60 @@ alternative signal only has to break a tie.
 10. Coverage-oriented eviction - maximise "some viable stand-in is always
     resident" rather than hit rate. Never tried; the most plausible home for the
     validated 3-way fold structure. See DESIGN ARGUMENT section 4.
-11. Perplexity at low residency (1-2%), which is where substitution bites. Does
-    NOT need the corruption bug fixed. The result most likely to sink the design.
+11. **[re-opened for a fresh run, 2026-08-29 - the old result is for a
+    system that no longer exists]** Perplexity at low residency (1-2%),
+    which is where substitution bites. Does NOT need the corruption bug
+    fixed. The result most likely to sink the design. "SUBSTITUTION FAILS
+    AT LOW RESIDENCY" above (2026-08-25) measured this once already
+    (PPL 6.74 off vs 41.32 on, a 6x degradation) - caught on first pass as
+    if that closed the item, but it doesn't: that measurement predates
+    the rank-gated draft/fallback redesign
+    (`GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK`, validated later this
+    session at +8.11% tok/s, 4/4 rounds) - substitution unconditionally
+    fired on every miss when the 41.32 number was measured. Rank-gating
+    exists specifically to bound this kind of quality risk by only
+    substituting the router's least-confident picks, never its top ones -
+    whether that changes the low-residency verdict has never been tested.
+    Re-running with today's substitution mechanism now.
 12. Reuse-distance prediction - the 17pp Belady gap. Six signals have failed;
     none of them addresses the actual quantity.
-11. Persist co-activation across runs like `session.history`, for cold start.
+11. **[still open, corrected 2026-08-29 - do not trust the previous note]**
+    Persist co-activation across runs like `session.history`, for cold
+    start. Confirmed via the real code (`moe_cache_predictor_save`,
+    `moe-cache.cu:6868-6927`, read in full): no persistence exists for
+    `device.co_activation` today - that part holds.
+    An earlier version of this note additionally claimed co-activation
+    was "the worst arm yet" as a standalone eviction signal and therefore
+    not worth persisting - **that claim was wrong, caught on challenge,
+    verified by re-reading the actual table** ("six eviction signals"
+    section above, 151,580 decisions): plain co-activation ("coact") was
+    the SECOND-BEST of five arms tested (56.95 pred tok/s, beating random's
+    51.43, losing only to LRU's 63.20) - the "worst arm" description
+    belongs to *anti*-co-firing (32.91 tok/s), a different, inverted
+    signal, conflated with plain co-activation in the earlier draft of
+    this note. Separately, using "underperforms in a session-limited test"
+    as an argument against trying persistence has the logic backwards -
+    the live-activation predictor (this session's own validated win) was
+    itself a *regression* before persistence, and only became a real win
+    once cross-restart accumulation gave it more history to work with.
+    Whether persisting co-activation would do the same thing here has
+    never actually been tested. Genuinely open, not superseded.
 12. Track 1.5 - merged, value never independently verified.
-13. The cache filling VRAM to a 128 MiB floor regardless of `-ngl`; the reserve
-    should scale with the device, and the budget should yield under pressure.
+13. **[closed, confirmed 2026-08-29]** The cache filling VRAM to a 128 MiB
+    floor regardless of `-ngl`; the reserve should scale with the device,
+    and the budget should yield under pressure. Already resolved by later
+    work, superseding this note: `moe_cache_check_budget`
+    (`moe-cache.cu:4301-4397`) computes the reserve as 5% of live free
+    VRAM (clamped [128, 1024] MiB, not a fixed 128 MiB - explicitly
+    documents the exact scaling problem this item describes: "a 3GB
+    reserve left ~47MB available after loading a 26B model" on a 12GB
+    card vs "negligible" on a 141GB one), and yields under real pressure
+    by releasing dispatch scratch (not pool slabs, which can't be
+    partially freed) when `available < committed`. Also fixed, same
+    function: `GGML_CUDA_MOE_CACHE_BUDGET_MB` previously being silently
+    ignored past the point pools grew beyond it (measured: "BUDGET_MB=256
+    and 3413 both peaked at 11,797 MiB - the knob did nothing at all"),
+    now reasserted as a hard ceiling on every re-check.
 
 ## Open, no proposal yet
 
@@ -2301,6 +2402,18 @@ scratch buffers should be re-scoped as a buffer-reuse investigation, not
 carried forward as a "tiered cache" item - it doesn't fit the model.
 Output head weights are explicitly descoped from tiering; any future win
 there is a sampling-side project, not a caching one.
+
+**CORRECTION (2026-08-29, track-2): item 3 was already closed upstream,
+before this scoping note was written.** `ggml_backend_cuda_context::cuda_graph()`
+(`ggml/src/ggml-cuda/common.cuh:1428-1453`) already keys captured graphs
+by `first_node_ptr` (one graph object per distinct topology/shape, not a
+single global graph - from upstream `81ab64f3c` "enable cuda-graphs for
+n-cpu-moe") and already evicts: a sweep every 5s drops any graph unused
+for >=10s (from upstream `b94050e89` "use LRU based eviction for cuda
+graphs"). Both merged into this tree already. No measurement pass, no new
+mechanism needed - this item is done, not "lower urgency." Track-2 scope
+narrows to the other two: embedding-row GPU cache, and scratch-buffer
+right-sizing.
 
 ## Already closed out (adjacent work, same session)
 
@@ -3518,3 +3631,622 @@ approximation cost is small, but the reasoning-benchmark check (item #5,
 one prior run each, 79.2% vs 62.5%, surprising and unvalidated) still
 needs more rounds before quality can be called settled, separate from this
 speed result.
+
+## Track 4 - "run 320B-class models on this hardware" - SCOPED, not yet built (2026-08-29)
+
+New branch, `track-4` off track-1.6's HEAD (renamed from an earlier `track-2`
+that collided with the existing Track 2 heading above). Prompted by asking
+whether GLM-5.3-Flash (321B total / 18B active, zai-org, hybrid 34 KDA +
+11 MLA/DSA layers, 288 experts/8 routed/1 shared, hidden_size=4096,
+moe_intermediate_size=2048 - real config.json values) could hit 40 TPS on
+this machine (RTX 3060 12GB VRAM, ~31GiB RAM, WD Blue SN5000 NVMe).
+
+**Verdict on the original ask: no.** Best-case VRAM-bandwidth ceiling with
+zero cache misses is ~25-30 tok/s; realistic ceiling given VRAM can only
+hold ~12GB against a ~200GB Q4_K_XL model (fast-memory budget doesn't even
+cover the 90GB 1-bit floor) is far below that - comparable published
+results on FAR more capable hardware (4x3090/4090 + 192GB RAM) land at
+3-9 tok/s. A hardware-tier problem, not a software one, for the *whole*
+question. Full reasoning and sourcing captured in conversation, not yet
+copied into this file verbatim.
+
+**What IS still worth building, independent of hitting 40 TPS on GLM-5.3
+specifically** - the queue, in the order scoped so far:
+
+1. **Embedding-row GPU cache.** Real, validated by an independent frontier
+   lab at far larger scale (Qwen3.8-Flash-Next / "Qwen4"'s 51B-parameter
+   N-gram lookup table, offloaded to host RAM and gathered per-token,
+   measured 84GB->60GB per-GPU footprint / 78% more KV headroom / 0.007%
+   throughput cost / bit-identical output, independently confirmed by
+   SGLang + community builds within days of release). `tok_embd` is
+   CPU-resident by default in this fork already (`src/llama-model.cpp:
+   1368-1370`) - the win is promoting hot rows into VRAM, not evicting
+   them out. Needs new plumbing: `GET_ROWS` has no interception hook
+   today (unlike `mul_mat_id`), and it's a shared op (LoRA, MoE routing,
+   ALiBi, recurrent state all use it too) so any hook must be tensor-
+   scoped to `tok_embd` specifically. Not started.
+
+2. **Heat-aware intra-expert neuron subsetting.** New idea, not published
+   anywhere in this exact form (adjacent literature - DejaVu/PowerInfer,
+   arXiv:2310.17157 / arXiv:2312.12456 - is per-token-predictive and
+   dense-model-only, getting real sparsity out of SwiGLU normally needs
+   retraining per ProSparse arXiv:2402.13516; the one MoE-specific paper,
+   arXiv:2605.08575, is magnitude-threshold and compute-only, can't touch
+   transfer bytes). This fork's version: track accumulated
+   `|gate_i * up_i|` per neuron per `(layer, expert)` over time (same
+   style of signal as existing LFRU heat, just nested one level deeper),
+   and at admission time only transfer/keep the historically-hot neuron
+   subset of `gate_proj`/`up_proj` resident - the un-loaded neurons read
+   as zero to the (unmodified) `down_proj` matmul, so phase 1 needs no
+   new kernel for `down_proj` at all, only smaller loads/matmuls for
+   gate/up. `down_proj` itself resists this (its neuron axis is the
+   Q4_K quantization-block axis, not row-addressable) and needs a
+   one-time repack to a neuron-major layout - deferred to a fast-follow
+   phase 2 once phase 1 is proven out.
+   Verified against moe-cache's actual architecture before committing to
+   this shape (2026-08-29 scoping pass):
+   - `ggml_mul_mat_id`'s weight tensor is a single 3D tensor, one shape/
+     stride for every expert in a batched call (`ggml/src/ggml.c:
+     3329-3353`) - confirmed structurally, not just a kernel-level
+     optimization choice, that every expert of a tensor needs the SAME
+     resident neuron count per dispatch. A variable per-expert budget
+     doesn't fit the op as it exists.
+   - moe-cache's own pool design independently hard-codes uniform slot
+     size (`moe_cache_pool` has one `expert_size` for the whole pool,
+     `moe-cache.cu:161-212`; addressing/guard-byte logic throughout
+     assumes it) - per-slot variable sizing isn't structurally possible
+     in the current pool type.
+   - No per-neuron statistic exists today (`moe_cache_slot::heat` is a
+     single `uint32_t`, `moe-cache.cu:156`) - genuinely new state, but
+     cheap (~100-200MB total across a realistic layer/expert count).
+   - No existing hook observes the actual gate x up intermediate value -
+     moe-cache's hooks all anchor to the `mul_mat_id` node itself, which
+     fires BEFORE the SiLU/gate-up combine (`llama-graph.cpp:2262-2280`,
+     tensors `ffn_moe_silu`/`ffn_moe_swiglu`). Needs a new graph-level
+     `ggml_moe_cache_api` callback, the first one not anchored to
+     `mul_mat_id`.
+   Net: buildable, but a real three-part lift (tiered-K dispatch scheme
+   to keep batching legal, a second pool architecture for per-slot
+   neuron metadata, a new hook surface) - not a parameter on the
+   existing system. Not started.
+
+3. **NVMe read-pattern optimization.** Distinct from both items above -
+   not about needing fewer bytes, about reading the needed bytes with
+   less latency/overhead (io_uring async reads, larger sequential
+   batches, smarter mmap/madvise hints). No GPUDirect Storage in this
+   codebase (checked, zero `cuFile`/GDS references in moe-cache.cu).
+   Readahead was already tried once this session for a different purpose
+   and found to hurt cold-start (~+21% worse, "Readahead re-test" section
+   above) - worth keeping in mind as a prior negative result on a
+   related lever, though not the same mechanism. Not started, not yet
+   scoped in detail.
+
+4. **Weight compression on top of quantization.** Requested, not yet
+   scoped. Three genuinely distinct axes here, worth keeping separate
+   rather than treating quantization as a form of compression (an
+   earlier draft of this note blurred that, corrected 2026-08-29):
+   **precision** (quantization - changes the values themselves, lossy,
+   but everything stays present at reduced fidelity), **statistical
+   redundancy** (this item - generic zstd/lz4-style re-encoding of the
+   same bytes, can be fully lossless), and **importance-based omission**
+   (item 2 above - not storing some values at all and treating their
+   absence as zero, the sparse-matrix/CSR family; lossy like
+   quantization, but by omission rather than re-encoding, which is why
+   it belongs conceptually with compression rather than as its own
+   fourth category). All three compose - quantize, then optionally
+   losslessly compress the quantized bytes, independent of which
+   neurons get kept at all.
+   Expected value for THIS item specifically is real but modest -
+   already-quantized bytes have less redundancy left to exploit than
+   raw f32/f16 would; likely gets more traction from per-block scale/min
+   metadata patterns than from the packed values themselves. Needs a
+   prep-time compression pass over the GGUF's expert tensors plus a
+   decompression step in moe-cache's fill path (CPU-side before H2D
+   transfer is the likely right default, since NVMe bandwidth is the
+   established bottleneck here, not CPU headroom). Not started, not yet
+   scoped in detail.
+
+**Item 1 (embedding-row GPU cache) - REOPENED, 2026-08-29, scoped to the
+320B-class case specifically, not Ornith.** Originally dropped on a sizing
+argument that turned out to be measured against the wrong denominator:
+"the win is small" was argued relative to the whole ~200GB model, not
+relative to what's actually scarce - the ~4-6GB of leftover VRAM
+moe-cache's pool has to work with after model/KV/scratch overhead on a
+12GB card. Against that number, a ~1GB+ table (Ornith's `token_embd.weight`
+measured directly from the gguf: 508M params, ~1GB) is not a rounding
+error. Separately worth being precise about: this is not the same
+direction of move Qwen3.8-Flash-Next/SGLang validated (they moved a 51B
+table OFF VRAM to free capacity; `token_embd.weight` here is already
+CPU-resident by default, so the scoped mechanism is promoting hot rows
+ONTO VRAM for speed, not freeing footprint) - related but structurally
+different, and the "validated at scale" claim should be read with that
+caveat, not as a direct precedent.
+Explicitly scoped by the user to matter for the 320B-class case
+(GLM-5.3-Flash, where every GB of the ~4-6GB scarce cache budget counts)
+and NOT for Ornith-1.5-35B, where it isn't needed right now. The mechanism
+itself is still real work: picking the hot set is cheap (reuse
+`llama-frspec-vocab-trim` + `llm_frspec_load_d2t_sidecar()`, zero new
+tooling), but making hot rows actually faster still requires touching
+`ggml_compute_forward_get_rows` - generic, shared code every model and
+every `GET_ROWS` call in the graph goes through (LoRA, MoE routing, ALiBi,
+recurrent state, embeddings). Not started; reopened as a real item for the
+320B-class track, not attempted on Ornith.
+
+**Item 2 (heat-aware intra-expert neuron subsetting) - the historical/
+reactive-heat framing is suspect, not yet resolved.** Raised independently
+during the differential-quantization discussion below and never fully
+settled for this item too: a signal based on *past* usage (accumulated
+`|gate_i * up_i|` over time) can't tell you a topic shift is about to make
+a currently-cold neuron matter, and the damage from guessing wrong here
+would be worse than for VRAM residency (irreversible per-request, not
+cheaply corrected next token). Whether an atlas/req_dir-informed signal
+actually fixes this (as opposed to just moving the same problem one level
+down) was never tested or confirmed - genuinely open, not dropped, not
+proceeded with either.
+
+**Differential per-expert quantization (shrink cold experts, keep hot ones
+full quality) - explored and abandoned, 2026-08-29.** Generated a real
+imatrix (Ornith-1.5-35B, single-novel calibration corpus, ~341 chunks) and
+started an IQ2_XXS-vs-Q4_K_M full-model requantization to measure a
+worst-case quality ceiling. Stopped mid-run, by explicit instruction: "this
+we will never be sure of" - the underlying question (how to decide which
+experts get the cheap copy, permanently, given the decision can't be
+undone the way VRAM eviction can) was never resolved, and the local test
+wasn't answering it either. Separately noted: generic quantization-quality
+tradeoffs (e.g. IQ2_XXS vs Q4_K_M perplexity deltas) are usually already
+published and should be looked up before running a fresh local
+measurement - reserve local tests for genuinely session/implementation-
+specific claims, not well-established generic facts. Imatrix file left on
+disk at /mnt/nvme/models/ornith/shadow/ornith-imatrix.gguf, unused,
+harmless. Partial IQ2_XXS output deleted.
+
+**Also confirmed and dropped from scope this pass:**
+- CUDA graph capture eviction (originally item 3 of the "three VRAM
+  consumers" list) - already done upstream (`81ab64f3c`, `b94050e89`),
+  nothing to build.
+- Compute/activation scratch buffer right-sizing - re-verified a dead
+  end (`ggml_gallocr` already does genuine liveness-based reuse via a
+  real free-list allocator, not naive per-node summation,
+  `ggml/src/ggml-alloc.c:717-822`) - no sizeable waste to reclaim.
+- KV-cache LFRU tiering (the "keep hot pages resident, evict cold ones
+  to host RAM" idea, explicitly requested and then explicitly dropped
+  once scoped) - attention has no paged-access primitive to hang
+  eviction on (dense reduction over the full live KV range every
+  decode step, unlike MoE's sparse per-token expert gather), would need
+  a new CUDA attention kernel from scratch, and is low-priority for
+  this fork's actual target models anyway (MLA/KDA hybrids keep KV cache
+  in the low single-digit GiB range at typical context lengths - GLM-5.3
+  specifically: 34 of 45 layers use KDA, fixed-size recurrent state,
+  independent of context length at all).
+- Output head / LM head tiering - explicitly out of scope, dense read
+  every step by construction, no sparsity to exploit (same conclusion as
+  the original 2026-08-28 scoping note).
+- Intra-FFN activation sparsity via a predictive approach (DejaVu/
+  PowerInfer-style) - superseded by item 2 above, which uses a
+  historical/heat-tracked signal instead specifically to solve the
+  transfer-bytes problem the predictive approach can't touch.
+
+## Heat-aware intra-expert neuron subsetting - step 1 built and verified (2026-08-29)
+
+Step 1 of the phased build (gate/up neuron subsetting first, down_proj
+repack deferred): the observation hook. Per the earlier verification pass,
+no existing moe-cache hook observes the actual gate/up matmul output values
+- `.begin`/`.plan`/`.dispatch`/`.collect` all operate on ids and slot
+indices, never the computed rows. Turned out not to need a new
+graph-level hook at all: `moe_cache_collect()` already downloads and
+validates the real matmul output (`device.h_out`) for every gate_exps/
+up_exps hit, as part of what it already does - the accumulation only
+needed to read data already present there.
+
+**Built:** `device.neuron_heat: unordered_map<moe_cache_key, vector<float>>`
+(moe-cache.cu, next to `co_activation`), accumulating `sum(|value|)` per
+neuron per `(tensor, expert)` key, gated behind `GGML_CUDA_MOE_CACHE_NEURON_HEAT`
+(off by default). Purely observational - nothing reads this map yet.
+
+**Verified, not assumed:**
+- No new CUDA kernel, no new sync: confirmed by reading the insertion
+  point directly (right after `moe_cache_collect`'s existing `h_out`
+  memcpy loop, already inside the `if (ok)` branch after the mandatory
+  post-dispatch `cudaStreamSynchronize`).
+- Compiles clean (`ggml-cuda` target), no new warnings.
+- Actually running, not silently no-op'ing: temporary debug print
+  confirmed real collect() calls with `n_out=512` (matches Ornith's
+  `expert_feed_forward_length` for gate/up) and `n_out=2048` (matches
+  down_exps's hidden width) - removed after confirming, not left in.
+- True no-op on inference correctness: same prompt, temperature 0, flag
+  off vs on, output diffed byte-for-byte identical - checked twice, on
+  two different prompts (photosynthesis, Rome essay), after both the
+  debug-print version and the cleaned-up final version.
+
+**Still open, the two harder pieces:**
+1. Tiered-K dispatch scheme so `ggml_mul_mat_id`'s batching (one shape per
+   call, confirmed structural at `ggml.c:3329-3353`) stays legal when
+   different experts have different resident-neuron-subset sizes.
+2. The actual admission-time decision (which neurons to keep, atlas/
+   req_dir-informed per the corrected design, not raw historical
+   accumulation) - `neuron_heat` exists now as a real signal to build that
+   on, but nothing consumes it yet.
+
+Not shipped, not benchmarked - this is infrastructure, not a measured
+result. No performance or quality claim attached to this step.
+
+## Heat-aware intra-expert neuron subsetting - full measurement pass and a precise, ready-to-execute spec for the remaining mechanism (2026-08-29)
+
+Continuation of the section above. Everything in this section is either
+(a) measured, real data from the live `neuron_heat` infrastructure, or
+(b) a fully-scoped design for what's NOT built yet - marked clearly which
+is which. No performance claim anywhere here; this mechanism has never
+been dispatched, only measured and designed.
+
+### What the measurements actually found, in order
+
+**1. Value-threshold concentration (not rank-based - see the correction
+below on why rank-based framing was wrong).** For each expert, using ITS
+OWN max neuron value as the reference (not a shared/global constant):
+
+| neurons clearing this % of the expert's own max | mass retained | neuron count clearing it |
+|---|---|---|
+| 50% | ~27-28% | ~18-20% |
+| 25% | ~81-82% | ~71-72% |
+| 10% | ~99% | ~95-96% |
+| 5% | ~99.8% | ~97-98% |
+
+This replaced an earlier rank-based table ("top K% of neurons by count ->
+X% of mass") that was the wrong framing entirely - a count-based cutoff
+doesn't adapt to each expert's own distribution shape, and using MEAN as
+the reference for "dead" was unreliable given how skewed these
+distributions are (measured max/mean ratios 120-270x across different
+runs). Fixed to: value threshold relative to each expert's own max
+(concentration measurement) and each expert's own MEDIAN, not mean (dead-
+neuron threshold - median is far more robust to the skew).
+
+**2. Per-expert "required width for 90% coverage", if each expert could
+pick its own K freely:** min=6-7%, p25=~80%, median=~83-84%, p75=~85-86%,
+p90=~86-87%, max=~88% (n≈14,500-23,500 keys depending on the run).
+Bimodal in shape: most experts are genuinely flat (need 80%+ width),
+a real minority is sharply concentrated (down to 6-7%).
+
+**3. Per-layer breakdown - INITIALLY looked like "layer 0 is uniquely
+special" (median dead-fraction 30.9%, required-width 45.7%, vs ~0%/82-85%
+for every other layer, 0-39, confirmed with `-ncmoe 41` for full
+visibility). This framing was WRONG, caught on challenge (see below).**
+
+**4. THE CORRECTION - this is not a layer-level effect, it's a per-expert
+effect that happens to concentrate in layer 0 but is NOT exclusive to it.**
+Checked directly: among 7,598 non-layer-0 experts, 17 individual outliers
+(>10% dead-fraction) exist, scattered across layers 1, 2, 3, 4, 37, and 39
+- some with very high sample counts (layer 3 expert 163: 23.4% dead-
+fraction, mass=141,111 - not a small-sample artifact). The per-layer
+MEDIAN masked these because they're a small minority within an otherwise
+flat layer. **Correct design: no layer restriction at all - apply the
+same per-expert eligibility check (enough accumulated mass, then top-K
+selection) to every expert in every layer, and let whichever ones qualify
+convert, regardless of which layer they're in.** This is simpler code,
+not harder - removing an artificial gate, not adding one.
+
+**5. Throughput signal (per-layer miss rate) - deliberately different
+question from concentration, and the two are confirmed DECOUPLED.** Added
+`device.layer_hits`/`layer_misses` (moe-cache.cu, indexed by `node->layer`,
+already parsed from the tensor name at `moe_cache_begin()`), reported via
+`GGML_CUDA_MOE_CACHE_SUMMARY`. Result: miss rate is flat across all 40
+layers (12.1%-16.0%, no outliers) - and critically, layer 0 (the
+concentration outlier) has a completely ordinary miss rate (12.55%, mid-
+pack). This is the mechanism explanation, not just correlation: TODAY,
+every expert access computes the FULL neuron width regardless of that
+expert's own concentration, because nothing yet exploits neuron_heat to
+skip work - so of course current cost is flat, the system doesn't yet act
+on the signal that says it doesn't need to be. Confirms concentration
+(the structural property) and throughput cost (the current, unexploited
+behavior) are different questions - "which layer/expert to prefer" needs
+the concentration signal for the NEURON-subsetting mechanism specifically,
+not a proxy for present-day cost.
+
+**6. Gemma4 (this fork's MTP draft model) has genuine per-layer
+heterogeneity Ornith doesn't** - `has_expert = layer.ffn_gate_inp !=
+nullptr` is evaluated per-layer (`src/models/gemma4.cpp:128`), some layers
+dense-only, some MoE. Not tested (no immediate need once the per-expert,
+layer-agnostic design was confirmed correct), but noted as a real
+candidate if per-layer heterogeneity ever needs testing again without
+GLM-5.3.
+
+### What's built and verified (safe, live, in production on this branch)
+
+- `device.neuron_heat` (moe-cache.cu ~line 598): per-neuron accumulated
+  `|value|`, keyed by `(tensor, expert)`, accumulated in
+  `moe_cache_collect()` from data it already downloads (`h_out`) - no new
+  sync, no new kernel. Gated by `GGML_CUDA_MOE_CACHE_NEURON_HEAT`, off by
+  default.
+- `device.neuron_heat_mu`: dedicated mutex, NOT `session.mu` - the first
+  cut reused `session.mu` and measured a real regression (~50-60 tok/s ->
+  ~4 tok/s, GPU util 0%) from contending with the cache's core bookkeeping
+  lock. Fixed by giving it its own lock.
+- `moe_cache_neuron_heat_report()`: full concentration/required-width/
+  dead-fraction report with per-neuron dump capability
+  (`GGML_CUDA_MOE_CACHE_NEURON_HEAT_DUMP`), called ONLY from
+  `moe_cache_session_destroy()` - deliberately off the hot path, after a
+  second real regression was found and fixed (the report's per-key sort,
+  first written to run inline from the periodic stats logger, cost
+  tok/s down to ~2 when `GGML_CUDA_MOE_CACHE_STATS` was set - moving it
+  out of the lock wasn't enough, because the problem was the analysis
+  running synchronously on the compute thread at all, not lock
+  contention).
+- `moe_cache_select_reduced_indices()`: pure function, given one expert's
+  heat vector and K, returns the top-K neuron indices by value (ties
+  broken arbitrarily), sorted ascending, gated on a minimum accumulated
+  mass (`GGML_CUDA_MOE_CACHE_NEURON_REDUCE_MIN_MASS`, default 50) so a
+  just-admitted expert with 1-2 samples can't get reduced on
+  near-nothing.
+- `device.reduced_indices`: storage for the per-expert index set once
+  selected, protected by `session.mu` (consistent with pool/slot state),
+  lock order `session.mu` -> `neuron_heat_mu` when both are needed (same
+  order `moe_cache_neuron_heat_report` already uses from
+  `moe_cache_session_destroy`).
+- Live UI integration: `moe_cache_get_neuron_concentration_map()` (a
+  cheap O(n) dead-fraction proxy, no sort, safe to poll every ~1.5s),
+  wired through `common_moe_cache_get_neuron_concentration_map()` ->
+  `/experts`'s `neuron_concentration` field -> Brain.svelte, mapped to
+  ATLAS DOT SIZE (not color - color already carries tier + substitute
+  state). Verified: `npm run check` 0 errors, correctness re-confirmed
+  bit-identical output with the flag on/off after every change.
+- Layer-level throughput signal: `device.layer_hits`/`layer_misses`,
+  reported via `GGML_CUDA_MOE_CACHE_SUMMARY` - real, live, no gating
+  issues found.
+
+None of the above changes any existing behavior. Everything is
+observation-only or read-only until the mechanism below is built.
+
+### What's NOT built - the precise, ready-to-execute spec for the reduced-width mechanism itself
+
+**Scope, corrected per the finding above: per-expert, every layer, NOT
+layer-restricted.** Gate/up only (down_proj deferred - its neuron axis is
+the Q4_K quantization-block axis, not row-addressable without a one-time
+repack to a neuron-major layout).
+
+**Why this can't be built incrementally the way everything above was:**
+the moment `moe_cache_plan()` starts producing `slot_indices` values that
+mean "this hit is in the reduced pool", `.dispatch()`/`.collect()` MUST
+already know how to decode them, or those values get used as raw
+primary-pool slot numbers - out-of-bounds slot access / garbage weight
+data / silent corruption or a crash. There is no safe partial state
+between "plan encodes, dispatch doesn't decode yet" - unlike
+`neuron_heat`, which was safe to build in small additive pieces because
+nothing downstream read it. This has to land as ONE atomic change,
+behind a flag that defaults off, encoding + decoding + scatter all
+together, correctness-verified (coherent generation on real prompts, not
+just "compiles") before it's trusted at all.
+
+**The design, precisely:**
+
+1. **Reduced pool creation.** No new pool TYPE needed - `moe_cache_find_pool`
+   already keys pools by `(expert_size, wtype)`; a pool with a smaller
+   `expert_size` (K rows instead of the full `moe_intermediate_size`) is
+   automatically a separate pool via the existing mechanism. K is a fixed
+   neuron COUNT (not a percentage - percentages don't mean the same thing
+   across experts with different required-widths, and K must be uniform
+   across every expert sharing that reduced pool for `ggml_mul_mat_id`'s
+   batching to stay legal - confirmed structural requirement,
+   `ggml/src/ggml.c:3329-3353`). `GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K`
+   already exists as a knob (default 256), reused here.
+
+2. **Conversion trigger.** An expert is ALWAYS admitted normally (full
+   width) first - this is also what lets `neuron_heat` accumulate real
+   data for it (heat is only recorded on GPU-side hits, via
+   `moe_cache_collect()`). Once `moe_cache_select_reduced_indices()`
+   returns a non-empty set for a resident, full-width expert (enough
+   accumulated mass), it becomes eligible for conversion: gather its
+   top-K rows from the SAME host source the normal fill already reads
+   from (`host_base + expert * full_expert_size`) into a staging buffer,
+   copy to a newly-allocated reduced-pool slot (reusing the existing H2D
+   copy pattern, just a different, gathered source), record the mapping
+   in `device.reduced_indices[key]`, then free the original full-width
+   slot back to its pool's free list. NOT YET DECIDED: where exactly this
+   trigger should live - candidates are a new job type in
+   `moe_cache_worker`'s existing queue (touches the most fragile,
+   corruption-history-bearing part of this codebase, needs careful study
+   of its existing job/lock/stream invariants first) versus some other
+   safely-isolated trigger point. This is real, undecided design work,
+   not just an implementation detail.
+
+3. **Lookup encoding, in `moe_cache_plan()` (~moe-cache.cu:7916,
+   `pool.map.find(key)`).** On a miss against the primary pool, also
+   check `device.reduced_indices` (and the reduced pool's own map) for
+   this key. If found there, encode `slot_indices[index]` as a value that
+   cannot collide with a real primary-pool slot number (e.g. a fixed
+   large offset + the reduced-pool slot number - primary slot numbers are
+   bounded by `pool.n_slots`, so any offset larger than the largest
+   possible pool size is unambiguous). `ggml-cpu.c` never needs to know
+   this encoding exists - it already treats `slot_indices` as opaque data
+   moe-cache produces and consumes.
+
+4. **Batch splitting and scatter, inside `.dispatch()`/`.collect()` ONLY
+   - `ggml-cpu.c` stays completely unmodified.** `.dispatch()` splits the
+   `n_hits` batch by the encoding (primary vs. reduced), runs the matmul
+   against each pool's own slab data (two kernel-launch sequences instead
+   of one, for a batch containing both), and for the reduced-pool subset,
+   writes each row's K computed values into the correct positions of a
+   ZERO-INITIALIZED n_out-wide row (using that specific expert's stored
+   index mapping from `device.reduced_indices`) rather than a contiguous
+   K-wide write. Once this scatter is done, `d_out` holds correctly-shaped,
+   correctly-valued n_out-wide rows for both primary and reduced hits
+   alike - `.collect()` needs NO changes at all, it already just copies
+   `h_out` back to the caller assuming full n_out width, which is now
+   true either way.
+
+5. **`down_proj` is untouched, deliberately, in this phase.** The
+   zero-filled positions in the scattered row are exactly what makes this
+   correct without touching `down_proj`'s own matmul at all - down_proj
+   sums over a mostly-real, partly-zero input vector, which is
+   mathematically exactly "the neurons we didn't compute contributed
+   nothing", the intended approximation.
+
+**Honest open questions, not yet resolved:**
+- Exact trigger mechanism for conversion (point 2 above) - the biggest
+  undecided piece.
+- Whether eviction/re-expansion needs to be symmetric (can a reduced
+  expert ever convert BACK to full width if its concentration profile
+  turns out to have been wrong, e.g. from too little data at conversion
+  time)? Not designed.
+- Quality cost has never been measured for this mechanism at all - no
+  perplexity check, no output-coherence check beyond "the observation
+  infrastructure doesn't corrupt anything", because the mechanism that
+  would actually change output has never been dispatched.
+- No tok/s claim anywhere in this section, deliberately - see the D2D
+  prefill double-buffer precedent (this doc, "moe-cache prefill double-
+  buffer") where a data-movement reduction measured 5% SLOWER due to
+  added bookkeeping overhead. This mechanism's overhead (batch-splitting,
+  scatter) is real and unmeasured; "fewer bytes moved" is not the same
+  claim as "faster", and the second one needs its own measurement once
+  built.
+
+## Heat-aware neuron subsetting SHIPPED, and the CPU bottleneck root-caused (2026-08-29, later session)
+
+Continuation of the two sections above. The mechanism specified there is now
+built, measured, and working; separately, chasing its disappointing initial
+throughput led to a much larger, unrelated finding about placement.
+
+### The mechanism: built and working
+
+All the pieces the previous section listed as "NOT built" now exist in
+`ggml/src/ggml-cuda/moe-cache.cu`: `moe_cache_try_reduce_convert` (the
+conversion trigger, called from `moe_cache_collect`), a `reduce_convert`
+job kind gathering top-K rows in `moe_cache_worker`, the
+`MOE_CACHE_REDUCED_SLOT_OFFSET` encoding in `moe_cache_plan`, batch
+splitting in `moe_cache_dispatch`, and `moe_cache_reduce_scatter_kernel`
+writing K dense results into their sparse positions in an otherwise-zeroed
+n_out row. `ggml-cpu.c` is unchanged, as designed. Pins now carry their own
+pool pointer (`moe_cache_pin::pool`) since a pin can point into either the
+primary or the reduced pool.
+
+Verified: multi-topic, multi-turn conversation (topic switches, context
+recall, arithmetic) with correct output, no guard breaches, no corruption
+markers. Measured 50% VRAM saving on every converted expert (K=256 against
+Ornith's 576 KiB gate/up experts).
+
+### Three bugs, all found by measuring rather than by reading the code
+
+Worth recording as a pattern: every one of these looked fine on inspection.
+
+1. **`session.mu` on the hot path: -16% tok/s** (35.56 -> 29.89).
+   `moe_cache_try_reduce_convert` took the cache's core lock on every
+   gate/up hit, even though the answer was almost always "already decided".
+   This is the same regression shape `neuron_heat_mu` was created to avoid,
+   reintroduced. Fixed with `device.reduce_decided`, a keyset guarded by
+   the already-held `neuron_heat_mu`, so the common case never touches
+   `session.mu`.
+
+2. **20,201 conversions decided, 0 placed.** Pure overhead, zero benefit,
+   completely silent. Primary admission (`moe_cache_build_pending`) divides
+   ALL remaining budget among pending shapes, so the reduced pool's own
+   `moe_cache_allocate_pool` call never saw headroom. Fixed by reserving
+   off the top - and then that fix had its own two-stage failure, below.
+
+3. **Reduction was being applied to `down_exps`.** The design says gate/up
+   only (down_exps's row axis is hidden_size, an OUTPUT dimension - zeroing
+   "unselected" rows there deletes real output dimensions rather than
+   approximating activation sparsity). The restriction was never actually
+   coded. Fixed with `moe_cache_node::reduce_eligible`, an allowlist on the
+   tensor name computed once in `moe_cache_begin`.
+
+The reservation fix in (2) then failed twice more, each time caught only by
+looking at the pool table in `GGML_CUDA_MOE_CACHE_SUMMARY`:
+
+- Flat 256 MiB out of a 512 MiB budget starved Ornith's 840 KiB down_exps
+  pool out of existence entirely. Hit rate 31.3% -> 23.1%, costing far more
+  than the 72 MiB saved.
+- Subtracting a per-shape floor did NOT fix it: `moe_cache_build_pending`
+  runs repeatedly as shapes are discovered, so on the call where only one
+  shape remains pending, the floor covers only that shape. down_exps stayed
+  absent, hit rate fell further (19.5%), ~236 MiB of budget went unused.
+- Fixed by ALSO capping the reservation at budget/8, which is invariant to
+  call count and discovery order. Result: all three pools present (576 KiB
+  / 840 KiB / 288 KiB reduced), 511 of 512 MiB used.
+
+With that fixed, at matched `-ncmoe` and matched warm-up: 44.07 -> 47.62
+tok/s, **+8.1%**.
+
+### The much bigger finding: the fit margin was the CPU bottleneck
+
+Chasing why the mechanism only bought 8%, the utilization data said
+something was wrong with the whole picture: **CPU ~5.4 of 12 cores busy,
+GPU only 41% utilized, and ~3 GB of a 12 GB card unused.** Neither resource
+saturated means the bottleneck is serialization, not capacity.
+
+Root cause, in `common_maybe_raise_moe_for_ctx` (`common/common.cpp`):
+
+```
+const int64_t margin = 3 * (int64_t) params.fit_params_target[0];
+```
+
+`fit_params_target` defaults to 1024 MiB, so placement reserves **3 GiB**
+before deciding anything - and that reservation silently RAISES a requested
+`-ncmoe` until the context "fits". This invalidated an entire `-ncmoe` sweep
+before it was noticed: requesting 22, 16 and 10 all produced identical
+8947 MiB and near-identical throughput, because all three were being raised
+to 27. The log line saying so was there the whole time
+(`... raised to 27 layer(s) so the requested context fits`).
+
+Measured on Ornith-1.5-35B-Q4_K_M / RTX 3060 12 GB / -c 4096, requesting
+`-ncmoe 8`:
+
+| -fitt | effective ncmoe | tok/s | CPU% | GPU mem |
+|---|---|---|---|---|
+| 1024 (default) | 27 | 47.32 | 472 | 8951 MiB |
+| 640 | 24 | 50.37 | 438 | 10307 MiB |
+| 448 | 23 | 51.61 | 445 | 10741 MiB |
+| 320 | 22 | 52.85 | 406 | 11237 MiB |
+
+**+11.7% from the margin alone**, ~+30% against the session's starting
+`-ncmoe 30` configuration. Every candidate passed its correctness check.
+The margin is not removable (it covers post-probe allocation - real weight
+loading, lazy CUDA graph capture - and removing it reproduced a documented
+4k context collapse), but 3 GiB is not the right value for every machine.
+
+### Calibration upgraded - and it is genuinely model-specific
+
+`common_moe_calibration_entry` now carries `fit_target_mb`,
+`neuron_reduce_k` and `neuron_reduce_budget_mb`; the margin is applied in
+`common_maybe_raise_moe_for_ctx` BEFORE placement is computed (applying it
+after would record a margin that never influenced anything). Old entries
+still load - missing fields default to -1. Verified end to end: a launch
+with no tuning flags logs both "using calibrated fit margin of 320 MiB" and
+"using calibrated placement of 22 CPU layer(s)", and delivers 52.60 tok/s.
+
+**The tightened margin is NOT universally good, which is the whole argument
+for calibrating it.** Real `--moe-calibrate` run on gemma-4-26B-A4B,
+concurrency 4: the cache knee found 71.86 tok/s at 4096 MiB with the
+DEFAULT margin, while every tightened margin scored ~50 (640: 50.79, 448:
+51.21, 320: 49.86, 256: 49.56). Opposite of Ornith. A constant would have
+been wrong for one model or the other no matter which constant was chosen.
+
+That run also exposed a bug in the new search itself: it seeded its
+comparison baseline from `best_threads_tps` (measured at a different cache
+size) rather than the cache-knee winner, so it declared fitt=448 the winner
+against 43.57 and never compared against the 71.86 the default margin
+actually achieved. It would have shipped a ~29% regression as a "calibrated
+optimum". Fixed by seeding from `best_cache_tps`, so -1 ("keep the
+default") correctly survives when tightening does not help.
+
+Also measured, incidentally: `n_threads=12` lost to `n_threads=6` on this
+12-core machine at both concurrency 4 (43.57 vs ~48) and concurrency 8
+(75.22 vs 98.59), independently confirming the `n_threads: 6` that older
+cached entries already carried.
+
+### Still fixed constants that should be calibration-derived
+
+Named here because they are the same class of problem the margin turned out
+to be, and at least one of them is now known to cost real throughput:
+
+- `MOE_CACHE_MIN_POOL_SLOTS` (64) - was a bare literal in three places,
+  now one named constant, still a guess.
+- The reduce reservation fraction (budget/8) and
+  `GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K` (256).
+- `cache_candidates_mb[]` in the cache-knee search - a hardcoded ladder.
+
+### Not wired, and the most interesting remaining idea
+
+A converted expert costs K rows instead of full width, so the same hit rate
+now needs LESS cache VRAM than it used to. That surplus should feed back
+into placement (fewer CPU layers, less CPU work). Nothing does this: the
+fit logic still sizes everything as though every expert costs full width.
+Reduction currently makes the cache cheaper without ever telling the
+placement decision that it did.

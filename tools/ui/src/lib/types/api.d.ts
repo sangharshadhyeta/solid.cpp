@@ -280,6 +280,14 @@ export interface ApiExpertMapResponse {
 	 * Empty string when the provider has nothing to report (older builds,
 	 * or a mid-poll shape mismatch) - treat as "no substitutions this poll". */
 	substitutions: string;
+	/** Live per-cell dead-neuron-fraction proxy (0.0-1.0, -1.0 = no data
+	 * yet), same rows x cols shape as `map`, row-major flat array. Only
+	 * present when the server has GGML_CUDA_MOE_CACHE_NEURON_HEAT enabled
+	 * - absent (not an empty array) otherwise, so "not measured" and "flat
+	 * zero" stay distinguishable. Unlike `substitutions`, this is a live
+	 * snapshot (not read-and-cleared), so re-polling without new traffic
+	 * returns the same values. */
+	neuron_concentration?: number[];
 	seq: number;
 	stats: ApiExpertMapStats;
 	atlas?: ApiExpertAtlas;

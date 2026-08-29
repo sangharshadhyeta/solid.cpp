@@ -23,6 +23,7 @@ void ggml_moe_cache_register(const void * owner) {
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <cerrno>
 #include <chrono>
 #if defined(__linux__)
@@ -226,6 +227,14 @@ struct moe_cache_seen_tensor {
     int wtype = -1;
 };
 
+enum class moe_cache_job_kind : uint8_t {
+    fill,           // ordinary admission: contiguous copy of job.bytes from job.source
+    reduce_convert, // heat-aware neuron subsetting: gather job.key's top-K rows (see
+                     // device.reduced_indices) from the SOURCE tensor into job's
+                     // destination slot instead of a single contiguous copy - see
+                     // the gather branch in moe_cache_worker.
+};
+
 struct moe_cache_job {
     int pool = -1;
     int slot = -1;
@@ -238,6 +247,7 @@ struct moe_cache_job {
     // so registration is done per tensor rather than per expert.
     const void * region_base = nullptr;
     size_t region_bytes = 0;
+    moe_cache_job_kind kind = moe_cache_job_kind::fill;
 };
 
 struct moe_cache_demand {
@@ -583,6 +593,78 @@ struct moe_cache_device {
     // switched from an opaque hash - that was a real bug, not a style
     // choice), undirected.
     std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation;
+    // Per-neuron accumulated |value| for gate_exps/up_exps matmul outputs,
+    // keyed by the SAME moe_cache_key as everything else here (tensor +
+    // expert) - the intra-expert analogue of co_activation above, one level
+    // deeper. Purely observational for now, gated off by default
+    // (GGML_CUDA_MOE_CACHE_NEURON_HEAT): accumulated in moe_cache_collect()
+    // from device.h_out, which that function already downloads and
+    // validates for every gate_exps/up_exps hit - no new CUDA kernel, no
+    // new sync, nothing read here changes any existing behavior. Vector
+    // length is n_out (moe_intermediate_size) for whichever tensor this
+    // key belongs to; lazily sized to that on first sight of a key, since
+    // gate/up and down share the key type but not the width.
+    std::unordered_map<moe_cache_key, std::vector<float>, moe_cache_key_hash> neuron_heat;
+    // Dedicated lock for neuron_heat, deliberately NOT session.mu: that
+    // mutex is the cache's core bookkeeping lock (fill worker, eviction,
+    // plan()/dispatch() accounting all contend for it constantly). The
+    // first cut of the neuron_heat accumulator reused session.mu and
+    // measured a real regression (~50-60 tok/s -> ~4 tok/s, GPU util
+    // dropped to 0% while CPU held steady) - not from the accumulation
+    // work itself being slow, but from adding a new, frequent (up to a
+    // few hundred times per token) contender for an already-hot shared
+    // lock. A separate mutex, touched by nothing else, removes that
+    // contention entirely without changing what's actually synchronized.
+    std::mutex neuron_heat_mu;
+    // Fast-path mirror of reduced_indices' keyset, guarded by neuron_heat_mu
+    // (NOT session.mu) - deliberately separate from reduced_indices itself.
+    // The first version of heat-aware neuron subsetting called
+    // moe_cache_try_reduce_convert (which takes session.mu unconditionally)
+    // from moe_cache_collect for EVERY gate/up hit, on the theory that an
+    // early return for an already-decided key would be cheap - measured
+    // this directly and it was not: ~35.6 -> ~29.9 tok/s (-16%), the same
+    // shape of regression neuron_heat_mu itself already exists to prevent,
+    // reintroduced by an extra session.mu acquisition on the hot collect()
+    // path for a case (already decided) that is by far the common one after
+    // the first handful of tokens. This set is checked FIRST, under the
+    // already-held neuron_heat_mu (collect() holds it for the heat
+    // accumulation loop right above), so the common "nothing to do" case
+    // never touches session.mu at all - only a genuinely new decision
+    // (rare: bounded by the number of distinct experts that ever qualify,
+    // not by token count) pays for it. Inserted into (alongside
+    // reduced_indices) at the end of every moe_cache_try_reduce_convert
+    // call that reaches a decision, whether or not that decision converts
+    // anything.
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> reduce_decided;
+    // Per-expert reduced-width neuron index set, once converted (see
+    // moe_cache_select_reduced_indices / moe_cache_try_reduce_convert).
+    // Protected by session.mu, NOT neuron_heat_mu - it's read/written from
+    // the fill/admission path, which already holds session.mu throughout,
+    // the same as pool/slot state. When code needs both (deciding whether
+    // to convert requires reading neuron_heat), the lock order is always
+    // session.mu first, then neuron_heat_mu - the same order
+    // moe_cache_neuron_heat_report already uses from
+    // moe_cache_session_destroy, so this doesn't introduce a new ordering
+    // to get wrong.
+    //
+    // Presence of a key here is itself the "decided" marker for the
+    // convert-once policy in moe_cache_try_reduce_convert: once a key is
+    // inserted (even if the conversion below it never actually completes -
+    // no free slot, no budget headroom), it is never re-evaluated for the
+    // rest of the session. idx is the chosen row set (ascending); the other
+    // two fields exist because a reduced-pool slot cannot recover them from
+    // its own pool the way a primary slot can (pool.expert_size there is
+    // the REDUCED size, not the tensor's real per-expert byte size) - both
+    // moe_cache_invalidate_session (to compute the correct source address
+    // range) and the fill worker's reduce_convert gather (to know the
+    // source stride and per-row size) need the ORIGINAL, full-width values.
+    struct reduced_entry {
+        std::vector<int32_t> idx;
+        size_t src_expert_size = 0; // full (unreduced) per-expert byte size in the source tensor
+        size_t row_bytes = 0;       // bytes per selected row = src_expert_size / n_out
+        int pool_index = -1;        // index into device.pools of the reduced-width pool
+    };
+    std::unordered_map<moe_cache_key, reduced_entry, moe_cache_key_hash> reduced_indices;
     // Bounded adjacency list, for coverage-aware eviction. co_activation is
     // keyed by EDGE, which answers "do these two co-fire" in O(1) but cannot
     // enumerate a given expert's partners without scanning every edge. Eviction
@@ -755,6 +837,34 @@ struct moe_cache_device {
     float * h_out = nullptr;
     size_t h_out_cap = 0;
 
+    // Heat-aware neuron subsetting: dispatch scratch for the REDUCED-pool
+    // subset of a batch, entirely separate from h_ids/d_ids/d_act_q8/d_out
+    // above. Same growth discipline (moe_cache_grow_host/moe_cache_grow_device,
+    // doubling, canary-poisoned on growth), just a second, smaller set of
+    // buffers because a reduced-pool sub-batch has its own row count
+    // (n_hits_reduced <= n_hits) and its own row width (K, not n_out) - see
+    // the split in moe_cache_dispatch. Allocated lazily on first use; a
+    // session that never produces a reduced-pool hit never touches these.
+    int32_t * h_ids_reduced = nullptr;
+    int32_t * d_ids_reduced = nullptr;
+    size_t h_ids_reduced_cap = 0;
+    size_t d_ids_reduced_cap = 0;
+    void * d_act_q8_reduced = nullptr;
+    size_t act_q8_reduced_cap = 0;
+    float * d_out_reduced = nullptr;
+    size_t d_out_reduced_cap = 0;
+    // Per reduced-hit row: which absolute row of the batch it is (so the
+    // scatter kernel writes into the right place in d_out) and its K chosen
+    // neuron indices (so it writes each computed value to the right column).
+    int32_t * h_reduce_row_map = nullptr;
+    int32_t * d_reduce_row_map = nullptr;
+    size_t h_reduce_row_map_cap = 0;
+    size_t d_reduce_row_map_cap = 0;
+    int32_t * h_reduce_sel_idx = nullptr;
+    int32_t * d_reduce_sel_idx = nullptr;
+    size_t h_reduce_sel_idx_cap = 0;
+    size_t d_reduce_sel_idx_cap = 0;
+
     // Full-layer prefill double buffer (see moe_cache_prefill_prefetch/_wait).
     // Keyed by tensor_bytes (a shape proxy: distinct MoE tensors reuse the same
     // slab as long as they're the same total size, same as the decode pool's
@@ -789,6 +899,23 @@ struct moe_cache_device {
     // Observational only - nothing reads these to make a decision.
     long long rank_hits[GGML_MOE_CACHE_MAX_RANK] = {};
     long long rank_misses[GGML_MOE_CACHE_MAX_RANK] = {};
+    // Hit/miss split by LAYER - the actual throughput-relevant signal for
+    // "which layer to prefer", as opposed to neuron_heat's concentration
+    // stats (a structural property of a layer's activations, not a cost
+    // measure). A layer with a flat, unconcentrated neuron distribution
+    // can still be cheap if it rarely misses; a layer with a sharp
+    // distribution can still be expensive if it misses constantly. This
+    // answers "how much wall-clock cost does this layer actually
+    // generate", which is the right question for prioritization - miss
+    // COUNT is a proxy for cost here (same expert_size per pool on this
+    // model, so cost-per-miss is roughly uniform across layers sharing a
+    // pool), not a proxy for "how the layer looks". Fixed-size array
+    // indexed by node->layer (parsed from the tensor name at moe_cache_
+    // begin(), already bounds-checked there) - 256 is far more layers
+    // than any real model has, no map/lock overhead needed on this path.
+    static constexpr int MAX_LAYER_STAT = 256;
+    long long layer_hits[MAX_LAYER_STAT] = {};
+    long long layer_misses[MAX_LAYER_STAT] = {};
     // Substitution: a miss served by running a RESIDENT expert in place of the
     // one the router asked for, rather than falling back to CPU compute.
     long long substitutions = 0;      // misses served by a stand-in
@@ -880,6 +1007,15 @@ struct moe_cache_pin {
     // this slot while it was supposedly protected by the pin (readers>0),
     // i.e. the row was computed against weights that changed underneath it.
     uint64_t generation = 0;
+    // Which pool this slot belongs to. Every existing pin (ordinary hit,
+    // substitution) pins a slot in node->pool, so this used to be implicit;
+    // heat-aware neuron subsetting introduced a SECOND pool per node (the
+    // reduced-width pool, see device.reduced_indices) that a pin can now
+    // also point into. Always set explicitly at every pin-creation site -
+    // never left to default to node->pool implicitly - so every consumer
+    // (moe_cache_collect's guard/gen checks, moe_cache_end's unpin loop)
+    // can treat pins uniformly regardless of which pool they came from.
+    moe_cache_pool * pool = nullptr;
 };
 
 struct moe_cache_node {
@@ -904,6 +1040,9 @@ struct moe_cache_node {
     // transition and records a self-edge. See the tracking block in
     // moe_cache_plan.
     int layer = -1;
+    // Heat-aware neuron subsetting eligibility (gate_exps/up_exps only -
+    // see the comment where this is computed in moe_cache_begin).
+    bool reduce_eligible = false;
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[GGML_MOE_CACHE_MAX_BATCH_ROWS];
     int n_pins = 0;
@@ -3860,7 +3999,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // once removes the copy: 506 us -> 303 us per expert.
             // Record this expert's source hash the first time we admit it; the
             // idle-tick sweep re-verifies all of them.
-            if (moe_cache_weight_guard_on() && job.source && job.bytes) {
+            // Skipped for reduce_convert: this hash-based weight-mutation
+            // guard is keyed by (job.source, job.bytes) meaning "the
+            // CONTIGUOUS byte range starting at job.source" - true for an
+            // ordinary fill (job.source already points at this expert's own
+            // bytes) but not for a reduce_convert job, whose job.source is
+            // the whole tensor's base and whose real data is a scattered,
+            // non-contiguous gather from it (see the gather branch below).
+            // The original full-width fill for this same expert already
+            // registered the correct guard entry for its actual bytes;nothing
+            // is lost by not registering a second, meaningless one here.
+            if (job.kind == moe_cache_job_kind::fill &&
+                moe_cache_weight_guard_on() && job.source && job.bytes) {
                 const uint64_t id = ((uint64_t) (uintptr_t) job.source) ^ (job.bytes * 2654435761ull);
                 std::lock_guard<std::mutex> glock(moe_guard_mu);
                 if (moe_guard_seen.find(id) == moe_guard_seen.end()) {
@@ -3959,7 +4109,52 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 const char * e = getenv("GGML_CUDA_MOE_CACHE_EXPLICIT_READ");
                 return e && atoi(e) != 0;
             }();
-            if (error == cudaSuccess && skip_copy) {
+            if (job.kind == moe_cache_job_kind::reduce_convert) {
+                // Heat-aware neuron subsetting: gather this expert's chosen
+                // K rows (device.reduced_indices[job.key]) from the SOURCE
+                // tensor (job.source == the tensor's own host base - the
+                // gather needs the per-expert AND per-row offset, which a
+                // single contiguous job.source/job.bytes pair cannot carry)
+                // into the pinned `stage` buffer, then one contiguous H2D
+                // copy of the gathered result - same staging discipline as
+                // an ordinary fill, just with a scattered source instead of
+                // a contiguous one. Looked up here rather than carried on
+                // the job itself to avoid growing moe_cache_job for a path
+                // every OTHER job on the queue never touches.
+                std::vector<int32_t> idx;
+                size_t row_bytes = 0, src_expert_size = 0;
+                {
+                    std::lock_guard<std::mutex> lock(session->mu);
+                    const auto it = device->reduced_indices.find(job.key);
+                    if (it != device->reduced_indices.end()) {
+                        idx = it->second.idx;
+                        row_bytes = it->second.row_bytes;
+                        src_expert_size = it->second.src_expert_size;
+                    }
+                }
+                if (error == cudaSuccess && skip_copy) {
+                    // bookkeeping only, same contract as an ordinary fill's
+                    // SKIP_COPY branch - fall through with error==cudaSuccess
+                } else if (idx.empty() || row_bytes == 0 || src_expert_size == 0 ||
+                           idx.size() * row_bytes != job.bytes ||
+                           !job.source || job.key.expert < 0) {
+                    error = cudaErrorInvalidValue;
+                } else if (stage && stage_capacity >= job.bytes) {
+                    const char * expert_base = (const char *) job.source +
+                        (size_t) job.key.expert * src_expert_size;
+                    for (size_t i = 0; i < idx.size(); i++) {
+                        memcpy(stage + i * row_bytes,
+                               expert_base + (size_t) idx[i] * row_bytes, row_bytes);
+                    }
+                    error = cudaMemcpyAsync(
+                            destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                    if (error == cudaSuccess) {
+                        error = cudaStreamSynchronize(stream);
+                    }
+                } else {
+                    error = cudaErrorMemoryAllocation;
+                }
+            } else if (error == cudaSuccess && skip_copy) {
                 // bookkeeping only - fall through with error==cudaSuccess
             } else if (error == cudaSuccess && direct) {
                 error = cudaMemcpyAsync(
@@ -4025,7 +4220,18 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         // only drops cached pages - the virtual mapping stays
                         // valid and re-faults from disk if ever needed again,
                         // never corrupts or invalidates anything.
-                        if (job.source && job.bytes && moe_cache_release_fill_source_enabled()) {
+                        // Not applicable to reduce_convert: job.source there
+                        // is the whole tensor's base, and job.bytes is the
+                        // GATHERED size, not a real, madvise-able byte range
+                        // starting at job.source (see the gather branch
+                        // above) - releasing [source, source+bytes) would
+                        // target the wrong pages (typically expert 0's), a
+                        // wasted call rather than anything unsafe, but
+                        // pointless either way since the full-width fill for
+                        // this same expert already released its own, correct
+                        // range when IT completed.
+                        if (job.kind == moe_cache_job_kind::fill &&
+                            job.source && job.bytes && moe_cache_release_fill_source_enabled()) {
                             moe_cache_release_source_pages(job.source, 0, job.bytes);
                         }
                         if (pool && pool->canary) {
@@ -4140,6 +4346,133 @@ static int moe_cache_find_pool(
         }
     }
     return -1;
+}
+
+// ---------------------------------------------------------------------
+// Heat-aware intra-expert neuron subsetting - reduced-width admission.
+//
+// Scoped per what was actually measured (docs/plan.md, "Heat-aware
+// intra-expert neuron subsetting"): gate_exps/up_exps only (down_proj
+// deferred - its neuron axis is the Q4_K quantization-block axis, not
+// row-addressable without a repack). Per-EXPERT top-K selection, not a
+// shared/global index set - measured directly that a shared set only
+// retains ~56% of aggregate mass at 50% width, because different experts
+// care about different specific neurons; a per-expert set retains ~90% at
+// a similar width for a typical expert.
+//
+// Deliberately NOT layer-scoped, unlike an earlier version of this
+// comment. The first pass looked at per-LAYER medians and found layer 0
+// alone standing out (30.9% median dead-neuron fraction vs ~0% for every
+// other layer) - but re-checking at the individual-expert level found 17
+// real outlier experts scattered across layers 1, 2, 3, 4, 37 and 39 too,
+// some on large sample counts (not noise). The layer-0 median was masking
+// a genuine per-expert effect that exists everywhere, just unevenly
+// distributed - restricting to one layer would have thrown those 17 away
+// for no principled reason. So every expert in every layer gets the same
+// eligibility check; whichever ones actually qualify convert.
+//
+// Lifecycle: an expert is admitted normally (full width) first, same as
+// every other expert - this is also what lets neuron_heat accumulate real
+// data for it in the first place (heat is only recorded on GPU-side hits,
+// via moe_cache_collect()). Only once it has enough accumulated heat to
+// trust a top-K ranking does it become eligible for CONVERSION to a
+// reduced-width slot (moe_cache_try_reduce_convert). This is not a special
+// admission path, it's a promotion that happens after normal admission has
+// already done its job.
+//
+// The reduced-width pool self-stabilizes the same way the primary pool
+// does: once it fills up, a new conversion evicts the coldest unpinned
+// slot already in it (same moe_cache_pick_coldest_unpinned policy, same
+// segments) rather than going permanently inert - so under real memory
+// pressure this pool's own contents track whichever converted experts are
+// CURRENTLY hottest, not just whichever converted first. An evicted
+// reduced expert's decision is un-decided again (its device.reduced_indices
+// entry is dropped, not just its slot), so it is eligible to re-convert
+// later if it earns enough heat again - it is only the SELECTION ranking
+// for a still-resident key that is convert-once (never re-ranked while
+// its slot survives): re-ranking a resident key from the same
+// ever-growing heat vector would not change the answer anyway, since heat
+// only accumulates and never resets per key.
+static bool moe_cache_neuron_reduce_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Fixed VRAM reservation for the reduced-width pool(s), capped further by
+// whatever headroom is actually left under the cache's own overall budget
+// at the moment the first conversion happens (moe_cache_try_reduce_convert)
+// - this is never allowed to push total usage past the existing
+// --moe-cache budget, only to claim a slice of what that budget already
+// allows and hasn't yet been spent.
+static size_t moe_cache_neuron_reduce_budget_bytes() {
+    static const size_t bytes = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB");
+        long long mb = env ? atoll(env) : 256;
+        if (mb < 0) {
+            mb = 0;
+        }
+        return (size_t) mb << 20;
+    }();
+    return bytes;
+}
+
+// K, the reduced width, in neurons (not a percentage - the measured
+// per-expert required-width varies too much for one shared percentage to
+// mean the same thing across experts; a fixed neuron count is what
+// actually needs to be uniform for mul_mat_id's batching, see the struct
+// comment on device.reduced_indices below).
+static int moe_cache_neuron_reduce_k() {
+    static const int k = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K");
+        return env ? atoi(env) : 256;
+    }();
+    return k;
+}
+
+// Minimum accumulated mass (sum of |value| across a key's whole heat
+// vector) before its ranking is trusted enough to convert. Without this,
+// an expert admitted moments ago with only 1-2 real samples could get
+// "reduced" based on almost no evidence - the same class of mistake
+// flagged earlier for reactive/session-limited signals generally.
+static double moe_cache_neuron_reduce_min_mass() {
+    static const double min_mass = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_MIN_MASS");
+        return env ? atof(env) : 50.0;
+    }();
+    return min_mass;
+}
+
+// Given one expert's full neuron_heat vector, return the top-K neuron
+// indices by accumulated |value|, sorted ASCENDING by index (not by
+// rank) - ascending order makes the gather-at-fill and scatter-at-collect
+// loops simple linear scans instead of needing a reverse lookup, and the
+// actual VALUE ordering doesn't matter once the set is chosen, only
+// membership does. Returns an empty vector if there isn't enough
+// accumulated mass yet to trust the ranking (see min_mass above), or if
+// the heat vector is too small to be a real gate/up-width vector.
+static std::vector<int32_t> moe_cache_select_reduced_indices(const std::vector<float> & heat, int k) {
+    if ((int) heat.size() < 8 || k <= 0 || k >= (int) heat.size()) {
+        return {};
+    }
+    double mass = 0.0;
+    for (float v : heat) {
+        mass += v;
+    }
+    if (mass < moe_cache_neuron_reduce_min_mass()) {
+        return {};
+    }
+    std::vector<int32_t> idx(heat.size());
+    for (size_t i = 0; i < idx.size(); i++) {
+        idx[i] = (int32_t) i;
+    }
+    std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+            [&](int32_t a, int32_t b) { return heat[a] > heat[b]; });
+    idx.resize(k);
+    std::sort(idx.begin(), idx.end());
+    return idx;
 }
 
 // How often moe_cache_prepare_budget() re-queries live VRAM instead of
@@ -4410,6 +4743,13 @@ static bool moe_cache_prepare_budget(
     return true;
 }
 
+// Below this many slots a pool is not worth creating at all (it would
+// thrash immediately) - moe_cache_allocate_pool refuses outright. Named
+// because moe_cache_build_pending's reduce reservation must know the same
+// floor to avoid starving a shape below it; it was a bare 64 in three
+// places before that reservation existed.
+static constexpr size_t MOE_CACHE_MIN_POOL_SLOTS = 64;
+
 static bool moe_cache_allocate_pool(
         moe_cache_session & session, moe_cache_device & device,
         moe_cache_shape & shape, size_t budget) {
@@ -4453,7 +4793,7 @@ static bool moe_cache_allocate_pool(
     if (slot_count > INT_MAX) {
         slot_count = INT_MAX;
     }
-    if (slot_count < 64) {
+    if (slot_count < MOE_CACHE_MIN_POOL_SLOTS) {
         if (getenv("MOE_CACHE_DEBUG_GATE")) {
             fprintf(stderr, "[moe-cache-pool-dbg] pool creation SKIPPED: expert_size=%zu budget=%zu "
                     "slots_by_budget=%zu max_entries=%lld slot_count=%zu\n",
@@ -4465,7 +4805,7 @@ static bool moe_cache_allocate_pool(
     ggml_cuda_set_device(device.physical);
     char * slab = nullptr;
     cudaError_t error = cudaSuccess;
-    while (slot_count >= 64) {
+    while (slot_count >= MOE_CACHE_MIN_POOL_SLOTS) {
         if (moe_cache_fail(session, "slab")) {
             error = cudaErrorMemoryAllocation;
         } else {
@@ -4477,7 +4817,7 @@ static bool moe_cache_allocate_pool(
         (void)cudaGetLastError();
         slot_count /= 2;
     }
-    if (error != cudaSuccess || !slab || slot_count < 64) {
+    if (error != cudaSuccess || !slab || slot_count < MOE_CACHE_MIN_POOL_SLOTS) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d skipped %zu KiB expert pool: allocation failed\n",
                 device.physical, shape.expert_size >> 10);
         return false;
@@ -4598,6 +4938,188 @@ static bool moe_cache_allocate_pool(
 // path where a mistake could corrupt live cache state - it can only ever fill
 // slots that nothing is using yet.
 //
+// Heat-aware neuron subsetting: how moe_cache_plan tells a reduced-pool hit
+// apart from an ordinary primary-pool hit in slot_indices[], the same array
+// ggml-cpu.c reads as an opaque "which compact slot" value and passes
+// straight through to dispatch()/collect() unmodified (ggml-cpu.c only ever
+// checks `>= 0`, see the mul_mat_id path in ggml-cpu.c). A primary pool's
+// n_slots is bounded by its VRAM budget in bytes divided by its (at least
+// hundreds-of-KiB) expert size - nowhere close to this offset for any
+// budget this cache could plausibly be given, so encoding as offset+slot is
+// unambiguous and reversible with no risk of colliding with a real primary
+// slot number.
+static constexpr int32_t MOE_CACHE_REDUCED_SLOT_OFFSET = 1 << 24;
+
+// Attempt to convert `key` (a resident, full-width expert whose neuron_heat
+// just accumulated another sample - see the caller in moe_cache_collect) to
+// a reduced-width slot. Idempotent and convert-once: the very first thing
+// this does under session.mu is check device.reduced_indices for `key` and
+// return immediately if it's already there, whether or not that earlier
+// attempt actually finished converting it (see the comment above
+// moe_cache_neuron_reduce_enabled for why a retry policy was deliberately
+// left out). Safe to call speculatively for every hit - the common case
+// (already decided, or not enough accumulated mass yet) is a single hash
+// lookup and an early return.
+//
+// full_expert_size/wtype/n_expert describe the SOURCE tensor this key
+// belongs to (node->expert_size/wtype/n_expert at the call site) - needed
+// to size and create the reduced pool and to record the gather geometry,
+// none of which is recoverable from `key` alone.
+static void moe_cache_try_reduce_convert(
+        moe_cache_session & session, moe_cache_device & device,
+        const moe_cache_key & key, int64_t n_out,
+        size_t full_expert_size, int wtype, int64_t n_expert) {
+    std::lock_guard<std::mutex> lock(session.mu);
+    if (session.stopping || device.dead.load()) {
+        return;
+    }
+    if (device.reduced_indices.find(key) != device.reduced_indices.end()) {
+        return;
+    }
+    // Records `entry` as this key's decision in BOTH reduced_indices
+    // (session.mu-protected, the source of truth for pool/slot bookkeeping)
+    // and reduce_decided (neuron_heat_mu-protected, the cheap fast-path
+    // membership check moe_cache_collect uses to avoid taking session.mu at
+    // all for the overwhelmingly common already-decided case - see that
+    // field's own comment for the regression this fixed).
+    auto decide = [&](moe_cache_device::reduced_entry entry) {
+        device.reduced_indices.emplace(key, std::move(entry));
+        std::lock_guard<std::mutex> hlock(device.neuron_heat_mu);
+        device.reduce_decided.insert(key);
+    };
+    if (n_out <= 0 || full_expert_size == 0 || full_expert_size % (size_t) n_out != 0) {
+        return;
+    }
+    const int k = moe_cache_neuron_reduce_k();
+    std::vector<int32_t> indices;
+    {
+        // session.mu -> neuron_heat_mu, the order documented on
+        // device.reduced_indices - never the reverse.
+        std::lock_guard<std::mutex> hlock(device.neuron_heat_mu);
+        const auto hit = device.neuron_heat.find(key);
+        if (hit == device.neuron_heat.end() || (int64_t) hit->second.size() != n_out) {
+            return;
+        }
+        indices = moe_cache_select_reduced_indices(hit->second, k);
+    }
+    if (indices.empty()) {
+        // Not enough accumulated mass yet, or k is out of range for this
+        // tensor's width - stays undecided, eligible for a later call once
+        // more heat has accumulated. Deliberately does NOT record a
+        // decided-but-empty entry: unlike every failure mode below this
+        // point (which are about VRAM/slot availability, not about whether
+        // the ranking itself is trustworthy yet), this one is expected to
+        // resolve itself with more data.
+        return;
+    }
+
+    const size_t row_bytes = full_expert_size / (size_t) n_out;
+    if (row_bytes == 0) {
+        return;
+    }
+    const size_t reduced_expert_size = (size_t) indices.size() * row_bytes;
+
+    int pool_index = moe_cache_find_pool(device, reduced_expert_size, wtype);
+    if (pool_index < 0) {
+        const size_t headroom = device.budget_limit > device.allocated_bytes
+            ? device.budget_limit - device.allocated_bytes : 0;
+        const size_t budget = std::min(moe_cache_neuron_reduce_budget_bytes(), headroom);
+        moe_cache_shape shape{reduced_expert_size, wtype, n_expert, 1, -1, false};
+        if (!moe_cache_allocate_pool(session, device, shape, budget)) {
+            // Decided (see the decide() call below), never retried this
+            // session - see the "convert-once" rationale above.
+            decide(moe_cache_device::reduced_entry{
+                    std::move(indices), full_expert_size, row_bytes, -1});
+            return;
+        }
+        pool_index = shape.pool;
+    }
+    moe_cache_pool & rpool = *device.pools[pool_index];
+    if (rpool.map.find(key) != rpool.map.end()) {
+        // Already resident in the reduced pool (should not happen given the
+        // decided-key guard above, but harmless either way).
+        decide(moe_cache_device::reduced_entry{
+                std::move(indices), full_expert_size, row_bytes, pool_index});
+        return;
+    }
+    int slot_index = -1;
+    if (!rpool.free_slots.empty()) {
+        slot_index = rpool.free_slots.back();
+        rpool.free_slots.pop_back();
+    } else {
+        // Same reactive, coldest-unpinned-wins eviction the primary pool's
+        // own admission path uses (moe_cache_plan) - drain probation before
+        // protected_, and within a segment, heat (not recency alone)
+        // decides. This is what makes the reduced pool self-stabilizing
+        // under its own budget the same way the primary pool already is,
+        // rather than a first-come-first-served allocation that goes
+        // permanently inert once full: a newly-eligible, hotter expert can
+        // displace a colder one that already converted.
+        int victim = moe_cache_pick_coldest_unpinned(device, rpool, rpool.lru_head);
+        if (victim < 0) {
+            victim = moe_cache_pick_coldest_unpinned(device, rpool, rpool.protected_head);
+        }
+        if (victim < 0) {
+            // Every slot is pinned (in-flight reads) - decided, but not
+            // placed. Not retried: the same convert-once policy as every
+            // other failure path here. A future hit for this key falls
+            // through to the ordinary primary-pool path indefinitely (see
+            // the struct comment on device.reduced_indices) rather than
+            // this function being called again to find the same result.
+            decide(moe_cache_device::reduced_entry{
+                    std::move(indices), full_expert_size, row_bytes, pool_index});
+            return;
+        }
+        // Unlike a primary-pool eviction, the victim's OWN reduced_indices
+        // AND reduce_decided entries must be dropped too (moe_cache_slot_reset
+        // only touches the pool/slot, not these device-level maps) - erasing
+        // both makes the victim's key eligible for re-conversion later if it
+        // earns enough heat again, rather than being permanently exiled from
+        // ever re-entering this pool once evicted from it.
+        {
+            const moe_cache_key victim_key = rpool.slots[victim].key;
+            device.reduced_indices.erase(victim_key);
+            std::lock_guard<std::mutex> hlock(device.neuron_heat_mu);
+            device.reduce_decided.erase(victim_key);
+        }
+        moe_cache_slot_reset(rpool, victim, false);
+        device.evictions++;
+        slot_index = victim;
+    }
+    moe_cache_slot & slot = rpool.slots[slot_index];
+    slot.key = key;
+    slot.generation++;
+    slot.readers = 0;
+    slot.state = moe_cache_slot_state::copying;
+    if (!moe_cache_map_insert(rpool, key, slot_index)) {
+        moe_cache_slot_reset(rpool, slot_index, true);
+        decide(moe_cache_device::reduced_entry{
+                std::move(indices), full_expert_size, row_bytes, pool_index});
+        return;
+    }
+
+    // Record BEFORE queuing the job: the worker (moe_cache_worker) looks
+    // this entry up by key, under session.mu, to know which rows to gather
+    // and what stride to gather them from - see the reduce_convert branch
+    // there.
+    decide(moe_cache_device::reduced_entry{
+            indices, full_expert_size, row_bytes, pool_index});
+
+    moe_cache_job job;
+    job.pool = pool_index;
+    job.slot = slot_index;
+    job.generation = slot.generation;
+    job.key = key;
+    job.source = key.tensor; // tensor base - the worker computes the per-expert,
+                              // per-row offset itself from reduced_indices
+    job.bytes = reduced_expert_size; // gathered size; drives stage-buffer growth
+                                      // exactly like an ordinary fill job
+    job.kind = moe_cache_job_kind::reduce_convert;
+    device.queue.push_back(job);
+    device.queued_bytes += reduced_expert_size;
+    session.cv.notify_all();
+}
+
 // Bounded to half of each pool so a stale or over-large history cannot claim the
 // whole cache before the live workload has said anything; the remaining half is
 // left for what this run actually routes to.
@@ -4784,9 +5306,80 @@ static void moe_cache_build_pending(
 
     const size_t scratch_reserve =
         moe_cache_scratch_total(device.scratch_reserve);
-    const size_t slab_limit =
-        scratch_reserve < device.budget_limit
+    // Heat-aware neuron subsetting needs real headroom to ever place
+    // anything - reserved off the top here, the same way scratch_reserve
+    // already is, rather than left to whatever primary admission happens
+    // not to consume. Primary admission (the loop below) is greedy: it
+    // divides up ALL of `remaining` among pending shapes every time this
+    // function runs, so without this reservation the reduced pool's own
+    // moe_cache_allocate_pool call (from moe_cache_try_reduce_convert)
+    // would NEVER see enough headroom to create its pool - measured
+    // directly: a full session produced 20000+ reduce decisions and placed
+    // exactly zero of them, paying real per-decision lock overhead for no
+    // benefit at all, before this reservation existed.
+    //
+    // Bounded so it can never starve a PRIMARY shape. Two successive
+    // measured failures shaped this, both worth keeping written down:
+    //
+    //  1. A flat 256 MiB reservation out of a 512 MiB budget left too
+    //     little for the pending shapes, and Ornith's 840 KiB down_exps
+    //     pool - which this mechanism deliberately never uses at all -
+    //     was never created. Hit rate fell 31.3% -> 23.1%, costing far
+    //     more than the 72 MiB the reduced pool saved.
+    //  2. Subtracting a per-shape floor (MOE_CACHE_MIN_POOL_SLOTS worth
+    //     per still-pending shape) did NOT fix it: this function runs
+    //     repeatedly as shapes are discovered, so on the call where only
+    //     the last shape is still pending, the floor covers just that one
+    //     shape and a 256 MiB reservation still swallowed everything the
+    //     already-allocated pools had not taken. down_exps stayed absent,
+    //     hit rate fell further (19.5%) and ~236 MiB of the budget simply
+    //     went unused.
+    //
+    // So the reservation is also capped as a FRACTION of the whole budget,
+    // which is invariant to how many times this runs and to discovery
+    // order. The floor subtraction is kept as well - it is the tighter
+    // bound in the single-shape case.
+    //
+    // TODO(calibration): this fraction, MOE_CACHE_MIN_POOL_SLOTS, and K
+    // (GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K) are all fixed numbers standing
+    // in for values that should be derived per GPU+model+context by
+    // --moe-calibrate, the way -ncmoe and thread count already are. A
+    // 12 GB 3060 and a 141 GB card have no business sharing them. The
+    // reduced pool's real appetite is knowable (converted experts x
+    // reduced expert size) and measurable at calibration time; until then
+    // this cap exists to make the failure mode "reduce gets less than it
+    // wanted" instead of "a primary pool silently ceases to exist".
+    static constexpr size_t MOE_CACHE_REDUCE_RESERVE_MAX_NUM = 1;
+    static constexpr size_t MOE_CACHE_REDUCE_RESERVE_MAX_DEN = 8;
+    size_t reduce_reserve = 0;
+    if (moe_cache_neuron_reduce_enabled()) {
+        size_t primary_floor = 0;
+        for (const moe_cache_shape & shape : device.shapes) {
+            if (!shape.finished && shape.n_tensors > 0 && shape.expert_size > 0) {
+                // Matches moe_cache_allocate_pool's own slot_stride
+                // computation closely enough to be a floor (the real stride
+                // is expert_size rounded up past the guard region, i.e.
+                // always >= this) - deliberately an UNDER-estimate of the
+                // shape's true need, so this reservation errs toward
+                // leaving primary admission MORE room, never less.
+                primary_floor += shape.expert_size * MOE_CACHE_MIN_POOL_SLOTS;
+            }
+        }
+        const size_t after_scratch = scratch_reserve < device.budget_limit
             ? device.budget_limit - scratch_reserve : 0;
+        const size_t spare = after_scratch > device.allocated_bytes
+            ? after_scratch - device.allocated_bytes : 0;
+        const size_t claimable = spare > primary_floor ? spare - primary_floor : 0;
+        const size_t fraction_cap = device.budget_limit / MOE_CACHE_REDUCE_RESERVE_MAX_DEN
+                                                        * MOE_CACHE_REDUCE_RESERVE_MAX_NUM;
+        reduce_reserve = std::min(moe_cache_neuron_reduce_budget_bytes(),
+                                  std::min(claimable, fraction_cap));
+    }
+    const size_t total_reserve = scratch_reserve <= SIZE_MAX - reduce_reserve
+        ? scratch_reserve + reduce_reserve : SIZE_MAX;
+    const size_t slab_limit =
+        total_reserve < device.budget_limit
+            ? device.budget_limit - total_reserve : 0;
     size_t remaining = slab_limit > device.allocated_bytes
         ? slab_limit - device.allocated_bytes : 0;
     if (remaining == 0) {
@@ -4874,6 +5467,8 @@ static int moe_cache_discover_pool(
     return moe_cache_find_pool(device, expert_size, wtype);
 }
 
+static bool moe_cache_neuron_heat_enabled();
+
 static void moe_cache_log_stats(moe_cache_device & device) {
     size_t used = 0;
     size_t slots = 0;
@@ -4903,6 +5498,216 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             device.evictions, device.insert_skips,
             device.admission_skips, device.queue.size(), device.queued_bytes >> 20,
             device.dispatch_failures, device.collect_failures);
+
+}
+
+// Full concentration report for device.neuron_heat - deliberately NOT
+// called from moe_cache_log_stats(). First cut called it from there,
+// gated by stats_every like everything else in that function, and
+// measured a second real regression on top of the first: tok/s fell to
+// ~2 (from the already-fixed ~48-60 baseline) whenever GGML_CUDA_MOE_CACHE_STATS
+// was actually set, because this analysis (a full sort of every key's
+// heat vector, up to 256 experts x 2048 floats each) runs SYNCHRONOUSLY
+// on the compute thread inside moe_cache_collect() - moving it out of
+// neuron_heat_mu (the first fix) only helped the lock-contention case,
+// it does nothing for "this function itself is slow and blocks the
+// thread that called it". Correct fix: don't run it on the hot path at
+// all. Called once, from moe_cache_session_destroy(), off any path that
+// affects token generation.
+static void moe_cache_neuron_heat_report(moe_cache_device & device) {
+    if (!moe_cache_neuron_heat_enabled()) {
+        return;
+    }
+    std::vector<std::pair<moe_cache_key, std::vector<float>>> heat_copy;
+    {
+        std::lock_guard<std::mutex> lock(device.neuron_heat_mu);
+        heat_copy.reserve(device.neuron_heat.size());
+        for (const auto & [key, vec] : device.neuron_heat) {
+            heat_copy.emplace_back(key, vec);
+        }
+    }
+    if (heat_copy.empty()) {
+        return;
+    }
+    float max_val = 0.0f;
+    double sum_val = 0.0;
+    size_t n_vals = 0;
+    // Concentration, done right this time: a VALUE threshold (relative to
+    // this expert's own max), not a neuron-COUNT cutoff. "Top 25% of
+    // neurons" picks a fixed rank regardless of whether that 25% is
+    // actually meaningful for THIS expert - a value threshold instead
+    // asks "how much mass is held by neurons that clear this bar", and
+    // lets however many neurons that turns out to be fall out as an
+    // observation, never an input. This directly answers "how much
+    // weight is concentrated vs spread thin", not "what does an
+    // arbitrary rank cutoff capture". Averaged across keys with enough
+    // accumulated mass to be meaningful (>0), not weighted by how much
+    // traffic each key saw - this answers "is weight concentrated within
+    // a typical expert", not "concentrated across the whole
+    // traffic-weighted population".
+    static constexpr int N_THRESH = 6;
+    static constexpr double THRESH_FRAC_OF_MAX[N_THRESH] = {0.50, 0.25, 0.10, 0.05, 0.02, 0.01};
+    double mass_frac_sum[N_THRESH] = {0};   // fraction of THIS key's mass held above each threshold
+    double count_frac_sum[N_THRESH] = {0};  // fraction of THIS key's neuron count that clears each threshold (observed, not chosen)
+    size_t n_keys_ranked = 0;
+    std::vector<float> sorted_buf;
+    // Per-expert "required width": if this expert could pick its own K
+    // freely (unconstrained by mul_mat_id's batching requirement), how
+    // many neurons (as % of its own width) would it actually need to
+    // reach 90% of its own mass? Reported as a distribution across
+    // experts, not a single number - directly answers whether a small
+    // number of discrete tiers can approximate free per-expert choice
+    // (experts cluster near the same required width) or not (required
+    // width varies too much for a handful of tiers to fit well).
+    static constexpr double TARGET_COVERAGE = 0.90;
+    std::vector<double> required_width_pct;
+    std::vector<double> dead_frac_pct;
+    for (const auto & [key, vec] : heat_copy) {
+        double key_sum = 0.0;
+        for (float v : vec) {
+            max_val = std::max(max_val, v);
+            sum_val += v;
+            n_vals++;
+            key_sum += v;
+        }
+        if (key_sum <= 0.0 || vec.size() < 8) {
+            continue;
+        }
+        sorted_buf.assign(vec.begin(), vec.end());
+        std::sort(sorted_buf.begin(), sorted_buf.end(), std::greater<float>());
+        // Per-key max is sorted_buf[0] (descending sort) - the LIVE
+        // reference point for this specific expert's own distribution,
+        // not a global constant. This is the "heavy weight decides the
+        // bar" framing: a threshold relative to THIS expert's strongest
+        // neuron, not an absolute number or a shared-across-experts rank.
+        const double key_max = (double) sorted_buf[0];
+        // Cumulative sum once, then sample it at each value threshold -
+        // O(n log n) for the sort plus O(n) here, not O(n * N_THRESH).
+        std::vector<double> cum(sorted_buf.size());
+        double running = 0.0;
+        for (size_t i = 0; i < sorted_buf.size(); i++) {
+            running += sorted_buf[i];
+            cum[i] = running;
+        }
+        if (key_max > 0.0) {
+            for (int t = 0; t < N_THRESH; t++) {
+                const double value_cutoff = THRESH_FRAC_OF_MAX[t] * key_max;
+                // sorted_buf is descending, so the first run of values
+                // clearing the cutoff is a prefix - find its end.
+                size_t n_above = 0;
+                while (n_above < sorted_buf.size() && (double) sorted_buf[n_above] >= value_cutoff) {
+                    n_above++;
+                }
+                const double mass_above = n_above > 0 ? cum[n_above - 1] : 0.0;
+                mass_frac_sum[t]  += mass_above / key_sum;
+                count_frac_sum[t] += (double) n_above / (double) sorted_buf.size();
+            }
+        }
+        const double target = TARGET_COVERAGE * key_sum;
+        size_t n_needed = sorted_buf.size();
+        for (size_t i = 0; i < cum.size(); i++) {
+            if (cum[i] >= target) {
+                n_needed = i + 1;
+                break;
+            }
+        }
+        required_width_pct.push_back(100.0 * (double) n_needed / (double) sorted_buf.size());
+        // Dead-neuron fraction: relative threshold, 1% of this expert's
+        // own MEDIAN (not mean) neuron value - mean is a poor reference
+        // when the distribution is heavily skewed (measured max/mean
+        // ratios well over 100x elsewhere in this report), since a
+        // handful of extreme outliers drag the mean up and make the
+        // threshold too lenient. Median is far more robust to exactly
+        // that skew. sorted_buf is already sorted descending, so the
+        // median is just its middle element. This is a genuinely
+        // different question from "required width for 90% coverage"
+        // above: that measures how much of the USEFUL mass a reduced
+        // tier would keep; this measures how much is contributing
+        // essentially NOTHING at all - a true pruning candidate, not
+        // just a cache-tier exclusion.
+        const double key_median = (double) sorted_buf[sorted_buf.size() / 2];
+        const double dead_threshold = 0.01 * key_median;
+        size_t n_dead = 0;
+        for (float v : sorted_buf) {
+            if ((double) v < dead_threshold) {
+                n_dead++;
+            }
+        }
+        dead_frac_pct.push_back(100.0 * (double) n_dead / (double) sorted_buf.size());
+        n_keys_ranked++;
+    }
+    std::sort(required_width_pct.begin(), required_width_pct.end());
+    std::sort(dead_frac_pct.begin(), dead_frac_pct.end());
+    auto pct_at = [](const std::vector<double> & v, double p) -> double {
+        if (v.empty()) return 0.0;
+        size_t idx = (size_t) (p * (double) (v.size() - 1));
+        return v[idx];
+    };
+    // fprintf, not MOE_CACHE_LOG - the server installs a ggml log callback
+    // that drops GGML_LOG_INFO (same reason GGML_CUDA_MOE_CACHE_SUMMARY,
+    // right above moe_cache_session_destroy, uses fprintf directly), so
+    // this would silently never appear there otherwise.
+    fprintf(stderr, "[moe-cache] CUDA%d neuron_heat FINAL REPORT: %zu keys, %zu values, mean=%.4f max=%.4f "
+            "(max/mean=%.1fx)\n",
+            device.physical, heat_copy.size(), n_vals,
+            n_vals ? sum_val / (double) n_vals : 0.0, (double) max_val,
+            (n_vals && sum_val > 0.0) ? (double) max_val / (sum_val / (double) n_vals) : 0.0);
+    fprintf(stderr, "[moe-cache] CUDA%d neuron_heat concentration by VALUE threshold (n=%zu keys) - "
+            "\"clears\" means >= this fraction of THIS expert's own max, count%% is an OUTPUT not a chosen cutoff:\n",
+            device.physical, n_keys_ranked);
+    for (int t = 0; t < N_THRESH; t++) {
+        fprintf(stderr, "[moe-cache]   neurons clearing %.0f%% of own max -> %.1f%% of mass, "
+                "%.1f%% of neuron count\n",
+                100.0 * THRESH_FRAC_OF_MAX[t],
+                n_keys_ranked ? 100.0 * mass_frac_sum[t]  / (double) n_keys_ranked : 0.0,
+                n_keys_ranked ? 100.0 * count_frac_sum[t] / (double) n_keys_ranked : 0.0);
+    }
+    fprintf(stderr, "[moe-cache] CUDA%d per-expert required width for %.0f%% coverage "
+            "(n=%zu experts, if each could pick freely): "
+            "min=%.0f%% p25=%.0f%% median=%.0f%% p75=%.0f%% p90=%.0f%% max=%.0f%%\n",
+            device.physical, 100.0 * TARGET_COVERAGE, required_width_pct.size(),
+            pct_at(required_width_pct, 0.0), pct_at(required_width_pct, 0.25),
+            pct_at(required_width_pct, 0.5), pct_at(required_width_pct, 0.75),
+            pct_at(required_width_pct, 0.9), pct_at(required_width_pct, 1.0));
+    fprintf(stderr, "[moe-cache] CUDA%d dead-neuron fraction per expert (< 1%% of that expert's "
+            "own MEDIAN (not mean - robust to the skew), true pruning candidates - n=%zu experts): "
+            "min=%.0f%% p25=%.0f%% median=%.0f%% p75=%.0f%% p90=%.0f%% max=%.0f%%\n",
+            device.physical, dead_frac_pct.size(),
+            pct_at(dead_frac_pct, 0.0), pct_at(dead_frac_pct, 0.25),
+            pct_at(dead_frac_pct, 0.5), pct_at(dead_frac_pct, 0.75),
+            pct_at(dead_frac_pct, 0.9), pct_at(dead_frac_pct, 1.0));
+    fflush(stderr);
+
+    // Full per-neuron dump, for offline analysis (per-topic isolation
+    // comparison, down_proj-weighted true-contribution reweighting) that
+    // needs the raw per-key vectors, not just aggregate percentiles.
+    // Plain text, one key per line: tensor_name expert_id n_values v0 v1 ...
+    // Tensor name resolved via device.tensor_names (populated at
+    // moe_cache_begin() for every tensor this device has ever seen) so
+    // the dump is meaningful across separate process runs, unlike the
+    // raw host_base pointer which is not stable across restarts.
+    const char * dump_path = getenv("GGML_CUDA_MOE_CACHE_NEURON_HEAT_DUMP");
+    if (dump_path) {
+        FILE * f = fopen(dump_path, "w");
+        if (f) {
+            for (const auto & [key, vec] : heat_copy) {
+                const auto name_it = device.tensor_names.find(key.tensor);
+                const std::string name = name_it != device.tensor_names.end()
+                    ? name_it->second : "unknown";
+                fprintf(f, "%s %d %zu", name.c_str(), key.expert, vec.size());
+                for (float v : vec) {
+                    fprintf(f, " %.6f", v);
+                }
+                fprintf(f, "\n");
+            }
+            fclose(f);
+            fprintf(stderr, "[moe-cache] CUDA%d neuron_heat full dump written to %s (%zu keys)\n",
+                    device.physical, dump_path, heat_copy.size());
+        } else {
+            fprintf(stderr, "[moe-cache] CUDA%d neuron_heat dump: failed to open %s\n",
+                    device.physical, dump_path);
+        }
+    }
 }
 
 // Defined near the end of the file, alongside the rest of the bandwidth
@@ -5048,6 +5853,38 @@ static void moe_cache_free_device(moe_cache_device & device) {
         cudaFreeHost(device.h_out);
         device.h_out = nullptr;
     }
+    if (device.d_ids_reduced) {
+        cudaFree(device.d_ids_reduced);
+        device.d_ids_reduced = nullptr;
+    }
+    if (device.d_act_q8_reduced) {
+        cudaFree(device.d_act_q8_reduced);
+        device.d_act_q8_reduced = nullptr;
+    }
+    if (device.d_out_reduced) {
+        cudaFree(device.d_out_reduced);
+        device.d_out_reduced = nullptr;
+    }
+    if (device.d_reduce_row_map) {
+        cudaFree(device.d_reduce_row_map);
+        device.d_reduce_row_map = nullptr;
+    }
+    if (device.d_reduce_sel_idx) {
+        cudaFree(device.d_reduce_sel_idx);
+        device.d_reduce_sel_idx = nullptr;
+    }
+    if (device.h_ids_reduced) {
+        cudaFreeHost(device.h_ids_reduced);
+        device.h_ids_reduced = nullptr;
+    }
+    if (device.h_reduce_row_map) {
+        cudaFreeHost(device.h_reduce_row_map);
+        device.h_reduce_row_map = nullptr;
+    }
+    if (device.h_reduce_sel_idx) {
+        cudaFreeHost(device.h_reduce_sel_idx);
+        device.h_reduce_sel_idx = nullptr;
+    }
     if (device.compute_stream) {
         cudaStreamDestroy(device.compute_stream);
         device.compute_stream = nullptr;
@@ -5084,6 +5921,16 @@ static void moe_cache_free_device(moe_cache_device & device) {
     device.h_ids_cap = 0;
     device.h_act_cap = 0;
     device.h_out_cap = 0;
+    device.d_ids_reduced_cap = 0;
+    device.act_q8_reduced_cap = 0;
+    device.d_out_reduced_cap = 0;
+    device.d_reduce_row_map_cap = 0;
+    device.d_reduce_sel_idx_cap = 0;
+    device.h_ids_reduced_cap = 0;
+    device.h_reduce_row_map_cap = 0;
+    device.h_reduce_sel_idx_cap = 0;
+    device.reduced_indices.clear();
+    device.reduce_decided.clear();
 }
 
 static void moe_cache_session_destroy(void * opaque) {
@@ -5119,6 +5966,81 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            // Per-pool breakdown, in creation order (index 0 is always the
+            // first shape the model actually presented - a real pool, not
+            // necessarily "the" primary one on a model with several
+            // distinct expert byte sizes). Distinguishes an ordinary pool
+            // from a heat-aware-reduced one only by comparing its
+            // expert_size against every OTHER pool's - a reduced pool is,
+            // by construction, always smaller than the full-width pool for
+            // the same (wtype, tensor family), see moe_cache_try_reduce_convert.
+            for (size_t pi = 0; pi < d.pools.size(); pi++) {
+                const moe_cache_pool & p = *d.pools[pi];
+                const size_t pused = (size_t) p.n_slots - p.free_slots.size();
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d pool[%zu] expert_size=%zuKiB "
+                        "slots=%zu/%d (%.2f%%) allocated=%zuMiB\n",
+                        d.physical, pi, p.expert_size >> 10, pused, p.n_slots,
+                        p.n_slots ? 100.0 * (double) pused / (double) p.n_slots : 0.0,
+                        ((size_t) p.n_slots * p.slot_stride) >> 20);
+            }
+            // Heat-aware neuron subsetting: how many experts were DECIDED
+            // (device.reduced_indices has an entry - whether or not that
+            // decision resulted in an actual resident reduced slot; see the
+            // "convert-once" note on moe_cache_neuron_reduce_enabled) versus
+            // actually PLACED (pool_index >= 0, meaning a real reduced-pool
+            // slot exists for it right now), and the aggregate VRAM this
+            // mechanism is saving on the ones actually placed: for each
+            // placed key, src_expert_size (the full width it would
+            // otherwise cost) minus idx.size()*row_bytes (the reduced width
+            // it actually costs).
+            if (moe_cache_neuron_reduce_enabled()) {
+                size_t decided = 0, placed = 0;
+                long long saved_bytes = 0, full_bytes = 0;
+                for (const auto & [rkey, entry] : d.reduced_indices) {
+                    (void) rkey;
+                    decided++;
+                    if (entry.pool_index >= 0) {
+                        placed++;
+                        const size_t reduced_bytes = entry.idx.size() * entry.row_bytes;
+                        full_bytes  += (long long) entry.src_expert_size;
+                        saved_bytes += (long long) entry.src_expert_size - (long long) reduced_bytes;
+                    }
+                }
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d neuron-reduce: decided=%zu placed=%zu "
+                        "full_width_equiv=%.2fMiB saved=%.2fMiB (%.1f%% of that width)\n",
+                        d.physical, decided, placed,
+                        full_bytes / (1024.0 * 1024.0), saved_bytes / (1024.0 * 1024.0),
+                        full_bytes > 0 ? 100.0 * (double) saved_bytes / (double) full_bytes : 0.0);
+            }
+            // Per-layer miss rate: the throughput-relevant "which layer to
+            // prefer" signal (see device.layer_hits/layer_misses's own
+            // comment) - miss COUNT/RATE, not neuron_heat's concentration
+            // stats. Cheap (plain array scan, no sort), printed
+            // unconditionally under the same GGML_CUDA_MOE_CACHE_SUMMARY
+            // flag rather than gated behind NEURON_HEAT, since it needs
+            // none of that machinery.
+            for (int l = 0; l < moe_cache_device::MAX_LAYER_STAT; l++) {
+                const long long lh = d.layer_hits[l];
+                const long long lm = d.layer_misses[l];
+                const long long lt = lh + lm;
+                if (lt == 0) {
+                    continue;
+                }
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d layer=%3d hits=%lld misses=%lld "
+                        "miss_rate=%.4f\n",
+                        d.physical, l, lh, lm, (double) lm / (double) lt);
+            }
+        }
+    }
+
+    // Off the hot path entirely - see moe_cache_neuron_heat_report's own
+    // comment for why it must never be called from anywhere token
+    // generation touches. Only fires (and only does real work) when
+    // GGML_CUDA_MOE_CACHE_NEURON_HEAT is set; a no-op otherwise.
+    {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            moe_cache_neuron_heat_report(*device_ptr);
         }
     }
 
@@ -5586,6 +6508,19 @@ static void * moe_cache_begin(
             node->layer = atoi(digits);
         }
     }
+    // Heat-aware neuron subsetting is explicitly gate_exps/up_exps only
+    // (docs/plan.md: down_exps's row axis is hidden_size, an OUTPUT
+    // dimension, not an intermediate "neuron" - selecting top-K rows there
+    // and zero-filling the rest would silently delete real output
+    // dimensions rather than approximate an activation sparsity pattern,
+    // which is a correctness bug, not a smaller approximation). Computed
+    // once here, from the same `name` string moe_cache_begin already has,
+    // rather than re-checked per hit: an ALLOWLIST (only gate_exps/up_exps
+    // qualify), not a denylist, so any tensor whose name doesn't match
+    // either pattern - including down_exps, and anything not yet
+    // anticipated - defaults to ineligible.
+    node->reduce_eligible = strstr(name, "gate_exps") != nullptr ||
+                             strstr(name, "up_exps") != nullptr;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -5917,6 +6852,19 @@ static bool moe_cache_partner_index_enabled() {
 static bool moe_cache_substitute_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// Purely observational per-neuron heat accumulation (device.neuron_heat),
+// off by default. See that field's comment for what it measures and why
+// this costs no new sync/kernel. Off by default because it is not read by
+// anything yet - this is step one (measure) of a two-step build, not the
+// full mechanism.
+static bool moe_cache_neuron_heat_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_HEAT");
         return env && atoi(env) != 0;
     }();
     return enabled;
@@ -7287,6 +8235,22 @@ static int moe_cache_plan(
     // block after the demand-fill queue below.
     bool group_evicted_this_call = false;
 
+    // See device.layer_hits/layer_misses's own comment for what this
+    // measures and why (throughput cost per layer, not activation shape).
+    // session.mu is already held for this whole function, same as the
+    // plain (non-atomic) rank_hits/rank_misses increments below - no
+    // extra locking needed.
+    auto note_layer = [&](bool hit) {
+        if (node->layer < 0 || node->layer >= moe_cache_device::MAX_LAYER_STAT) {
+            return;
+        }
+        if (hit) {
+            device.layer_hits[node->layer]++;
+        } else {
+            device.layer_misses[node->layer]++;
+        }
+    };
+
     moe_cache_lock_trace_guard lock_trace("plan");
     std::unique_lock<std::mutex> lock(session.mu);
     if (session.stopping) {
@@ -7416,6 +8380,28 @@ static int moe_cache_plan(
     const int rank_top_k = (node->n_tokens > 0 && n_ids >= node->n_tokens)
         ? (int) (n_ids / node->n_tokens) : 0;
 
+    // Heat-aware neuron subsetting: resolve the reduced-width pool for
+    // THIS tensor's shape once per plan() call, not once per id - the
+    // reduced expert_size is deterministic from node->expert_size/n_out and
+    // the global K (moe_cache_neuron_reduce_k()), so every id in this call
+    // shares the same answer. nullptr (the common case: reduction disabled,
+    // or no reduced pool exists yet because nothing has converted) means
+    // every id below falls straight through to the ordinary primary-pool
+    // lookup, unchanged.
+    moe_cache_pool * reduced_pool_ptr = nullptr;
+    if (moe_cache_neuron_reduce_enabled() && node->reduce_eligible && node->n_out > 0 &&
+        node->expert_size % (size_t) node->n_out == 0) {
+        const int reduce_k = moe_cache_neuron_reduce_k();
+        const size_t row_bytes = node->expert_size / (size_t) node->n_out;
+        if (reduce_k > 0 && row_bytes > 0) {
+            const size_t reduced_expert_size = (size_t) reduce_k * row_bytes;
+            const int ridx = moe_cache_find_pool(device, reduced_expert_size, node->wtype);
+            if (ridx >= 0) {
+                reduced_pool_ptr = device.pools[ridx].get();
+            }
+        }
+    }
+
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
@@ -7497,6 +8483,41 @@ static int moe_cache_plan(
             }
         }
 
+        // Heat-aware neuron subsetting: prefer a reduced-width hit over the
+        // primary pool once one exists for this key. A row served this way
+        // is fully handled here (dispatch/collect will read its K real
+        // values out of the reduced pool and reconstruct an n_out-wide row
+        // with everything else zero - see the split in moe_cache_dispatch) -
+        // it must NOT also fall through to the primary lookup below, or the
+        // row would end up pinned in two pools for one id.
+        if (reduced_pool_ptr) {
+            auto rfound = reduced_pool_ptr->map.find(key);
+            if (rfound != reduced_pool_ptr->map.end()) {
+                moe_cache_slot & rslot = reduced_pool_ptr->slots[rfound->second];
+                if (rslot.state == moe_cache_slot_state::valid &&
+                    node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
+                    rslot.readers++;
+                    rslot.heat = std::min(MOE_CACHE_HEAT_MAX, rslot.heat + MOE_CACHE_HEAT_STEP);
+                    moe_cache_pool_note_heat_step(*reduced_pool_ptr, rslot.heat);
+                    node->pins[node->n_pins++] = {rfound->second, rslot.generation, reduced_pool_ptr};
+                    slot_indices[index] = MOE_CACHE_REDUCED_SLOT_OFFSET + rfound->second;
+                    // moe_cache_verify_slot is deliberately NOT called here:
+                    // it assumes a resident slot is a byte-for-byte
+                    // contiguous copy of [host_base + expert*pool.expert_size,
+                    // ...), which is true for every other pool but not this
+                    // one - a reduced-pool slot holds a GATHERED, non-
+                    // contiguous subset of rows, so that comparison would
+                    // compare against the wrong host bytes entirely and
+                    // report a false mismatch on every sampled hit.
+                    device.hits++;
+                    device.rank_hits[rank_bucket]++;
+                    note_layer(true);
+                    hits++;
+                    continue;
+                }
+            }
+        }
+
         auto found = pool.map.find(key);
         if (found != pool.map.end()) {
             moe_cache_slot & slot = pool.slots[found->second];
@@ -7528,6 +8549,7 @@ static int moe_cache_plan(
                 }
                 device.misses++;
                 device.rank_misses[rank_bucket]++;
+                note_layer(false);
                 continue;
             }
             if (slot.state == moe_cache_slot_state::valid) {
@@ -7556,7 +8578,7 @@ static int moe_cache_plan(
                 if (!no_promote) {
                     moe_cache_promote_to_protected(device, pool, found->second);
                 }
-                node->pins[node->n_pins++] = {found->second, slot.generation};
+                node->pins[node->n_pins++] = {found->second, slot.generation, &pool};
                 // GGML_CUDA_MOE_CACHE_NO_HITS=1: do every bit of accounting a
                 // hit normally does (heat, promotion, pin, counters) but never
                 // report the hit to the caller, so ggml-cpu.c routes the row
@@ -7573,16 +8595,19 @@ static int moe_cache_plan(
                 moe_cache_verify_slot(pool, found->second, key, device.physical);
                 device.hits++;
                 device.rank_hits[rank_bucket]++;
+                note_layer(true);
                 hits++;
             } else {
                 device.misses++;
                 device.rank_misses[rank_bucket]++;
+                note_layer(false);
             }
             continue;
         }
 
         device.misses++;
         device.rank_misses[rank_bucket]++;
+        note_layer(false);
 
         // Substitution. Deliberately does NOT skip the admission bookkeeping
         // below: the router still wanted this expert, and admission must keep
@@ -7613,7 +8638,7 @@ static int moe_cache_plan(
                 // strength of standing in.
                 ssl.heat = std::min(MOE_CACHE_HEAT_MAX, ssl.heat + MOE_CACHE_HEAT_STEP);
                 moe_cache_pool_note_heat_step(pool, ssl.heat);
-                node->pins[node->n_pins++] = {sub, ssl.generation};
+                node->pins[node->n_pins++] = {sub, ssl.generation, &pool};
                 slot_indices[index] = sub;
                 device.substitutions++;
                 // For the Brain UI's substitute overlay (yellow) - see
@@ -8088,6 +9113,38 @@ static int moe_cache_plan(
     return hits;
 }
 
+// Heat-aware neuron subsetting: scatter the reduced-pool sub-batch's dense
+// K-wide results into their correct, sparse positions within the full
+// n_out-wide d_out rows the primary mmv call already produced (junk there,
+// from a dummy slot-0 substitution - see the split in moe_cache_dispatch).
+// Zeroes the whole row first: every position NOT in this row's own K
+// selected indices is defined to contribute nothing to the following
+// down_proj matmul - the same "only the neurons that matter" approximation
+// this whole mechanism is built on, made explicit here instead of implicit
+// in a real value. One block per reduced row, threads cooperate within it -
+// n_out is typically a few thousand (moe_intermediate_size) and k a few
+// hundred, both comfortably coverable by a small number of grid-stride
+// passes per block.
+static __global__ void moe_cache_reduce_scatter_kernel(
+        float * __restrict__ d_out, int64_t n_out,
+        const float * __restrict__ d_out_reduced, int32_t k,
+        const int32_t * __restrict__ d_row_map,
+        const int32_t * __restrict__ d_sel_idx) {
+    const int r = blockIdx.x;
+    const int64_t orig_row = d_row_map[r];
+    float * out_row = d_out + orig_row * n_out;
+    for (int64_t j = threadIdx.x; j < n_out; j += blockDim.x) {
+        out_row[j] = 0.0f;
+    }
+    __syncthreads();
+    for (int j = threadIdx.x; j < k; j += blockDim.x) {
+        const int32_t idx = d_sel_idx[(size_t) r * (size_t) k + (size_t) j];
+        if (idx >= 0 && (int64_t) idx < n_out) {
+            out_row[idx] = d_out_reduced[(size_t) r * (size_t) k + (size_t) j];
+        }
+    }
+}
+
 static int moe_cache_dispatch(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows) {
@@ -8145,10 +9202,43 @@ static int moe_cache_dispatch(
         }
     }
     const int activation_rows = shared_activation ? 1 : n_hits;
+
+    // Heat-aware neuron subsetting: a row's slot_indices value can now
+    // point into EITHER node->pool (an ordinary hit) or a second,
+    // reduced-width pool (see MOE_CACHE_REDUCED_SLOT_OFFSET and the
+    // encoding in moe_cache_plan). Classify every row here, cross-checked
+    // against node->pins[] - positionally aligned with slot_indices[],
+    // since both are built by the same ids-order loop in
+    // moe_cache_plan/ggml-cpu.c - rather than trusting the raw integer
+    // alone, so an inconsistent slot_indices value fails dispatch instead
+    // of being silently misinterpreted as pointing into the wrong pool.
+    int n_reduced = 0;
+    moe_cache_pool * rpool = nullptr;
     for (int index = 0; index < n_hits; index++) {
-        if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
-            !act_rows[index]) {
+        if (!act_rows[index]) {
             return 0;
+        }
+        const moe_cache_pin & pin = node->pins[index];
+        if (slot_indices[index] >= MOE_CACHE_REDUCED_SLOT_OFFSET) {
+            const int32_t rslot = slot_indices[index] - MOE_CACHE_REDUCED_SLOT_OFFSET;
+            if (!pin.pool || pin.pool == &pool || pin.slot != rslot ||
+                rslot < 0 || rslot >= pin.pool->n_slots) {
+                return 0;
+            }
+            if (rpool && rpool != pin.pool) {
+                // Can only happen if this tensor somehow had two different
+                // reduced pools active at once, which nothing in this file
+                // does (K and wtype are both fixed per session) - refuse
+                // rather than guess which one is right.
+                return 0;
+            }
+            rpool = pin.pool;
+            n_reduced++;
+        } else {
+            if (slot_indices[index] < 0 || slot_indices[index] >= pool.n_slots ||
+                pin.pool != &pool || pin.slot != slot_indices[index]) {
+                return 0;
+            }
         }
     }
 
@@ -8183,6 +9273,27 @@ static int moe_cache_dispatch(
     node->q8_bytes_used = q8_bytes;
     node->out_bytes_used = out_bytes;
 
+    // Heat-aware neuron subsetting: reduced-pool sub-batch scratch sizing.
+    // Every size below is 0 when n_reduced == 0 (the common case - no
+    // reduced-pool hit this call), so none of the growth calls below fire
+    // and no reduced-path buffer is ever touched by a session that never
+    // produces one.
+    const int64_t s11_blocks = padded_n_in / QK8_1;
+    const size_t row_bytes = (n_reduced > 0 && n_out > 0 &&
+            node->expert_size % (size_t) n_out == 0)
+        ? node->expert_size / (size_t) n_out : 0;
+    const int reduce_k = (n_reduced > 0 && rpool && row_bytes > 0)
+        ? (int) (rpool->expert_size / row_bytes) : 0;
+    if (n_reduced > 0 && (!rpool || row_bytes == 0 || reduce_k <= 0 ||
+            (size_t) reduce_k * row_bytes != rpool->expert_size)) {
+        return 0;
+    }
+    const size_t reduced_ids_bytes     = (size_t) n_reduced * sizeof(int32_t);
+    const size_t reduced_q8_bytes      = (size_t) n_reduced * (size_t) s11_blocks * sizeof(block_q8_1);
+    const size_t reduced_out_bytes     = (size_t) n_reduced * (size_t) reduce_k * sizeof(float);
+    const size_t reduced_row_map_bytes = (size_t) n_reduced * sizeof(int32_t);
+    const size_t reduced_sel_bytes     = (size_t) n_reduced * (size_t) reduce_k * sizeof(int32_t);
+
     const size_t desired_caps[] = {
         moe_cache_growth_capacity(device.d_ids_cap, ids_bytes),
         moe_cache_growth_capacity(device.d_act_cap, act_bytes),
@@ -8197,6 +9308,28 @@ static int moe_cache_dispatch(
             return 0;
         }
         scratch_bytes += capacity;
+    }
+    // Separate loop, only entered when n_reduced > 0: moe_cache_growth_capacity
+    // returns 0 both for "already sufficient at 0 bytes required" and for
+    // "overflow", and the primary loop above relies on 0 always meaning
+    // failure - reusing it for entries that are legitimately 0 whenever
+    // n_reduced == 0 would reject every ordinary dispatch call.
+    if (n_reduced > 0) {
+        const size_t reduced_caps[] = {
+            moe_cache_growth_capacity(device.d_ids_reduced_cap, reduced_ids_bytes),
+            moe_cache_growth_capacity(device.act_q8_reduced_cap, reduced_q8_bytes),
+            moe_cache_growth_capacity(device.d_out_reduced_cap, reduced_out_bytes),
+            moe_cache_growth_capacity(device.d_reduce_row_map_cap, reduced_row_map_bytes),
+            moe_cache_growth_capacity(device.d_reduce_sel_idx_cap, reduced_sel_bytes),
+        };
+        for (size_t capacity : reduced_caps) {
+            if (capacity == 0 || capacity > SIZE_MAX - scratch_bytes) {
+                std::lock_guard<std::mutex> lock(session.mu);
+                device.dispatch_failures++;
+                return 0;
+            }
+            scratch_bytes += capacity;
+        }
     }
     {
         std::lock_guard<std::mutex> lock(session.mu);
@@ -8230,6 +9363,35 @@ static int moe_cache_dispatch(
         device.dead.store(true);
         return 0;
     }
+    // Reduced-path growth failure is NOT fatal to the whole cache (unlike
+    // the primary scratch above): these buffers are tiny (bounded by
+    // n_reduced <= GGML_MOE_CACHE_MAX_BATCH_ROWS and reduce_k, typically
+    // low hundreds of KiB at most), so a failure here is far more likely to
+    // be transient allocator pressure than a real out-of-memory condition -
+    // failing just this one dispatch call (which safely falls back to the
+    // ordinary CPU path in ggml-cpu.c for every row of the batch) is the
+    // proportionate response, not killing an otherwise-healthy cache.
+    if (n_reduced > 0 && (
+        !moe_cache_grow_host(device, (void **)&device.h_ids_reduced, device.h_ids_reduced_cap,
+                             reduced_ids_bytes, "reduced ids host allocation") ||
+        !moe_cache_grow_device(device, (void **)&device.d_ids_reduced, device.d_ids_reduced_cap,
+                               reduced_ids_bytes, "reduced ids device allocation") ||
+        !moe_cache_grow_device(device, &device.d_act_q8_reduced, device.act_q8_reduced_cap,
+                               reduced_q8_bytes, "reduced q8 activation allocation") ||
+        !moe_cache_grow_device(device, (void **)&device.d_out_reduced, device.d_out_reduced_cap,
+                               reduced_out_bytes, "reduced output device allocation") ||
+        !moe_cache_grow_host(device, (void **)&device.h_reduce_row_map, device.h_reduce_row_map_cap,
+                             reduced_row_map_bytes, "reduce row-map host allocation") ||
+        !moe_cache_grow_device(device, (void **)&device.d_reduce_row_map, device.d_reduce_row_map_cap,
+                               reduced_row_map_bytes, "reduce row-map device allocation") ||
+        !moe_cache_grow_host(device, (void **)&device.h_reduce_sel_idx, device.h_reduce_sel_idx_cap,
+                             reduced_sel_bytes, "reduce sel-idx host allocation") ||
+        !moe_cache_grow_device(device, (void **)&device.d_reduce_sel_idx, device.d_reduce_sel_idx_cap,
+                               reduced_sel_bytes, "reduce sel-idx device allocation"))) {
+        std::lock_guard<std::mutex> lock(session.mu);
+        device.dispatch_failures++;
+        return 0;
+    }
     // A (re)growth repoisons the WHOLE buffer with canary (moe_cache_grow_device),
     // so the high-water mark of real-data bytes written resets to 0 along with it -
     // otherwise the guard below would compare against a stale hwm from before the
@@ -8245,11 +9407,63 @@ static int moe_cache_dispatch(
     }
 
     for (int index = 0; index < n_hits; index++) {
-        device.h_ids[index] = slot_indices[index];
+        // Reduced rows get a dummy, always-valid primary slot (0 - every
+        // pool that exists has at least 64 slots, see moe_cache_allocate_pool)
+        // so the primary mmv call below can still run as ONE ordinary batched
+        // call over the full n_hits, unchanged in every other respect - its
+        // result for a reduced row is discarded, overwritten below by the
+        // reduced mmv call + scatter kernel. This avoids compacting/
+        // reordering the primary rows at all.
+        device.h_ids[index] = slot_indices[index] >= MOE_CACHE_REDUCED_SLOT_OFFSET
+            ? 0 : slot_indices[index];
     }
     for (int index = 0; index < activation_rows; index++) {
         memcpy(device.h_act + (size_t)index * n_in,
                act_rows[shared_activation ? 0 : index], n_in * sizeof(float));
+    }
+
+    // Compact per-reduced-row bookkeeping: which absolute row of the batch
+    // it is (for the scatter kernel to write to the right place in d_out)
+    // and its expert's chosen K neuron indices (for the scatter kernel to
+    // write each computed value to the right column). Looked up from
+    // device.reduced_indices under session.mu - see that field's comment
+    // for why this is never touched from any thread other than the compute
+    // thread except under this lock.
+    if (n_reduced > 0) {
+        int c = 0;
+        for (int index = 0; index < n_hits && c < n_reduced; index++) {
+            if (slot_indices[index] < MOE_CACHE_REDUCED_SLOT_OFFSET) {
+                continue;
+            }
+            const moe_cache_pin & pin = node->pins[index];
+            device.h_ids_reduced[c] = pin.slot;
+            device.h_reduce_row_map[c] = index;
+            bool filled = false;
+            {
+                std::lock_guard<std::mutex> lock(session.mu);
+                const moe_cache_key rkey = pin.pool->slots[pin.slot].key;
+                const auto it = device.reduced_indices.find(rkey);
+                if (it != device.reduced_indices.end() &&
+                    (int) it->second.idx.size() == reduce_k) {
+                    for (int j = 0; j < reduce_k; j++) {
+                        device.h_reduce_sel_idx[(size_t) c * reduce_k + j] = it->second.idx[j];
+                    }
+                    filled = true;
+                }
+            }
+            if (!filled) {
+                // Should not happen - a valid, pinned reduced-pool slot only
+                // exists after a successful conversion recorded its indices
+                // (moe_cache_try_reduce_convert records reduced_indices
+                // BEFORE queuing the fill job that brings the slot to
+                // `valid`). Fail safe rather than scatter into undefined
+                // positions.
+                std::lock_guard<std::mutex> lock(session.mu);
+                device.dispatch_failures++;
+                return 0;
+            }
+            c++;
+        }
     }
 
     if (getenv("GGML_CUDA_MOE_CACHE_ACT_MAGNITUDE_LOG")) {
@@ -8317,6 +9531,65 @@ static int moe_cache_dispatch(
                 device.compute_stream);
         ok = moe_cache_cuda_ok(
                 device, cudaPeekAtLastError(), "expert matvec launch", true);
+    }
+
+    // Heat-aware neuron subsetting: the reduced-pool subset of this batch
+    // (if any) needs its own matvec call - one launch can only address one
+    // pool/slab (see docs/plan.md, "ggml_mul_mat_id batching constraint") -
+    // followed by a scatter of its dense K-wide results into the sparse
+    // positions of the SAME d_out rows the call above already produced
+    // (junk, from the dummy slot-0 substitution) for those rows.
+    if (ok && n_reduced > 0) {
+        ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                    device.d_ids_reduced, device.h_ids_reduced, reduced_ids_bytes,
+                    cudaMemcpyHostToDevice, device.compute_stream),
+                "reduced ids upload", true) &&
+            moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                    device.d_reduce_row_map, device.h_reduce_row_map, reduced_row_map_bytes,
+                    cudaMemcpyHostToDevice, device.compute_stream),
+                "reduce row-map upload", true) &&
+            moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                    device.d_reduce_sel_idx, device.h_reduce_sel_idx, reduced_sel_bytes,
+                    cudaMemcpyHostToDevice, device.compute_stream),
+                "reduce sel-idx upload", true);
+    }
+    if (ok && n_reduced > 0) {
+        // Compact the reduced rows' quantized activation out of the
+        // already-quantized device.d_act_q8 (built for the FULL batch just
+        // above) via one small device-to-device copy per reduced row -
+        // correct whether or not shared_activation is true (a shared
+        // source is just the same source row copied n_reduced times).
+        // Bounded by n_reduced <= GGML_MOE_CACHE_MAX_BATCH_ROWS; a real
+        // scatter/gather kernel would remove this loop, but a reduced-pool
+        // sub-batch is a fraction of an already-small decode batch, and
+        // correctness came first for this landing - see docs/plan.md's
+        // "no tok/s claim" note on this mechanism.
+        const size_t s11_bytes = (size_t) s11_blocks * sizeof(block_q8_1);
+        for (int c = 0; c < n_reduced && ok; c++) {
+            const int orig_row = device.h_reduce_row_map[c];
+            const size_t src_off = (shared_activation ? 0 : (size_t) orig_row) * s11_bytes;
+            ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
+                        (char *) device.d_act_q8_reduced + (size_t) c * s11_bytes,
+                        (const char *) device.d_act_q8 + src_off, s11_bytes,
+                        cudaMemcpyDeviceToDevice, device.compute_stream),
+                    "reduced activation compact", true);
+        }
+    }
+    if (ok && n_reduced > 0) {
+        ggml_cuda_moe_cache_mmv(
+                rpool->slab, (ggml_type)wtype, (const char *)device.d_act_q8_reduced,
+                device.d_ids_reduced, device.d_out_reduced, n_in, (int64_t) reduce_k,
+                rpool->n_slots, (int64_t) rpool->slot_stride, n_reduced, n_reduced,
+                device.compute_stream);
+        ok = moe_cache_cuda_ok(
+                device, cudaPeekAtLastError(), "reduced expert matvec launch", true);
+    }
+    if (ok && n_reduced > 0) {
+        moe_cache_reduce_scatter_kernel<<<n_reduced, 256, 0, device.compute_stream>>>(
+                device.d_out, n_out, device.d_out_reduced, reduce_k,
+                device.d_reduce_row_map, device.d_reduce_sel_idx);
+        ok = moe_cache_cuda_ok(
+                device, cudaPeekAtLastError(), "reduce scatter launch", true);
     }
 
     // GGML_CUDA_MOE_CACHE_VERIFY_MMV=1: run the SAME rows through the SAME
@@ -8455,22 +9728,29 @@ static int moe_cache_collect(
         const char * e = getenv("GGML_CUDA_MOE_CACHE_GUARD_CHECK");
         return e && atoi(e) != 0;
     }();
+    // Checkability is now per-pin, not a single flag for the whole call:
+    // each pin carries its own pool (moe_cache_pin), and heat-aware neuron
+    // subsetting means that pool can be either node->pool or the
+    // reduced-width pool, which can have its own (possibly different, or
+    // absent) guard gap.
     std::vector<char> guard_sample;
-    const moe_cache_pool * gpool = node->pool;
-    const bool guard_checkable = guard_check_enabled && ok && gpool && gpool->slab &&
-        gpool->slot_stride > gpool->expert_size &&
-        (gpool->slot_stride - gpool->expert_size) >= GUARD_SAMPLE_BYTES;
+    std::vector<bool> guard_checked(n_hits, false);
+    const bool guard_checkable = guard_check_enabled && ok;
     if (guard_checkable) {
         guard_sample.resize((size_t) n_hits * GUARD_SAMPLE_BYTES);
         for (int index = 0; index < n_hits; index++) {
             const moe_cache_pin & pin = node->pins[index];
-            if (pin.slot < 0 || pin.slot >= gpool->n_slots) {
+            const moe_cache_pool * gpool = pin.pool;
+            if (!gpool || pin.slot < 0 || pin.slot >= gpool->n_slots || !gpool->slab ||
+                gpool->slot_stride <= gpool->expert_size ||
+                (gpool->slot_stride - gpool->expert_size) < GUARD_SAMPLE_BYTES) {
                 continue;
             }
             const char * guard_src = gpool->slab +
                 (size_t) pin.slot * gpool->slot_stride + gpool->expert_size;
             cudaMemcpyAsync(guard_sample.data() + (size_t) index * GUARD_SAMPLE_BYTES,
                     guard_src, GUARD_SAMPLE_BYTES, cudaMemcpyDeviceToHost, device.compute_stream);
+            guard_checked[index] = true;
         }
     }
 
@@ -8519,10 +9799,10 @@ static int moe_cache_collect(
     if (guard_checkable && ok) {
         static std::atomic<int> greported{0};
         for (int index = 0; index < n_hits; index++) {
-            const moe_cache_pin & pin = node->pins[index];
-            if (pin.slot < 0 || pin.slot >= gpool->n_slots) {
+            if (!guard_checked[index]) {
                 continue;
             }
+            const moe_cache_pin & pin = node->pins[index];
             const char * sample = guard_sample.data() + (size_t) index * GUARD_SAMPLE_BYTES;
             for (size_t b = 0; b < GUARD_SAMPLE_BYTES; b++) {
                 if ((unsigned char) sample[b] != MOE_CACHE_GUARD_PATTERN) {
@@ -8581,10 +9861,10 @@ static int moe_cache_collect(
         static std::atomic<int> reported{0};
         for (int index = 0; index < n_hits; index++) {
             const moe_cache_pin & pin = node->pins[index];
-            if (pin.slot < 0 || pin.slot >= node->pool->n_slots) {
+            if (!pin.pool || pin.slot < 0 || pin.slot >= pin.pool->n_slots) {
                 continue;
             }
-            const moe_cache_slot & slot = node->pool->slots[pin.slot];
+            const moe_cache_slot & slot = pin.pool->slots[pin.slot];
             if (slot.generation != pin.generation && reported.fetch_add(1) < 20) {
                 fprintf(stderr, "[moe-cache] GENERATION MISMATCH row=%d/%d slot=%d "
                         "pinned_gen=%llu now_gen=%llu readers=%d\n",
@@ -8600,6 +9880,65 @@ static int moe_cache_collect(
         for (int index = 0; index < n_hits; index++) {
             memcpy(dst_rows[index], device.h_out + (size_t)index * n_out,
                    n_out * sizeof(float));
+        }
+    }
+
+    // Per-neuron heat: read-only over data moe_cache_collect already
+    // downloaded and validated above (h_out, post-sync) - accumulates
+    // |value| per neuron per (tensor, expert) key, keyed the same way as
+    // everything else here. gate_exps/up_exps calls land here with
+    // n_out == moe_intermediate_size; down_exps calls also pass through
+    // (n_out == hidden size) and get their own, separate heat vector under
+    // the same key - harmless, just an unused signal for now, since only
+    // gate/up are ever meant to be read from this map.
+    // Keys whose heat vector was just updated this call AND are not yet a
+    // decided reduce-conversion candidate (device.reduce_decided, checked
+    // right here under the neuron_heat_mu this loop already holds - see
+    // that field's comment for why this fast check, not
+    // moe_cache_try_reduce_convert itself, is what runs on every hit).
+    // Checked for reduce-conversion eligibility AFTER neuron_heat_mu is
+    // released below (moe_cache_try_reduce_convert needs session.mu, and
+    // the documented order is session.mu -> neuron_heat_mu, never nested
+    // the other way).
+    std::vector<moe_cache_key> heat_touched_keys;
+    const bool reduce_enabled_this_call = moe_cache_neuron_reduce_enabled() && node->reduce_eligible;
+    if (ok && moe_cache_neuron_heat_enabled()) {
+        // device.neuron_heat_mu, NOT session.mu - see that field's comment
+        // for why (measured regression from contending with the cache's
+        // core bookkeeping lock). Reading pin.pool->slots[pin.slot].key
+        // without session.mu is safe here specifically: the pin mechanism
+        // already guarantees a pinned slot's key cannot change out from
+        // under this call (that is the whole point of pinning), and
+        // pool.slots itself is a fixed-size array sized once at pool
+        // creation - never resized - so no other thread's write to a
+        // DIFFERENT slot can invalidate this read. Each pin carries its OWN
+        // pool now (see moe_cache_pin) rather than assuming node->pool -
+        // heat-aware neuron subsetting introduced pins into a second
+        // (reduced-width) pool.
+        std::lock_guard<std::mutex> lock(device.neuron_heat_mu);
+        for (int index = 0; index < n_hits; index++) {
+            const moe_cache_pin & pin = node->pins[index];
+            if (!pin.pool || pin.slot < 0 || pin.slot >= pin.pool->n_slots) {
+                continue;
+            }
+            const moe_cache_key key = pin.pool->slots[pin.slot].key;
+            std::vector<float> & heat = device.neuron_heat[key];
+            if ((int64_t) heat.size() != n_out) {
+                heat.assign((size_t) n_out, 0.0f);
+            }
+            const float * row = device.h_out + (size_t) index * n_out;
+            for (int64_t j = 0; j < n_out; j++) {
+                heat[(size_t) j] += fabsf(row[j]);
+            }
+            if (reduce_enabled_this_call && device.reduce_decided.find(key) == device.reduce_decided.end()) {
+                heat_touched_keys.push_back(key);
+            }
+        }
+    }
+    if (ok && reduce_enabled_this_call) {
+        for (const moe_cache_key & key : heat_touched_keys) {
+            moe_cache_try_reduce_convert(
+                    session, device, key, n_out, node->expert_size, node->wtype, node->n_expert);
         }
     }
 
@@ -8637,8 +9976,8 @@ static void moe_cache_end(void * opaque) {
         std::lock_guard<std::mutex> lock(session.mu);
         for (int index = 0; index < node->n_pins; index++) {
             const moe_cache_pin & pin = node->pins[index];
-            if (pin.slot >= 0 && pin.slot < node->pool->n_slots) {
-                moe_cache_slot & slot = node->pool->slots[pin.slot];
+            if (pin.pool && pin.slot >= 0 && pin.slot < pin.pool->n_slots) {
+                moe_cache_slot & slot = pin.pool->slots[pin.slot];
                 if (slot.readers > 0) {
                     slot.readers--;
                 }
@@ -8699,6 +10038,40 @@ static void moe_cache_invalidate_session(
                     moe_cache_ranges_overlap(source, pool.expert_size, base, size)) {
                     moe_cache_slot_reset(pool, index, true);
                 }
+            }
+        }
+        // Heat-aware neuron subsetting: the generic per-pool loop just
+        // above computes each slot's source range as
+        // key.expert*pool.expert_size, which is correct for every ordinary
+        // pool but WRONG for a reduced-width pool - pool.expert_size there
+        // is the REDUCED size, not the real per-expert byte span in the
+        // source tensor a reduced slot was gathered from (a scattered
+        // subset of a much larger range). Left alone, that means a
+        // reduced-pool slot could survive an invalidation event it should
+        // have been caught by. device.reduced_indices carries the real
+        // (src_expert_size) span for exactly this reason - use it here
+        // instead, for the reduced pool specifically.
+        for (auto it = device.reduced_indices.begin(); it != device.reduced_indices.end();) {
+            const moe_cache_key & rkey = it->first;
+            const auto & entry = it->second;
+            const void * source = rkey.expert >= 0 && entry.src_expert_size > 0
+                ? (const char *) rkey.tensor + (size_t) rkey.expert * entry.src_expert_size
+                : nullptr;
+            if (moe_cache_ranges_overlap(source, entry.src_expert_size, base, size)) {
+                if (entry.pool_index >= 0 && entry.pool_index < (int) device.pools.size()) {
+                    moe_cache_pool & rpool = *device.pools[entry.pool_index];
+                    const auto mit = rpool.map.find(rkey);
+                    if (mit != rpool.map.end()) {
+                        moe_cache_slot_reset(rpool, mit->second, true);
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> hlock(device.neuron_heat_mu);
+                    device.reduce_decided.erase(rkey);
+                }
+                it = device.reduced_indices.erase(it);
+            } else {
+                ++it;
             }
         }
         for (auto it = device.seen_tensors.begin(); it != device.seen_tensors.end();) {
@@ -8938,6 +10311,76 @@ static int moe_cache_get_substitute_map(uint8_t * out_bits, int max_bytes, int *
                 out_bits[i >> 3] |= (uint8_t) (1u << (i & 7));
             }
             device_ptr->substituted_recently.clear();
+        }
+        if (out_rows) *out_rows = n_rows;
+        if (out_cols) *out_cols = n_cols;
+        return 1;
+    }
+    return 0;
+}
+
+// Live per-expert concentration, for the Brain/Atlas view (dot size, not
+// color - color already carries tier + substitute state). Deliberately a
+// CHEAP O(n) proxy (dead-fraction: share of neurons below 1% of this
+// expert's own mean), not the full sorted "required width for 90%
+// coverage" curve moe_cache_neuron_heat_report computes - that needs an
+// O(n log n) sort per key, fine for a one-time end-of-session dump, not
+// for something the Brain UI polls every ~1.5s across potentially
+// thousands of keys. Same shape convention as moe_cache_get_expert_map/
+// moe_cache_get_substitute_map (session->tensor_layer for rows,
+// n_expert_hint for cols), but writes a float per cell instead of a bit -
+// -1.0 for a cell with no neuron_heat data yet (never touched, or
+// GGML_CUDA_MOE_CACHE_NEURON_HEAT not enabled), 0.0-1.0 dead-fraction
+// otherwise.
+static int moe_cache_get_neuron_concentration_map(float * out_values, int max_floats, int * out_rows, int * out_cols) {
+    if (out_rows) *out_rows = 0;
+    if (out_cols) *out_cols = 0;
+    if (!moe_cache_neuron_heat_enabled() || g_session_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->tensor_layer.empty() || session->n_expert_hint <= 0) {
+            continue;
+        }
+        int n_rows = 0;
+        for (const auto & kv : session->tensor_layer) {
+            n_rows = std::max(n_rows, kv.second + 1);
+        }
+        const int n_cols = (int) std::min<int64_t>(session->n_expert_hint, INT_MAX);
+        if (n_rows <= 0 || n_cols <= 0) {
+            continue;
+        }
+        const long long n_cells = (long long) n_rows * (long long) n_cols;
+        if (n_cells > max_floats) {
+            if (out_rows) *out_rows = n_rows;
+            if (out_cols) *out_cols = n_cols;
+            return 0;
+        }
+        std::fill(out_values, out_values + n_cells, -1.0f);
+        for (auto & device_ptr : session->devices) {
+            std::lock_guard<std::mutex> heat_lock(device_ptr->neuron_heat_mu);
+            for (const auto & [key, vec] : device_ptr->neuron_heat) {
+                const auto rit = session->tensor_layer.find(key.tensor);
+                if (rit == session->tensor_layer.end() || key.expert < 0 || key.expert >= n_cols ||
+                    vec.size() < 8) {
+                    continue;
+                }
+                double sum = 0.0;
+                for (float v : vec) sum += v;
+                if (sum <= 0.0) {
+                    continue;
+                }
+                const double mean = sum / (double) vec.size();
+                const double thresh = 0.01 * mean;
+                size_t n_dead = 0;
+                for (float v : vec) {
+                    if ((double) v < thresh) n_dead++;
+                }
+                const long long i = (long long) rit->second * n_cols + key.expert;
+                out_values[i] = (float) n_dead / (float) vec.size();
+            }
         }
         if (out_rows) *out_rows = n_rows;
         if (out_cols) *out_cols = n_cols;
@@ -9690,6 +11133,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_substitute_map = moe_cache_get_substitute_map;
+    ggml_moe_cache.get_neuron_concentration_map = moe_cache_get_neuron_concentration_map;
     ggml_moe_cache.verify_rows    = moe_cache_verify_rows;
     ggml_moe_cache.get_summary = moe_cache_get_summary;
     ggml_moe_cache.set_atlas = moe_cache_set_atlas;

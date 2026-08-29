@@ -977,6 +977,13 @@ bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out
 // as get_expert_map.
 bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols);
 
+// Live per-(layer,expert) neuron concentration (dead-neuron-fraction
+// proxy, 0.0-1.0, -1.0 for no data yet), same rows/cols shape convention
+// as common_moe_cache_get_expert_map. Only produces real data when
+// GGML_CUDA_MOE_CACHE_NEURON_HEAT is set - returns false otherwise, same
+// as when no CUDA backend is registered.
+bool common_moe_cache_get_neuron_concentration_map(std::vector<float> & out_values, int & out_rows, int & out_cols);
+
 // Aggregate moe-cache health, for the Brain view's stats panel. Mirrors
 // ggml_moe_cache_summary (see ggml-backend-moe-cache.h) one field at a
 // time rather than exposing that C struct directly, so this header
