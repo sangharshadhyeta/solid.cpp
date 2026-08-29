@@ -37,17 +37,65 @@ K_SELECTED = 8
 
 def load_traces(paths, keep=K_SELECTED):
     """One sequence per file, kept separate (not concatenated) so fold_in can
-    reset its cross-layer `prev` pointer at each file boundary - otherwise
-    the last decision of one trace file would get a spurious cross-layer
-    edge to the first decision of the next."""
+    reset its cross-layer batch grouping at each file boundary - otherwise
+    the last token of one trace file would get spuriously linked to the
+    first token of the next.
+
+    Each line is `layer token_id expert:weight ...` - a trace file logs one
+    batch of tokens at a time, one layer's worth of lines for the whole
+    batch before moving to the next layer, so `token_id` re-identifies the
+    same token across those layer-major blocks."""
     out = []
     for p in paths:
         seq = []
         for line in open(p):
             f = line.split()
-            seq.append((int(f[0]), [int(x.split(':')[0]) for x in f[2:2 + keep]]))
+            seq.append((int(f[0]), int(f[1]), [int(x.split(':')[0]) for x in f[2:2 + keep]]))
         out.append(seq)
     return out
+
+
+def fold_coact(paths, nodes, edges):
+    """Fold co-activation edges emitted by the running server itself
+    (GGML_CUDA_MOE_CACHE_COACT_FILE) straight into the persisted graph.
+
+    The cache already accumulates exactly this graph while it serves - one
+    edge per pair of experts the router selected together, keyed by
+    (layer, expert), which is the same node identity fold_in() builds from
+    trace files. So there is nothing to re-derive here: the server writes
+    `layer_a expert_a layer_b expert_b weight` and this adds those weights
+    on top of whatever the state already holds, exactly as fold_in does.
+
+    The point of this path is that the graph then reflects REAL SERVED
+    TRAFFIC rather than a separate offline llama-moe-trace run over prompts
+    somebody invented - an atlas built from what a deployment actually
+    routes, which an offline probe cannot produce by construction.
+    """
+    def nid(l, e):
+        k = (int(l), int(e))
+        i = nodes.get(k)
+        if i is None:
+            i = len(nodes)
+            nodes[k] = i
+        return i
+    folded = 0
+    for p in paths:
+        with open(p) as f:
+            first = f.readline()
+            if not first.startswith('moe-cache-coact'):
+                print(f"  {p}: not a coact file (bad header) - skipped", file=sys.stderr)
+                continue
+            for line in f:
+                fs = line.split()
+                if len(fs) != 5:
+                    continue
+                la, ea, lb, eb, w = fs
+                a_i, b_i = nid(la, ea), nid(lb, eb)
+                if a_i == b_i:
+                    continue
+                edges[(min(a_i, b_i), max(a_i, b_i))] += float(w)
+                folded += 1
+    return folded
 
 
 def load_state(path):
@@ -82,9 +130,24 @@ def fold_in(seq, nodes, edges):
     are all trivially 1.0 and the eigengap heuristic sees pure degeneracy,
     not structure (caught empirically: a 2-topic smoke test returned 31
     components all magnitude 1.0). moe-discovered-atlas.py's build_graph
-    avoided this with a cross-layer edge (layer L's top pick -> layer L+1's
-    top pick, step 4b) tying the whole graph into one connected space - same
-    fix here, restructured to fold in incrementally.
+    fixed connectivity with a cross-layer edge (layer L's top pick -> layer
+    L+1's top pick), but only ever to the immediately next layer, for every
+    token, unconditionally - that makes each layer a tight within-layer
+    clique joined to its neighbours by one narrow, always-present bottleneck
+    edge. Structurally that's a chain of clusters, and the leading
+    eigenvectors of a chain-of-clusters graph are low-frequency waves along
+    the chain: "which cluster (layer) am I in" dominates the embedding
+    regardless of edge weight, which is exactly the layer-ordered "spokes"
+    artifact seen in the atlas view.
+
+    Fix: link a token's top pick at EVERY layer it touched to its top pick
+    at every OTHER layer it touched (all pairs, not just adjacent), so two
+    layers can bridge directly whenever they tend to route the same token
+    to a related expert - the graph stops being forced through a rigid
+    layer-sequential backbone and can bridge on topic/content similarity
+    instead. Requires grouping lines by token_id within each file's
+    layer-major batches (see load_traces): a batch boundary is detected
+    whenever the layer number goes DOWN instead of up.
     """
     def nid(l, e):
         k = (l, e)
@@ -93,20 +156,32 @@ def fold_in(seq, nodes, edges):
             i = len(nodes)
             nodes[k] = i
         return i
+
+    def flush_batch(batch):
+        for layer_map in batch.values():
+            top1 = list(layer_map.values())
+            for i in range(len(top1)):
+                for j in range(i + 1, len(top1)):
+                    a, b = top1[i], top1[j]
+                    if a != b:
+                        edges[(min(a, b), max(a, b))] += 1.0
+
     for stream in seq:
-        prev = None
-        for il, picks in stream:
+        batch = {}
+        prev_layer = None
+        for il, tid, picks in stream:
             idx = [nid(il, e) for e in picks]
             for i in range(len(idx)):
                 for j in range(i + 1, len(idx)):
                     a, b = idx[i], idx[j]
                     if a != b:
                         edges[(min(a, b), max(a, b))] += 1.0
-            if prev is not None and prev[0] != il:
-                a, b = nid(prev[0], prev[1]), idx[0]
-                if a != b:
-                    edges[(min(a, b), max(a, b))] += 1.0
-            prev = (il, picks[0])
+            if prev_layer is not None and il < prev_layer:
+                flush_batch(batch)
+                batch = {}
+            batch.setdefault(tid, {})[il] = idx[0]
+            prev_layer = il
+        flush_batch(batch)
 
 
 def spectral(nodes, edges, max_dims, iters=12, seed=0):
@@ -167,6 +242,10 @@ def main():
     ap.add_argument('--traces', nargs='*', default=[],
                      help='new trace files to fold into the persisted graph this run (optional - '
                           'omit to just re-decide dims on the existing state)')
+    ap.add_argument('--coact', nargs='*', default=[],
+                     help='co-activation edge files written by the running server itself '
+                          '(GGML_CUDA_MOE_CACHE_COACT_FILE) - real served traffic, no offline '
+                          'trace run needed')
     ap.add_argument('--state', default='traces/atlas-evolve-state.npz',
                      help='persisted graph - accumulates across runs, like moe-incremental-atlas.py')
     ap.add_argument('--out', default='/mnt/nvme/models/ornith/expert-atlas-discovered-evolve.json')
@@ -183,6 +262,13 @@ def main():
     else:
         print("no prior state - starting fresh")
 
+    if a.coact:
+        n_edges = fold_coact(a.coact, nodes, edges)
+        print(f"folded in {n_edges:,} co-activation edges from {len(a.coact)} live-traffic file(s)")
+        print(f"graph now: {len(nodes):,} nodes ({len(nodes) - prior_nodes:+,}), "
+              f"{len(edges):,} edges ({len(edges) - prior_edges:+,})")
+        prior_nodes, prior_edges = len(nodes), len(edges)
+
     if a.traces:
         seq = load_traces(a.traces)
         fold_in(seq, nodes, edges)
@@ -190,8 +276,8 @@ def main():
         print(f"folded in {n_decisions:,} decisions from {len(a.traces)} trace file(s)")
         print(f"graph now: {len(nodes):,} nodes ({len(nodes) - prior_nodes:+,}), "
               f"{len(edges):,} edges ({len(edges) - prior_edges:+,})")
-    elif not prior_nodes:
-        print("no --traces given and no prior state - nothing to build", file=sys.stderr)
+    elif not prior_nodes and not a.coact:
+        print("no --traces/--coact given and no prior state - nothing to build", file=sys.stderr)
         sys.exit(1)
     else:
         print("no new --traces - re-deciding dimensionality on the existing graph only")
@@ -208,7 +294,53 @@ def main():
     else:
         print(f"eigengap heuristic: too few components for a real gap search, k={k}")
 
-    xy_raw = emb[:, 1:3] if k >= 2 else np.zeros((len(nodes), 2))
+    # Position each expert the same way the old fixed 9-topic atlas did -
+    # a weighted combination of topic anchor positions - generalised to
+    # however many axes k the eigengap heuristic picked THIS run (not a
+    # fixed 9), and with the anchors themselves data-driven instead of
+    # preset. Anchors start on an equal-angle circle (same mechanism the old
+    # atlas used for its fixed categories, just sized to k) then get pulled
+    # by reciprocal averaging: each topic's anchor moves to the weighted
+    # centroid of the experts that load on it, so topics whose experts
+    # overlap drift toward each other and topics with nothing in common
+    # drift apart - unlike the old preset categories, which sat at their
+    # starting angle forever regardless of what the data said.
+    if k >= 2:
+        w = emb[:, 1:k] ** 2  # non-negative affinity per (expert, axis) - direction doesn't matter for a spatial pull, magnitude does
+        row_sums = w.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1.0
+        w_norm = w / row_sums
+
+        n_axes = k - 1
+        angles = 2.0 * np.pi * np.arange(n_axes) / n_axes
+        topic_xy = np.stack([np.cos(angles), np.sin(angles)], axis=1)
+
+        for _ in range(2):
+            xy_raw = w_norm @ topic_xy
+            col_sums = w.sum(axis=0)
+            col_sums[col_sums == 0] = 1.0
+            topic_xy = (w.T @ xy_raw) / col_sums[:, None]
+            scale = np.abs(topic_xy).max()
+            if scale > 0:
+                topic_xy = topic_xy / scale
+
+        xy_raw = w_norm @ topic_xy
+    else:
+        xy_raw = np.zeros((len(nodes), 2))
+
+    # Strip out whatever's left correlated with layer position: the Grid
+    # panel already shows layer directly, so the atlas plotting layer again
+    # (even as a residual trend after the cross-layer edge fix above) is
+    # redundant at best. Per-layer mean-centering removes any systematic
+    # layer effect - linear or not - leaving only the within-layer spread
+    # that actually reflects topic content.
+    layer_of = np.empty(len(nodes), dtype=np.int64)
+    for (l, _e), i in nodes.items():
+        layer_of[i] = l
+    for lyr in np.unique(layer_of):
+        m = layer_of == lyr
+        xy_raw[m, 0] -= xy_raw[m, 0].mean()
+        xy_raw[m, 1] -= xy_raw[m, 1].mean()
 
     def rank_normalize(v):
         order = np.argsort(v)
