@@ -1455,6 +1455,39 @@ struct common_moe_calibration_entry {
     int         concurrency     = 1;  // > 1: tok_per_sec is aggregate throughput at this many concurrent requests, not solo
     double      tok_per_sec     = 0.0;
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
+    // Per-device fit margin (-fitt/--fit-target, MiB). -1 = not calibrated.
+    //
+    // This is not a minor knob: common_maybe_raise_moe_for_ctx reserves
+    // 3 x fit_target of VRAM before deciding placement, and that reservation
+    // is what silently RAISES a requested -ncmoe until the context "fits".
+    // Measured on this fork (Ornith-1.5-35B-Q4_K_M, RTX 3060 12 GB, -c 4096,
+    // requesting -ncmoe 8):
+    //
+    //     fitt=1024 (default) -> forced to ncmoe 27, 47.32 tok/s,  8951 MiB used
+    //     fitt=640            -> forced to ncmoe 24, 50.37 tok/s, 10307 MiB used
+    //     fitt=448            -> forced to ncmoe 23, 51.61 tok/s, 10741 MiB used
+    //
+    // i.e. the default margin left ~3 GiB of a 12 GiB card unused and pushed
+    // 4 extra layers of experts onto the CPU, which is where that throughput
+    // went. The margin genuinely cannot be dropped to zero (it covers real
+    // weight loading and lazy CUDA graph capture that the no-alloc fit probe
+    // cannot see - removing it reproduced a hard 4k context collapse), so the
+    // right value is neither "3 GiB always" nor "as small as possible": it is
+    // hardware- and model-specific, which makes it exactly the kind of thing
+    // this calibration exists to measure instead of guess.
+    int         fit_target_mb   = -1;
+    // Heat-aware intra-expert neuron subsetting (GGML_CUDA_MOE_CACHE_NEURON_REDUCE
+    // and friends). -1 = not calibrated / leave to the environment.
+    //
+    // Recorded here because this mechanism changes the VRAM arithmetic every
+    // other value in this struct was measured under: a converted expert costs
+    // K rows instead of the tensor's full width (measured 50% for K=256 on
+    // Ornith's 576 KiB gate/up experts), so the same hit rate needs less cache
+    // VRAM than it used to. A calibration taken with reduction off is not
+    // valid for a run with it on, and vice versa - hence storing it rather
+    // than letting the two drift silently apart.
+    int         neuron_reduce_k         = -1; // > 0 also means "reduction was enabled"
+    int         neuron_reduce_budget_mb = -1;
     std::string calibrated_at;
 };
 
@@ -1512,6 +1545,13 @@ static bool common_moe_calibration_lookup(
         out.concurrency     = e.value("concurrency", 1);
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
+        // Absent in entries written before these were calibrated - the
+        // value() defaults keep such an entry loadable rather than making
+        // it a hard cache miss, since the fields it DOES carry are still
+        // valid measurements.
+        out.fit_target_mb           = e.value("fit_target_mb", -1);
+        out.neuron_reduce_k         = e.value("neuron_reduce_k", -1);
+        out.neuron_reduce_budget_mb = e.value("neuron_reduce_budget_mb", -1);
         out.calibrated_at   = e.value("calibrated_at", std::string());
         return true;
     } catch (const std::exception &) {
@@ -1542,6 +1582,9 @@ static void common_moe_calibration_save(
         {"concurrency",     entry.concurrency},
         {"tok_per_sec",     entry.tok_per_sec},
         {"moe_cache_mb",    entry.moe_cache_mb},
+        {"fit_target_mb",           entry.fit_target_mb},
+        {"neuron_reduce_k",         entry.neuron_reduce_k},
+        {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
         {"calibrated_at",   entry.calibrated_at},
     };
     fs_create_directory_with_parents(fs_get_cache_directory());
@@ -1703,7 +1746,7 @@ static std::pair<double, double> common_moe_bench_one_request(int port, const ch
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
-        int n_concurrency = 1, int moe_cache_mb = -1) {
+        int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1) {
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -1747,12 +1790,26 @@ static double common_moe_bench_candidate_server(
     // instead of real traffic.
     char cache_arg[32];
     snprintf(cache_arg, sizeof(cache_arg), moe_cache_mb > 0 ? "%d" : "auto", moe_cache_mb);
+    // -fitt controls the VRAM margin common_maybe_raise_moe_for_ctx reserves
+    // before deciding placement, and that margin is what silently raises
+    // -ncmoe until the requested context fits. Passing it through means a
+    // candidate is benchmarked at the placement it actually asked for
+    // instead of whatever the default 3 x 1024 MiB margin forced it to -
+    // without this, sweeping -ncmoe below the margin's floor measures the
+    // same effective configuration several times over (confirmed: -ncmoe
+    // 22/16/10 all silently became 27 and returned near-identical tok/s).
+    std::string fit_args;
+    if (fit_target_mb > 0) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "-fitt %d ", fit_target_mb);
+        fit_args = buf;
+    }
     snprintf(cmd, sizeof(cmd),
-        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache %s -c %u %s%s%s"
+        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
         self_exe.c_str(), path_model.c_str(), n_cpu_moe, cache_arg, ctx_for_launch,
-        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), port);
+        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
         return -1.0;
@@ -2213,6 +2270,73 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Fit margin (-fitt). Searched LAST and deliberately re-searching
+    // -ncmoe underneath it, because the two are not independent: the margin
+    // is a floor on how little offload is allowed, so lowering it does not
+    // just free VRAM, it unlocks placements the -ncmoe search above was
+    // never permitted to evaluate. Measured on Ornith-1.5-35B-Q4_K_M /
+    // RTX 3060 12 GB / -c 4096, requesting -ncmoe 8:
+    //
+    //     fitt=1024 (default) -> forced to ncmoe 27, 47.32 tok/s
+    //     fitt=640            -> forced to ncmoe 24, 50.37 tok/s
+    //     fitt=448            -> forced to ncmoe 23, 51.61 tok/s
+    //     fitt=320            -> forced to ncmoe 22, 52.85 tok/s
+    //
+    // +11.7% end to end, entirely from VRAM the default margin was holding
+    // in reserve and CPU work that reservation forced. Descending (largest
+    // margin first, i.e. safest first) and stopping at the first candidate
+    // that fails to launch or produces no improvement: below some point the
+    // margin stops covering the post-probe allocations it exists for (real
+    // weight loading, lazy CUDA graph capture) and the server either fails
+    // outright or collapses its context - a documented, reproduced failure,
+    // so this walks toward the edge and stops rather than bisecting across
+    // it. Each candidate asks for the minimum offload (safe_n) and lets the
+    // fit logic raise it to whatever that margin actually permits, which is
+    // the quantity being measured.
+    int    best_fit_mb  = -1;
+    // Baseline MUST be the best throughput already measured at the DEFAULT
+    // margin under the SAME cache size and thread count these candidates
+    // run with - i.e. the cache-knee winner, not best_threads_tps. Getting
+    // this wrong is not a subtle accounting slip: best_threads_tps was
+    // measured during the thread sweep at a different (auto) cache size, so
+    // comparing margin candidates against it compares across two different
+    // configurations at once. Measured consequence on gemma-4-26B-A4B,
+    // concurrency 4: the cache knee found 71.86 tok/s at 4096 MiB with the
+    // default 1024 MiB margin, every tightened margin scored ~50, and this
+    // search still declared fitt=448 the winner because it was only being
+    // compared against the thread stage's 43.57. That entry would have
+    // shipped a ~29% REGRESSION as a calibrated optimum. Seeding with the
+    // cache-stage best means -1 ("keep the default") correctly survives
+    // whenever tightening does not actually help, which for this model it
+    // does not.
+    double best_fit_tps = best_cache_tps > 0 ? best_cache_tps : best_threads_tps;
+    {
+        const int default_fit_mb = (int) (params.fit_params_target[0] / (1024 * 1024));
+        static const int fit_candidates_mb[] = {640, 448, 320, 256};
+        LOG_INF("%s: searching fit margin (-fitt) below the default of %d MiB at ncmoe>=%u ...\n",
+                __func__, default_fit_mb, safe_n);
+        for (size_t i = 0; i < sizeof(fit_candidates_mb) / sizeof(fit_candidates_mb[0]); i++) {
+            const int mb = fit_candidates_mb[i];
+            if (mb >= default_fit_mb) {
+                continue; // only ever tighten below the default, never loosen past it
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, safe_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, mb);
+            LOG_INF("%s:   fitt=%dMiB -> %s\n", __func__, mb,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            if (tps <= 0) {
+                LOG_INF("%s:   fitt=%dMiB did not come up - stopping here, this is the edge the "
+                        "margin exists to stay clear of\n", __func__, mb);
+                break;
+            }
+            if (tps > best_fit_tps) {
+                best_fit_tps = tps;
+                best_fit_mb  = mb;
+            }
+        }
+    }
+
     time_t now = time(nullptr);
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -2223,8 +2347,29 @@ void common_moe_calibrate(common_params & params) {
     entry.n_threads_batch = best_threads;
     entry.spec_n_max      = best_n_max;
     entry.concurrency     = concurrency;
-    entry.tok_per_sec     = best_threads_tps;
+    // best_fit_tps is already seeded from the cache-knee best, so it is the
+    // running maximum across every stage that measured a full candidate -
+    // reporting anything lower here would understate what this entry's own
+    // settings actually achieved (the pre-existing code reported only
+    // best_threads_tps, which ignored the cache sweep entirely and on
+    // gemma-4 understated the result by 71.86 -> 43.57).
+    entry.tok_per_sec     = std::max(best_threads_tps, best_fit_tps);
     entry.moe_cache_mb    = best_cache_mb;
+    entry.fit_target_mb   = best_fit_mb;
+    // Record the reduction settings this calibration was actually measured
+    // under, read from the same environment the cache itself reads (rather
+    // than from params, which has no field for them) - see the field
+    // comments on common_moe_calibration_entry for why an entry measured
+    // with reduction on is not valid for a run with it off.
+    {
+        const char * en = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
+        if (en && atoi(en) != 0) {
+            const char * k  = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K");
+            const char * bm = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB");
+            entry.neuron_reduce_k         = k  ? atoi(k)  : 256;
+            entry.neuron_reduce_budget_mb = bm ? atoi(bm) : 256;
+        }
+    }
     entry.calibrated_at   = timebuf;
     common_moe_calibration_save(path_model, params, entry);
 
@@ -2447,6 +2592,28 @@ bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & 
     out_bits.assign(need, 0);
     if (!ggml_moe_cache.get_substitute_map(out_bits.data(), (int) out_bits.size(), &rows, &cols)) {
         out_bits.clear();
+        return false;
+    }
+    out_rows = rows;
+    out_cols = cols;
+    return true;
+}
+
+bool common_moe_cache_get_neuron_concentration_map(std::vector<float> & out_values, int & out_rows, int & out_cols) {
+    out_rows = 0;
+    out_cols = 0;
+    if (!ggml_moe_cache.get_neuron_concentration_map) {
+        return false;
+    }
+    int rows = 0, cols = 0;
+    ggml_moe_cache.get_neuron_concentration_map(nullptr, 0, &rows, &cols);
+    if (rows <= 0 || cols <= 0) {
+        return false;
+    }
+    const size_t need = (size_t) rows * (size_t) cols;
+    out_values.assign(need, -1.0f);
+    if (!ggml_moe_cache.get_neuron_concentration_map(out_values.data(), (int) out_values.size(), &rows, &cols)) {
+        out_values.clear();
         return false;
     }
     out_rows = rows;
@@ -2692,6 +2859,29 @@ static bool common_maybe_raise_moe_for_ctx(
     // no-alloc probe can't see (real weight loading, lazy CUDA graph capture).
     // Judging placement by a bare fit here is what let a 65536-token request
     // get "fixed" by a single extra offloaded layer and still collapse to 4096.
+    // A calibrated fit margin, if one was measured for this exact
+    // GPU+model+context, replaces the default before the margin is computed
+    // - it has to be applied HERE rather than alongside the placement
+    // decision below, because this margin is precisely what determines how
+    // far -ncmoe gets raised. Applying it afterwards would compute the
+    // placement against the untuned default and then record a margin that
+    // never influenced anything. Only ever tightens: a calibrated value
+    // above the default is ignored, on the same "calibration is a floor,
+    // never a licence to undershoot safety" principle the placement lookup
+    // below already follows.
+    {
+        common_moe_calibration_entry cal_fit;
+        if (common_moe_calibration_lookup(path_model, params, cal_fit) && cal_fit.fit_target_mb > 0) {
+            const size_t want = (size_t) cal_fit.fit_target_mb * 1024 * 1024;
+            if (want < params.fit_params_target[0]) {
+                LOG_WRN("%s: using calibrated fit margin of %d MiB per device (default %zu MiB) - "
+                        "measured %.2f tok/s on %s\n", __func__, cal_fit.fit_target_mb,
+                        params.fit_params_target[0] / (1024 * 1024), cal_fit.tok_per_sec,
+                        cal_fit.calibrated_at.c_str());
+                std::fill(params.fit_params_target.begin(), params.fit_params_target.end(), want);
+            }
+        }
+    }
     const int64_t margin = 3 * (int64_t) params.fit_params_target[0];
 
     // Prefer a calibrated placement when one exists. The search below answers

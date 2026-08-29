@@ -94,6 +94,15 @@
 
 	let pulse: Float32Array | null = null;
 	let subPulse: Float32Array | null = null;
+	// Live snapshot (not read-and-cleared, not pulsed/decayed like pulse/
+	// subPulse above) of per-cell neuron dead-fraction, from
+	// next.neuron_concentration - -1 for "no data", 0-1 otherwise. Directly
+	// overwritten each poll rather than diffed, since the server always
+	// reports its current live value, not "since last poll". $state, unlike
+	// pulse/subPulse: those are only read inside the imperative rAF draw
+	// loop, this is also bound directly in the legend template ({#if
+	// neuronConcentration}), which needs real reactivity to update.
+	let neuronConcentration: Float32Array | null = $state(null);
 	let lastSeq = 0;
 	let rafHandle = 0;
 	let pollHandle: ReturnType<typeof setInterval> | undefined;
@@ -163,6 +172,12 @@
 						subPulse[i] = 1;
 					}
 				}
+			}
+
+			if (next.neuron_concentration && next.neuron_concentration.length === rows * cols) {
+				neuronConcentration = Float32Array.from(next.neuron_concentration);
+			} else {
+				neuronConcentration = null;
 			}
 		} catch {
 			probeErr = true;
@@ -314,7 +329,24 @@
 				continue;
 			}
 
-			const r = ATLAS_POINT_R + 1 + cell.spec * 2.5;
+			let r = ATLAS_POINT_R + 1 + cell.spec * 2.5;
+
+			// Neuron concentration overlay: shrink the dot for experts with a
+			// high dead-neuron fraction (highly compressible - most of their
+			// neurons contribute almost nothing), leave it untouched when
+			// there's no data (-1) or the expert is genuinely dense (near 0).
+			// A separate visual channel from color deliberately - color
+			// already carries tier + substitute state, and cramming a third
+			// signal into hue/saturation would make all three hard to read
+			// at once. Floor at 0.4x so a highly-concentrated expert's dot
+			// never disappears entirely.
+			if (neuronConcentration) {
+				const idx = cell.layer * cols + cell.expert;
+				const deadFrac = neuronConcentration[idx];
+				if (deadFrac !== undefined && deadFrac >= 0) {
+					r *= Math.max(0.4, 1 - deadFrac * 0.6);
+				}
+			}
 
 			ctx.beginPath();
 			ctx.arc(px, py, r, 0, 2 * Math.PI);
@@ -619,6 +651,11 @@
 				<Flame class="size-3" />
 				brightness = recent hits
 			</span>
+			{#if neuronConcentration}
+				<span class="flex items-center gap-1" title="smaller dot = more of this expert's neurons contribute almost nothing (GGML_CUDA_MOE_CACHE_NEURON_HEAT)">
+					size = neuron concentration
+				</span>
+			{/if}
 		</div>
 	</div>
 

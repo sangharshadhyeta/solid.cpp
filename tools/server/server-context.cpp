@@ -4835,7 +4835,22 @@ void server_routes::init_routes() {
             }
         }
 
+        // Neuron concentration overlay (dead-fraction proxy, Brain UI dot
+        // size) - a live snapshot like get_expert_map, not read-and-cleared
+        // like the substitute overlay, so no diffing needed. Same
+        // shape-mismatch handling as the substitute overlay above: treat a
+        // mismatch as "nothing to report" rather than risk a stale-shape
+        // array reaching the UI. Only present in the response at all when
+        // GGML_CUDA_MOE_CACHE_NEURON_HEAT is enabled server-side - omitted
+        // entirely otherwise, so the UI can tell "not measured" from "flat
+        // zero" without a magic sentinel in the JSON itself.
+        std::vector<float> concentration;
+        int conc_rows = 0, conc_cols = 0;
         json body = {{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"substitutions", sub_hex}, {"seq", seq}, {"stats", stats}};
+        if (common_moe_cache_get_neuron_concentration_map(concentration, conc_rows, conc_cols) &&
+            conc_rows == rows && conc_cols == cols) {
+            body["neuron_concentration"] = concentration;
+        }
         if (atlas_loaded) {
             body["atlas"] = atlas_json;
         }

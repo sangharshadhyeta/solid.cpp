@@ -171,6 +171,17 @@ struct ggml_moe_cache_api {
     // with the real shape in out_rows/out_cols if out_bits is too small).
     int (*get_substitute_map)(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols);
 
+    // Live per-(layer,expert) neuron concentration, for the Brain/Atlas
+    // view - a cheap O(n) dead-neuron-fraction proxy (0.0-1.0, share of
+    // this expert's neurons contributing under 1% of its own mean value),
+    // -1.0 for a cell with no data yet. Same rows/cols shape convention
+    // as get_expert_map, writes a float per cell instead of a bit. Only
+    // produces real data when GGML_CUDA_MOE_CACHE_NEURON_HEAT is set;
+    // NULL-safe, returns 0 (no data) otherwise. Same failure/retry
+    // convention as get_expert_map/get_substitute_map for an
+    // undersized buffer.
+    int (*get_neuron_concentration_map)(float * out_values, int max_floats, int * out_rows, int * out_cols);
+
     // Debug only, NULL-safe: assert that each compacted hit row is about to be
     // served by a slot actually holding the expert that row asked for. The
     // slot CONTENTS have been verified correct, so a corruption that survives
