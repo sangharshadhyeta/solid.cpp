@@ -46,6 +46,7 @@ body{
   -webkit-font-smoothing:antialiased;
 }
 ::selection{background:var(--hot);color:#06110d;}
+p{text-align:justify;text-align-last:left;hyphens:auto;}
 
 .wrap{max-width:960px;margin:0 auto;padding:0 1.25rem 6rem;position:relative;}
 
@@ -198,11 +199,11 @@ td.num{font-variant-numeric:tabular-nums;font-weight:600;font-family:var(--font-
 .brain-legend .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:.4rem;vertical-align:middle;}
 
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:.85rem;}
-.grid a.card{display:block;color:var(--fg);}
+.grid a.card{display:flex;flex-direction:column;color:var(--fg);}
 .grid a.card:hover{border-color:var(--hot);text-decoration:none;transform:translateY(-2px);}
 .grid a.card .k{font-weight:700;color:var(--hot);font-size:.95rem;}
 .grid a.card .d{color:var(--muted);font-size:.83rem;margin-top:.3rem;}
-.grid a.card img{width:100%;border-radius:8px;margin-bottom:.6rem;display:block;}
+.grid a.card img{width:100%;height:220px;object-fit:cover;object-position:center;border-radius:8px;margin-bottom:.6rem;display:block;}
 
 footer{margin-top:4rem;padding-top:1.75rem;border-top:1px solid var(--border);color:var(--muted-2);font-size:.85rem;display:flex;justify-content:space-between;flex-wrap:wrap;gap:.5rem;}
 footer a{color:var(--muted);text-decoration:underline;}
@@ -405,7 +406,7 @@ session's real history and some are pp2048 (prompt processing) rather than tg (g
 <thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
 <tr><td>Real placement optimum <span class="note">(vs a conservative <code>-ncmoe</code> guess)</span></td><td class="num">46.995 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+10.0%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Native full-tensor prefetch double-buffer <span class="note">(<code>GGML_SCHED_PREFETCH_EXPERTS</code>, existing code &mdash; found shipping disabled, verified stable, correctness-checked; pp2048; VRAM cost now measured (820 MiB) and reserved in the fit margin, so it's safe to opt into &mdash; still off by default)</span></td><td class="num">951.77 tok/s</td><td class="num">1072.96 tok/s</td><td class="num delta-pos">+12.7%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Native full-tensor prefetch double-buffer <span class="note">(<code>GGML_SCHED_PREFETCH_EXPERTS</code> &mdash; found shipping disabled, now safe to opt into)</span></td><td class="num">951.77 tok/s</td><td class="num">1072.96 tok/s</td><td class="num delta-pos">+12.7%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td><code>--moe-calibrate</code> empirical search <span class="note">(vs safe-floor placement)</span></td><td class="num">41.68 tok/s</td><td class="num">50.70 tok/s</td><td class="num delta-pos">+21.6%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>MTP speculative decoding</td><td class="num">50.70 tok/s</td><td class="num">64.92 tok/s</td><td class="num delta-pos">+28.1%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>MoE expert-cache <span class="note">(vs <code>--moe-cache off</code>)</span></td><td class="num">39.37 tok/s</td><td class="num">51.71 tok/s</td><td class="num delta-pos">+31.3%</td><td><span class="tag tag-solid">solid</span></td></tr>
@@ -426,34 +427,34 @@ that only publishes wins is the thing this project exists not to be.</p>
 <colgroup><col style="width:38%"><col style="width:17%"><col style="width:17%"><col style="width:14%"><col style="width:14%"></colgroup>
 <thead><tr><th>What</th><th>Before</th><th>After</th><th>Change</th><th></th></tr></thead>
 <tbody>
-<tr><td>Speculative eviction, single guess <span class="note">(3 refutation attempts: abundant RAM 100.9&rarr;65.9 tok/s; genuine &gt;RAM pressure 44.75&rarr;37.42 tok/s; retested with cost-aware target selection 56.4&rarr;47.7 tok/s)</span></td><td class="num">3 regimes</td><td class="num">-35% / -16% / -15%</td><td class="num delta-neg">refuted 3&times;</td><td><span class="tag tag-solid">refuted</span></td></tr>
-<tr><td>Cross-depth-agreement eviction <span class="note">(require a closer depth to independently confirm a farther one before evicting anything; hit rate, 200-tok run)</span></td><td class="num">76.5% hits</td><td class="num">77.3% hits</td><td class="num delta-pos">fewer evictions, more hits</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Speculative eviction, single guess <span class="note">(refuted across 3 different memory-pressure regimes)</span></td><td class="num">3 regimes</td><td class="num">-35% / -16% / -15%</td><td class="num delta-neg">refuted 3&times;</td><td><span class="tag tag-solid">refuted</span></td></tr>
+<tr><td>Cross-depth-agreement eviction <span class="note">(a closer depth must confirm a farther one before evicting; 200-tok run)</span></td><td class="num">76.5% hits</td><td class="num">77.3% hits</td><td class="num delta-pos">fewer evictions, more hits</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>NVMe migration <span class="note">(model reads, SATA &rarr; PCIe NVMe)</span></td><td class="num">0.50 GB/s</td><td class="num">2.9 GB/s</td><td class="num delta-pos">5.8&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Expert-cache size knee <span class="note">(sweep 1/2/4/6/8 GiB, production shape)</span></td><td class="num">7.4&ndash;8 GiB</td><td class="num">4 GiB, same tok/s</td><td class="num delta-pos">3.5 GiB freed</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Low cache-size placement collapse <span class="note">(2,048 MiB request starves the fit search)</span></td><td class="num">4 slots</td><td class="num">1 slot</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">found live</span></td></tr>
 <tr><td>Router-lookahead ranking fix <span class="note">(missing sigmoid + load-balancing bias)</span></td><td class="num">raw logits</td><td class="num">sigmoid+bias</td><td class="num delta-pos">fixed</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Brain/atlas UI <span class="note">(upstream #22937 defaulted the build to a prebuilt HF bundle)</span></td><td class="num">stock square</td><td class="num">atlas</td><td class="num delta-pos">restored</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>TurboQuant V cache <span class="note">(WHT+Lloyd-Max vs <code>q4_0</code>, real V, matched 4.5&nbsp;bpw &mdash; no outliers to remove on this axis)</span></td><td class="num">0.0475 err</td><td class="num">0.0500 err</td><td class="num delta-neg">worse</td><td><span class="tag tag-solid">not built</span></td></tr>
-<tr><td>Fit margin dropped to 0 <span class="note">(tried after calibration was wired into the fit path, on the reasoning that a measurement shouldn't need the same safety margin a guess does &mdash; wrong: it doesn't excuse skipping post-probe allocation)</span></td><td class="num">65536 ctx</td><td class="num">4096 ctx</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">reverted</span></td></tr>
+<tr><td>Fit margin dropped to 0 <span class="note">(the margin also covers post-probe allocation, not just placement uncertainty)</span></td><td class="num">65536 ctx</td><td class="num">4096 ctx</td><td class="num delta-neg">collapsed</td><td><span class="tag tag-solid">reverted</span></td></tr>
 <tr><td>FR-Spec draft-vocab trim <span class="note">(measured, not assumed free)</span></td><td class="num">75.93 tok/s</td><td class="num">56.2 tok/s</td><td class="num delta-neg">-26%</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Context + concurrency from placement fix <span class="note">(<code>-ncmoe 15 -c 65536</code>, same command, same root fix)</span></td><td class="num">4,096 tok / 1 slot</td><td class="num">65,536 tok / 4 slots</td><td class="num delta-pos">16&times; / 4&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Restart re-prefill <span class="note">(disk prompt cache, 3,623-token prompt)</span></td><td class="num">5,775 ms</td><td class="num">271 ms</td><td class="num delta-pos">21&times;</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>KV cache size <span class="note">(<code>q8_0</code>, 65,536 ctx &times; 4 slots)</span></td><td class="num">2,180 MiB</td><td class="num">1,158 MiB</td><td class="num delta-pos">-47%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Host-resident hot-expert holding <span class="note">(2 variants tried: dedicated 5 GiB buffer -56% [11.31&rarr;5.03 tok/s], <code>mlock</code> pinning -12% [11.74&rarr;10.30 tok/s] &mdash; both ship disabled; re-checked wiring, still correctly reached, negative results stand)</span></td><td class="num">2 variants</td><td class="num">-56% / -12%</td><td class="num delta-neg">both worse</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after 5-round harness; re-measured with the LFRU/prefill fixes in place)</span></td><td class="num">96 D2D hits</td><td class="num">121 D2D hits</td><td class="num delta-pos">+26% hits, tok/s unchanged</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Host-resident hot-expert holding <span class="note">(2 variants tried, both worse &mdash; dedicated buffer -56%, mlock pinning -12%)</span></td><td class="num">2 variants</td><td class="num">-56% / -12%</td><td class="num delta-neg">both worse</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Usage-history pre-warm <span class="note">(claimed +21&ndash;50%, retracted after a 5-round harness; re-measured)</span></td><td class="num">96 D2D hits</td><td class="num">121 D2D hits</td><td class="num delta-pos">+26% hits, tok/s unchanged</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Router-lookahead prefetch <span class="note">(next layer's experts predicted, filled early &mdash; confirmed still firing live, 232 calls/short run)</span></td><td class="num">88.3% hit rate</td><td class="num">89.4% hit rate</td><td class="num delta-pos">+1.1pp</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>LFRU hit/miss split for prefill <span class="note">(device-to-device for cache-resident experts instead of always PCIe &mdash; design from <a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>, re-derived against our own cache. The D2D copies work and are measurable (65 hits warm), but the moe-cache prefill double-buffer that carries them was never benchmarked until now &mdash; and it costs 5%, see the row below. Ships off by default.)</span></td><td class="num">0 D2D, always PCIe</td><td class="num">65 D2D hits, warm</td><td class="num">mechanism works, see below</td><td><span class="tag tag-solid">superseded</span></td></tr>
-<tr><td>moe-cache prefill double-buffer, measured at last <span class="note">(<code>GGML_CUDA_MOE_PREFILL_BUFFER</code> &mdash; the mechanism the D2D path rides on. Never benchmarked before: the +12.7% above belongs to a <em>different</em> flag, <code>GGML_SCHED_PREFETCH_EXPERTS</code>. Gemma-4 is the only architecture that registers prefill successors, so it is the only place this can run at all; pp2048, 3 rounds, near-zero variance)</span></td><td class="num">953.00 tok/s</td><td class="num">905.35 tok/s</td><td class="num delta-neg">-5.0%</td><td><span class="tag tag-solid">refuted</span></td></tr>
-<tr><td>Silent corruption under copy failure <span class="note">(a failed prefill copy still published its slot, so the consumer read the previous tensor's bytes as expert weights &mdash; fluent-looking garbage, clean logs. Fixed, then <em>proven</em> with deterministic fault injection rather than assumed)</span></td><td class="num">122 prefill hits, garbage out</td><td class="num">19 hits, correct out, loud disable</td><td class="num delta-pos">fixed + validated</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Low draft-acceptance warning <span class="note">(Ornith-1.5-35B's built-in MTP head drafts at 0.19 acceptance and runs ~2&times; <em>slower</em> than no speculation, with nothing in the output saying why; Gemma with a matched draft model reaches 0.65&ndash;0.74 on the same build)</span></td><td class="num">silent 2&times; slowdown</td><td class="num">warns once, names the cause</td><td class="num delta-pos">diagnosable</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Stale LFRU hit-mask corruption <span class="note">(root cause of a garbled, repeated-character output bug: the scheduler's device-to-device cache-hit bitmask was computed once per routing decision and reused across <code>gate_exps</code>/<code>up_exps</code>/<code>down_exps</code>, but LFRU residency is tracked per weight tensor &mdash; a bit cleared because an expert was cached for <code>gate_exps</code> got wrongly treated as "already copied" for the other two, leaving their row neither device- nor host-copied. Bisected to the exact introducing commit, root-caused via direct code reading rather than trusting the symptom, fixed by separating the routing bitmask from a per-tensor copy mask)</span></td><td class="num">corrupts reliably, 2nd of 2 sequential prompts</td><td class="num">verified clean across repeated varied prompts</td><td class="num delta-pos">fixed, root cause</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Sentinel expert-id (&minus;1) handling <span class="note">(a skipped-slot sentinel id triggered an assert in the sparse H2D copy path and, separately, an off-by-one in the CUDA compaction kernel's row-position tally, plus an out-of-bounds channel read in the vector matmul kernel &mdash; all three fixed to skip the sentinel rather than assume every id is a real expert)</span></td><td class="num">assert / OOB risk</td><td class="num">sentinel skipped correctly</td><td class="num delta-pos">fixed</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Recurrent-state dtype, Gated DeltaNet/KDA <span class="note">(new <code>-ctr</code>/<code>-cts</code> flags, mirroring <code>-ctk</code>/<code>-ctv</code> &mdash; F32 was hardcoded with no override anywhere in the loader. f16 needed a real fix underneath it: <code>ggml_cuda_op_scale</code> had no F16 kernel at all and asserted on first decode, now templated over F32/f16 like this codebase's other elementwise CUDA ops. Verified: buffer halves, output stays coherent, default F32 path unaffected)</span></td><td class="num">62.81 MiB (f32)</td><td class="num">31.41 MiB (f16)</td><td class="num delta-pos">-50%</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Explicit <code>pread()</code> for cold expert fetch <span class="note">(tested whether replacing mmap page-fault demand-paging with one explicit read sized to the whole expert would help, per a comparable macOS SSD-streaming project's 8&times; finding &mdash; it doesn't transfer here: real fills measured at 0.133ms average, 53 fills summing to 7.1ms against a ~700ms request, so fill mechanics were never the bottleneck this hardware/workload pair. Kept as a working, opt-in, zero-cost-when-unset code path; not made default)</span></td><td class="num">750.4ms</td><td class="num">729.3ms</td><td class="num">within run-to-run noise</td><td><span class="tag tag-solid">no gain here</span></td></tr>
-<tr><td>Topic-affinity atlas cache warming, iterated to a real win <span class="note">(offline-probed per-expert topic position + a live decaying request-direction centroid; three designs measured in sequence: thin eviction -0.31pp, wide eviction -6.55pp &mdash; six times worse, proving forced speculative eviction was the actual defect, not its budget &mdash; then free-slot-only admission with boost-only eviction protection, safe but flat at -0.35pp. A cold-start root cause found after: burst-mode admission was firing on <em>convergence noise</em> during a session's first ~200 routing decisions, not real topic shifts, competing with genuine first-time demand for a free-slot budget that never refills)</span></td><td class="num">3 designs</td><td class="num">-0.31 / -6.55 / -0.35pp</td><td class="num delta-neg">unwound in order</td><td><span class="tag tag-solid">superseded below</span></td></tr>
-<tr><td>Live-activation MoE predictor <span class="note">(the atlas above predicts from a hand-picked 9-category topic position; two graph-only alternatives &mdash; spectral co-activation embedding, incremental SGNS &mdash; were tried to let the system discover its own axes and both lost decisively on held-out link-prediction AUC, 0.57 and 0.49 vs the hand-labeled atlas's 0.71, confirming a documented split in the literature: functional signals generalize to future decisions, correlational ones just memorize training structure. Built the alternative recent MoE literature actually uses instead: a small linear layer trained <em>online</em>, per model, on the real pre-FFN hidden state each routing decision was actually computed from &mdash; captured at the existing cache dispatch hook, with zero new GPU graph nodes. 40&ndash;45% top-1 accuracy against a ~3% chance floor from a cold start)</span></td><td class="num">0.71 vs 0.57/0.49 AUC</td><td class="num">40-45% top-1 (~3% chance)</td><td class="num delta-pos">real signal, not noise</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Predictor-driven warming, self-tuned and persisted <span class="note">(wired into the SAME free-slot-only admission the atlas uses &mdash; no new eviction rights anywhere. Naively unthrottled it over-fired (7,436 prefetches from one 400-token request, several times a full 6-request atlas round) and cost -0.32pp; fixed with a hard floor on the pool's own remaining free-slot budget, not a guessed rate limit. The live topic-direction signal (req_dir) is fed to the predictor as a learned input feature rather than hand-blended with its score, and admission aggressiveness is scaled by a live evidence ratio (did an admitted slot actually get reused before eviction) instead of a fixed constant &mdash; both self-tuning, not hand-picked. That evidence reset to a neutral 50% prior on every restart until weights and evidence were persisted to disk, keyed by tensor name since the in-memory address isn't stable across restarts; fixed a real bug caught in the process, where different expert tensors in the same model (gate vs. down projections) have genuinely different hidden widths, not one shared value. Multi-round topic-switch benchmark, temperature 0, 4 rounds/arm)</span></td><td class="num">off (no warming)</td><td class="num">+0.12pp hit rate, 3/4 rounds</td><td class="num delta-pos">first real win, post-atlas</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Substitution, rank-gated draft/fallback <span class="note">(<code>GGML_CUDA_MOE_CACHE_SUBSTITUTE</code> existed and was perplexity/router-score measured but had never actually been run live before now, and never with this fork's own multi-round tok/s methodology &mdash; it can't move hit rate at all, <code>device.misses</code> increments unconditionally before the substitution check runs, so every earlier hit-rate benchmark was structurally blind to it. Speculative-decoding-shaped fix added alongside: split by the missed expert's own router rank, the one cost proxy actually available at this CPU dispatch point (no access to the router's real probability values here &mdash; same limitation the "full-probs oracle" row above documents) &mdash; below a configured rank floor (the router's most-confident, most-consequential picks) a miss always pays exact CPU fallback; at or above it (already-measured: rank 7 misses 44% of the time vs rank 0's 20%, and carries only a sliver of the total gate mass) the cheap resident stand-in serves it instead. Multi-round topic-switch benchmark, temperature 0, 4 rounds/arm, MIN_RANK=4; hit rate confirmed unchanged, 0.766 vs 0.767)</span></td><td class="num">55.12 tok/s</td><td class="num">59.59 tok/s</td><td class="num delta-pos">+8.11%, 4/4 rounds</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>LFRU hit/miss split for prefill <span class="note">(device-to-device for resident experts &mdash; design from <a href="https://github.com/FlashML-org/FreeToken">FreeToken</a>; the buffer it rides on costs 5%, see row below)</span></td><td class="num">0 D2D, always PCIe</td><td class="num">65 D2D hits, warm</td><td class="num">mechanism works, see below</td><td><span class="tag tag-solid">superseded</span></td></tr>
+<tr><td>moe-cache prefill double-buffer, measured at last <span class="note">(<code>GGML_CUDA_MOE_PREFILL_BUFFER</code> &mdash; distinct from the +12.7% flag above; Gemma-4 only, pp2048)</span></td><td class="num">953.00 tok/s</td><td class="num">905.35 tok/s</td><td class="num delta-neg">-5.0%</td><td><span class="tag tag-solid">refuted</span></td></tr>
+<tr><td>Silent corruption under copy failure <span class="note">(a failed prefill copy still published its slot &mdash; fixed, verified with deterministic fault injection)</span></td><td class="num">122 prefill hits, garbage out</td><td class="num">19 hits, correct out, loud disable</td><td class="num delta-pos">fixed + validated</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Low draft-acceptance warning <span class="note">(Ornith's MTP head drafts at 0.19 acceptance, runs ~2&times; slower &mdash; now diagnosed, not silent)</span></td><td class="num">silent 2&times; slowdown</td><td class="num">warns once, names the cause</td><td class="num delta-pos">diagnosable</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Stale LFRU hit-mask corruption <span class="note">(a shared hit bitmask vs. per-tensor LFRU residency &mdash; bisected, root-caused, fixed)</span></td><td class="num">corrupts reliably, 2nd of 2 sequential prompts</td><td class="num">verified clean across repeated varied prompts</td><td class="num delta-pos">fixed, root cause</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Sentinel expert-id (&minus;1) handling <span class="note">(an assert, an off-by-one, and an OOB read, all from one unhandled sentinel id)</span></td><td class="num">assert / OOB risk</td><td class="num">sentinel skipped correctly</td><td class="num delta-pos">fixed</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Recurrent-state dtype, Gated DeltaNet/KDA <span class="note">(new <code>-ctr</code>/<code>-cts</code> flags &mdash; needed a new F16 <code>ggml_cuda_op_scale</code> kernel too)</span></td><td class="num">62.81 MiB (f32)</td><td class="num">31.41 MiB (f16)</td><td class="num delta-pos">-50%</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Explicit <code>pread()</code> for cold expert fetch <span class="note">(vs. mmap demand-paging &mdash; fill mechanics were never the bottleneck here)</span></td><td class="num">750.4ms</td><td class="num">729.3ms</td><td class="num">within run-to-run noise</td><td><span class="tag tag-solid">no gain here</span></td></tr>
+<tr><td>Topic-affinity atlas cache warming, iterated to a real win <span class="note">(3 designs tried in sequence &mdash; thin/wide eviction, then free-slot-only admission)</span></td><td class="num">3 designs</td><td class="num">-0.31 / -6.55 / -0.35pp</td><td class="num delta-neg">unwound in order</td><td><span class="tag tag-solid">superseded below</span></td></tr>
+<tr><td>Live-activation MoE predictor <span class="note">(two graph-discovered alternatives lost decisively to the hand-picked atlas on link-prediction AUC)</span></td><td class="num">0.71 vs 0.57/0.49 AUC</td><td class="num">40-45% top-1 (~3% chance)</td><td class="num delta-pos">real signal, not noise</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Predictor-driven warming, self-tuned and persisted <span class="note">(free-slot budget floor + live evidence ratio, both self-tuning; weights persist across restarts)</span></td><td class="num">off (no warming)</td><td class="num">+0.12pp hit rate, 3/4 rounds</td><td class="num delta-pos">first real win, post-atlas</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Substitution, rank-gated draft/fallback <span class="note">(exact fallback above a router-rank floor, cheap resident stand-in below it)</span></td><td class="num">55.12 tok/s</td><td class="num">59.59 tok/s</td><td class="num delta-pos">+8.11%, 4/4 rounds</td><td><span class="tag tag-solid">solid</span></td></tr>
 </tbody>
 </table>
 </div>
@@ -478,7 +479,7 @@ polls the running server and renders, live, which experts are actually resident 
 </div>
 
 <p style="margin-top:1.5rem">Merged into the same view: the <strong>Atlas</strong> — each expert positioned by
-measured topic affinity (code, math, law, medicine, and six other categories, probed with greedy decode and a
+measured topic affinity (code, math, law, medicine, and five other categories, probed with greedy decode and a
 replication gate so one lucky prompt can't fake a specialist), colour still driven by live cache state. Position
 from measurement, colour from reality, one canvas. Cells flash <strong style="color:#eab308">yellow</strong> when
 serving as a live substitution stand-in — a resident expert doing someone else's work rather than the router's
@@ -529,11 +530,18 @@ both lost.</p>
 <p><strong>Then the same two maps were run through the live server, and were indistinguishable.</strong>
 Probe atlas (AUC 0.7116): <strong>58.45 tok/s, 71.20% hit</strong>. Incremental atlas (AUC 0.4823, i.e.
 chance): <strong>58.43 tok/s, 71.28% hit</strong>. A map scoring at chance performs exactly as well in the
-running system as one scoring 0.7116, because warming is rate-limited to once per 64 routing decisions and
-admission-gated &mdash; it supplies roughly <strong>2% of fills</strong>. The map's advantage is real as a
-statement about maps and never reaches the mechanism consuming it. Any claim that one atlas beats another now
-has to say <em>which of the two things</em> it means.</p>
+running system as one scoring 0.7116, on the original rate-limited, admission-gated design that supplied
+roughly 2% of fills. The map's advantage is real as a statement about maps and never reaches the mechanism
+consuming it. Any claim that one atlas beats another now has to say <em>which of the two things</em> it
+means.</p>
 </div>
+
+<p class="note">That 2% figure is from the original design; a later rebuild (free-slot-only admission, a
+wider candidate pool, burst-mode firing on a detected topic shift) touches roughly <strong>22% of
+decisions</strong> instead, and fixed two designs measured actively harmful (&minus;0.31pp, &minus;6.55pp)
+along the way. Current honest state: safe, not harmful, but still short of a consistent win &mdash;
+post-switch pooled hit-rate delta of &minus;0.35pp overall, with individual topics mixed rather than uniform
+(one, law, is a real +0.40pp win, 3 of 4 rounds). Ships off by default either way.</p>
 
 <p>Why the ceiling is that low is the deeper answer: atlas warming gains <strong>+0.31pp</strong> hit rate in
 simulation, while a <em>topic oracle</em> with perfect foreknowledge of the segment's experts gains
@@ -713,39 +721,23 @@ measured context that fits instead - see <a href="#brain-atlas">above</a> for ho
 </div>
 <div class="card">
 <h3>Stale LFRU hit-mask corruption, root-caused</h3>
-<p>Chased a garbled, repeated-character output bug across an extended session — every sanitizer clean, every
-moe-cache-internal mechanism individually ruled out by direct fault injection. Git-bisected to the exact
-introducing commit, then found it by reading the code, not by trusting what a comment claimed: the scheduler's
-device-to-device cache-hit bitmask is computed once per routing decision and legitimately shared across
-<code>gate_exps</code>/<code>up_exps</code>/<code>down_exps</code> (they share one routing tensor), but LFRU
-residency is tracked per weight tensor — a bit cleared because an expert was cached for <code>gate_exps</code>
-got reused as "already copied" for the other two, which have independent cache contents. That left the row
-neither device- nor host-copied: garbage GPU memory read straight into the matmul as expert weights. Fix
-separates the routing bitmask (legitimately shared) from a fresh per-tensor copy mask (rescanned every input).
-Verified clean across repeated, varied, sequential prompts on the exact config that corrupted reliably before.</p>
+<p>A garbled, repeated-character output bug, git-bisected and root-caused: the device-to-device hit bitmask is
+legitimately shared across <code>gate_exps</code>/<code>up_exps</code>/<code>down_exps</code>, but LFRU residency
+is tracked per tensor — a bit cleared for one left the others neither device- nor host-copied, reading garbage
+as weights. Fixed by separating the shared routing bitmask from a fresh per-tensor copy mask.</p>
 </div>
 <div class="card">
 <h3>Recurrent-state dtype: <code>-ctr</code>/<code>-cts</code></h3>
-<p>Gated DeltaNet/KDA's per-sequence recurrent state was hardcoded F32 everywhere in the loader, with zero
-override — unlike K/V cache, which has had <code>-ctk</code>/<code>-ctv</code> for years. New flags mirror that
-exact pattern; f16 halves the state's footprint (62.81 &rarr; 31.41 MiB on a 40-layer GDN model) for a real
-concurrency win on memory-constrained cards. Needed a real fix underneath it, not just a config path:
-<code>ggml_cuda_op_scale</code> had no F16 kernel at all and asserted on the first decode step, so it's now
-templated over F32/f16 like this codebase's other elementwise CUDA ops (<code>clamp.cu</code> et al.). Default
-stays F32, unchanged; f16 verified coherent, correct output.</p>
+<p>Gated DeltaNet/KDA's recurrent state was hardcoded F32 with no override, unlike K/V cache's
+<code>-ctk</code>/<code>-ctv</code>. New flags mirror that pattern; f16 halves the footprint (62.81 &rarr; 31.41
+MiB) with output verified coherent — needed a new F16 <code>ggml_cuda_op_scale</code> kernel underneath it too.</p>
 </div>
 <div class="card">
 <h3>Live-activation predictor for expert-cache warming</h3>
-<p>A small linear layer per model, trained online at the existing dispatch hook on the real pre-FFN hidden state
-each routing decision actually came from &mdash; not an offline probe, not a graph built from historical
-co-activation (both tried, both lost decisively to a hand-labeled baseline on held-out link prediction). Feeds
-the same free-slot-only admission path the topic atlas uses, so it inherits every safety property already
-proven there. Self-tuning throughout: a hard floor on the pool's own remaining free-slot budget replaces a
-guessed rate limit, and admission strength scales off a live evidence ratio (did a warmed slot actually get
-reused) rather than a fixed constant. Weights and evidence persist across restarts, keyed by stable tensor name.
-40&ndash;45% top-1 accuracy from a cold start against ~3% chance; +0.12pp hit rate, 3/4 rounds, on a multi-round
-topic-switch benchmark &mdash; the first mechanism in this whole line of work to beat the no-warming baseline on
-repeated measurement rather than land at "safe but flat."</p>
+<p>A small linear layer trained online on the real hidden state each routing decision came from, feeding the
+same free-slot-only admission path the topic atlas uses. Self-tuning throughout, weights persisted across
+restarts. 40&ndash;45% top-1 accuracy from a cold start (~3% chance); +0.12pp hit rate, 3/4 rounds — the first
+mechanism here to beat the no-warming baseline on repeat measurement.</p>
 </div>
 </div>
 </section>
