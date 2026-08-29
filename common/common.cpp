@@ -2485,6 +2485,72 @@ static int common_moe_verify_width(const common_params & params) {
     return params.speculative.has_dft() ? (params.speculative.draft.n_max + 1) : 1;
 }
 
+// Hard safety clamp on concurrent slots while the MoE expert cache is active.
+//
+// This is a CORRECTNESS guard, not a throughput knob, which is why it clamps
+// instead of warning: above the limit the cache produces silently corrupted
+// output - the model emits garbage vocabulary tokens (`<unused49>` on
+// gemma-4) instead of text - and the session never recovers, so every later
+// request on that server is affected too, including sequential ones.
+//
+// Measured directly, gemma-4-26B-A4B / RTX 3060 / -c 4096, 8 concurrent
+// requests x 3 rounds per configuration, counting responses containing
+// garbage tokens:
+//
+//     --parallel 2, cache on        ->  0/24   clean
+//     --parallel 3, cache on        -> 21/24   corrupt, and permanent
+//     --parallel 4, cache on        -> 20/24   corrupt, and permanent
+//     --parallel 8, cache on        -> 24/24   corrupt, and permanent
+//     --parallel 4, --moe-cache off ->  0/24   clean
+//
+// The last row is what makes this the cache's own bug rather than a general
+// concurrency problem in the server, and it reproduced with neuron
+// subsetting, neuron heat and the atlas all disabled - so it is pre-existing
+// rather than anything the heat-aware work introduced. Root cause is not yet
+// found; until it is, refusing to run in the configuration that corrupts is
+// strictly better than producing wrong output at speed. See docs/plan.md.
+//
+// GGML_CUDA_MOE_CACHE_MAX_PARALLEL overrides the limit for anyone
+// deliberately investigating the bug (set it higher to reproduce), and a
+// calibrated entry can raise it for a machine where a higher value has
+// actually been verified clean - but the DEFAULT is the measured-safe value,
+// because the failure mode is silent.
+static void common_enforce_moe_cache_parallel_limit(common_params & params, llama_context_params & cparams) {
+    const char * mode = getenv("GGML_CUDA_MOE_CACHE_MODE");
+    const char * en   = getenv("GGML_CUDA_MOE_CACHE");
+    const bool cache_off = (mode && std::string(mode) == "off") || (en && std::string(en) == "0");
+    if (cache_off || params.n_parallel <= 0) {
+        return;
+    }
+    int limit = 2; // measured safe ceiling - see the table above
+    if (const char * ov = getenv("GGML_CUDA_MOE_CACHE_MAX_PARALLEL")) {
+        const int v = atoi(ov);
+        if (v > 0) {
+            limit = v;
+        }
+    }
+    if (params.n_parallel <= limit) {
+        return;
+    }
+    LOG_WRN("%s: --parallel %d exceeds the MoE expert cache's measured-safe concurrency limit of %d - "
+            "clamping to %d. Above this limit the cache corrupts output silently and permanently "
+            "(garbage vocabulary tokens, and the session never recovers). This is a correctness "
+            "guard, not a tuning choice. Run with --moe-cache off to use higher concurrency, or set "
+            "GGML_CUDA_MOE_CACHE_MAX_PARALLEL to override if you have verified a higher value clean "
+            "on this machine.\n",
+            __func__, params.n_parallel, limit, limit);
+    params.n_parallel = limit;
+    // cparams.n_seq_max must move with it, not just the reported slot count.
+    // The per-slot context has already been divided by the ORIGINAL slot
+    // count by this point, so clamping params alone leaves the server with
+    // (say) 2 slots each holding 4096/8 = 512 tokens instead of 4096/2 =
+    // 2048 - silently costing three quarters of each slot's context as a
+    // side effect of a safety guard, which would be its own bug.
+    if (cparams.n_seq_max > (uint32_t) limit) {
+        cparams.n_seq_max = (uint32_t) limit;
+    }
+}
+
 static void common_warn_concurrency_cliff(const common_params & params) {
     // Ignoring the MTP multiplier here would under-warn: even --parallel 1
     // can hit the real cliff once MTP's own verify-width alone exceeds the
@@ -3052,6 +3118,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     // would be checked/sized against the wrong (understated) effective
     // batch size.
     common_warn_concurrency_cliff(params);
+    common_enforce_moe_cache_parallel_limit(params, cparams);
     common_moe_apply_mtp_aware_max_batch_hint(params);
     common_warn_p_min_disabled(params);
 
