@@ -3202,6 +3202,7 @@ static void moe_cache_host_promote_locked_free(
 static size_t moe_cache_host_budget_bytes();
 static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
+static void moe_cache_coact_save(const moe_cache_session & session, const moe_cache_device & device);
 
 // Host RAM this process may pin for hot CPU-resident experts.
 //
@@ -3836,6 +3837,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                     if (now_idle - session->last_history_save >= MOE_CACHE_HISTORY_SAVE_INTERVAL) {
                         session->last_history_save = now_idle;
                         moe_cache_history_save(*session, *device);
+                        // Same idle moment, same rationale as history: the
+                        // graph is only written when nothing is decoding.
+                        moe_cache_coact_save(*session, *device);
                     }
                 }
                 continue;
@@ -4602,6 +4606,65 @@ static void moe_cache_history_save(moe_cache_session & session, const moe_cache_
             f << (uint32_t) (key >> 32) << " " << (uint32_t) (key & 0xffffffffull) << " " << count << "\n";
         }
         if (!f) {
+            f.close();
+            std::remove(tmp.c_str());
+            return;
+        }
+    }
+    if (std::rename(tmp.c_str(), path) != 0) {
+        std::remove(tmp.c_str());
+    }
+}
+
+// Persist the co-activation graph this session has been accumulating, so the
+// evolving atlas can be rebuilt from REAL SERVED TRAFFIC instead of from a
+// separate offline `llama-moe-trace` run over synthetic prompts.
+//
+// The data already existed and was simply being discarded: device.co_activation
+// holds exactly the within-layer edges scripts/moe-atlas-evolve.py derives from
+// trace files (its fold_in() builds edges[(min,max)] += 1 over co-selected
+// experts, keyed by a (layer, expert) node), and moe_cache_plan has been
+// maintaining it on every routing decision all along - it just never outlived
+// the process. Writing it out closes the loop: serve traffic, persist the
+// graph, re-run the evolve script against it, feed the result back through
+// --expert-atlas-file. The atlas then reflects what this deployment actually
+// routes, which is the whole point of a "discovered" atlas and something an
+// offline probe over invented prompts cannot do by construction.
+//
+// Emitted as `layer_a expert_a layer_b expert_b weight`, one edge per line -
+// the node identity the evolve script uses, written directly rather than
+// re-derived, so nothing has to reconstruct layer numbers from tensor
+// pointers on the Python side. Same atomic .tmp + rename and same plain-text
+// versioned shape as the history file above, for the same reason: a crash
+// mid-save must not leave a half-written graph that the next run silently
+// folds in as real observations.
+static void moe_cache_coact_save(const moe_cache_session & session, const moe_cache_device & device) {
+    static const char * path = getenv("GGML_CUDA_MOE_CACHE_COACT_FILE");
+    if (!path || device.co_activation.empty()) {
+        return;
+    }
+    const std::string tmp = std::string(path) + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) {
+            return;
+        }
+        f << "moe-cache-coact 1\n";
+        size_t written = 0;
+        for (const auto & [edge, count] : device.co_activation) {
+            const auto la = session.tensor_layer.find(edge.from.tensor);
+            const auto lb = session.tensor_layer.find(edge.to.tensor);
+            // A tensor with no known layer cannot be placed in the graph's
+            // (layer, expert) node space at all - skip rather than invent a
+            // layer index, which would fabricate structure.
+            if (la == session.tensor_layer.end() || lb == session.tensor_layer.end()) {
+                continue;
+            }
+            f << la->second << " " << edge.from.expert << " "
+              << lb->second << " " << edge.to.expert << " " << count << "\n";
+            written++;
+        }
+        if (!f || written == 0) {
             f.close();
             std::remove(tmp.c_str());
             return;

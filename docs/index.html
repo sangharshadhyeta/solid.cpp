@@ -497,6 +497,60 @@ until you go looking.</p>
 </div>
 </section>
 
+<section id="atlas">
+<div class="eyebrow">Where experts live, measured not assumed</div>
+<h2>The Atlas &mdash; a good map, and proof the system can't tell</h2>
+<p class="section-lede">Every expert gets a position from <em>measured</em> topic affinity: probed offline
+across nine categories with greedy decode and a replication gate, so one lucky prompt can't promote an expert
+to specialist. The map is genuinely predictive. The finding that matters is that being predictive
+<strong>doesn't reach the running system at all</strong>.</p>
+
+<p>As a map, it holds up. Tested on link prediction &mdash; &ldquo;do these two experts fire together?&rdquo;
+&mdash; against embeddings factored directly out of the observed co-activation graph, on 31.6&times; more data
+than the atlas ever saw:</p>
+
+<table>
+<colgroup><col style="width:62%"><col style="width:38%"></colgroup>
+<thead><tr><th>Method</th><th>AUC</th></tr></thead>
+<tbody>
+<tr><td>Popularity control (expert frequency alone)</td><td>0.5437</td></tr>
+<tr><td>Incremental / online-learned atlas (AdaGrad, 178M steps)</td><td>0.4823 &mdash; chance</td></tr>
+<tr><td>Discovered co-activation embedding (64 dims)</td><td>0.5761</td></tr>
+<tr><td><strong>Probe atlas (9 categories)</strong></td><td><strong>0.7116</strong></td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">The probe atlas predicts co-firing <em>better than an embedding built from
+co-firing itself</em>, having never seen that traffic &mdash; a result from a test designed to be fair to the
+alternative. Two successive attempts to replace the nine hand-chosen categories with something label-free
+both lost.</p>
+
+<div class="callout">
+<p><strong>Then the same two maps were run through the live server, and were indistinguishable.</strong>
+Probe atlas (AUC 0.7116): <strong>58.45 tok/s, 71.20% hit</strong>. Incremental atlas (AUC 0.4823, i.e.
+chance): <strong>58.43 tok/s, 71.28% hit</strong>. A map scoring at chance performs exactly as well in the
+running system as one scoring 0.7116, because warming is rate-limited to once per 64 routing decisions and
+admission-gated &mdash; it supplies roughly <strong>2% of fills</strong>. The map's advantage is real as a
+statement about maps and never reaches the mechanism consuming it. Any claim that one atlas beats another now
+has to say <em>which of the two things</em> it means.</p>
+</div>
+
+<p>Why the ceiling is that low is the deeper answer: atlas warming gains <strong>+0.31pp</strong> hit rate in
+simulation, while a <em>topic oracle</em> with perfect foreknowledge of the segment's experts gains
+<strong>+0.30pp</strong>. The atlas is already at the ceiling. Every topic touches ~6,000 of 7,680 experts and
+the top 1,000 cover only 52&ndash;61% of selections &mdash; <strong>there is no compact topic hot set to
+preload</strong>, so no prefetcher of this shape can win. One result explaining an entire family of refuted
+experiments is worth more than the feature would have been.</p>
+
+<p>So the atlas ships as what it demonstrably is: <strong>the spatial layer of the Brain view</strong> &mdash;
+position from measurement, colour from live cache state &mdash; with its warming path rate-limited,
+admission-gated and <strong>off by default</strong>. Related reversals were reported the same way: combining
+atlas admission with eviction-weighting went <strong>net negative</strong> (&minus;0.95pp, 1 of 4 rounds)
+against admission alone (+2.75pp, 4 of 4); and hit rate itself turned out to be <em>purchasable</em> &mdash;
+79.25% is available for one environment variable and a slower server, which is exactly why throughput, not hit
+rate, is the objective here.</p>
+</section>
+
 <section id="sparse-activation">
 <div class="eyebrow">Below the expert: individual neurons</div>
 <h2>Sparse activation: not every neuron in a hot expert earns its VRAM</h2>
