@@ -107,6 +107,19 @@ llama_context::llama_context(
         LLAMA_LOG_DEBUG("%s: n_rs_seq=%u requested but model arch does not support recurrent partial rollback; clamping to 0\n",
                         __func__, cparams.n_rs_seq);
         cparams.n_rs_seq = 0;
+    } else if (cparams.n_rs_seq == 0 && llm_arch_supports_rs_rollback(model.arch)) {
+        // Nothing explicitly requested this (e.g. no speculative decoding), but the
+        // arch supports it and the cost is small: n_rows = n_seq_max * (1 + n_rs_seq)
+        // per recurrent-state tensor, i.e. proportional to the number of parallel
+        // sequences, not to context length. Without this, any ordinary request that
+        // only partially matches what's cached for a slot - a message edit/regen
+        // near the tail, or a slot reused for a different-but-overlapping
+        // conversation - can only be served by discarding the recurrent state and
+        // reprocessing the whole prompt from scratch (the server's checkpoint/reset
+        // fallback), even when just the last few tokens actually diverged. A small
+        // default lets that common case use cheap bounded rollback instead.
+        constexpr uint32_t default_rs_seq_live = 4;
+        cparams.n_rs_seq = default_rs_seq_live;
     }
 
     cparams.n_threads               = params.n_threads;
