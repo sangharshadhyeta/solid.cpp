@@ -253,7 +253,8 @@ class Keys:
         DT_B_C_RMS     = "{arch}.ssm.dt_b_c_rms"
 
     class KDA:
-        HEAD_DIM = "{arch}.kda.head_dim"
+        HEAD_DIM        = "{arch}.kda.head_dim"
+        GATE_LOWER_BOUND = "{arch}.kda.gate_lower_bound"
 
     class WKV:
         HEAD_SIZE = "{arch}.wkv.head_size"
@@ -5464,6 +5465,7 @@ KEY_SSM_DT_B_C_RMS     = Keys.SSM.DT_B_C_RMS
 
 # KDA
 KEY_KDA_HEAD_DIM       = Keys.KDA.HEAD_DIM
+KEY_KDA_GATE_LOWER_BOUND = Keys.KDA.GATE_LOWER_BOUND
 
 # tokenization
 KEY_TOKENIZER_MODEL      = Keys.Tokenizer.MODEL
