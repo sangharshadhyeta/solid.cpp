@@ -2195,6 +2195,13 @@ bool server_prompt_cache::disk_load(server_prompt & prompt, const server_tokens 
             prompt.n_tokens(), (ggml_time_us() - t_start) / 1000.0,
             (main_bytes + drft_bytes) / (1024.0 * 1024.0));
 
+    // this prefix just proved itself worth keeping - protect it from disk_trim()
+    entry.hits++;
+    {
+        std::error_code ec;
+        std::filesystem::last_write_time(entry.path, std::filesystem::file_time_type::clock::now(), ec);
+    }
+
     return true;
 }
 
@@ -2211,9 +2218,14 @@ void server_prompt_cache::disk_trim() {
         return;
     }
 
-    // Oldest first, matching the RAM tier's eviction order.
+    // Least-reused first, oldest as the tiebreak. A prefix that keeps getting
+    // hit (a system prompt, a resumed document) survives longer than a one-off
+    // long context that happens to be newer but was only ever used once.
     std::sort(disk_entries.begin(), disk_entries.end(),
             [](const server_prompt_disk_entry & a, const server_prompt_disk_entry & b) {
+                if (a.hits != b.hits) {
+                    return a.hits < b.hits;
+                }
                 std::error_code ec1, ec2;
                 const auto ta = std::filesystem::last_write_time(a.path, ec1);
                 const auto tb = std::filesystem::last_write_time(b.path, ec2);
