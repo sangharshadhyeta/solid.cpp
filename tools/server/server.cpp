@@ -12,6 +12,9 @@
 #include "llama.h"
 #include "log.h"
 
+#include <cpp-httplib/httplib.h>
+#include <nlohmann/json.hpp>
+
 #include <atomic>
 #include <clocale>
 #include <exception>
@@ -163,8 +166,142 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // probe with "n_seq_max must be <= 256" - found by testing --moe-calibrate
     // together with --model-draft/--spec-type for real, not by inspection.
     if (params.moe_calibrate) {
+        // Stand up a minimal status server on the normal host:port for the
+        // duration of calibration. Without this, the webui's poll of /props
+        // gets a bare connection refused - indistinguishable from "the
+        // server crashed" - for however long calibration takes (this fork's
+        // own first GLM-5.3-Flash calibration took several minutes just for
+        // its first candidate, and a full run can take hours). Returning a
+        // real HTTP 503 with a status message instead makes the webui show
+        // its existing "loading" state (server.svelte.ts already treats any
+        // 503 from /props that way) with real progress in the description,
+        // rather than the scarier "server unavailable" it shows for a
+        // genuine connection failure.
+        httplib::Server calib_srv;
+        auto status_handler = [](const httplib::Request &, httplib::Response & res) {
+            const auto st = common_moe_calibration_status_get_struct();
+            nlohmann::json body = {
+                {"error", {
+                    {"message", common_moe_calibration_status_get()},
+                    {"type",    "calibrating"},
+                    {"code",    503},
+                }},
+                // Structured fields for the status page's progress bar - the
+                // "error.message" string above carries the same info for any
+                // plain client that only reads that (e.g. a future webui
+                // integration), this is for one that wants to render it.
+                {"calibration", {
+                    {"stage",     st.stage},
+                    {"elapsed_s", st.elapsed_s},
+                    {"done",      st.done},
+                    {"total",     st.total}, // 0 = no estimate yet
+                    {"eta_s",     st.eta_s}, // -1 = not enough data yet
+                }},
+            };
+            res.status = 503;
+            res.set_content(body.dump(), "application/json; charset=utf-8");
+        };
+        calib_srv.Get("/props",  status_handler);
+        calib_srv.Get("/health", status_handler);
+        // The real webui shell (index.html + JS bundle) is served by
+        // server_http_context, which isn't stood up in calibrate mode - so a
+        // browser hitting "/" here would otherwise get nothing at all to
+        // render, not even the code that would poll /props. A small
+        // self-contained page instead of nothing: polls /props itself and
+        // shows the same status text, no build/asset dependency.
+        calib_srv.Get("/", [](const httplib::Request &, httplib::Response & res) {
+            static const char * const html =
+                "<!doctype html><html><head><meta charset='utf-8'>"
+                "<title>Calibrating - llama.cpp</title>"
+                "<meta name='viewport' content='width=device-width, initial-scale=1'>"
+                "<style>"
+                "body{font-family:system-ui,sans-serif;background:#0b0b0c;color:#e5e5e5;"
+                "display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:1.5rem}"
+                "main{max-width:38rem;width:100%}"
+                "h1{font-size:1.1rem;font-weight:600;display:flex;align-items:center;gap:.6rem;margin:0 0 .9rem}"
+                ".spin{width:1rem;height:1rem;border:2px solid #555;border-top-color:#e5e5e5;"
+                "border-radius:50%;animation:spin 1s linear infinite;flex:none}"
+                "@keyframes spin{to{transform:rotate(360deg)}}"
+                "p{color:#a3a3a3;line-height:1.5;font-size:.9rem;margin:.4rem 0}"
+                "#stage{color:#e5e5e5;font-weight:500}"
+                "#bar-track{background:#232326;border-radius:999px;height:.5rem;overflow:hidden;margin:.7rem 0}"
+                "#bar-fill{background:#4ed6a5;height:100%;width:0%;transition:width .4s ease;border-radius:999px}"
+                "#stats{display:flex;justify-content:space-between;font-size:.78rem;color:#8a8a8f}"
+                "</style></head><body><main>"
+                "<h1><span class='spin'></span>Calibrating MoE placement</h1>"
+                "<p id='stage'>Contacting status endpoint ...</p>"
+                "<div id='bar-track'><div id='bar-fill'></div></div>"
+                "<div id='stats'><span id='count'></span><span id='eta'></span></div>"
+                "<p style='font-size:.78rem'>This page refreshes itself every 3 seconds - no action needed. "
+                "The progress bar is a rough estimate, not exact - some search stages only get sized once "
+                "earlier ones finish.</p>"
+                "</main><script>"
+                "async function poll(){"
+                "try{"
+                "const r=await fetch('/props');const j=await r.json();"
+                "const c=j.calibration;"
+                "if(c){"
+                "document.getElementById('stage').textContent=c.stage||'Calibrating ...';"
+                "const pct=c.total>0?Math.min(100,Math.round(100*c.done/c.total)):0;"
+                "document.getElementById('bar-fill').style.width=pct+'%';"
+                "document.getElementById('count').textContent=c.total>0?"
+                "('candidate '+c.done+' / ~'+c.total+' ('+pct+'%)'):'';"
+                "const es=c.elapsed_s,em=Math.floor(es/60),ss=es%60;"
+                "let etaTxt='elapsed '+em+'m'+String(ss).padStart(2,'0')+'s';"
+                "if(c.eta_s>=0){const tm=Math.floor(c.eta_s/60),ts=c.eta_s%60;"
+                "etaTxt+=' - ~'+tm+'m'+String(ts).padStart(2,'0')+'s left';}"
+                "document.getElementById('eta').textContent=etaTxt;"
+                "}else{"
+                "document.getElementById('stage').textContent="
+                "(j.error&&j.error.message)||'Calibrating ...';"
+                "}"
+                "}catch(e){"
+                "document.getElementById('stage').textContent="
+                "'Waiting for the status endpoint to come up ...';"
+                // Clear the stale bar/count/eta from the last successful poll -
+                // otherwise a fetch failure (calibration finished and this
+                // process exited, or the page was left open across a restart)
+                // leaves an old progress snapshot on screen next to text that
+                // contradicts it, reading as "still running" when it is not.
+                "document.getElementById('bar-fill').style.width='0%';"
+                "document.getElementById('count').textContent='';"
+                "document.getElementById('eta').textContent='';"
+                "}"
+                "}"
+                "poll();setInterval(poll,3000);"
+                "</script></body></html>";
+            res.set_content(html, "text/html; charset=utf-8");
+        });
+
+        std::thread calib_http_thread;
+        if (calib_srv.bind_to_port(params.hostname, params.port)) {
+            calib_http_thread = std::thread([&calib_srv] { calib_srv.listen_after_bind(); });
+            SRV_INF("--moe-calibrate: status server listening on http://%s:%d/props while calibrating "
+                    "(this same process starts real serving on the same port once calibration completes)\n",
+                    params.hostname.c_str(), params.port);
+        } else {
+            SRV_WRN("--moe-calibrate: could not bind %s:%d for the status server (port busy?) - "
+                    "calibration will still run, just without live status on that port\n",
+                    params.hostname.c_str(), params.port);
+        }
+
         common_moe_calibrate(params);
-        return 0;
+
+        if (calib_http_thread.joinable()) {
+            calib_srv.stop();
+            calib_http_thread.join();
+        }
+
+        // Fall through into normal serving instead of exiting - the cache
+        // entry common_moe_calibrate() just wrote is picked up automatically
+        // a few hundred lines down by common_maybe_autoplace_moe_cpu() (via
+        // common_moe_calibration_lookup()), the same path any later launch
+        // without --moe-calibrate would use. Clearing the flag here only
+        // matters for router mode, which re-reads params per spawned
+        // instance - it must not re-enter calibration on every one.
+        params.moe_calibrate = false;
+        SRV_INF("%s", "--moe-calibrate: calibration complete, starting real serving now on the same port "
+                "with the placement just measured\n");
     }
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias

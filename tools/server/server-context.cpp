@@ -20,7 +20,9 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <cinttypes>
 #include <exception>
 #include <memory>
@@ -4651,6 +4653,104 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
           queue_tasks(ctx_server.impl->queue_tasks),
           queue_results(ctx_server.impl->queue_results) {
     init_routes();
+
+    // Only meaningful when both an atlas destination and a live-traffic
+    // source are configured - otherwise there is nothing to regenerate from
+    // or into, so the thread is never started (this stays a true no-op for
+    // every deployment that doesn't ask for it).
+    const char * coact_env = getenv("GGML_CUDA_MOE_CACHE_COACT_FILE");
+    if (!params.expert_atlas_file.empty() && coact_env && coact_env[0]) {
+        atlas_regen_thread = std::thread(&server_routes::atlas_regen_loop, this,
+                params.expert_atlas_file, std::string(coact_env));
+    }
+}
+
+server_routes::~server_routes() {
+    if (atlas_regen_thread.joinable()) {
+        atlas_regen_stop.store(true);
+        atlas_regen_thread.join();
+    }
+}
+
+// mirrors common_shell_quote() in common/common.cpp (not exported there -
+// this is the only caller outside that file, not worth a header for)
+static std::string server_shell_quote(const std::string & s) {
+    std::string out = "'";
+    for (char c : s) {
+        if (c == '\'') {
+            out += "'\\''";
+        } else {
+            out += c;
+        }
+    }
+    out += "'";
+    return out;
+}
+
+// Periodically regenerates --expert-atlas-file from the co-activation edges
+// the moe-cache itself writes to GGML_CUDA_MOE_CACHE_COACT_FILE, by shelling
+// out to scripts/moe-atlas-evolve.py - kept as a subprocess rather than an
+// in-process reimplementation because the atlas build is a real numpy
+// spectral-graph-embedding workload with its own failure modes (malformed
+// edge lines, eigensolver blowing up on a large graph); isolating it in a
+// separate process means a crash there can't take inference down, the same
+// reasoning that originally put this in a standalone systemd unit - moved
+// in-process here only to cut the number of services to manage, not to
+// change that isolation boundary.
+//
+// State (the persisted co-activation graph) and the atlas JSON both live
+// next to --expert-atlas-file, named deterministically from it, so nothing
+// new needs to be configured beyond the two settings that already imply
+// this feature is wanted. moe-atlas-evolve.py's own --state handling already
+// does "resume if the file is there, start fresh if not" - nothing to
+// special-case on this side.
+void server_routes::atlas_regen_loop(std::string atlas_file, std::string coact_file) {
+    const std::filesystem::path atlas_path(atlas_file);
+    const std::filesystem::path state_path = atlas_path.parent_path() / "atlas-evolve-state.npz";
+
+    const int interval_s = [] () -> int {
+        if (const char * env = getenv("GGML_MOE_ATLAS_REGEN_INTERVAL")) {
+            const int v = atoi(env);
+            if (v > 0) return v;
+        }
+        return 180;
+    }();
+
+    // llama.cpp's own source tree location relative to this binary isn't
+    // tracked at runtime, so the script is found the same way a user would
+    // invoke it themselves: relative to the current working directory the
+    // server was launched from. Matches how scripts/ is documented to be run
+    // (docs/index.html's own example commands are all repo-root-relative).
+    const std::string script_path = "scripts/moe-atlas-evolve.py";
+
+    SRV_INF("atlas-regen: will regenerate '%s' from '%s' every %ds (state: '%s')\n",
+            atlas_file.c_str(), coact_file.c_str(), interval_s, state_path.string().c_str());
+
+    while (!atlas_regen_stop.load()) {
+        // sleep in short increments so shutdown doesn't wait a full interval
+        for (int waited = 0; waited < interval_s && !atlas_regen_stop.load(); waited++) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+        if (atlas_regen_stop.load()) {
+            break;
+        }
+
+        std::error_code ec;
+        const auto coact_size = std::filesystem::file_size(coact_file, ec);
+        if (ec || coact_size == 0) {
+            continue; // no traffic logged yet - nothing to fold in this round
+        }
+
+        const std::string cmd = "python3 " + server_shell_quote(script_path) +
+            " --coact "  + server_shell_quote(coact_file) +
+            " --state "  + server_shell_quote(state_path.string()) +
+            " --out "    + server_shell_quote(atlas_file) +
+            " >/dev/null 2>&1";
+        const int rc = std::system(cmd.c_str());
+        if (rc != 0) {
+            SRV_WRN("atlas-regen: moe-atlas-evolve.py exited %d, will retry next interval\n", rc);
+        }
+    }
 }
 
 void server_routes::init_routes() {
@@ -4688,27 +4788,47 @@ void server_routes::init_routes() {
         static std::vector<uint8_t> prev_bytes;
         static uint64_t seq = 0;
 
-        // topic-affinity atlas is static once produced by llama-expert-atlas,
-        // so load it lazily on first request rather than at server startup
-        static std::once_flag atlas_once;
+        // The discovered/evolving atlas (scripts/moe-atlas-evolve.py) is meant
+        // to be periodically regenerated from a running deployment's own
+        // traffic (GGML_CUDA_MOE_CACHE_COACT_FILE) and re-written to the same
+        // --expert-atlas-file path - a static once-per-startup load would
+        // never pick that up without a restart. Poll the file's mtime (one
+        // stat() per request, cheap) and only re-parse when it actually
+        // changed, so a background regeneration loop shows up in the Brain
+        // view live. The file may not exist yet on first request (nothing
+        // generated from traffic so far) - that's not an error, just nothing
+        // to show until the first regeneration completes.
+        static std::mutex atlas_mutex;
         static json atlas_json;
         static bool atlas_loaded = false;
-        std::call_once(atlas_once, [this]() {
-            if (params.expert_atlas_file.empty()) {
-                return;
+        static std::filesystem::file_time_type atlas_mtime{};
+        if (!params.expert_atlas_file.empty()) {
+            std::error_code ec;
+            const auto mtime = std::filesystem::last_write_time(params.expert_atlas_file, ec);
+            if (!ec) {
+                std::lock_guard<std::mutex> lock(atlas_mutex);
+                if (!atlas_loaded || mtime != atlas_mtime) {
+                    std::ifstream f(params.expert_atlas_file);
+                    if (!f) {
+                        SRV_WRN("failed to open --expert-atlas-file '%s'\n", params.expert_atlas_file.c_str());
+                    } else {
+                        try {
+                            atlas_json   = json::parse(f);
+                            atlas_loaded = true;
+                            atlas_mtime  = mtime;
+                            SRV_INF("reloaded --expert-atlas-file '%s' (changed on disk)\n",
+                                    params.expert_atlas_file.c_str());
+                        } catch (const std::exception & e) {
+                            SRV_WRN("failed to parse --expert-atlas-file '%s': %s\n",
+                                    params.expert_atlas_file.c_str(), e.what());
+                        }
+                    }
+                }
             }
-            std::ifstream f(params.expert_atlas_file);
-            if (!f) {
-                SRV_WRN("failed to open --expert-atlas-file '%s'\n", params.expert_atlas_file.c_str());
-                return;
-            }
-            try {
-                atlas_json   = json::parse(f);
-                atlas_loaded = true;
-            } catch (const std::exception & e) {
-                SRV_WRN("failed to parse --expert-atlas-file '%s': %s\n", params.expert_atlas_file.c_str(), e.what());
-            }
-        });
+            // ec set (file doesn't exist yet, or transient stat failure):
+            // leave whatever was last successfully loaded (possibly nothing)
+            // in place rather than treating it as an error.
+        }
 
         common_moe_cache_summary cs;
         const bool have_summary = common_moe_cache_get_summary(cs);
@@ -4778,8 +4898,11 @@ void server_routes::init_routes() {
         int rows = 0, cols = 0;
         if (!common_moe_cache_get_expert_map(bytes, rows, cols)) {
             json body = {{"rows", 0}, {"cols", 0}, {"map", ""}, {"hits", ""}, {"substitutions", ""}, {"seq", seq}, {"stats", stats}};
-            if (atlas_loaded) {
-                body["atlas"] = atlas_json;
+            {
+                std::lock_guard<std::mutex> lock(atlas_mutex);
+                if (atlas_loaded) {
+                    body["atlas"] = atlas_json;
+                }
             }
             res->ok(body);
             return res;
@@ -4851,8 +4974,11 @@ void server_routes::init_routes() {
             conc_rows == rows && conc_cols == cols) {
             body["neuron_concentration"] = concentration;
         }
-        if (atlas_loaded) {
-            body["atlas"] = atlas_json;
+        {
+            std::lock_guard<std::mutex> lock(atlas_mutex);
+            if (atlas_loaded) {
+                body["atlas"] = atlas_json;
+            }
         }
         res->ok(body);
         return res;
