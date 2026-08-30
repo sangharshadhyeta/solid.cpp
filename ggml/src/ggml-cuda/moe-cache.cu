@@ -7284,6 +7284,43 @@ static int moe_cache_atlas_rank(
 // The cheap half. Must hold session.mu: touches pool.map, the slot table,
 // the LRU list and the fill queue. Returns whether anything was queued, so
 // the caller can fold it into its own worker wake.
+// Live counterpart to GGML_CUDA_MOE_CACHE_READAHEAD (see its comment ~5380):
+// that one only fires once, at session warm-start, from persisted cross-run
+// history. This fires on every admission this function ever makes - atlas
+// scan and predictor warming alike - for a candidate device.residency has
+// already flagged cold (POSIX_MADV_DONTNEED'd by the cold sweep, or never
+// resident this run). moe_cache_atlas_admit only queues the copy (see
+// device.queue.push_back below); the actual host read happens later, on the
+// fill worker, so a WILLNEED issued here has a real window to complete
+// before that read arrives instead of racing it.
+//
+// On by default, unlike the one-shot version - and this is a measured
+// decision, not an assumption that "more prefetch" generalizes from that
+// other result. A/B'd 5 interleaved rounds each way (Gemma-4-26B-A4B,
+// -ncmoe 20, under a real 15 GiB cgroup memory cap to force genuine cold
+// misses): off = {34.86, 20.11, 16.81, 36.66, 37.07} tok/s (mean 29.1,
+// wide spread with real stalls down to ~17); on = {40.50, 33.83, 40.30,
+// 42.46, 41.90} (mean 39.8, tight). +37% on the mean, and - the more telling
+// part - on eliminates the worst-case stalls rather than just raising the
+// average, exactly the failure mode this is meant to fix (a synchronous
+// cold-page read on the admit path, now hidden behind compute instead).
+// Unlike the one-shot version - which blindly prefetches whatever cross-run
+// history says was hot, whether or not anything currently wants it - this
+// only fires for a candidate the live predictor is already about to admit
+// AND that device.residency has already flagged cold, so it does not carry
+// the "page-cache pressure from stuff nothing asked for" cost that made the
+// one-shot version a net loss warm. Re-measure if that reasoning stops
+// holding (e.g. after other changes to the admit path).
+#if defined(__linux__)
+static bool moe_cache_live_prefetch_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_LIVE_PREFETCH");
+        return !env || atoi(env) != 0;
+    }();
+    return enabled;
+}
+#endif
+
 static bool moe_cache_atlas_admit(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
         const void * host_base, size_t expert_size,
@@ -7339,14 +7376,39 @@ static bool moe_cache_atlas_admit(
                 moe_cache_slot_reset(pool, slot_index, true);
                 continue;
             }
+            const char * host_ptr = (const char *) host_base + (size_t) expert * expert_size;
             device.queue.push_back({
                     pool_index, slot_index, slot.generation, key,
-                    (const char *) host_base + (size_t) expert * expert_size,
-                    expert_size});
+                    host_ptr, expert_size});
             device.queued_bytes += expert_size;
             device.prefetches++;
             admitted++;
             woke = true;
+#if defined(__linux__)
+            // See moe_cache_live_prefetch_enabled()'s comment above. Only
+            // for a candidate device.residency has actually flagged cold -
+            // an already-warm expert's host pages need no hint, and hinting
+            // on every admission regardless of residency would be exactly
+            // the "more prefetch, unconditionally" mistake that comment
+            // warns against.
+            if (moe_cache_live_prefetch_enabled()) {
+                const auto rit = device.residency.find(host_base);
+                if (rit != device.residency.end() &&
+                    (size_t) expert < rit->second.is_cold.size() &&
+                    rit->second.is_cold[expert]) {
+                    static const long page_size = sysconf(_SC_PAGESIZE);
+                    if (page_size > 0) {
+                        const uintptr_t begin = (uintptr_t) host_ptr;
+                        const uintptr_t end   = begin + expert_size;
+                        const uintptr_t first = (begin + page_size - 1) & ~((uintptr_t) page_size - 1);
+                        const uintptr_t last  = end & ~((uintptr_t) page_size - 1);
+                        if (last > first) {
+                            posix_madvise((void *) first, (size_t) (last - first), POSIX_MADV_WILLNEED);
+                        }
+                    }
+                }
+            }
+#endif
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
         }
