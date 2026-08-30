@@ -28,6 +28,7 @@
 #include <iterator>
 #include <list>
 #include <map>
+#include <mutex>
 #include <regex>
 #include <sys/wait.h>
 
@@ -1294,17 +1295,41 @@ struct common_init_result::impl {
     std::vector<llama_sampler_seq_config> samplers_seq_config;
 };
 
+// True when the real (non-probe) load will keep CPU-resident model weights
+// on a plain lazy mmap: LOAD_MODE_AUTO resolves to mmap whenever the device
+// supports it (the common case), and LOAD_MODE_MMAP asks for it explicitly.
+// MLOCK/MMAP_MLOCK force full residency (that's the point of mlock), and
+// NONE/DIRECT_IO never mmap at all, so those still need the real byte count.
+static bool common_mmap_is_lazy(const llama_model_params & mparams) {
+    return mparams.load_mode == LLAMA_LOAD_MODE_AUTO || mparams.load_mode == LLAMA_LOAD_MODE_MMAP;
+}
+
 // margin: bytes that must remain free per device on top of what's needed.
 // Defaults to 0 (bare fit) for callers that only ask "would this load at all".
 // A caller whose answer will be re-judged by common_fit_params() must pass the
 // same margin that check will demand - otherwise placement approves a config
 // that fit then rejects, and the two silently disagree.
-static bool common_device_memory_data_fits(const common_device_memory_data_vec & data, int64_t margin = 0) {
-    for (const auto & d : data) {
+//
+// host_model_lazy_mmap: whether the host (CPU) entry's `model` bytes are a
+// lazily-paged zero-copy mapping rather than a real allocation - see
+// common_mmap_is_lazy(). When true, those bytes are excluded from what must
+// fit in available RAM: the kernel reclaims clean, unmodified file pages
+// under pressure instead of committing them, so CPU-offloaded ("cold") MoE
+// experts don't need to be simultaneously resident the way a real copy would
+// - only the host's KV cache and compute-buffer bytes (context/compute) are
+// genuine allocations that still have to fit.
+static bool common_device_memory_data_fits(
+        const common_device_memory_data_vec & data, int64_t margin = 0, bool host_model_lazy_mmap = false) {
+    for (size_t i = 0; i < data.size(); i++) {
+        const auto & d = data[i];
         if (d.total <= 0) {
             continue; // not a real device (host aggregate, or a device with unknown budget)
         }
-        const int64_t needed = (int64_t) d.model + (int64_t) d.context + (int64_t) d.compute;
+        // by construction (common_get_device_memory_data_impl), the host
+        // aggregate is always the last entry
+        const bool is_host = (i + 1 == data.size());
+        const size_t model_bytes = (is_host && host_model_lazy_mmap) ? 0 : d.model;
+        const int64_t needed = (int64_t) model_bytes + (int64_t) d.context + (int64_t) d.compute;
         if (needed + margin > d.free) {
             return false;
         }
@@ -1380,7 +1405,7 @@ static bool common_moe_fits_with_n(
     try {
         common_device_memory_data_vec trial_data = common_get_device_memory_data(
                 path_model, &mparams_trial, &cparams, devs, hp_ngl, hp_n_ctx_train, hp_n_expert, GGML_LOG_LEVEL_ERROR);
-        return common_device_memory_data_fits(trial_data, margin);
+        return common_device_memory_data_fits(trial_data, margin, common_mmap_is_lazy(mparams_base));
     } catch (const std::exception &) {
         return false;
     }
@@ -1422,7 +1447,7 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
     result.n_layer = hp_ngl;
     result.is_moe  = hp_n_expert > 0;
 
-    if (common_device_memory_data_fits(data, margin)) {
+    if (common_device_memory_data_fits(data, margin, common_mmap_is_lazy(mparams_base))) {
         result.already_fits = true;
         return result;
     }
@@ -1488,6 +1513,17 @@ struct common_moe_calibration_entry {
     // than letting the two drift silently apart.
     int         neuron_reduce_k         = -1; // > 0 also means "reduction was enabled"
     int         neuron_reduce_budget_mb = -1;
+    // How many layers common_moe_calibrate found best kept resident on GPU
+    // (the -ngl a real launch should use), -1 = not calibrated / use whatever
+    // -ngl was requested. Distinct from n_cpu_moe: this trades GPU-resident
+    // dense/attention compute for VRAM the expert cache converts into hit
+    // rate, the same "extra CPU offload pays for itself in cache hits"
+    // effect n_cpu_moe's own search already knows about (see the ncmoe_hi
+    // extension comment above) - just on the layer-residency axis instead of
+    // the expert-placement axis. Only searched/applied when the model didn't
+    // already fit on GPU as the model's own full layer count (see
+    // common_moe_calibrate): a model with room to spare has nothing to trade.
+    int         n_gpu_layers            = -1;
     std::string calibrated_at;
 };
 
@@ -1552,6 +1588,7 @@ static bool common_moe_calibration_lookup(
         out.fit_target_mb           = e.value("fit_target_mb", -1);
         out.neuron_reduce_k         = e.value("neuron_reduce_k", -1);
         out.neuron_reduce_budget_mb = e.value("neuron_reduce_budget_mb", -1);
+        out.n_gpu_layers            = e.value("n_gpu_layers", -1);
         out.calibrated_at   = e.value("calibrated_at", std::string());
         return true;
     } catch (const std::exception &) {
@@ -1585,6 +1622,7 @@ static void common_moe_calibration_save(
         {"fit_target_mb",           entry.fit_target_mb},
         {"neuron_reduce_k",         entry.neuron_reduce_k},
         {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
+        {"n_gpu_layers",    entry.n_gpu_layers},
         {"calibrated_at",   entry.calibrated_at},
     };
     fs_create_directory_with_parents(fs_get_cache_directory());
@@ -1746,7 +1784,7 @@ static std::pair<double, double> common_moe_bench_one_request(int port, const ch
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
-        int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1) {
+        int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99) {
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -1805,10 +1843,10 @@ static double common_moe_bench_candidate_server(
         fit_args = buf;
     }
     snprintf(cmd, sizeof(cmd),
-        "'%s' -m '%s' -ngl 99 -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
+        "'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
-        self_exe.c_str(), path_model.c_str(), n_cpu_moe, cache_arg, ctx_for_launch,
+        self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
@@ -1875,13 +1913,16 @@ static double common_moe_bench_candidate_server(
 
     double result_tps = -1.0;
     if (n_concurrency <= 1) {
-        // Solo path: average per-request predicted_per_second across a
-        // couple of sequential probes - unchanged from before concurrency
-        // support was added, so existing solo calibration behavior is
-        // bit-for-bit identical.
+        // Solo path: average per-request predicted_per_second across
+        // n_solo_probes sequential probes. Deliberately reduced from 2 to 1
+        // (see n_samples_per_candidate's comment below - the same
+        // speed-vs-noise trade, made together) on a slow-decoding model
+        // where every probe is expensive; this drops the averaging that
+        // partially absorbed run-to-run variance within a single candidate.
+        constexpr int n_solo_probes = 1;
         double sum_tps = 0.0;
         int n_ok = 0;
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < n_solo_probes; i++) {
             const auto [predicted_n, predicted_ms] = common_moe_bench_one_request(port, probe_prompts[i], n_predict);
             if (predicted_n > 0 && predicted_ms > 0) {
                 sum_tps += predicted_n / (predicted_ms / 1000.0);
@@ -1971,13 +2012,121 @@ static std::string common_self_exe_path() {
 // deploying with the same --parallel value is what makes the cache
 // lookup find this entry later - a separate flag that could drift out of
 // sync with --parallel would be a real footgun here.
+static std::mutex                    g_moe_calib_status_mutex;
+static std::string                   g_moe_calib_status_stage = "starting";
+static std::chrono::steady_clock::time_point g_moe_calib_status_start = std::chrono::steady_clock::now();
+static int                           g_moe_calib_status_done  = 0;
+static int                           g_moe_calib_status_total = 0; // 0 = no estimate yet
+static long long                     g_moe_calib_status_eta_s = -1; // frozen at each candidate_done(), not live
+
+void common_moe_calibration_status_start() {
+    std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+    g_moe_calib_status_stage = "starting";
+    g_moe_calib_status_start = std::chrono::steady_clock::now();
+    g_moe_calib_status_done  = 0;
+    g_moe_calib_status_total = 0;
+    g_moe_calib_status_eta_s = -1;
+}
+
+void common_moe_calibration_status_set(const std::string & stage) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+    g_moe_calib_status_stage = stage;
+}
+
+void common_moe_calibration_status_set_total(int total_candidates) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+    g_moe_calib_status_total = total_candidates;
+}
+
+void common_moe_calibration_status_candidate_done() {
+    std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+    g_moe_calib_status_done++;
+    // Recompute the ETA only here, at a real completion instant - not live
+    // on every status poll, which would inflate the estimate every second
+    // spent waiting on the current (still in-flight) candidate purely
+    // because the numerator (elapsed) keeps growing while the denominator
+    // (done) sits still until it actually finishes. Confirmed happening in
+    // practice: watched a live run's ETA climb from 248m to 371m across a
+    // single still-in-progress candidate before this fix.
+    if (g_moe_calib_status_total > 0 && g_moe_calib_status_done < g_moe_calib_status_total) {
+        const long long elapsed_s = (long long) std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::steady_clock::now() - g_moe_calib_status_start).count();
+        g_moe_calib_status_eta_s = (long long) (((double) elapsed_s / g_moe_calib_status_done) *
+                (g_moe_calib_status_total - g_moe_calib_status_done));
+    } else {
+        g_moe_calib_status_eta_s = -1;
+    }
+}
+
+common_moe_calibration_status common_moe_calibration_status_get_struct() {
+    common_moe_calibration_status s;
+    std::chrono::steady_clock::time_point start;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+        s.stage   = g_moe_calib_status_stage;
+        start     = g_moe_calib_status_start;
+        s.done    = g_moe_calib_status_done;
+        s.total   = g_moe_calib_status_total;
+        s.eta_s   = g_moe_calib_status_eta_s; // frozen at the last candidate_done() - see its comment
+    }
+    s.elapsed_s = (long long) std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::steady_clock::now() - start).count();
+    return s;
+}
+
+std::string common_moe_calibration_status_get() {
+    const common_moe_calibration_status s = common_moe_calibration_status_get_struct();
+
+    std::string progress_note;
+    if (s.total > 0) {
+        // done can exceed total - the estimate is a single upfront guess
+        // (see common_moe_calibrate), not a hard ceiling; a stage that
+        // genuinely needed more candidates than guessed just shows 100%+
+        // rather than a nonsensical negative "time left".
+        const int pct = (int) std::lround(100.0 * std::min(s.done, s.total) / s.total);
+        std::string eta;
+        if (s.eta_s >= 0) {
+            eta = string_format(", ~%lldm%02llds left", s.eta_s / 60, s.eta_s % 60);
+        }
+        progress_note = string_format(" [candidate %d/~%d, %d%%%s]", s.done, s.total, pct, eta.c_str());
+    }
+
+    char buf[420];
+    snprintf(buf, sizeof(buf),
+            "Calibrating MoE placement for maximum throughput: %s%s (elapsed %lldm%02llds). "
+            "This runs once per hardware+model+context combination and is cached - a normal "
+            "launch afterward (without --moe-calibrate) starts instantly using the cached result.",
+            s.stage.c_str(), progress_note.c_str(), s.elapsed_s / 60, s.elapsed_s % 60);
+    return buf;
+}
+
+// Rough evaluation-count estimate for common_golden_section_search_max over
+// [lo, hi] - used only to size the status page's progress bar/ETA, not the
+// search itself (which is exact and memoized regardless of this guess being
+// off). Mirrors the real loop's shrink rate without running it.
+static int common_golden_section_eval_estimate(int lo, int hi) {
+    if (lo >= hi) {
+        return 1;
+    }
+    const double gr = 1.618033988749895;
+    int evals = 2; // initial x1, x2
+    double width = hi - lo;
+    while (width > 2.0) {
+        width /= gr;
+        evals++;
+    }
+    return evals + 3; // close-out linear scan of the final <=3-point range
+}
+
 void common_moe_calibrate(common_params & params) {
+    common_moe_calibration_status_start();
     const char * path_model = params.model.path.c_str();
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
     const int concurrency = std::max(1, (int) params.n_parallel);
 
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
+    common_moe_calibration_status_set("probing safe MoE CPU-offload floor");
     common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
     if (!probe.is_moe) {
         LOG_WRN("%s: model has no MoE experts - nothing for --moe-calibrate to do\n", __func__);
@@ -2021,7 +2170,18 @@ void common_moe_calibrate(common_params & params) {
     // than ordinary timing noise); a sample that still fails after its
     // retry is dropped from the average rather than failing the whole
     // candidate, so one bad launch doesn't cost two good measurements.
-    constexpr int n_samples_per_candidate = 2;
+    //
+    // Reduced from 2 to 1 on a deliberate speed-for-noise trade (chosen by
+    // the user, not a default): with this model decoding at ~1 tok/s, each
+    // extra sample costs several real minutes, and calibration's own search
+    // ranges grew (the -ngl search above did not exist when the 2-sample
+    // default and the swings cited above were measured). Single-sample
+    // candidates reopen exactly the outlier risk those swings describe -
+    // still guarded by the retry-on-failure below (a launch failure, not
+    // ordinary timing noise) and by golden-section's own "always trust the
+    // best of what was truly measured" check, but with no averaging to
+    // absorb a plain bad-luck sample within one candidate.
+    constexpr int n_samples_per_candidate = 1;
     auto bench_one_sample = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency);
@@ -2052,9 +2212,35 @@ void common_moe_calibrate(common_params & params) {
     // stays cheap.
     uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
 
+    // Single upfront, deliberately generous estimate of the total candidate
+    // count for the whole calibration run (ncmoe search, the -ngl search and
+    // its possible ncmoe re-search, spec-draft-n-max if MTP is configured,
+    // plus the fixed-size thread/cache/fit-margin stages later) - purely for
+    // the status page's progress bar and ETA. Not recomputed per branch
+    // (whether -ngl actually wins and triggers a re-search, whether a
+    // boundary extends, whether a fit-margin candidate fails early): erring
+    // generous means "time left" only ever counts down, never climbs back up
+    // as stages run, at the cost of finishing a bit before it reaches 100%.
+    {
+        int est = common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi); // ncmoe search
+        const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
+        const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
+        est += common_golden_section_eval_estimate((int) ngl_lo_est, (int) ngl_hi_est); // -ngl search
+        est += common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi);       // possible ncmoe re-search at new -ngl
+        if (params.speculative.has_dft()) {
+            est += 6;                                                // spec-draft-n-max envelope doubling
+            est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
+        }
+        est += 2; // thread-count candidates
+        est += 8; // expert-cache size knee (fixed candidate list)
+        est += 4; // fit-margin search (upper bound; stops early on first failure)
+        common_moe_calibration_status_set_total(est);
+    }
+
     LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
             "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
             concurrency > 1 ? string_format(", concurrency=%d (aggregate throughput)", concurrency).c_str() : "");
+    common_moe_calibration_status_set(string_format("searching MoE CPU-offload depth (-ncmoe) in [%u, %u]", safe_n, ncmoe_hi));
 
     std::map<int, double> ncmoe_trace;
     auto measure_ncmoe = [&](int n) -> double {
@@ -2066,6 +2252,7 @@ void common_moe_calibrate(common_params & params) {
         }
         const double tps = bench_with_retry((uint32_t) n, 0, "", n_threads_default);
         LOG_INF("%s:   ncmoe=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        common_moe_calibration_status_candidate_done();
         return tps; // failed candidates measure as -1, golden-section still works (just avoids them)
     };
     uint32_t best_n = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
@@ -2116,6 +2303,121 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Trade GPU-resident dense/attention-layer compute for VRAM the expert
+    // cache converts into hit rate. The ncmoe search above only ever moved
+    // MoE EXPERT weights off GPU - every layer's attention/dense compute
+    // (the majority of the graph, on a model this sparsely routed) stayed
+    // GPU-resident regardless, at whatever VRAM the fit search left for it.
+    // If the CPU/NVMe path for cold experts is the actual bottleneck, giving
+    // up some GPU-resident layers to grow the expert cache's own (auto-sized,
+    // free-VRAM-minus-reserve) budget can pay for itself, the same way extra
+    // -ncmoe offload sometimes does above - just on the layer-residency axis
+    // instead of the expert-placement axis. Reaching this point already means
+    // the model did not fit fully on GPU (probe.already_fits was false), so
+    // there is always something to trade here.
+    uint32_t best_ngl = (uint32_t) probe.n_layer + 1; // "all" - mirrors llama_model::n_gpu_layers()'s own +1
+    {
+        const uint32_t ngl_hi = best_ngl;
+        const uint32_t ngl_lo = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
+        LOG_INF("%s: golden-section search for -ngl in [%u, %u] at ncmoe=%u (trading GPU-resident layers "
+                "for expert-cache VRAM) ...\n", __func__, ngl_lo, ngl_hi, best_n);
+        common_moe_calibration_status_set(string_format("searching GPU-resident layer count (-ngl) in [%u, %u]", ngl_lo, ngl_hi));
+
+        std::map<int, double> ngl_trace;
+        ngl_trace[(int) ngl_hi] = best_tps; // already measured above - full residency is the ncmoe search's own baseline
+        // bench_with_retry doesn't take an ngl override, so this wraps
+        // common_moe_bench_candidate_server directly instead.
+        auto measure_ngl = [&](int n) -> double {
+            double sum = 0.0; int n_ok = 0;
+            for (int i = 0; i < n_samples_per_candidate; i++) {
+                double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                        concurrency, -1, -1, n);
+                if (tps < 0) {
+                    tps = common_moe_bench_candidate_server(
+                            self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                            concurrency, -1, -1, n);
+                }
+                if (tps > 0) { sum += tps; n_ok++; }
+            }
+            const double result = n_ok > 0 ? sum / n_ok : -1.0;
+            LOG_INF("%s:   ngl=%d -> %s\n", __func__, n, result > 0 ? string_format("%.2f tok/s", result).c_str() : "failed");
+            common_moe_calibration_status_candidate_done();
+            return result;
+        };
+
+        best_ngl = (uint32_t) common_golden_section_search_max((int) ngl_lo, (int) ngl_hi, measure_ngl, ngl_trace);
+        double best_ngl_tps = ngl_trace.at((int) best_ngl);
+        for (const auto & kv : ngl_trace) {
+            if (kv.second > best_ngl_tps) {
+                best_ngl_tps = kv.second;
+                best_ngl     = (uint32_t) kv.first;
+            }
+        }
+        if (best_ngl == ngl_lo && ngl_lo > 0) {
+            LOG_INF("%s: -ngl peak landed on the search boundary (%u) - throughput was still rising as more "
+                    "layers moved to CPU, extending the range to [0, %u]\n", __func__, ngl_lo, ngl_lo);
+            common_golden_section_search_max(0, (int) ngl_lo, measure_ngl, ngl_trace);
+            for (const auto & kv : ngl_trace) {
+                if (kv.second > best_ngl_tps) {
+                    best_ngl_tps = kv.second;
+                    best_ngl     = (uint32_t) kv.first;
+                }
+            }
+        }
+
+        if (best_ngl_tps > best_tps && best_ngl < ngl_hi) {
+            LOG_INF("%s: -ngl=%u wins over full GPU residency (%.2f vs %.2f tok/s) - re-searching ncmoe at "
+                    "this layer residency, since the safe floor and available VRAM both just changed\n",
+                    __func__, best_ngl, best_ngl_tps, best_tps);
+            common_moe_calibration_status_set(string_format("re-searching -ncmoe at -ngl=%u", best_ngl));
+            best_tps = best_ngl_tps;
+
+            llama_model_params mparams_ngl = mparams;
+            mparams_ngl.n_gpu_layers = (int) best_ngl;
+            common_moe_fit_probe_result probe_ngl = common_moe_find_safe_layers(path_model, mparams_ngl, cparams);
+            const uint32_t safe_n_ngl = probe_ngl.already_fits ? 0 :
+                    (probe_ngl.found_safe_n ? probe_ngl.safe_n : safe_n);
+            const uint32_t ncmoe_hi_ngl = std::min<uint32_t>(probe.n_layer, safe_n_ngl + std::max<uint32_t>(4, probe.n_layer / 8));
+
+            if (safe_n_ngl < ncmoe_hi_ngl) {
+                std::map<int, double> ncmoe_trace2;
+                auto measure_ncmoe2 = [&](int n) -> double {
+                    double tps = common_moe_bench_candidate_server(
+                            self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
+                            concurrency, -1, -1, (int) best_ngl);
+                    if (tps < 0) {
+                        tps = common_moe_bench_candidate_server(
+                                self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
+                                concurrency, -1, -1, (int) best_ngl);
+                    }
+                    LOG_INF("%s:   ncmoe=%d (ngl=%u) -> %s\n", __func__, n, best_ngl,
+                            tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                    common_moe_calibration_status_candidate_done();
+                    return tps;
+                };
+                uint32_t best_n2 = (uint32_t) common_golden_section_search_max(
+                        (int) safe_n_ngl, (int) ncmoe_hi_ngl, measure_ncmoe2, ncmoe_trace2);
+                double best_tps2 = ncmoe_trace2.at((int) best_n2);
+                for (const auto & kv : ncmoe_trace2) {
+                    if (kv.second > best_tps2) {
+                        best_tps2 = kv.second;
+                        best_n2   = (uint32_t) kv.first;
+                    }
+                }
+                if (best_tps2 > best_tps) {
+                    LOG_INF("%s: ncmoe=%u wins at ngl=%u (%.2f tok/s, was %.2f)\n",
+                            __func__, best_n2, best_ngl, best_tps2, best_tps);
+                    best_n   = best_n2;
+                    best_tps = best_tps2;
+                }
+            }
+        } else {
+            LOG_INF("%s: full GPU residency still wins (%.2f tok/s) - -ngl left at default\n", __func__, best_tps);
+            best_ngl = ngl_hi;
+        }
+    }
+
     int best_n_max = -1;
     if (params.speculative.has_dft()) {
         {
@@ -2126,6 +2428,7 @@ void common_moe_calibrate(common_params & params) {
             // is a safe, real signal for "past the edge" rather than
             // ordinary run-to-run noise).
             LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
+            common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
             std::map<int, double> nmax_trace;
             double baseline = -1.0;
             int last_good = 1;
@@ -2133,6 +2436,7 @@ void common_moe_calibrate(common_params & params) {
                 const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                 nmax_trace[n] = tps;
                 LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                common_moe_calibration_status_candidate_done();
                 if (n == 1) {
                     baseline = tps;
                 }
@@ -2153,6 +2457,7 @@ void common_moe_calibrate(common_params & params) {
                     }
                     const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                     LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                    common_moe_calibration_status_candidate_done();
                     return tps;
                 };
                 best_n_max = common_golden_section_search_max(1, nmax_hi, measure_nmax, nmax_trace);
@@ -2205,6 +2510,7 @@ void common_moe_calibrate(common_params & params) {
     int    best_threads = n_threads_default;
     double best_threads_tps = best_tps;
     if (thread_candidates.size() > 1) {
+        common_moe_calibration_status_set(string_format("benchmarking %zu thread-count candidate(s)", thread_candidates.size()));
         LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u%s ...\n", __func__, thread_candidates.size(), best_n,
                 best_n_max > 0 ? string_format(", spec-draft-n-max=%d", best_n_max).c_str() : "");
         for (int nt : thread_candidates) {
@@ -2213,6 +2519,7 @@ void common_moe_calibrate(common_params & params) {
             }
             const double tps = bench_with_retry(best_n, n_max_for_threads, mtp_path_for_threads, nt);
             LOG_INF("%s:   n_threads=%d -> %s\n", __func__, nt, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_candidate_done();
             if (tps > best_threads_tps) {
                 best_threads_tps = tps;
                 best_threads     = nt;
@@ -2230,6 +2537,7 @@ void common_moe_calibrate(common_params & params) {
     // approach below rather than a full sweep of every candidate.
     LOG_INF("%s: finding expert-cache size knee (growing while it still helps) at ncmoe=%u ...\n",
             __func__, best_n);
+    common_moe_calibration_status_set("searching expert-cache VRAM budget size");
     static const int cache_candidates_mb[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
     // Test every candidate rather than stopping at the first non-improving
     // step: the curve is not guaranteed monotonic below the knee - our own
@@ -2252,6 +2560,7 @@ void common_moe_calibrate(common_params & params) {
         }
         LOG_INF("%s:   moe-cache=%dMiB -> %s\n", __func__, mb,
                 tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        common_moe_calibration_status_candidate_done();
         if (tps > 0) {
             cache_results.emplace_back(mb, tps);
         }
@@ -2313,6 +2622,7 @@ void common_moe_calibrate(common_params & params) {
     {
         const int default_fit_mb = (int) (params.fit_params_target[0] / (1024 * 1024));
         static const int fit_candidates_mb[] = {640, 448, 320, 256};
+        common_moe_calibration_status_set("searching fit margin (-fitt)");
         LOG_INF("%s: searching fit margin (-fitt) below the default of %d MiB at ncmoe>=%u ...\n",
                 __func__, default_fit_mb, safe_n);
         for (size_t i = 0; i < sizeof(fit_candidates_mb) / sizeof(fit_candidates_mb[0]); i++) {
@@ -2325,6 +2635,7 @@ void common_moe_calibrate(common_params & params) {
                     best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, mb);
             LOG_INF("%s:   fitt=%dMiB -> %s\n", __func__, mb,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_candidate_done();
             if (tps <= 0) {
                 LOG_INF("%s:   fitt=%dMiB did not come up - stopping here, this is the edge the "
                         "margin exists to stay clear of\n", __func__, mb);
@@ -2356,6 +2667,10 @@ void common_moe_calibrate(common_params & params) {
     entry.tok_per_sec     = std::max(best_threads_tps, best_fit_tps);
     entry.moe_cache_mb    = best_cache_mb;
     entry.fit_target_mb   = best_fit_mb;
+    // -1 ("not calibrated / use default") when full GPU residency won its own
+    // search above - only recorded as an explicit override when giving up
+    // some GPU-resident layers actually measured faster.
+    entry.n_gpu_layers    = best_ngl <= (uint32_t) probe.n_layer ? (int) best_ngl : -1;
     // Record the reduction settings this calibration was actually measured
     // under, read from the same environment the cache itself reads (rather
     // than from params, which has no field for them) - see the field
@@ -2374,17 +2689,19 @@ void common_moe_calibrate(common_params & params) {
     common_moe_calibration_save(path_model, params, entry);
 
     const char * tps_label = concurrency > 1 ? "aggregate tok/s" : "tok/s";
+    const std::string ngl_note = entry.n_gpu_layers >= 0 ?
+            string_format(", ngl=%d (some layers moved to CPU to grow the expert cache)", entry.n_gpu_layers) : "";
     if (best_n_max > 0) {
-        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, spec-draft-n-max=%d%s, measured %.2f %s. "
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d, spec-draft-n-max=%d%s%s, measured %.2f %s. "
                 "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
                 __func__, entry.n_cpu_moe, entry.n_threads, entry.spec_n_max,
-                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "",
+                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "", ngl_note.c_str(),
                 entry.tok_per_sec, tps_label, common_moe_calibration_cache_path().c_str());
     } else {
-        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d%s, measured %.2f %s. "
+        LOG_INF("%s: calibration complete - ncmoe=%d, n_threads=%d%s%s, measured %.2f %s. "
                 "Cached to %s - launch normally (without --moe-calibrate) to use it.\n",
                 __func__, entry.n_cpu_moe, entry.n_threads,
-                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "",
+                concurrency > 1 ? string_format(", concurrency=%d", concurrency).c_str() : "", ngl_note.c_str(),
                 entry.tok_per_sec, tps_label, common_moe_calibration_cache_path().c_str());
     }
 }
@@ -2839,11 +3156,24 @@ static bool common_maybe_autoplace_moe_cpu(
 #endif
                 params.moe_cache_force = true;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s, measured %.2f %s on %s) "
+            // Same rule again: only apply the calibrated -ngl when the user
+            // left it at the default (-1, "auto"/all) - an explicit -ngl is a
+            // deliberate choice calibration should never silently override.
+            // Safe to apply after the fits-check above without re-verifying:
+            // fewer GPU-resident layers only ever *reduces* VRAM demand, so a
+            // placement that already fit at the (higher) default -ngl still
+            // fits at the calibrated (lower) one.
+            const bool applied_ngl = cached.n_gpu_layers >= 0 && params.n_gpu_layers == -1;
+            if (applied_ngl) {
+                params.n_gpu_layers  = cached.n_gpu_layers;
+                mparams.n_gpu_layers = cached.n_gpu_layers;
+            }
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
                     cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
                     cached.moe_cache_mb > 0 && cache_mode_is_auto ? string_format(", moe-cache=%dMiB", cached.moe_cache_mb).c_str() : "",
+                    applied_ngl ? string_format(", ngl=%d", cached.n_gpu_layers).c_str() : "",
                     cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
                     cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;

@@ -1254,6 +1254,37 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 // a server or load a long-lived context. See --moe-calibrate in arg.cpp.
 void common_moe_calibrate(common_params & params);
 
+// Thread-safe status string for common_moe_calibrate()'s current stage, so a
+// concurrent status server (tools/server/server.cpp's --moe-calibrate branch)
+// can report real progress instead of its port simply being unreachable -
+// with no signs of life at all - for however long calibration takes (this
+// model's own first calibration run took several minutes just for its first
+// candidate). common_moe_calibration_status_start() resets the elapsed timer
+// and must be called once, right before calibration begins.
+void        common_moe_calibration_status_start();
+void        common_moe_calibration_status_set(const std::string & stage);
+// Sets the rough total candidate-count estimate for the whole calibration
+// run - a single upfront guess (see common_moe_calibrate's own comment on
+// this), not recomputed per branch, so "time left" counts down rather than
+// climbing back up as stages run.
+void        common_moe_calibration_status_set_total(int total_candidates);
+// Call once each time a real benchmark candidate finishes (success or
+// failure - both cost the same wall-clock time), regardless of stage.
+void        common_moe_calibration_status_candidate_done();
+std::string common_moe_calibration_status_get(); // human-readable, includes elapsed time, progress, and ETA
+
+struct common_moe_calibration_status {
+    std::string stage;
+    long long   elapsed_s;
+    int         done;
+    int         total;    // 0 = no estimate yet
+    long long   eta_s;    // -1 = not enough data yet for an estimate
+};
+// Same underlying state as common_moe_calibration_status_get(), as raw
+// fields - for a caller (the --moe-calibrate status page) that wants to
+// render its own progress bar rather than parse the human-readable string.
+common_moe_calibration_status common_moe_calibration_status_get_struct();
+
 //
 // training utils
 //

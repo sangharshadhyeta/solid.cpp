@@ -14,6 +14,7 @@
 #include <cassert>
 #include <stdexcept>
 #include <cinttypes>
+#include <fstream>
 #include <set>
 #include <string>
 #include <vector>
@@ -110,7 +111,29 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         size_t free;
         size_t total;
         ggml_backend_dev_memory(cpu_dev, &free, &total);
-        ret.back().free  = free;
+
+        // ggml's CPU device reports installed capacity for *both* free and
+        // total, not what's actually free - on a host with other things
+        // resident it silently overstates how much RAM is available. Prefer
+        // /proc/meminfo's MemAvailable (already reclaimable page cache
+        // included, so our own mmap'd model weights don't count against
+        // themselves), falling back to the ggml figure where it can't be
+        // read. Same fix as llama-model.cpp's mmap-prefetch decision and
+        // server-context.cpp's prompt-cache sizing - keep these three in
+        // sync if the approach ever changes.
+        size_t avail = 0;
+        {
+            std::ifstream meminfo("/proc/meminfo");
+            std::string key, unit;
+            size_t value_kib = 0;
+            while (meminfo >> key >> value_kib >> unit) {
+                if (key == "MemAvailable:") {
+                    avail = value_kib * 1024ULL;
+                    break;
+                }
+            }
+        }
+        ret.back().free  = avail > 0 ? avail : free;
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
