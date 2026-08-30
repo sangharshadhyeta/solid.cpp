@@ -32,6 +32,7 @@
 #include <functional>
 #include <map>
 #include <numeric>
+#include <fstream>
 #include <regex>
 #include <sstream>
 #include <stdexcept>
@@ -1568,7 +1569,56 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // MAP_POPULATE/madvise(WILLNEED) over the whole mapping is a synchronous
+    // "fault every page in now" - a harmless (even beneficial, sequential vs.
+    // scattered faults) prefetch when the model fits in host RAM, which is
+    // true of every model this fork was tested against before. It stops being
+    // harmless once CPU-offloaded ("cold") experts are meant to stay
+    // NVMe-resident and page in on demand: eagerly populating the whole file
+    // then tries to force it all into RAM at once, which is what happens when
+    // the model is larger than available RAM. Skip the eager prefetch in that
+    // case so cold weights page in lazily instead, unless mlock was requested
+    // explicitly - that already forces full residency, so populating first is
+    // pure upside there.
+    bool mmap_prefetch = true;
+    if (ml.use_mmap && !use_mlock) {
+        size_t total_mapped = 0;
+        for (const auto & file : ml.files) {
+            total_mapped += file->size();
+        }
+
+        size_t avail_bytes = 0;
+        {
+            std::ifstream meminfo("/proc/meminfo");
+            std::string key, unit;
+            size_t value_kib = 0;
+            while (meminfo >> key >> value_kib >> unit) {
+                if (key == "MemAvailable:") {
+                    avail_bytes = value_kib * 1024ULL;
+                    break;
+                }
+            }
+        }
+        if (avail_bytes == 0) {
+            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (cpu_dev) {
+                size_t free_ram = 0, total_ram = 0;
+                ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+                avail_bytes = free_ram;
+            }
+        }
+
+        // leave headroom for the compute-graph reserve and everything else
+        // sharing the host, not just the raw model file size
+        if (avail_bytes != 0 && total_mapped > avail_bytes * 3 / 4) {
+            mmap_prefetch = false;
+            LLAMA_LOG_WARN("%s: model file(s) total %zu MiB exceeds a safe fraction of the %zu MiB of "
+                    "available host RAM - disabling eager mmap prefetch so CPU-offloaded weights "
+                    "page in on demand instead of being forced resident at load time\n",
+                    __func__, total_mapped >> 20, avail_bytes >> 20);
+        }
+    }
+    ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2352,7 +2402,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_MINIMAX_01 || arch == LLM_ARCH_GLM5NEXT) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_GLM5NEXT) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
@@ -2691,7 +2741,6 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_GLM5NEXT:
-        case LLM_ARCH_KIMI_K3:
             return LLAMA_ROPE_TYPE_NONE;
 
         // use what we call a normal RoPE, operating on pairs of consecutive head values
