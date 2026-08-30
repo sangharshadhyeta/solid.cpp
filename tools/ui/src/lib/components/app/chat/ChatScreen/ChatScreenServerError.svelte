@@ -32,9 +32,7 @@
 				{/if}
 			</Alert.Title>
 
-			{#if !isLoadingModel}
-				<Alert.Description>{serverError()}</Alert.Description>
-			{/if}
+			<Alert.Description>{serverError()}</Alert.Description>
 		</Alert.Root>
 	</div>
 {/if}
