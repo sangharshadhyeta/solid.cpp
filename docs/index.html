@@ -111,6 +111,25 @@ header.hero{text-align:center;padding:5rem 1rem 3rem;position:relative;}
   overflow:hidden;
 }
 .logo-badge img{width:100%;height:100%;object-fit:cover;}
+
+.hero-panel{
+  position:absolute;top:1.5rem;right:1.25rem;width:19rem;text-align:left;
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.2rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 20px 44px -26px rgba(0,0,0,.9);
+  font-size:.82rem;
+}
+.hero-panel h4{margin:0 0 .15rem;font-size:.8rem;color:var(--fg);font-weight:700;}
+.hero-panel .hp-sub{color:var(--muted-2);font-size:.72rem;margin:0 0 .7rem;}
+.hero-panel .hp-row{display:flex;justify-content:space-between;gap:.6rem;padding:.22rem 0;border-top:1px solid var(--border-soft);}
+.hero-panel .hp-row:first-of-type{border-top:none;}
+.hero-panel .hp-row span:first-child{color:var(--muted);}
+.hero-panel .hp-row span:last-child{color:var(--fg);font-variant-numeric:tabular-nums;text-align:right;}
+.hero-panel .hp-group{margin-top:.7rem;padding-top:.55rem;border-top:1px solid var(--border);}
+.hero-panel .hp-group-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-2);margin-bottom:.15rem;}
+.hero-panel .hp-note{color:var(--muted-2);font-size:.7rem;margin-top:.7rem;padding-top:.6rem;border-top:1px solid var(--border);line-height:1.5;}
+.hero-panel .hp-note strong{color:var(--muted);}
+@media (max-width:900px){.hero-panel{position:static;width:auto;max-width:26rem;margin:2rem auto 0;}}
 header.hero h1{font-size:3rem;margin:.2rem 0;}
 header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:34rem;margin:.75rem auto 2rem;text-wrap:balance;}
 
@@ -233,6 +252,33 @@ footer a{color:var(--muted);text-decoration:underline;}
 <div class="wrap">
 
 <header class="hero">
+<div class="hero-panel">
+<h4>GLM-5.3-Flash, on a card it isn't supposed to fit on</h4>
+<p class="hp-sub">UD-IQ1_S · 93&nbsp;GB, measured 2026-08-30</p>
+<div class="hp-row"><span>GPU</span><span>RTX 3060 12&nbsp;GB</span></div>
+<div class="hp-row"><span>CPU</span><span>i5-12400F</span></div>
+<div class="hp-row"><span>RAM</span><span>30&nbsp;GB</span></div>
+<div class="hp-row"><span>total memory</span><span>42&nbsp;GB</span></div>
+<div class="hp-group">
+<div class="hp-group-label">Placement</div>
+<div class="hp-row"><span>experts on CPU</span><span>45 / 45 layers</span></div>
+<div class="hp-row"><span>context · slots</span><span>2,048 tok · 1</span></div>
+</div>
+<div class="hp-group">
+<div class="hp-group-label">Brain / expert cache</div>
+<div class="hp-row"><span>positioned</span><span>10,575 experts</span></div>
+<div class="hp-row"><span>hot / warm / cold</span><span>313 / 340 / 12,307</span></div>
+<div class="hp-row"><span>hit rate</span><span>38.7%</span></div>
+<div class="hp-row"><span>VRAM used</span><span>3.70 / 3.97&nbsp;GB</span></div>
+<div class="hp-row"><span>substitute rate</span><span>28.9%</span></div>
+</div>
+<div class="hp-group">
+<div class="hp-group-label">Throughput</div>
+<div class="hp-row"><span>prompt processing</span><span>1.39 tok/s</span></div>
+<div class="hp-row"><span>generation</span><span>1.18 tok/s</span></div>
+</div>
+<p class="hp-note"><strong>Why this is the number, not a complaint:</strong> Unsloth's own guidance puts the practical minimum for this model around 102&nbsp;GB of combined memory; this runs on 42&nbsp;GB. We couldn't find a single published benchmark of GLM-5.3-Flash below its stated minimum footprint — this is slow because the hardware is 60&nbsp;GB short, not because the placement is wrong.</p>
+</div>
 <div class="logo-badge"><img src="solid.cpp.jpeg" alt="solid.cpp logo"></div>
 <h1>solid.cpp</h1>
 <div class="tagline">llama.cpp, hardened: real bugs found, root-caused, and measured before they ship — with a live view into whether the fix is actually working.</div>
