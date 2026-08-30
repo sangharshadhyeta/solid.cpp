@@ -3486,8 +3486,21 @@ private:
 
                                 const auto n_cache_reuse = slot.task->params.n_cache_reuse;
 
+                                // chunk-reuse relocates a matched sub-range of the cache by shifting KV
+                                // positions - meaningful for attention KV cache, but recurrent memory has
+                                // only a single running-summary cell per sequence, so "shifting" it just
+                                // relabels that cell's position without actually moving any content. Treat
+                                // any model with a recurrent component (pure recurrent or hybrid) as unable
+                                // to support chunk reuse, regardless of what get_can_shift() reports (it
+                                // reports true because whole-sequence position shifts, used elsewhere for
+                                // context-shift-on-overflow, are trivial for recurrent state - that is a
+                                // different, uniform-shift use case from this non-uniform chunk relocation).
+                                const llama_model * model_tgt = llama_get_model(ctx_tgt);
+
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx_tgt)) &&
+                                    !llama_model_is_recurrent(model_tgt) &&
+                                    !llama_model_is_hybrid(model_tgt) &&
                                     !slot.prompt.tokens.has_mtmd;
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
