@@ -642,6 +642,12 @@ struct server_prompt_disk_entry {
     std::string   path;
     server_tokens tokens;
     size_t        size_bytes = 0;
+
+    // number of times this entry has served a disk_load() hit this run; not
+    // persisted, resets on restart. Used by disk_trim() to protect prefixes
+    // that keep recurring (a system prompt, a resumed document) from being
+    // evicted just because a one-off long context happens to be newer.
+    size_t hits = 0;
 };
 
 struct server_prompt_cache {
