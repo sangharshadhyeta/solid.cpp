@@ -874,6 +874,11 @@ upstream-only and won't have them. Full guide either way in
 </table>
 </div>
 <p class="note">Per-backend build flags in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/build.md">docs/build.md</a>.</p>
+<p class="note">The mmap-prefetch-safety fix behind the GLM-5.3-Flash result above (skips eagerly populating the whole
+model file into RAM when it won't fit) reads <code>/proc/meminfo</code> directly, so it's Linux-only. It doesn't
+crash or fail to build elsewhere - Windows/macOS fall back to ggml's own device-memory query, which reports
+installed capacity rather than what's actually free, so the fix is less accurate (not absent) at catching the
+same OOM there. Verified on Linux; not yet verified on other platforms.</p>
 </section>
 
 <section id="docs">
