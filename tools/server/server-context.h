@@ -6,9 +6,11 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <atomic>
 #include <cstddef>
 #include <memory>
 #include <set>
+#include <thread>
 
 struct server_context_impl; // private implementation
 
@@ -125,6 +127,7 @@ struct server_res_generator;
 
 struct server_routes {
     server_routes(const common_params & params, server_context & ctx_server);
+    ~server_routes();
 
     void init_routes();
 
@@ -188,4 +191,14 @@ private:
     server_queue & queue_tasks;
     server_response & queue_results;
     std::unique_ptr<server_res_generator> create_response(bool bypass_sleep = false);
+
+    // Owns the background loop that periodically regenerates --expert-atlas-file
+    // from live-traffic co-activation data (GGML_CUDA_MOE_CACHE_COACT_FILE) by
+    // shelling out to scripts/moe-atlas-evolve.py - see atlas_regen_loop() in
+    // server-context.cpp for why this stays a subprocess rather than an
+    // in-process reimplementation. No-op (thread never started) unless both
+    // --expert-atlas-file and the coact env var are set.
+    std::thread atlas_regen_thread;
+    std::atomic<bool> atlas_regen_stop{false};
+    void atlas_regen_loop(std::string atlas_file, std::string coact_file);
 };
