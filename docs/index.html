@@ -100,7 +100,10 @@ li{margin:.5rem 0;}
 .topnav .btn{padding:.45rem .95rem;font-size:.83rem;}
 @media (max-width:640px){.topnav nav a.nav-link{display:none;}}
 
-header.hero{text-align:center;padding:5rem 1rem 3rem;position:relative;}
+header.hero{padding:5rem 1rem 3rem;position:relative;display:flex;align-items:flex-start;justify-content:center;gap:2rem;}
+.hero-main{flex:1;min-width:0;text-align:center;order:1;}
+.hero-panel{order:2;}
+@media (max-width:900px){header.hero{flex-direction:column;align-items:stretch;}}
 .logo-badge{
   width:104px;height:104px;border-radius:26px;margin:0 auto 1.5rem;
   background:var(--card-2);
@@ -113,7 +116,7 @@ header.hero{text-align:center;padding:5rem 1rem 3rem;position:relative;}
 .logo-badge img{width:100%;height:100%;object-fit:cover;}
 
 .hero-panel{
-  position:absolute;top:1.5rem;right:1.25rem;width:19rem;text-align:left;
+  flex:none;width:19rem;text-align:left;
   background:var(--card);background-image:var(--shine);
   border:1px solid var(--border);border-radius:14px;padding:1.1rem 1.2rem;
   box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 20px 44px -26px rgba(0,0,0,.9);
@@ -129,7 +132,7 @@ header.hero{text-align:center;padding:5rem 1rem 3rem;position:relative;}
 .hero-panel .hp-group-label{font-size:.68rem;text-transform:uppercase;letter-spacing:.04em;color:var(--muted-2);margin-bottom:.15rem;}
 .hero-panel .hp-note{color:var(--muted-2);font-size:.7rem;margin-top:.7rem;padding-top:.6rem;border-top:1px solid var(--border);line-height:1.5;}
 .hero-panel .hp-note strong{color:var(--muted);}
-@media (max-width:900px){.hero-panel{position:static;width:auto;max-width:26rem;margin:2rem auto 0;}}
+@media (max-width:900px){.hero-panel{width:auto;max-width:26rem;margin:2rem auto 0;order:2;}}
 header.hero h1{font-size:3rem;margin:.2rem 0;}
 header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:34rem;margin:.75rem auto 2rem;text-wrap:balance;}
 
@@ -279,6 +282,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 <p class="hp-note"><strong>Why this is the number, not a complaint:</strong> Unsloth's own guidance puts the practical minimum for this model around 102&nbsp;GB of combined memory; this runs on 42&nbsp;GB. We couldn't find a single published benchmark of GLM-5.3-Flash below its stated minimum footprint — this is slow because the hardware is 60&nbsp;GB short, not because the placement is wrong.</p>
 </div>
+<div class="hero-main">
 <div class="logo-badge"><img src="solid.cpp.jpeg" alt="solid.cpp logo"></div>
 <h1>solid.cpp</h1>
 <div class="tagline">llama.cpp, hardened: real bugs found, root-caused, and measured before they ship — with a live view into whether the fix is actually working.</div>
@@ -290,6 +294,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 <span class="pill">MIT licensed</span>
 <span class="pill">based on llama.cpp</span>
 <span class="pill">CUDA · Metal · Vulkan · CPU</span>
+</div>
 </div>
 </header>
 
