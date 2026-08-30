@@ -35,3 +35,21 @@ weights for oversized models.
 
 **Coming soon:** the same run on an NVIDIA H200 with 512 GB RAM, at Q4 — a fair-hardware comparison against
 today's 1-bit-on-a-42GB-rig result.
+
+### Reproduce it yourself
+
+```sh
+git clone -b solid https://github.com/sangharshadhyeta/solid.cpp.git
+cd solid.cpp
+cmake -B build -DGGML_CUDA=ON   # drop -DGGML_CUDA=ON for a CPU-only build
+cmake --build build --config Release -j$(nproc)
+
+./build/bin/llama-server \
+  -hf unsloth/GLM-5.3-Flash-GGUF:UD-IQ1_S \
+  -ncmoe 45 --moe-cache auto \
+  -c 2048 --parallel 1 --host 0.0.0.0 --port 8099
+```
+
+The eager-mmap-prefetch fix (see below) means this loads and serves correctly even on a machine with under
+64 GB of combined VRAM+RAM, where it would otherwise OOM at load time. Full build options are in
+[docs/build.md](docs/build.md).
