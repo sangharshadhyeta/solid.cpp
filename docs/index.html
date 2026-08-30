@@ -733,6 +733,16 @@ device-to-device instead of re-fetching from host memory. Design from
 regression on a cold cache.</p>
 </div>
 <div class="card">
+<h3>Live NVMe-prefetch hint for cold experts (<code>GGML_CUDA_MOE_CACHE_LIVE_PREFETCH</code>, default on)</h3>
+<p>The live-activation predictor already ranked candidates and the cache already tracked per-expert CPU cold/warm
+state — admission just never acted on it. Now hints the kernel to start reading a cold candidate's host pages the
+moment it's queued, not when the fill worker actually needs them. A/B'd under real memory pressure (5 rounds each,
+15&nbsp;GiB cap): 29.1 &rarr; 39.8 tok/s mean, and it specifically kills the worst-case stalls (17 tok/s low end
+gone) rather than just nudging the average — unlike the older one-shot <code>READAHEAD</code> flag (blind,
+history-based, a measured net loss on warm throughput), this only fires for a candidate already independently
+wanted.</p>
+</div>
+<div class="card">
 <h3>Cost-aware (GreedyDual-Size) eviction tiebreak</h3>
 <p>Eviction now weighs heat by an NVMe-vs-RAM cost tier, so a hotter-but-cheap slot can lose to a
 colder-but-expensive one. A correctness fix for real memory pressure, not a throughput win — noise-neutral under
