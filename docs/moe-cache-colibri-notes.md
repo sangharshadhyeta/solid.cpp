@@ -17,7 +17,7 @@ enough VRAM for the whole thing.
 
 ## Where the code is
 
-Branch `moe-cache-port` in this repo, based on `ggml-org/llama.cpp` master
+Branch `solid` (renamed from `moe-cache-port` 2026-08-31) in this repo, based on `ggml-org/llama.cpp` master
 at commit `1f368f354`, 22 commits ahead. Remotes already configured:
 `origin` = `ggml-org/llama.cpp`, `leloch` = `leloch/llama.cpp` (source of
 the ported feature, branch `moe-cache-pr`). If this is a fresh checkout

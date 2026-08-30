@@ -506,7 +506,7 @@ that only publishes wins is the thing this project exists not to be.</p>
 </div>
 
 <div class="callout">
-<p>Several of those rows are losses, and they are deliberate. Speculative eviction failed three separate times before cross-depth agreement fixed it. FR-Spec was expected to be a free win and wasn't. The host buffer and <code>mlock</code> pinning both tried to hold hot experts in RAM and measured <em>worse</em> than doing nothing. The prefill double-buffer that carries the device-to-device path turns out to cost 5% &mdash; measured only after it had been shipped (off by default) and cited for a year on the strength of a <em>different</em> flag's benchmark. That last one is the uncomfortable kind: not a failed experiment but a claim that was never actually tested, and the correction cancelled a planned piece of work rather than starting one. That's the actual point of <code>solid.cpp</code>: every number here is something that was measured and would be reported honestly either way. Full raw numbers, per-row methodology, and the complete working log &mdash; including dead ends &mdash; live in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a> and <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/plan.md">docs/plan.md</a>.</p>
+<p>Several of those rows are losses, and they are deliberate. Speculative eviction failed three separate times before cross-depth agreement fixed it. FR-Spec was expected to be a free win and wasn't. The host buffer and <code>mlock</code> pinning both tried to hold hot experts in RAM and measured <em>worse</em> than doing nothing. The prefill double-buffer that carries the device-to-device path turns out to cost 5% &mdash; measured only after it had been shipped (off by default) and cited for a year on the strength of a <em>different</em> flag's benchmark. That last one is the uncomfortable kind: not a failed experiment but a claim that was never actually tested, and the correction cancelled a planned piece of work rather than starting one. That's the actual point of <code>solid.cpp</code>: every number here is something that was measured and would be reported honestly either way. Full raw numbers, per-row methodology, and the complete working log &mdash; including dead ends &mdash; live in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/moe-cache-colibri-notes.md">docs/moe-cache-colibri-notes.md</a> and <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/plan.md">docs/plan.md</a>.</p>
 </div>
 </section>
 
@@ -805,7 +805,7 @@ hardware, locally and in the cloud — carries through untouched:</p>
 lossless speedup) and <code>--spec-type draft-dspark</code>
 (<a href="https://arxiv.org/abs/2607.05147">DSpark</a>, DeepSeek's confidence-scheduled semi-autoregressive
 Markov-head drafter, 16&ndash;18% higher accepted length than DFlash) — full convert-script and README
-coverage in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/speculative.md">docs/speculative.md</a>.
+coverage in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/speculative.md">docs/speculative.md</a>.
 Not something this fork ported: real, working, upstream-inherited support, checked and confirmed present
 rather than assumed. <a href="https://arxiv.org/html/2606.02091v1">DFlare</a> (scales draft capacity further
 past DFlash) is a newer successor worth watching, not yet implemented anywhere.</li>
@@ -831,9 +831,9 @@ llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
 llama serve -hf &lt;big-moe-model-gguf&gt; -ngl 99 -ncmoe 15 --moe-cache auto</code></pre>
 <p class="note">Docker: <code>.devops/*.Dockerfile</code> builds from this source tree, so it includes every fix
 on this page - the pre-built <code>ghcr.io/ggml-org/llama.cpp</code> images in the
-<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">Docker docs</a> are
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/docker.md">Docker docs</a> are
 upstream-only and won't have them. Full guide either way in
-<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>.</p>
+<a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/build.md">docs/build.md</a>.</p>
 
 <div class="grid" style="margin-top:1.75rem">
 <a class="card" href="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4"><img src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" alt="VLM session with llama cli"><div class="d">VLM session with <code>llama cli</code></div></a>
@@ -868,58 +868,58 @@ upstream-only and won't have them. Full guide either way in
 </tbody>
 </table>
 </div>
-<p class="note">Per-backend build flags in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">docs/build.md</a>.</p>
+<p class="note">Per-backend build flags in <a href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/build.md">docs/build.md</a>.</p>
 </section>
 
 <section id="docs">
 <div class="eyebrow">Documentation</div>
 <h2>Everything, one click away</h2>
 <div class="grid">
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/moe-cache-colibri-notes.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/moe-cache-colibri-notes.md">
 <div class="k">Working log</div>
 <div class="d">Measurements, dead ends, and root causes for everything on this page</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/build.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/build.md">
 <div class="k">How to build</div>
 <div class="d">Full build guide, all backends</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/tools/server/README.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/tools/server/README.md">
 <div class="k">Server</div>
 <div class="d">llama-server usage and API</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/tools/cli/README.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/tools/cli/README.md">
 <div class="k">CLI</div>
 <div class="d">llama-cli usage</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/docker.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/docker.md">
 <div class="k">Docker</div>
 <div class="d">Running on Docker</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/android.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/android.md">
 <div class="k">Android</div>
 <div class="d">Build on Android</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/multi-gpu.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/multi-gpu.md">
 <div class="k">Multi-GPU</div>
 <div class="d">Multi-GPU usage</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/development/token_generation_performance_tips.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/development/token_generation_performance_tips.md">
 <div class="k">Performance tips</div>
 <div class="d">Token generation troubleshooting</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/models.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/models.md">
 <div class="k">Models</div>
 <div class="d">Supported model formats and sources</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/grammars/README.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/grammars/README.md">
 <div class="k">GBNF grammars</div>
 <div class="d">Constrained-output grammar syntax</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/completions.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/completions.md">
 <div class="k">Completions</div>
 <div class="d">Completion endpoint reference</div>
 </a>
-<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/moe-cache-port/docs/xcframework.md">
+<a class="card" href="https://github.com/sangharshadhyeta/solid.cpp/blob/solid/docs/xcframework.md">
 <div class="k">XCFramework</div>
 <div class="d">Apple platform packaging</div>
 </a>
