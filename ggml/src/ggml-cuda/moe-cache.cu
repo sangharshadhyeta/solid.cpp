@@ -2645,9 +2645,29 @@ static void moe_cache_prefill_register_successor(
 // right place to have paid for it once mmap/pinning didn't already cover.
 
 // Userdata for moe_cache_prefill_release_readers_cb below.
+struct moe_cache_prefill_pin {
+    moe_cache_pool * pool;
+    int slot;
+    // Generation observed at pin time (mirrors moe_cache_pin, the decode-time
+    // hit-serving path's own pin struct - see its comment). Without this, the
+    // release callback below has no way to tell "this slot still holds what I
+    // pinned" from "this slot index was reset and reused for something else
+    // while my copy was in flight" - and unconditional slot.readers = 0 resets
+    // exist elsewhere (prewarm_from_history, eviction, teardown) that don't
+    // know about this pin at all. A generation-blind release can then
+    // decrement a completely unrelated (tensor, expert)'s reader count,
+    // corrupting whatever pin protection *that* occupant's own reader was
+    // relying on - a real bug found investigating qwen4exp corruption that
+    // reproduced with byte-correct D2D copies (see docs/plan.md): the copy
+    // itself was always right, but this generation-blind release could let a
+    // slot become eviction-eligible while a real reader elsewhere still
+    // depended on it staying pinned.
+    uint64_t generation;
+};
+
 struct moe_cache_prefill_reader_release_ctx {
     moe_cache_session * session;
-    std::vector<std::pair<moe_cache_pool *, int>> pins; // (pool, slot index)
+    std::vector<moe_cache_prefill_pin> pins;
 };
 
 // Enqueued on prefill_stream, after every D2D hit-copy that read from a live
@@ -2664,10 +2684,20 @@ static void moe_cache_prefill_release_readers_cb(void * userdata) {
     {
         std::lock_guard<std::mutex> lock(ctx->session->mu);
         for (auto & pin : ctx->pins) {
-            moe_cache_pool * pool = pin.first;
-            const int idx = pin.second;
-            if (idx >= 0 && (size_t) idx < pool->slots.size() && pool->slots[idx].readers > 0) {
-                pool->slots[idx].readers--;
+            moe_cache_pool * pool = pin.pool;
+            const int idx = pin.slot;
+            if (idx < 0 || (size_t) idx >= pool->slots.size()) {
+                continue;
+            }
+            moe_cache_slot & slot = pool->slots[idx];
+            // Generation-checked: if this slot was reset and reused for a
+            // different (tensor, expert) since we pinned it (a forced reset
+            // elsewhere that didn't know about this pin - see the struct
+            // comment), it is no longer ours to release. Decrementing anyway
+            // would steal reader protection from whatever legitimately holds
+            // it now.
+            if (slot.generation == pin.generation && slot.readers > 0) {
+                slot.readers--;
             }
         }
     }
@@ -2720,7 +2750,7 @@ static bool moe_cache_moe_lfru_copy_expert(
             if (pslot.state == moe_cache_slot_state::valid) {
                 src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                 pslot.readers++;
-                release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+                release_ctx->pins.push_back({pool_ptr.get(), found->second, pslot.generation});
             }
             break;
         }
@@ -2799,7 +2829,7 @@ static int moe_cache_moe_lfru_copy_experts(
                 if (pslot.state == moe_cache_slot_state::valid) {
                     src_ptr = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                     pslot.readers++;
-                    release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+                    release_ctx->pins.push_back({pool_ptr.get(), found->second, pslot.generation});
                 }
                 break;
             }
@@ -2824,8 +2854,8 @@ static int moe_cache_moe_lfru_copy_experts(
             n_hits++;
         }
     }
-    if (n_hits == 0) {
-        return 0; // release_ctx (empty pins) is simply dropped, nothing to release
+    if (release_ctx->pins.empty()) {
+        return 0; // nothing pinned, nothing to release
     }
     moe_cache_prefill_reader_release_ctx * raw = release_ctx.release();
     if (!moe_cache_cuda_ok(device,
@@ -2918,7 +2948,7 @@ static bool moe_cache_prefill_copy_split(
                 if (pslot.state == moe_cache_slot_state::valid) {
                     hit_src[(size_t) e] = pool_ptr->slab + (size_t) found->second * pool_ptr->slot_stride;
                     pslot.readers++;
-                    release_ctx->pins.emplace_back(pool_ptr.get(), found->second);
+                    release_ctx->pins.push_back({pool_ptr.get(), found->second, pslot.generation});
                 }
                 break;
             }
@@ -5315,30 +5345,22 @@ static void moe_cache_prewarm_from_history(
         pool.free_slots.pop_back();
 
         moe_cache_slot & slot = pool.slots[slot_index];
+        // Checked BEFORE the reset below, not after (a prior version of this
+        // check tested slot.readers > 0 immediately following slot.readers =
+        // 0 on the very same slot - always false, dead code, found during
+        // the qwen4exp corruption investigation alongside the real bug this
+        // was meant to catch: a generation-blind pin release in
+        // moe_cache_prefill_reader_release_ctx, see its struct comment.
+        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
+            static std::atomic<int> nc{0};
+            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
+                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
+                        slot.readers);
+            }
+        }
         slot.key = key;
         slot.generation++;
         slot.readers = 0;
-        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
-            static std::atomic<int> nc{0};
-            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
-                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
-                        slot.readers);
-            }
-        }
-        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
-            static std::atomic<int> nc{0};
-            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
-                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
-                        slot.readers);
-            }
-        }
-        if (moe_cache_pin_audit_enabled() && slot.readers > 0) {
-            static std::atomic<int> nc{0};
-            if (nc.fetch_add(1, std::memory_order_relaxed) < 20) {
-                fprintf(stderr, "[moe-cache] *** PIN VIOLATION: refill (state->copying) with readers=%d\n",
-                        slot.readers);
-            }
-        }
         slot.state = moe_cache_slot_state::copying;
         try {
             if (!moe_cache_map_insert(pool, key, slot_index)) {
