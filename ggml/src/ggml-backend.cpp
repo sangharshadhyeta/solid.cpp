@@ -2013,6 +2013,43 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                                     ggml_bitset_clear(copy_ids.data(), lfru_candidate_ids[ci]);
                                 }
                             }
+                            // The H2D path below always writes up to 512 bytes
+                            // past the end of a copied run's last expert (see
+                            // copy_experts' padding_end) - real host bytes
+                            // belonging to the next expert's row, copied only
+                            // so MMQ's read-ahead never lands on a NaN-capable
+                            // bit pattern. A D2D-served expert gets no such
+                            // trailing bytes: cudaMemcpyAsync above copies
+                            // exactly expert_size, nothing past it. When a D2D
+                            // hit is the last touched position in input_cpy
+                            // this call (its neighbour expert isn't touched
+                            // this token either), whatever input_cpy already
+                            // held there from a previous token/layer's
+                            // occupant is what MMQ reads - this is the
+                            // previously-unresolved qwen4exp corruption: byte-
+                            // correct D2D data, corrupted output, because the
+                            // bug is in the untouched byte just past it, not
+                            // in the copy itself. Unconditionally refresh that
+                            // same padding window per D2D hit (cheap - <=512B
+                            // over PCIe vs. the multi-MiB expert this D2D copy
+                            // just avoided fetching); a later real H2D copy of
+                            // the neighbour expert, enqueued after this on the
+                            // same stream, simply overwrites it with the
+                            // correct data, so this is never wasted-incorrect,
+                            // only sometimes wasted-redundant.
+                            for (size_t ci = 0; ci < lfru_candidate_ids.size(); ci++) {
+                                if (!lfru_hit_mask[ci]) {
+                                    continue;
+                                }
+                                const int32_t id = lfru_candidate_ids[ci];
+                                if (id >= n_expert - 1) {
+                                    continue; // no neighbour row to guard
+                                }
+                                const size_t pad_offset = (size_t) (id + 1) * expert_size;
+                                const size_t pad_bytes  = std::min<size_t>(expert_size, 512);
+                                ggml_backend_tensor_set_async(split_backend, input_cpy,
+                                    (const uint8_t *) input->data + pad_offset, pad_offset, pad_bytes);
+                            }
                         }
                     }
                     // Every used row for this input may have been served D2D above.
