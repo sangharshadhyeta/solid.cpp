@@ -1969,7 +1969,33 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // cudaLaunchHostFunc dispatch per hit for no reason, since
                     // every hit in this pass becomes releasable at the same real
                     // time anyway.
-                    if (ggml_moe_cache.moe_lfru_copy_experts) {
+                    // Off by default: qwen4exp (512 experts, 4x anything this
+                    // path was previously exercised against) reliably
+                    // reproduces silent corruption with this enabled -
+                    // deterministic repeated-token garbage, independent of
+                    // sampling settings. Root-caused as far as: the D2D-
+                    // copied bytes land byte-correct (verified against host
+                    // truth) and every other mechanism-level explanation
+                    // tried (padding overlap, explicit stream sync, CUDA
+                    // graph capture, the buffer-reuse event-record ordering,
+                    // curr_stream_no drift, the moe-cache-invalidate hook)
+                    // checked out as fine on direct inspection - yet any
+                    // coverage gap in the plain H2D path (even 3 of 140 used
+                    // experts skipped in favour of an independently-verified
+                    // -correct D2D copy) breaks output, while 100% H2D
+                    // coverage (redundant D2D writes included) never does,
+                    // reproducibly. Not fully root-caused at the byte level;
+                    // see docs/plan.md's qwen4exp corruption investigation
+                    // section for the full elimination log before touching
+                    // this again. GGML_CUDA_MOE_CACHE_LFRU_D2D=1 re-enables
+                    // this for archs where it was already measured safe
+                    // (Ornith-1.5-35B-A3B, Nemotron, GLM-5.2 - all <=256
+                    // experts) until the qwen4exp-specific bug is found.
+                    static const bool lfru_d2d_enabled = [] {
+                        const char * e = getenv("GGML_CUDA_MOE_CACHE_LFRU_D2D");
+                        return e && atoi(e) != 0;
+                    }();
+                    if (lfru_d2d_enabled && ggml_moe_cache.moe_lfru_copy_experts) {
                         lfru_candidate_ids.clear();
                         for (int64_t e = 0; e < n_expert; e++) {
                             if (ggml_bitset_get(copy_ids.data(), e)) {
