@@ -1256,6 +1256,14 @@ inline llama_model_tensor_buft_override llm_ffn_exps_cpu_override() {
 // a server or load a long-lived context. See --moe-calibrate in arg.cpp.
 void common_moe_calibrate(common_params & params);
 
+// True if this model+hardware+context+parallelism combination needs MoE
+// CPU-offload placement decided (is_moe, doesn't already fit as configured)
+// AND has no cached --moe-calibrate answer AND the user hasn't explicitly
+// pinned placement themselves (-ncmoe or any other tensor-buft override) -
+// i.e. whether a normal launch should transparently run calibration before
+// serving instead of falling back to a safe-but-unoptimized placement.
+bool common_moe_should_auto_calibrate(common_params & params);
+
 // Thread-safe status string for common_moe_calibrate()'s current stage, so a
 // concurrent status server (tools/server/server.cpp's --moe-calibrate branch)
 // can report real progress instead of its port simply being unreachable -

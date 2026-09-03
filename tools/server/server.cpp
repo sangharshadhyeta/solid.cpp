@@ -165,6 +165,21 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // silently wraps to a huge unsigned n_seq_max and crashes the no-alloc
     // probe with "n_seq_max must be <= 256" - found by testing --moe-calibrate
     // together with --model-draft/--spec-type for real, not by inspection.
+    //
+    // A plain launch with no cached calibration for this model+hardware+
+    // context combination, and no explicit -ncmoe of the user's own, should
+    // not silently fall back to a safe-but-unoptimized placement - it should
+    // calibrate automatically, the same way passing --moe-calibrate would,
+    // before serving. This reuses the exact same branch below (temporary
+    // status server, calibrate, fall through to normal serving) - the only
+    // difference from an explicit --moe-calibrate launch is who set the flag.
+    if (!params.moe_calibrate && common_moe_should_auto_calibrate(params)) {
+        SRV_WRN("%s", "no cached MoE calibration found for this model+hardware+context+parallelism "
+                "combination - running calibration automatically before serving "
+                "(pass -ncmoe explicitly, or run --moe-calibrate yourself, to control this)\n");
+        params.moe_calibrate = true;
+    }
+
     if (params.moe_calibrate) {
         // Stand up a minimal status server on the normal host:port for the
         // duration of calibration. Without this, the webui's poll of /props

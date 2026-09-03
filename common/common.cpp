@@ -1630,6 +1630,36 @@ static void common_moe_calibration_save(
     out << j.dump(2);
 }
 
+bool common_moe_should_auto_calibrate(common_params & params) {
+    // Same rule as common_maybe_autoplace_moe_cpu(): an explicit -ncmoe (or
+    // any other explicit tensor-buffer-type override) is a deliberate user
+    // choice and auto-calibration must never second-guess it.
+    for (const auto & o : params.tensor_buft_overrides) {
+        if (o.pattern != nullptr) {
+            return false;
+        }
+    }
+
+    const char * path_model = params.model.path.c_str();
+    common_moe_calibration_entry cached;
+    if (common_moe_calibration_lookup(path_model, params, cached)) {
+        return false; // already have a cached answer for this combination
+    }
+
+    // Cheap no-alloc probe (GGUF header + device memory, no tensor data
+    // loaded) - only trigger the (multi-minute) automatic calibration run
+    // for models that actually need MoE CPU-offload placement decided.
+    // Dense models, and MoE models that already fit as configured, have
+    // nothing for --moe-calibrate to usefully tune.
+    auto mparams = common_model_params_to_llama(params);
+    auto cparams = common_context_params_to_llama(params);
+    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
+    if (!probe.is_moe || probe.already_fits) {
+        return false;
+    }
+    return true;
+}
+
 // Golden-section search over integers in [lo, hi] for the argmax of a
 // unimodal (single-peak) function - the shape our own -ncmoe and
 // spec-draft-n-max sweeps actually showed empirically (a real interior
