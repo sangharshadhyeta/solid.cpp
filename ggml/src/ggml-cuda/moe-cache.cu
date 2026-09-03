@@ -513,6 +513,16 @@ struct moe_cache_device {
     // built from a single data point; the EMA itself still starts tracking
     // immediately, since observation alone is free and harmless.
     uint32_t req_dir_updates = 0;
+    // Live pacing signal for dynamic substitution gating (see
+    // moe_cache_substitute_min_rank below): an EMA of the wall-clock gap
+    // between consecutive moe_cache_plan() calls on this device, i.e. how
+    // fast this dispatch is actually managing to move right now - fetch
+    // time, compute time, contention, everything folded in, no separate
+    // instrumentation needed. Read/written only under device.dispatch_mu,
+    // which every moe_cache_plan() caller already holds.
+    double   substitute_pace_ema_ms   = 0.0;
+    bool     substitute_pace_has_last = false;
+    std::chrono::steady_clock::time_point substitute_pace_last{};
     // Rate limit for the warming scan below - same clock spec_evict already
     // uses (device.collect_calls), so this doesn't need its own timer.
     long long atlas_warm_last_calls = -1;
@@ -7033,33 +7043,65 @@ static bool moe_cache_neuron_heat_enabled() {
     return enabled;
 }
 
-// Draft/fallback split by the missed expert's own router rank (2026-08-29):
-// this dispatch path has no access to the router's actual probability
-// values (same GPU-only limitation as the "full-probs oracle" comparison
-// elsewhere in this file - ffn_moe_probs never reaches the CPU side), but
-// rank position IS available and is a real, already-measured proxy for how
-// much a miss costs: rank 0 misses 20% of the time vs. rank 7's 44%, and
-// ranks 4-7 carry only 32% of the total gate mass between them. Below this
-// floor (the router's most-confident, most-consequential picks), a miss
-// always pays the exact CPU fallback cost rather than accept an
-// approximation; at or above it (picks the router itself weighted least),
-// the cheap resident stand-in is used - the "draft" only ever substitutes
-// for output that barely moves the result either way. Default 0: no
-// gating, every miss may substitute, matching the pre-existing behavior
-// until this is actually measured.
-static int moe_cache_substitute_min_rank() {
-    static const int v = [] {
-        // Default 4, not 0: the measured +8.11% win was taken WITH this
-        // gate, and it is the gate that makes substitution safe to enable
-        // by default - only the router's least-confident picks (rank >= 4)
-        // may be served by a stand-in, so its most consequential choices
-        // always get exact compute. Ungated substitution was never the
-        // configuration that won 4/4 rounds. 0 restores ungated behaviour.
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
-        const int n = env ? atoi(env) : 4;
+// Dynamic substitution gate (2026-09-04): the rank floor a miss must clear
+// to accept a resident stand-in now adapts to how fast this dispatch is
+// ACTUALLY managing to get real experts into VRAM recently, rather than a
+// fixed router-confidence cutoff. Measured on qwen4exp the same day this
+// replaced the static default: MIN_RANK=4 (the prior default) still cost
+// real quality - PPL 3.54 -> 5.62, non-overlapping confidence intervals, on
+// a short decode-shaped test - even though the cache was 100%/99.6% full in
+// both arms. That rules out cache occupancy as the signal: this model's
+// cache is permanently saturated, so "pool pressure" never discriminates
+// between "needs substitution" and "doesn't" here. What does vary moment to
+// moment is how long this dispatch is actually taking - PCIe contention,
+// concurrent requests, everything folds into that one number for free. The
+// EMA lives on moe_cache_device (substitute_pace_ema_ms), updated here under
+// dispatch_mu (every caller already holds it, so no new lock).
+//
+// GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK, if the user sets it, still wins
+// outright - this dynamic path only fills in for someone who left it at
+// default, same "never override an explicit choice" rule as everywhere else
+// in this file.
+static int moe_cache_substitute_min_rank(moe_cache_device & device) {
+    const char * pinned_env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
+    if (pinned_env) {
+        const int n = atoi(pinned_env);
         return n < 0 ? 0 : n;
+    }
+
+    // Target: the per-dispatch pace this model needs to hit for an exact
+    // fetch to be "keeping up" rather than "falling behind". No universal
+    // right answer - override via GGML_CUDA_MOE_CACHE_SUBSTITUTE_TARGET_MS
+    // if a different model/hardware needs a different floor. 8ms chosen as
+    // a conservative starting point (roughly what a single mid-sized expert
+    // H2D fetch costs on a contended PCIe link) pending real calibration.
+    static const double target_ms = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_TARGET_MS");
+        const double v = e ? atof(e) : 8.0;
+        return v > 0.0 ? v : 8.0;
     }();
-    return v;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (device.substitute_pace_has_last) {
+        const double delta_ms = std::chrono::duration<double, std::milli>(
+                now - device.substitute_pace_last).count();
+        // Same decay-toward-new-sample shape as the atlas req_dir tracker
+        // above - reacts within a handful of calls, doesn't chase single-call
+        // noise.
+        device.substitute_pace_ema_ms += 0.15 * (delta_ms - device.substitute_pace_ema_ms);
+    }
+    device.substitute_pace_last = now;
+    device.substitute_pace_has_last = true;
+
+    if (device.substitute_pace_ema_ms <= target_ms) {
+        return 10; // keeping pace - never substitute, matches the measured-safe OFF behaviour
+    }
+    // Falling behind: ramp the floor down as the overrun grows, so a small
+    // overrun costs only the router's least-confident picks and a large one
+    // opens substitution up to all of them, rather than an on/off switch.
+    const double overrun = device.substitute_pace_ema_ms / target_ms; // > 1 here
+    const int rank = (int) (10.0 / overrun);
+    return rank < 0 ? 0 : (rank > 10 ? 10 : rank);
 }
 
 // How many resident candidates the stand-in search may examine. The offline
@@ -8398,6 +8440,65 @@ static int moe_cache_substitute_pick(
     return best_slot;
 }
 
+// Pick the hottest resident stand-in for `missed`, breaking ties by
+// co-activation count (how often it has fired alongside the expert it would
+// replace, averaged over every request this session has served - the "these
+// two do the same job for this input" signal moe_cache_substitute_pick
+// above already uses). Two deliberate differences from that function, both
+// per 2026-09-04 discussion:
+//   - heat is the PRIMARY key, co-activation only a tiebreak - "hot loaded"
+//     candidates are preferred outright, not merely used to break ties
+//     between similarly-co-activated ones.
+//   - no min_coact floor: a candidate with zero recorded co-activation is
+//     still eligible (scored as the lowest tiebreak tier), rather than
+//     skipped outright. That floor was what caused most declines; removing
+//     it means this only returns -1 when NOTHING for this tensor is
+//     resident within the scan at all, not merely when nothing resident
+//     happens to be a co-activation match yet.
+// Caller must hold the session lock, as everything reading pool state does.
+static int moe_cache_substitute_pick_hot(
+        moe_cache_device & device, moe_cache_pool & pool,
+        const void * host_base, int32_t missed, int64_t n_expert) {
+    const std::vector<uint64_t> * words = moe_cache_mask_words(pool, host_base);
+    if (!words) {
+        return -1;
+    }
+    const moe_cache_key mkey{host_base, missed};
+    const int scan_cap = moe_cache_substitute_scan();
+    int best_slot = -1;
+    uint16_t best_heat = 0;
+    uint32_t best_count = 0;
+    int examined = 0;
+    for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
+        uint64_t bits = (*words)[w];
+        while (bits && examined < scan_cap) {
+            const int cand = (int) (w << 6) + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (cand == missed || cand >= (int) n_expert) {
+                continue;
+            }
+            examined++;
+            const auto found = pool.map.find(moe_cache_key{host_base, cand});
+            if (found == pool.map.end()) {
+                continue; // mask and map disagree - trust the map, it is the truth
+            }
+            const moe_cache_slot & slot = pool.slots[found->second];
+            if (slot.state != moe_cache_slot_state::valid) {
+                continue;
+            }
+            const auto cit = device.co_activation.find(
+                    moe_cache_edge_undirected(mkey, moe_cache_key{host_base, cand}));
+            const uint32_t count = cit == device.co_activation.end() ? 0 : cit->second;
+            if (slot.heat > best_heat || (slot.heat == best_heat && count > best_count)) {
+                best_heat  = slot.heat;
+                best_count = count;
+                best_slot  = found->second;
+            }
+        }
+    }
+    return best_slot;
+}
+
 // Pick a stand-in from the SAME token's router picks. ids arrive rank-ordered,
 // so the first resident one is the highest-scoring available substitute - the
 // router's own judgement about which expert suits this input, which is exactly
@@ -8848,18 +8949,32 @@ static int moe_cache_plan(
         // used and therefore the only ones ever kept - the confirmation-drift
         // trap docs/plan.md already names for the dynamic atlas.
         if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
-            rank_bucket >= moe_cache_substitute_min_rank() &&
+            rank_bucket >= moe_cache_substitute_min_rank(device) &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
-            // Rank-based by default; the co-activation scan stays available
-            // for A/B via GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT=1.
+            // Hot-loaded-first by default (2026-09-04): picks the hottest
+            // currently-resident expert for this tensor, tiebroken by
+            // cross-request co-activation, with no min_coact floor to
+            // decline against - see moe_cache_substitute_pick_hot's own
+            // comment. The narrower per-token-rank method and the older
+            // co-activation-primary method both stay available for
+            // comparison via GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK=1 /
+            // GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT=1 respectively - strict
+            // rank wins if both are set, since it is the more conservative
+            // of the two opt-outs.
+            static const bool use_strict_rank = [] {
+                const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK");
+                return env && atoi(env) != 0;
+            }();
             static const bool use_coact = [] {
                 const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT");
                 return env && atoi(env) != 0;
             }();
-            const int sub = use_coact
+            const int sub = use_strict_rank
+                ? moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
+                                                 rank_top_k, node->n_expert)
+                : use_coact
                 ? moe_cache_substitute_pick(device, pool, node->host_base, expert, node->n_expert)
-                : moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
-                                                 rank_top_k, node->n_expert);
+                : moe_cache_substitute_pick_hot(device, pool, node->host_base, expert, node->n_expert);
             if (sub >= 0) {
                 moe_cache_slot & ssl = pool.slots[sub];
                 ssl.readers++;
