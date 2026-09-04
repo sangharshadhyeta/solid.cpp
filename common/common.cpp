@@ -2364,6 +2364,8 @@ static double common_moe_bench_candidate_server(
             LOG_WRN("%s: candidate rejected - output is degenerate (score %.2f >= %.2f) at %.2f tok/s; "
                     "throughput bought with broken generation is not a valid result\n",
                     __func__, worst_degeneracy, common_moe_degeneracy_reject_threshold(), result_tps);
+            common_moe_calibration_status_note("output check", "degeneracy",
+                    string_format("rejected - score %.2f (was %.2f tok/s)", worst_degeneracy, result_tps), false);
             result_tps = -1.0;
         }
         // Determinism gate: same request, same seed, repeated. A configuration
@@ -2406,6 +2408,9 @@ static double common_moe_bench_candidate_server(
                         "sampled greedily, agreed only %d times in %zu at %.2f tok/s. A forward pass that "
                         "varies run to run is reading memory it does not own, and no throughput redeems it\n",
                         __func__, modal, answers.size(), result_tps);
+                common_moe_calibration_status_note("output check", "reproducibility",
+                        string_format("rejected - %d of %zu agreed (was %.2f tok/s)",
+                                modal, answers.size(), result_tps), false);
                 result_tps = -1.0;
             }
         }
@@ -2517,6 +2522,20 @@ void common_moe_calibration_status_set_total(int total_candidates) {
     g_moe_calib_status_total = total_candidates;
 }
 
+static std::vector<common_moe_calibration_decision> g_moe_calib_decisions;
+
+void common_moe_calibration_status_note(
+        const std::string & lever, const std::string & value,
+        const std::string & result, bool accepted) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
+    // Bounded: a long run on a slow model can produce a lot of these, and the
+    // page only ever renders them. Oldest first out, newest kept.
+    if (g_moe_calib_decisions.size() >= 64) {
+        g_moe_calib_decisions.erase(g_moe_calib_decisions.begin());
+    }
+    g_moe_calib_decisions.push_back({lever, value, result, accepted});
+}
+
 void common_moe_calibration_status_candidate_done() {
     std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
     g_moe_calib_status_done++;
@@ -2558,6 +2577,7 @@ common_moe_calibration_status common_moe_calibration_status_get_struct() {
         s.done    = g_moe_calib_status_done;
         s.total   = g_moe_calib_status_total;
         s.eta_s   = g_moe_calib_status_eta_s; // frozen at the last candidate_done() - see its comment
+        s.decisions = g_moe_calib_decisions;
     }
     s.elapsed_s = (long long) std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - start).count();
@@ -3087,12 +3107,22 @@ void common_moe_calibrate(common_params & params) {
                             "substitution-free reference (fidelity %.2f < %.2f) at %.2f tok/s; this is the "
                             "fluent-but-wrong failure the degeneracy guard cannot see\n",
                             __func__, rank, fidelity, fidelity_bar, tps);
+                    common_moe_calibration_status_note("substitution floor",
+                            string_format("rank %d", rank),
+                            string_format("rejected - fidelity %.2f < %.2f (was %.2f tok/s)",
+                                    fidelity, fidelity_bar, tps), false);
                     continue;
                 }
             }
             LOG_INF("%s:   substitute-min-rank=%d -> %s%s\n", __func__, rank,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate",
                     fidelity >= 0.0 ? string_format(" (fidelity %.2f)", fidelity).c_str() : "");
+            common_moe_calibration_status_note("substitution floor",
+                    string_format("rank %d", rank),
+                    tps > 0 ? string_format("%.2f tok/s%s", tps,
+                            fidelity >= 0.0 ? string_format(", fidelity %.2f", fidelity).c_str() : "")
+                            : std::string("failed or degenerate"),
+                    tps > 0);
             if (tps > best_min_rank_tps) {
                 best_min_rank_tps = tps;
                 best_min_rank     = rank;
@@ -3173,12 +3203,22 @@ void common_moe_calibrate(common_params & params) {
                         LOG_WRN("%s:   quality-sigma=%.1f rejected - diverges from the substitution-free "
                                 "reference (fidelity %.2f < %.2f) at %.2f tok/s\n",
                                 __func__, sigma, fidelity, fidelity_bar, tps);
+                        common_moe_calibration_status_note("stand-in quality bar",
+                                string_format("%+.1f sigma", sigma),
+                                string_format("rejected - fidelity %.2f < %.2f (was %.2f tok/s)",
+                                        fidelity, fidelity_bar, tps), false);
                         continue;
                     }
                 }
                 LOG_INF("%s:   quality-sigma=%.1f -> %s%s\n", __func__, sigma,
                         tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected",
                         fidelity >= 0.0 ? string_format(" (fidelity %.2f)", fidelity).c_str() : "");
+                common_moe_calibration_status_note("stand-in quality bar",
+                        string_format("%+.1f sigma", sigma),
+                        tps > 0 ? string_format("%.2f tok/s%s", tps,
+                                fidelity >= 0.0 ? string_format(", fidelity %.2f", fidelity).c_str() : "")
+                                : std::string("failed or rejected"),
+                        tps > 0);
                 if (tps > best_sigma_tps) {
                     best_sigma_tps = tps;
                     best_sigma     = sigma;
