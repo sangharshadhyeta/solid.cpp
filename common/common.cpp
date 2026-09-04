@@ -1572,7 +1572,17 @@ static std::string common_moe_calibration_key(const char * path_model, const com
         }
         size_t dfree = 0, dtotal = 0;
         ggml_backend_dev_memory(dev, &dfree, &dtotal);
-        gpu_sig += string_format("%s:%zu;", ggml_backend_dev_name(dev), dtotal >> 20);
+        // Round to the nearest GiB. Total VRAM was chosen over free precisely
+        // because it should not move - but the value the backend reports does
+        // drift by a few MiB run to run (observed 11900 and 11909 MiB for the
+        // same card, against nvidia-smi's 12288), and at MiB precision that
+        // silently rewrites the key and orphans every entry cached under the
+        // old one. Qwen re-calibrated on every launch for exactly this reason,
+        // whatever -c and --parallel it was given. A GiB bucket is still
+        // specific enough to separate real hardware while being immune to the
+        // jitter.
+        const size_t dtotal_gib = (dtotal + (512ull << 20)) >> 30;
+        gpu_sig += string_format("%s:%zuG;", ggml_backend_dev_name(dev), dtotal_gib);
     }
     long long model_size = 0;
     struct stat st;
