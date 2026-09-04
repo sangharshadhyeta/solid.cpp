@@ -245,6 +245,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 <nav>
 <a class="nav-link" href="#run-it">Run it</a>
 <a class="nav-link" href="#proof">Proof</a>
+<a class="nav-link" href="#self-calibrating">Self-calibrating</a>
 <a class="nav-link" href="#brain-atlas">Brain / Atlas</a>
 <a class="nav-link" href="#docs">Docs</a>
 <a class="btn btn-shine" href="https://github.com/sangharshadhyeta/solid.cpp">GitHub</a>
@@ -298,11 +299,65 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 </header>
 
+<section id="self-calibrating">
+<div class="eyebrow">Nothing to tune</div>
+<h2>The flags below are what it works out on its own</h2>
+<p class="section-lede">Everything in the next section can be passed by hand. It no longer has to be. A plain
+launch &mdash; a model and a port, nothing else &mdash; notices there is no calibration for this
+model+GPU+context, runs one on that same port behind a live status page, caches the result, builds the expert
+atlas from the traffic that calibration itself just generated, and then serves the chat UI on the same port.
+Every launch after that starts straight into serving.</p>
+
+<pre><code>llama-server -m your-model.gguf --port 8080
+<span class="note"># that's it - no -ncmoe, no --moe-cache, no atlas file, no env vars</span></code></pre>
+
+<p class="section-lede">It has to decide rather than assume, because the right answers are not the same
+across models. Below is the same code, same GPU, same day &mdash; on a 26B MoE that fits in 12GB and an 87B one
+that badly does not. Nothing here was hand-set; each number is what the search measured and cached.</p>
+
+<div class="tablewrap">
+<table>
+<colgroup><col style="width:30%"><col style="width:35%"><col style="width:35%"></colgroup>
+<thead><tr><th>Decided</th><th>Gemma-4 26B-A4B <span class="note">(17GB, fits)</span></th><th>Qwen3.8-Flash-Next <span class="note">(87GB, does not)</span></th></tr></thead>
+<tbody>
+<tr><td>Expert placement</td><td>searched 21/20/19 &rarr; <strong>20 CPU layers</strong></td><td>only [47,48] fit the margin &rarr; <strong>47</strong>, decided by probe, not benchmarked</td></tr>
+<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 2 @ 42.70 tok/s</strong></td><td>ladder 10&rarr;0, <strong>rank 2 @ 1.64 tok/s</strong></td></tr>
+<tr><td>Fully aggressive (rank 0)</td><td>42.27 tok/s, <strong>accepted</strong></td><td>word salad, <strong>rejected by the guard</strong></td></tr>
+<tr><td>GPU-resident layers</td><td>full residency won &rarr; default</td><td><strong>ngl=43</strong> &mdash; trading layers for cache paid here</td></tr>
+<tr><td>Expert-cache size</td><td>knee at <strong>2048 MiB</strong> (36.86, falls off after)</td><td>budget spent before this stage</td></tr>
+<tr><td>Whole run</td><td>full search, <strong>4m45s</strong></td><td>truncated by budget, <strong>~12 min</strong></td></tr>
+<tr><td>Then serving at</td><td class="num">39.45 tok/s</td><td class="num">2.65 tok/s</td></tr>
+</tbody>
+</table>
+</div>
+
+<p class="note">Two things that only exist because a throughput-only search would get them wrong. Substitution
+&mdash; serving a cache miss from a resident stand-in rather than fetching the exact expert &mdash; is the
+largest single lever on a model that does not fit (0.66 &rarr; 2.65 tok/s once it was actually being applied),
+and it is also the one that destroys output when pushed too far: on Qwen3.8-Flash-Next, rank 0 emits
+<em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym is&rdquo;</em> at a very
+respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams, single-word dominance) and
+<strong>rejected outright</strong> rather than ranked &mdash; speed bought with broken generation cannot win.
+And because those probes are short while the failures show up at 150&ndash;250 tokens, the winner is
+re-confirmed over 4&times; the probe length before being committed, stepping back toward the safe end if it does
+not hold. On Gemma-4 that confirmation passed at 41.32 tok/s; the same guard is what rejects rank 0 on
+Qwen3.8-Flash-Next.</p>
+
+<p class="note">The honest limit: on Qwen3.8-Flash-Next this hardware is the binding constraint, not the tuning.
+55GB of experts against 30GB of RAM means real swap traffic during generation (634k major faults in one
+200-token run), and no cache policy removes that. Gemma-4 reaches 39.45 tok/s on the same GPU because it fits.
+Calibration's job is to find the best configuration available on the hardware you have &mdash; not to pretend
+the hardware is different.</p>
+</section>
+
 <section id="run-it">
 <div class="eyebrow">Everything on, one command</div>
 <h2>Run it the way it was measured</h2>
 <p class="section-lede">Every feature on this page, enabled together. This is the exact command the numbers below
-were taken from &mdash; a 26B MoE model at 64k context on a single 12GB RTX 3060.</p>
+were taken from &mdash; a 26B MoE model at 64k context on a single 12GB RTX 3060. Most of it is now optional:
+see <a href="#self-calibrating">the section above</a> for what a bare <code>llama-server -m model.gguf</code>
+works out on its own. This form is what you write when you want to pin a specific value rather than let it be
+measured.</p>
 
 <pre><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
 GGML_CUDA_MOE_CACHE_SUBSTITUTE=1 GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=4 \
@@ -324,11 +379,11 @@ llama-server \
 <tr><td><code>-c 65536</code></td><td>The context you want. Expert placement is derived <em>from</em> this &mdash; ask for more and the fork moves experts to CPU RAM to fit it, rather than silently shrinking your context. <strong>No <code>-ncmoe</code> needed:</strong> it resolved to 21 CPU layers on its own.</td></tr>
 <tr><td><code>--moe-cache auto</code></td><td>GPU-resident cache for the CPU-offloaded experts, LFRU eviction. 79% hit rate warm. Also enables router-lookahead prefetch, which predicts the next layer's experts and fetches them during the current layer's compute.</td></tr>
 <tr><td><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1</code></td><td>Live-activation predictor: a small linear layer per model, trained online on the real hidden state each routing decision came from, feeding the same free-slot-only warming path the atlas uses. Self-tuning (no rate constant to guess) and persists its learned weights across restarts. Measured separately, on Ornith-1.5-35B: +0.12pp hit rate, 3/4 rounds &mdash; see the proof table below, not part of this command's own gemma-4 numbers.</td></tr>
-<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in from the router's own other top-k picks instead of paying CPU fallback &mdash; gated to only the router's least-confident picks (rank&ge;4) so its most consequential choices always get exact compute. Measured separately, on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction) &mdash; see the proof table below.</td></tr>
+<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in instead of paying CPU fallback, gated so the router's most consequential picks still get exact compute. <strong>The rank is calibrated per model now</strong> &mdash; both Gemma-4 and Qwen3.8-Flash-Next measured to rank 2, and the same search rejects rank 0 on Qwen3.8-Flash-Next while accepting it on Gemma-4. Set this by hand only to override. Measured separately on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction).</td></tr>
 <tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
 <tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
 <tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
-<tr><td><code>--expert-atlas-file</code></td><td>Feeds the Brain view expert positions instead of an arbitrary layout. Use the discovered/evolving atlas from <code>scripts/moe-atlas-evolve.py</code> (co-activation-derived, persists and settles further with more traffic) rather than the static 9-topic-probe atlas from <code>llama-expert-atlas</code> &mdash; same file format, either works, but the discovered one is what the Brain view's layout was actually designed around. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
+<tr><td><code>--expert-atlas-file</code></td><td><strong>Optional now</strong> &mdash; defaults to a per-model path under the cache directory, which the server keeps current from live traffic (<code>scripts/moe-atlas-evolve.py</code>, co-activation-derived, accumulating and re-deciding its own axis count as more traffic arrives). Pass this only to override the location. The static 9-topic-probe generator that used to seed it has been removed: the discovered atlas needs no seed, and its layout is what the Brain view was designed around. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
 </tbody>
 </table>
 </div>
