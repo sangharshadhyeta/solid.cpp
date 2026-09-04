@@ -1481,6 +1481,7 @@ struct common_moe_calibration_entry {
     int         concurrency     = 1;  // > 1: tok_per_sec is aggregate throughput at this many concurrent requests, not solo
     double      tok_per_sec     = 0.0;
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
+    int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
     // Per-device fit margin (-fitt/--fit-target, MiB). -1 = not calibrated.
     //
     // This is not a minor knob: common_maybe_raise_moe_for_ctx reserves
@@ -1582,6 +1583,7 @@ static bool common_moe_calibration_lookup(
         out.concurrency     = e.value("concurrency", 1);
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
+        out.substitute_min_rank = e.value("substitute_min_rank", -1);
         // Absent in entries written before these were calibrated - the
         // value() defaults keep such an entry loadable rather than making
         // it a hard cache miss, since the fields it DOES carry are still
@@ -1620,6 +1622,7 @@ static void common_moe_calibration_save(
         {"concurrency",     entry.concurrency},
         {"tok_per_sec",     entry.tok_per_sec},
         {"moe_cache_mb",    entry.moe_cache_mb},
+        {"substitute_min_rank", entry.substitute_min_rank},
         {"fit_target_mb",           entry.fit_target_mb},
         {"neuron_reduce_k",         entry.neuron_reduce_k},
         {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
@@ -1944,7 +1947,8 @@ static bool common_moe_calibrate_budget_spent() {
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
-        int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99) {
+        int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99,
+        int substitute_min_rank = -1) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2005,11 +2009,21 @@ static double common_moe_bench_candidate_server(
         snprintf(buf, sizeof(buf), "-fitt %d ", fit_target_mb);
         fit_args = buf;
     }
+    // Substitution aggressiveness is an env var, not a flag, so it is passed
+    // as a shell assignment on the candidate's own command line - the
+    // subprocess must see the value being benchmarked, not whatever this
+    // calibrating process happens to have inherited.
+    std::string subst_env;
+    if (substitute_min_rank >= 0) {
+        char buf[96];
+        snprintf(buf, sizeof(buf), "GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=%d ", substitute_min_rank);
+        subst_env = buf;
+    }
     snprintf(cmd, sizeof(cmd),
-        "'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
+        "%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
-        self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
+        subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
@@ -2866,6 +2880,47 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Substitution aggressiveness. Serving a cache miss with a resident
+    // stand-in instead of fetching the exact expert is the single biggest
+    // throughput lever measured on this model (0.6 -> ~12 tok/s at its most
+    // aggressive) AND the one that destroys output when overused, so the
+    // balance point is exactly the kind of thing that has to be measured per
+    // model rather than picked: on qwen4exp rank 0 produced word salad and
+    // rank 10 (never substitute) was coherent but slow. Searched from the
+    // safest end downward, keeping the fastest setting whose output the
+    // degeneracy guard accepts - candidates that generate degenerate text
+    // come back as failures from the benchmark, so a broken-but-fast setting
+    // simply cannot win here.
+    int best_min_rank = -1;
+    double best_min_rank_tps = 0.0;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring substitution aggressiveness at ncmoe=%u (degenerate output is rejected, "
+                "not ranked) ...\n", __func__, best_n);
+        common_moe_calibration_status_set("measuring substitution aggressiveness");
+        // Coarse ladder rather than a golden-section search: the response is
+        // a quality cliff, not a smooth curve, and each point costs a full
+        // server spawn on a budget that is already tight for slow models.
+        for (const int rank : {10, 6, 4, 2}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, best_threads, next_port(), ctx, n_predict,
+                    concurrency, best_cache_mb, best_fit_mb, best_ngl <= (uint32_t) probe.n_layer ? (int) best_ngl : 99,
+                    rank);
+            LOG_INF("%s:   substitute-min-rank=%d -> %s\n", __func__, rank,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate");
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_min_rank_tps) {
+                best_min_rank_tps = tps;
+                best_min_rank     = rank;
+            }
+        }
+        if (best_min_rank >= 0) {
+            LOG_INF("%s: substitution floor: rank %d at %.2f tok/s\n", __func__, best_min_rank, best_min_rank_tps);
+        }
+    }
+
     time_t now = time(nullptr);
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -2884,6 +2939,7 @@ void common_moe_calibrate(common_params & params) {
     // gemma-4 understated the result by 71.86 -> 43.57).
     entry.tok_per_sec     = std::max(best_threads_tps, best_fit_tps);
     entry.moe_cache_mb    = best_cache_mb;
+    entry.substitute_min_rank = best_min_rank;
     entry.fit_target_mb   = best_fit_mb;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
@@ -3383,6 +3439,22 @@ static bool common_maybe_autoplace_moe_cpu(
             // common_moe_calibration_entry, but nothing ever read them back
             // on a normal launch - an entry with real measured values (e.g.
             // gemma-4's k=256, budget_mb=256) sat unused every time.
+            // Same rule again: a calibrated substitution floor is applied only
+            // when the user hasn't pinned one themselves. Measured per model
+            // because the safe point genuinely differs - it is the boundary
+            // between "fast" and "generates word salad", and the degeneracy
+            // guard in calibration is what makes recording it trustworthy.
+            const bool subst_rank_is_default = !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
+            const bool applied_subst_rank = cached.substitute_min_rank >= 0 && subst_rank_is_default;
+            if (applied_subst_rank) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                        std::to_string(cached.substitute_min_rank).c_str());
+#else
+                setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                        std::to_string(cached.substitute_min_rank).c_str(), 1);
+#endif
+            }
             const bool neuron_reduce_is_default = !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
             const bool applied_neuron_reduce =
                     cached.neuron_reduce_k > 0 && cached.neuron_reduce_budget_mb > 0 && neuron_reduce_is_default;
@@ -3411,13 +3483,14 @@ static bool common_maybe_autoplace_moe_cpu(
                 params.n_gpu_layers  = cached.n_gpu_layers;
                 mparams.n_gpu_layers = cached.n_gpu_layers;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s%s, measured %.2f %s on %s) "
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
                     cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
                     cached.moe_cache_mb > 0 && cache_mode_is_auto ? string_format(", moe-cache=%dMiB", cached.moe_cache_mb).c_str() : "",
                     applied_ngl ? string_format(", ngl=%d", cached.n_gpu_layers).c_str() : "",
                     applied_neuron_reduce ? string_format(", neuron-reduce=k%d/%dMiB", cached.neuron_reduce_k, cached.neuron_reduce_budget_mb).c_str() : "",
+                    applied_subst_rank ? string_format(", substitute-min-rank=%d", cached.substitute_min_rank).c_str() : "",
                     cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
                     cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;
