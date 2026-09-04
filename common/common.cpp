@@ -3010,7 +3010,13 @@ void common_moe_calibrate(common_params & params) {
     // settings actually achieved (the pre-existing code reported only
     // best_threads_tps, which ignored the cache sweep entirely and on
     // gemma-4 understated the result by 71.86 -> 43.57).
-    entry.tok_per_sec     = std::max(best_threads_tps, best_fit_tps);
+    // Include the substitution ladder's own best: substitute_min_rank is part
+    // of the configuration this entry caches, so a figure that ignores it
+    // understates what the cached config actually delivers. Measured on
+    // qwen4exp: the ladder found 1.64 tok/s at rank 2 while the entry
+    // reported 0.65, the placement/-ngl number - the same understatement the
+    // cache-sweep comment above already describes for a different stage.
+    entry.tok_per_sec     = std::max({best_threads_tps, best_fit_tps, best_min_rank_tps});
     entry.moe_cache_mb    = best_cache_mb;
     entry.substitute_min_rank = best_min_rank;
     entry.fit_target_mb   = best_fit_mb;
@@ -3731,6 +3737,42 @@ static bool common_maybe_raise_moe_for_ctx(
                         params.moe_cache_force = true;
                         LOG_WRN("%s: using calibrated expert-cache size of %d MiB\n", __func__, cal.moe_cache_mb);
                     }
+                }
+                // Substitution floor and neuron-reduce, for the same reason the
+                // cache size is applied here: this is the path most real
+                // launches take (context auto-raises -ncmoe, no explicit flag),
+                // and it returns before common_maybe_autoplace_moe_cpu ever
+                // runs - so settings applied only there were measured, cached,
+                // and then silently ignored at serving. Caught live: a run
+                // measured substitute_min_rank=2 at 1.64 tok/s, cached it, and
+                // then served 0.66 tok/s with substitutions=0 because this
+                // branch never applied it. Same "only fill in what the user
+                // left at default" rule as everywhere else.
+                if (cal.substitute_min_rank >= 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK")) {
+#if defined(_WIN32)
+                    _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                            std::to_string(cal.substitute_min_rank).c_str());
+#else
+                    setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                            std::to_string(cal.substitute_min_rank).c_str(), 1);
+#endif
+                    LOG_WRN("%s: using calibrated substitution floor of rank %d\n", __func__, cal.substitute_min_rank);
+                }
+                if (cal.neuron_reduce_k > 0 && cal.neuron_reduce_budget_mb > 0 &&
+                    !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
+#if defined(_WIN32)
+                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1");
+                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str());
+                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                            std::to_string(cal.neuron_reduce_budget_mb).c_str());
+#else
+                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1", 1);
+                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str(), 1);
+                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                            std::to_string(cal.neuron_reduce_budget_mb).c_str(), 1);
+#endif
+                    LOG_WRN("%s: using calibrated neuron-reduce k=%d / %d MiB\n",
+                            __func__, cal.neuron_reduce_k, cal.neuron_reduce_budget_mb);
                 }
                 params.tensor_buft_overrides  = common_moe_build_cpu_overrides((uint32_t) cal.n_cpu_moe);
                 mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
