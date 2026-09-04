@@ -381,16 +381,22 @@
 			posOf.set(`${cell.layer}:${cell.expert}`, { px, py });
 		}
 		const drawEdges = (
-			edges: { layer_from: number; expert_from: number; layer_to: number; expert_to: number; count: number }[] | undefined,
+			edges: { layer_from: number; expert_from: number; layer_to: number; expert_to: number; count: number; weight?: number }[] | undefined,
 			rgb: string
 		) => {
 			if (!edges?.length) return;
+			// Prefer the server's per-layer normalised weight. Scaling by a
+			// global max across layers made every line look identical,
+			// because co-activation counts differ by an order of magnitude
+			// between layers and the drawn set came from whichever layer was
+			// busiest - all 64 edges landed inside a 6% band. Fall back to the
+			// old derivation only for a server that predates the field.
 			const maxCount = Math.max(...edges.map((e) => e.count));
 			for (const e of edges) {
 				const a = posOf.get(`${e.layer_from}:${e.expert_from}`);
 				const b = posOf.get(`${e.layer_to}:${e.expert_to}`);
 				if (!a || !b) continue;
-				const weight = maxCount > 0 ? e.count / maxCount : 0;
+				const weight = e.weight ?? (maxCount > 0 ? e.count / maxCount : 0);
 				ctx.beginPath();
 				ctx.moveTo(a.px, a.py);
 				ctx.lineTo(b.px, b.py);
