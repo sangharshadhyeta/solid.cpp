@@ -2303,7 +2303,18 @@ void common_moe_calibrate(common_params & params) {
 
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
     common_moe_calibration_status_set("probing safe MoE CPU-offload floor");
-    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
+    // Probe with the SAME margin common_maybe_raise_moe_for_ctx will demand at
+    // serving time (3x the per-device fit target - see its own comment for why
+    // a bare fit is not enough there). Probing with the bare-fit default here
+    // instead put the search floor below anything serving would accept, so
+    // calibration spent its entire budget measuring placements that were then
+    // discarded: a real run measured ncmoe 46/45/44, picked 44 as the fastest,
+    // and the fit guard immediately overrode it with "calibrated placement of
+    // 44 CPU layer(s) is below the safe minimum for this context - keeping the
+    // fit search's more conservative answer", serving 47. Every candidate in
+    // that budget was unusable by construction.
+    const int64_t fit_margin = 3 * (int64_t) params.fit_params_target[0];
+    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams, fit_margin);
     if (!probe.is_moe) {
         LOG_WRN("%s: model has no MoE experts - nothing for --moe-calibrate to do\n", __func__);
         return;
@@ -2578,7 +2589,11 @@ void common_moe_calibrate(common_params & params) {
 
             llama_model_params mparams_ngl = mparams;
             mparams_ngl.n_gpu_layers = (int) best_ngl;
-            common_moe_fit_probe_result probe_ngl = common_moe_find_safe_layers(path_model, mparams_ngl, cparams);
+            // Same serving-time margin as the initial probe above - a re-search
+            // floor computed on a bare fit would reintroduce exactly the
+            // mismatch that made the first search's winner unusable.
+            common_moe_fit_probe_result probe_ngl =
+                    common_moe_find_safe_layers(path_model, mparams_ngl, cparams, fit_margin);
             const uint32_t safe_n_ngl = probe_ngl.already_fits ? 0 :
                     (probe_ngl.found_safe_n ? probe_ngl.safe_n : safe_n);
             const uint32_t ncmoe_hi_ngl = std::min<uint32_t>(probe.n_layer, safe_n_ngl + std::max<uint32_t>(4, probe.n_layer / 8));
