@@ -8847,8 +8847,19 @@ static int moe_cache_substitute_pick_hot(
     // and both terms come from the candidates actually examined on this scan,
     // so nothing here is a constant anybody chose.
     if (best_slot >= 0) {
+        // No co-activation evidence anywhere in this scan means the map is
+        // still cold, not that the candidates are bad - and declining on that
+        // basis turns substitution off for exactly the window where it is
+        // worth the most. Measured: a fresh qwen server showed
+        // substitutions=0 with declined=1404, the gate refusing every
+        // candidate because nothing had co-activated yet. Fall back to the
+        // hottest resident until there is something to judge with, which is
+        // what this picker did before co-activation ranked it.
+        if (coact_n == 0) {
+            return best_slot;
+        }
         if (best_count == 0) {
-            return -1; // never seen with this expert at all - fetch it properly
+            return -1; // others have history with this expert; this one has none
         }
         if (coact_n > 1) {
             const double mean = (double) coact_sum / (double) coact_n;
