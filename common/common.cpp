@@ -2243,6 +2243,17 @@ void common_moe_calibration_status_candidate_done() {
                 std::chrono::steady_clock::now() - g_moe_calib_status_start).count();
         g_moe_calib_status_eta_s = (long long) (((double) elapsed_s / g_moe_calib_status_done) *
                 (g_moe_calib_status_total - g_moe_calib_status_done));
+        // Never promise longer than the time budget allows. The extrapolation
+        // above assumes every remaining candidate gets measured, but the
+        // budget cuts the run the moment it expires - so on a slow model the
+        // naive number is not just pessimistic, it is describing a search
+        // that will not be permitted to happen: a real run showed "~70m57s
+        // left" on a 600s budget that would stop it inside 10 minutes.
+        const long long deadline_ms = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
+        if (deadline_ms != 0) {
+            const long long remaining_budget_s = (deadline_ms - common_moe_steady_now_ms()) / 1000;
+            g_moe_calib_status_eta_s = std::min(g_moe_calib_status_eta_s, std::max(0LL, remaining_budget_s));
+        }
     } else {
         g_moe_calib_status_eta_s = -1;
     }
@@ -2342,7 +2353,12 @@ void common_moe_calibrate(common_params & params) {
     }
 
     const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
-    const int n_predict = 64;
+    // 32, not 64: per-candidate cost is dominated by this probe on a
+    // CPU-offloaded model (64 tokens at ~0.6 tok/s is ~107s, against ~25s to
+    // spawn and load), and halving it roughly doubles how many levers fit in
+    // the time budget. Still well above the degeneracy guard's 16-word floor,
+    // so candidates that generate broken text are still caught.
+    const int n_predict = 32;
 
     // Hard wall-clock budget for the whole run. Per-candidate cost varies by
     // orders of magnitude across models (a candidate is a full server spawn
@@ -2440,6 +2456,12 @@ void common_moe_calibrate(common_params & params) {
     // stays cheap.
     uint32_t ncmoe_hi = std::min<uint32_t>(probe.n_layer, safe_n + std::max<uint32_t>(4, probe.n_layer / 8));
 
+    const uint32_t ncmoe_span = ncmoe_hi > safe_n ? ncmoe_hi - safe_n : 0;
+    static const uint32_t ncmoe_search_min_span = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_NCMOE_MIN_SPAN");
+        const long v = e ? atol(e) : 3;
+        return (uint32_t) (v >= 0 ? v : 3);
+    }();
     // Single upfront, deliberately generous estimate of the total candidate
     // count for the whole calibration run (ncmoe search, the -ngl search and
     // its possible ncmoe re-search, spec-draft-n-max if MTP is configured,
@@ -2450,11 +2472,21 @@ void common_moe_calibrate(common_params & params) {
     // generous means "time left" only ever counts down, never climbs back up
     // as stages run, at the cost of finishing a bit before it reaches 100%.
     {
-        int est = common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi); // ncmoe search
+        // Placement contributes one baseline measurement when the fit probe
+        // fixed it (the common case on a tightly-constrained model), not a
+        // whole search - counting the search anyway made the bar claim ~34
+        // candidates for a run that only ever intended to measure a handful.
+        const bool ncmoe_will_search = ncmoe_span >= ncmoe_search_min_span;
+        int est = ncmoe_will_search
+                ? common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi)
+                : 1;
+        est += 3; // substitution-floor ladder (rank 10 / 4 / 2)
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
         est += common_golden_section_eval_estimate((int) ngl_lo_est, (int) ngl_hi_est); // -ngl search
-        est += common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi);       // possible ncmoe re-search at new -ngl
+        if (ncmoe_will_search) {
+            est += common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi);   // possible ncmoe re-search at new -ngl
+        }
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
@@ -2465,10 +2497,33 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_set_total(est);
     }
 
-    LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
-            "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
-            concurrency > 1 ? string_format(", concurrency=%d (aggregate throughput)", concurrency).c_str() : "");
-    common_moe_calibration_status_set(string_format("searching MoE CPU-offload depth (-ncmoe) in [%u, %u]", safe_n, ncmoe_hi));
+    // Placement is a feasibility question first and a throughput question a
+    // distant second, so a narrow feasible range is decided by the (free,
+    // no-alloc) fit probe rather than benchmarked. Measured on qwen4exp: once
+    // the probe used the same margin serving demands, the whole range was
+    // [47, 48] and the two options differed by 3% (0.61 vs 0.59 tok/s) - yet
+    // benchmarking them consumed 7 of a 9-minute budget, starving the
+    // substitution search, whose own range spans 20x. Spending the budget on
+    // the levers that actually move is the entire point of having one.
+    //
+    // The threshold is on candidate COUNT, not on any measured spread: the
+    // spread is only knowable by paying for the very benchmarks this is
+    // deciding whether to skip. Above it the search runs as before, since a
+    // genuinely wide range can hide a real optimum.
+    if (ncmoe_span < ncmoe_search_min_span) {
+        LOG_INF("%s: MoE CPU-offload depth fixed at %u by the fit probe - only %u placement(s) fit this "
+                "context with the serving margin, not enough spread to be worth benchmarking; spending the "
+                "budget on the levers that move instead\n", __func__, safe_n, ncmoe_span + 1);
+    }
+
+    if (ncmoe_span >= ncmoe_search_min_span) {
+        LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
+                "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
+                concurrency > 1 ? string_format(", concurrency=%d (aggregate throughput)", concurrency).c_str() : "");
+        common_moe_calibration_status_set(string_format("searching MoE CPU-offload depth (-ncmoe) in [%u, %u]", safe_n, ncmoe_hi));
+    } else {
+        common_moe_calibration_status_set(string_format("measuring baseline at the probe-fixed placement (-ncmoe %u)", safe_n));
+    }
 
     std::map<int, double> ncmoe_trace;
     auto measure_ncmoe = [&](int n) -> double {
@@ -2483,8 +2538,18 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_candidate_done();
         return tps; // failed candidates measure as -1, golden-section still works (just avoids them)
     };
-    uint32_t best_n = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
-    double best_tps = ncmoe_trace.at((int) best_n);
+    uint32_t best_n;
+    double best_tps;
+    if (ncmoe_span < ncmoe_search_min_span) {
+        // Probe-decided (see the comment above): take the fit probe's own
+        // floor and measure it ONCE, so later stages still have a real
+        // baseline tok/s to compare against without paying for a search.
+        best_n   = safe_n;
+        best_tps = measure_ncmoe((int) safe_n);
+    } else {
+        best_n   = (uint32_t) common_golden_section_search_max((int) safe_n, (int) ncmoe_hi, measure_ncmoe, ncmoe_trace);
+        best_tps = ncmoe_trace.at((int) best_n);
+    }
     // Golden-section search assumes a unimodal objective and only ever
     // bisects toward whichever side of its *current* probe pair scores
     // higher - it never revisits a point once the search has narrowed
@@ -2568,7 +2633,11 @@ void common_moe_calibrate(common_params & params) {
         // Coarse ladder rather than a golden-section search: the response is
         // a quality cliff, not a smooth curve, and each point costs a full
         // server spawn on a budget that is already tight for slow models.
-        for (const int rank : {10, 6, 4, 2}) {
+        // Three points spanning the range (never / moderate / aggressive)
+        // rather than four: on a slow model each costs a full server spawn,
+        // and the response is a cliff, so a denser ladder buys resolution
+        // where there is none to find.
+        for (const int rank : {10, 4, 2}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
