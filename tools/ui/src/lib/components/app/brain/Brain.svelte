@@ -749,6 +749,28 @@
 				</span>
 			</div>
 
+			<!-- Static layer placement alone badly understates what is actually
+			     on the GPU: the layers above are only the ones PERMANENTLY
+			     resident, while the moe-cache keeps thousands more experts in
+			     VRAM at any moment, swapping them as routing demands. Reporting
+			     only "1 layer on GPU" for a model whose cache holds ~11 layers'
+			     worth of experts is the kind of number that sends you looking
+			     for a bug that isn't there. -->
+			{#if stats.slots_used && placement.nExpert}
+				<div class="text-muted-foreground mt-2 text-xs">
+					Plus <strong class="text-foreground tabular-nums"
+						>{(stats.slots_used ?? 0).toLocaleString()}</strong
+					>
+					experts held in the GPU cache right now — about
+					<strong class="text-foreground tabular-nums"
+						>{((stats.slots_used ?? 0) / placement.nExpert).toFixed(1)}</strong
+					>
+					layers' worth, rotating as the router demands. Effective GPU residency is this plus the
+					permanently-placed {placement.onGpu} layer{placement.onGpu === 1 ? '' : 's'} above, not the
+					layer count alone.
+				</div>
+			{/if}
+
 			{#if placement.raisedFrom !== null}
 				<div class="text-muted-foreground mt-2 text-xs">
 					Raised from {placement.raisedFrom} to {placement.onCpu} CPU layer{placement.onCpu === 1

@@ -1777,7 +1777,90 @@ static std::string common_shell_quote(const std::string & s) {
 
 // Fetches one /v1/chat/completions response and returns (predicted_n, predicted_ms),
 // or (-1, 0) on any failure - used by both the solo and concurrent benchmark paths below.
+// Degeneracy score for one candidate's generated text, in [0,1] where higher
+// is worse. Calibration maximises tok/s, and without this it would happily
+// pick a configuration that is fast BECAUSE it is broken: forcing
+// substitution on for every router pick measured 11.95 tok/s (vs ~0.7
+// otherwise) while emitting word salad ("a question to how a steps
+// explaining on the how quicksort, e shouldicym is"), and an earlier
+// variant produced verbatim repetition loops. Both were only caught by
+// reading the output by hand - exactly the kind of thing a throughput-only
+// objective cannot see.
+//
+// Two cheap checks, no extra model passes and no logprobs needed, each
+// aimed at one of the two failure modes actually observed:
+//   - repeated 4-grams (a loop repeats long spans verbatim)
+//   - single-word dominance (both failure modes degenerate into hammering a
+//     few function words - "to how a ... to how a")
+// Deliberately not a language-quality judgement, just a degeneracy floor:
+// it has to reject output that is obviously broken, not rank prose.
+static double common_moe_degeneracy_score(const std::string & text) {
+    std::vector<std::string> words;
+    {
+        std::istringstream iss(text);
+        std::string w;
+        while (iss >> w) {
+            words.push_back(w);
+        }
+    }
+    if (words.size() < 16) {
+        return 0.0; // too short to judge - don't reject on noise
+    }
+    std::unordered_map<std::string, int> word_counts;
+    for (const auto & w : words) {
+        word_counts[w]++;
+    }
+    int max_word = 0;
+    for (const auto & [w, c] : word_counts) {
+        max_word = std::max(max_word, c);
+    }
+    const double max_word_share = (double) max_word / (double) words.size();
+
+    std::unordered_map<std::string, int> gram_counts;
+    size_t n_grams = 0;
+    for (size_t i = 0; i + 4 <= words.size(); i++) {
+        gram_counts[words[i] + " " + words[i+1] + " " + words[i+2] + " " + words[i+3]]++;
+        n_grams++;
+    }
+    const double distinct_gram_ratio = n_grams > 0 ? (double) gram_counts.size() / (double) n_grams : 1.0;
+
+    // Worst of the two, each normalised so ~1.0 means clearly degenerate.
+    const double rep_score  = 1.0 - distinct_gram_ratio;      // 0 = all 4-grams unique
+    const double dom_score  = max_word_share;                  // 0 = perfectly varied vocabulary
+    return std::max(rep_score, dom_score);
+}
+
+// At or above this score a candidate is rejected outright. 0.45 sits well
+// clear of healthy prose (normal answers score low on both components - long
+// verbatim 4-gram repeats are rare, and no single word takes ~half the
+// output) while catching both observed failures, which are not marginal:
+// they repeat spans verbatim or hammer one word for a large fraction of the
+// text. Override with GGML_MOE_DEGENERACY_REJECT if a model legitimately
+// trips it (a format-constrained generator emitting highly repetitive
+// structure, say).
+static double common_moe_degeneracy_reject_threshold() {
+    static const double v = [] {
+        const char * e = getenv("GGML_MOE_DEGENERACY_REJECT");
+        const double x = e ? atof(e) : 0.45;
+        return x > 0.0 ? x : 0.45;
+    }();
+    return v;
+}
+
+struct common_moe_bench_result {
+    double predicted_n  = -1.0;
+    double predicted_ms = 0.0;
+    double degeneracy   = 0.0;
+};
+
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict);
+
 static std::pair<double, double> common_moe_bench_one_request(int port, const char * prompt, int n_predict) {
+    const auto r = common_moe_bench_one_request_full(port, prompt, n_predict);
+    return {r.predicted_n, r.predicted_ms};
+}
+
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict) {
     nlohmann::json req = {
         {"messages", nlohmann::json::array({
             {{"role", "user"}, {"content", prompt}}
@@ -1791,7 +1874,7 @@ static std::pair<double, double> common_moe_bench_one_request(int port, const ch
         port, common_shell_quote(req_body).c_str());
     FILE * rp = popen(req_cmd, "r");
     if (!rp) {
-        return {-1.0, 0.0};
+        return {};
     }
     std::string body;
     char buf[4096];
@@ -1803,12 +1886,29 @@ static std::pair<double, double> common_moe_bench_one_request(int port, const ch
     try {
         auto j = nlohmann::json::parse(body);
         if (j.contains("timings") && j["timings"].contains("predicted_n")) {
-            return {j["timings"]["predicted_n"].get<double>(), j["timings"]["predicted_ms"].get<double>()};
+            common_moe_bench_result r;
+            r.predicted_n  = j["timings"]["predicted_n"].get<double>();
+            r.predicted_ms = j["timings"]["predicted_ms"].get<double>();
+            // Score whatever the model actually emitted. Reasoning models put
+            // most of a short probe's tokens in reasoning_content rather than
+            // content, and a degenerate run is degenerate in either channel -
+            // so both are scored and the worse one wins.
+            if (j.contains("choices") && !j["choices"].empty() && j["choices"][0].contains("message")) {
+                const auto & msg = j["choices"][0]["message"];
+                double worst = 0.0;
+                for (const char * field : {"content", "reasoning_content"}) {
+                    if (msg.contains(field) && msg[field].is_string()) {
+                        worst = std::max(worst, common_moe_degeneracy_score(msg[field].get<std::string>()));
+                    }
+                }
+                r.degeneracy = worst;
+            }
+            return r;
         }
     } catch (const std::exception &) {
         // falls through to the failure return below
     }
-    return {-1.0, 0.0};
+    return {};
 }
 
 static double common_moe_bench_candidate_server(
@@ -1952,14 +2052,27 @@ static double common_moe_bench_candidate_server(
         constexpr int n_solo_probes = 1;
         double sum_tps = 0.0;
         int n_ok = 0;
+        double worst_degeneracy = 0.0;
         for (int i = 0; i < n_solo_probes; i++) {
-            const auto [predicted_n, predicted_ms] = common_moe_bench_one_request(port, probe_prompts[i], n_predict);
-            if (predicted_n > 0 && predicted_ms > 0) {
-                sum_tps += predicted_n / (predicted_ms / 1000.0);
+            const auto r = common_moe_bench_one_request_full(port, probe_prompts[i], n_predict);
+            if (r.predicted_n > 0 && r.predicted_ms > 0) {
+                sum_tps += r.predicted_n / (r.predicted_ms / 1000.0);
+                worst_degeneracy = std::max(worst_degeneracy, r.degeneracy);
                 n_ok++;
             }
         }
         result_tps = n_ok > 0 ? sum_tps / n_ok : -1.0;
+        // Reject rather than rank: a candidate that generates degenerate text
+        // is not a slower-but-valid point on the throughput curve, it is not a
+        // usable configuration at all, so it must not be able to win on speed.
+        // Reported as a failed candidate (-1), the same as one whose server
+        // never came up.
+        if (result_tps > 0 && worst_degeneracy >= common_moe_degeneracy_reject_threshold()) {
+            LOG_WRN("%s: candidate rejected - output is degenerate (score %.2f >= %.2f) at %.2f tok/s; "
+                    "throughput bought with broken generation is not a valid result\n",
+                    __func__, worst_degeneracy, common_moe_degeneracy_reject_threshold(), result_tps);
+            result_tps = -1.0;
+        }
     } else {
         // Concurrent path: fire n_concurrency real requests at once (cycling
         // through the prompt pool so it's not the same prompt N times, which
@@ -2173,6 +2286,43 @@ void common_moe_calibrate(common_params & params) {
     const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
     const int n_predict = 64;
 
+    // Hard wall-clock budget for the whole run. Per-candidate cost varies by
+    // orders of magnitude across models (a candidate is a full server spawn
+    // plus a real generation probe: seconds on a small model that fits in
+    // VRAM, ~90s+ on one decoding at ~1 tok/s), so a fixed candidate count
+    // cannot bound runtime - the same search that finishes in a minute on
+    // gemma-4 projected to 8-9 HOURS on qwen4exp, which is not a calibration
+    // anyone waits through before their first chat.
+    //
+    // A deadline degrades gracefully where a smaller fixed count would not:
+    // fast models still run the full search, slow ones get a truncated but
+    // valid one, since stages run in priority order (placement first, then
+    // the refinements) and each candidate is skipped once the budget is
+    // spent. Skipped candidates report as failures, which every search here
+    // already handles by keeping the best point actually measured.
+    const auto calibration_start = std::chrono::steady_clock::now();
+    const double calibration_budget_s = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_S");
+        const double v = e ? atof(e) : 600.0; // 10 minutes
+        return v > 0.0 ? v : 600.0;
+    }();
+    bool budget_warned = false;
+    auto budget_spent = [&]() -> bool {
+        const double elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - calibration_start).count();
+        if (elapsed < calibration_budget_s) {
+            return false;
+        }
+        if (!budget_warned) {
+            budget_warned = true;
+            LOG_WRN("%s: calibration time budget of %.0fs is spent - skipping remaining candidates and "
+                    "keeping the best configuration measured so far (raise GGML_MOE_CALIBRATE_BUDGET_S "
+                    "for a more exhaustive search)\n", __func__, calibration_budget_s);
+            common_moe_calibration_status_set("time budget spent - finalizing best measured configuration");
+        }
+        return true;
+    };
+
     const std::string self_exe = common_self_exe_path();
     if (self_exe.empty()) {
         LOG_ERR("%s: could not resolve /proc/self/exe - --moe-calibrate needs this to spawn benchmark "
@@ -2223,6 +2373,12 @@ void common_moe_calibrate(common_params & params) {
         return tps;
     };
     auto bench_with_retry = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
+        // Single choke point every stage's candidates go through, so the time
+        // budget applies to the whole run without each search needing its own
+        // deadline handling - see calibration_budget_s above.
+        if (budget_spent()) {
+            return -1.0;
+        }
         double sum = 0.0;
         int n_ok = 0;
         for (int i = 0; i < n_samples_per_candidate; i++) {

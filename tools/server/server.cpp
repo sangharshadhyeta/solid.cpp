@@ -159,6 +159,32 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // The dynamic atlas should work out of the box, not only for someone who
+    // knows to pass two paths by hand. Both default to per-model files under
+    // the cache directory (per-model, not one shared name, so switching
+    // models doesn't feed one model's co-activation graph into another's
+    // atlas). An explicit --expert-atlas-file still wins, same rule as
+    // everywhere else here.
+    {
+        std::string model_tag = std::filesystem::path(params.model.path).stem().string();
+        if (model_tag.empty()) {
+            model_tag = "model";
+        }
+        const std::string cache_dir = fs_get_cache_directory();
+        fs_create_directory_with_parents(cache_dir);
+        if (params.expert_atlas_file.empty()) {
+            params.expert_atlas_file = cache_dir + "expert-atlas-" + model_tag + ".json";
+        }
+        if (!getenv("GGML_CUDA_MOE_CACHE_COACT_FILE")) {
+            const std::string coact = cache_dir + "coact-" + model_tag + ".jsonl";
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_MOE_CACHE_COACT_FILE", coact.c_str());
+#else
+            setenv("GGML_CUDA_MOE_CACHE_COACT_FILE", coact.c_str(), 1);
+#endif
+        }
+    }
+
     // Must run after the n_parallel auto-resolution above -
     // common_moe_calibrate() builds a real llama_context_params from
     // params.n_parallel, and -1 ("auto", never resolved before this point)
