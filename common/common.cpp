@@ -1681,6 +1681,16 @@ static std::string common_moe_calibration_cache_path() {
 static bool common_moe_calibration_lookup(
         const char * path_model, const common_params & params, common_moe_calibration_entry & out) {
     std::ifstream f(common_moe_calibration_cache_path());
+    static const bool trace_lookup = getenv("LLAMA_MOE_CALIB_TRACE") != nullptr;
+    if (trace_lookup) {
+        // fprintf, not LOG_WRN: the logging macros are gated on a verbosity
+        // threshold that is not necessarily set yet this early in startup, and
+        // a diagnostic that can be silently swallowed is worse than none - it
+        // reads as "this code did not run" when it did.
+        fprintf(stderr, "[calib-trace] path='%s' good=%d\n",
+                common_moe_calibration_cache_path().c_str(), (int) f.good());
+        fflush(stderr);
+    }
     if (!f.good()) {
         return false;
     }
@@ -1694,8 +1704,11 @@ static bool common_moe_calibration_lookup(
             // cached entry was not being found (context, parallelism, GPU
             // signature) were each wrong in turn, and every one of them would
             // have been settled immediately by seeing the string itself.
-            LOG_WRN("%s: no entry for key '%s' - the cache has %zu\n",
-                    __func__, key.c_str(), (size_t) j.size());
+            if (trace_lookup) {
+                fprintf(stderr, "[calib-trace] MISS key='%s' (cache has %zu entries)\n",
+                        key.c_str(), (size_t) j.size());
+                fflush(stderr);
+            }
         }
         std::string use_key = key;
         if (!exact) {
