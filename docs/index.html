@@ -331,7 +331,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 <div class="hero-zero-grid">
 <div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">68.75<small> tok/s</small></span><span class="hz-note">ncmoe 20, rank&nbsp;1, &minus;1&sigma; bar</span></div>
-<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">0.60<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;1, single-stream</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">2.81<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;1, 84% stand-in rate</span></div>
 </div>
 <p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
 &mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
@@ -368,7 +368,8 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <tr><td>Rejected outright</td><td><strong>3 candidates</strong> &mdash; one degenerate (0.53), two not reproducible (2 of 5 agreed) at 38.46 and 50.62 tok/s</td><td>every <code>-ngl</code> candidate failed to load &rarr; full residency kept</td></tr>
 <tr><td>Draft model</td><td>found beside the target by itself &rarr; <strong>spec-draft-n-max 6</strong></td><td>none present</td></tr>
 <tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td>12 candidates in <strong>91 min</strong>, then budget spent</td></tr>
-<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">0.60 tok/s <span class="note">single-stream</span></td></tr>
+<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">2.81 tok/s <span class="note">single-stream</span></td></tr>
+<tr><td>With the floor NOT applied</td><td class="note">n/a</td><td class="num delta-neg">0.60 tok/s</td></tr>
 </tbody>
 </table>
 </div>
@@ -376,8 +377,10 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <p class="note">Two things that only exist because a throughput-only search would get them wrong. Substitution
 &mdash; serving a cache miss from a resident stand-in rather than fetching the exact expert &mdash; is the
 largest single lever on a model that does not fit &mdash; and the one most easily lost, since it is applied from a
-cached entry rather than measured live: a bare launch with no <code>-c</code> discarded it entirely until that was
-fixed, serving 0.60 tok/s with the gate never running &mdash;
+cached entry rather than measured live. Measured twice on the same binary and the same model, minutes apart:
+with the floor applied, 30,261 stand-ins served at an 84% accept rate and <strong>2.81 tok/s</strong>; without it,
+<code>substitutions=0, declined=0</code> &mdash; the gate never ran &mdash; and <strong>0.60 tok/s</strong>. A
+4.7&times; difference from one setting reaching the serving session or not &mdash;
 and it is also the one that destroys output when pushed too far: on Qwen3.8-Flash-Next, rank 0 emits
 <em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym is&rdquo;</em> at a very
 respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams, single-word dominance) and

@@ -1687,6 +1687,14 @@ static bool common_moe_calibration_lookup(
         f >> j;
         const std::string key = common_moe_calibration_key(path_model, params);
         bool exact = j.contains(key);
+        if (!exact) {
+            // Print the key on a miss. Three separate theories about why a
+            // cached entry was not being found (context, parallelism, GPU
+            // signature) were each wrong in turn, and every one of them would
+            // have been settled immediately by seeing the string itself.
+            LOG_WRN("%s: no entry for key '%s' - the cache has %zu\n",
+                    __func__, key.c_str(), (size_t) j.size());
+        }
         std::string use_key = key;
         if (!exact) {
             // Relaxed retry: same GPU, model and context shape, different
