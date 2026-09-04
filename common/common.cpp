@@ -1977,14 +1977,14 @@ struct common_moe_bench_result {
     std::string text;
 };
 
-static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed = 1234);
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed = 1234, bool greedy = false);
 
 static std::pair<double, double> common_moe_bench_one_request(int port, const char * prompt, int n_predict) {
     const auto r = common_moe_bench_one_request_full(port, prompt, n_predict);
     return {r.predicted_n, r.predicted_ms};
 }
 
-static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed) {
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed, bool greedy) {
     nlohmann::json req = {
         {"messages", nlohmann::json::array({
             {{"role", "user"}, {"content", prompt}}
@@ -2001,6 +2001,14 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
         // reference self-fidelity noise floor in the substitution ladder.
         {"seed", seed},
     };
+    if (greedy) {
+        // Only for the determinism check: pinning the sampler to argmax takes
+        // it out of the picture entirely, so any variation left is the forward
+        // pass. Deliberately not used for the throughput or fidelity probes,
+        // which have to measure the sampling the model actually ships with.
+        req["temperature"] = 0.0;
+        req["top_k"] = 1;
+    }
     const std::string req_body = req.dump();
     char req_cmd[4096];
     snprintf(req_cmd, sizeof(req_cmd),
@@ -2293,6 +2301,49 @@ static double common_moe_bench_candidate_server(
                     "throughput bought with broken generation is not a valid result\n",
                     __func__, worst_degeneracy, common_moe_degeneracy_reject_threshold(), result_tps);
             result_tps = -1.0;
+        }
+        // Determinism gate: same request, same seed, repeated. A configuration
+        // that answers one question two different ways is not a slower-but-
+        // valid point on the throughput curve - the forward pass is returning
+        // different numbers each time, and no amount of tok/s redeems that.
+        //
+        // This exists because calibration certified a gemma-4 configuration at
+        // 48 tok/s and shipped it as the default, when repeating one identical
+        // greedy request against it gave 9 distinct answers out of 12. Nothing
+        // already here could see that: the degeneracy guard scores each reply
+        // on its own and every one of those nine was lexically healthy, and the
+        // fidelity check compares a candidate against a reference but never
+        // compares a candidate against itself. Cheap to close - the replies are
+        // short and a broken config usually diverges within a few tokens.
+        // Majority agreement, not unanimity. Requiring all N identical was
+        // tried first and is wrong: measured on this hardware, even a pure-CPU
+        // run (-ngl 0) disagrees with itself occasionally at this length, so a
+        // unanimity gate rejects every configuration including the good ones
+        // and calibration finds nothing. Majority is the natural
+        // parameter-free line - it asks whether there IS a single answer this
+        // configuration mostly gives, which cleanly separates the failure that
+        // prompted this (9 distinct answers in 12 requests) from healthy noise
+        // (11 of 12 agreeing), without a tolerance anybody had to pick.
+        if (result_tps > 0 && !common_moe_calibrate_budget_spent()) {
+            constexpr int n_det_probes = 5;
+            std::vector<std::string> answers;
+            for (int i = 0; i < n_det_probes; i++) {
+                const auto r = common_moe_bench_one_request_full(port, quality_prompts[0], 12, probe_seed, /* greedy */ true);
+                if (r.predicted_n > 0) {
+                    answers.push_back(r.text);
+                }
+            }
+            int modal = 0;
+            for (const auto & a : answers) {
+                modal = std::max(modal, (int) std::count(answers.begin(), answers.end(), a));
+            }
+            if (!answers.empty() && modal * 2 <= (int) answers.size()) {
+                LOG_WRN("%s: candidate rejected - not reproducible: the same request at the same seed, "
+                        "sampled greedily, agreed only %d times in %zu at %.2f tok/s. A forward pass that "
+                        "varies run to run is reading memory it does not own, and no throughput redeems it\n",
+                        __func__, modal, answers.size(), result_tps);
+                result_tps = -1.0;
+            }
         }
     } else {
         // Concurrent path: fire n_concurrency real requests at once (cycling
