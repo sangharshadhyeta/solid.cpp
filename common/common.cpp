@@ -15,6 +15,7 @@
 #include <cinttypes>
 #include <climits>
 #include <cmath>
+#include <atomic>
 #include <chrono>
 #include <cstdarg>
 #include <cstring>
@@ -1911,10 +1912,42 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
     return {};
 }
 
+// Wall-clock deadline for the whole calibration run, set by
+// common_moe_calibrate() and checked here rather than at each search's own
+// call site. Every candidate in every stage funnels through this function,
+// which is what makes it the correct choke point: a first attempt put the
+// check in one stage's helper lambda and several stages (the -ngl search
+// among them) call this directly instead, so a 600s budget sailed 26 minutes
+// past its deadline with 89 more projected. Zero means "no deadline set".
+static std::atomic<long long> g_moe_calibrate_deadline_ms{0};
+static std::atomic<bool>      g_moe_calibrate_budget_warned{false};
+
+static long long common_moe_steady_now_ms() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+static bool common_moe_calibrate_budget_spent() {
+    const long long deadline = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
+    if (deadline == 0 || common_moe_steady_now_ms() < deadline) {
+        return false;
+    }
+    if (!g_moe_calibrate_budget_warned.exchange(true)) {
+        LOG_WRN("%s: calibration time budget spent - skipping remaining candidates and keeping the best "
+                "configuration measured so far (raise GGML_MOE_CALIBRATE_BUDGET_S for a longer search)\n",
+                __func__);
+        common_moe_calibration_status_set("time budget spent - finalizing best measured configuration");
+    }
+    return true;
+}
+
 static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
         int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99) {
+    if (common_moe_calibrate_budget_spent()) {
+        return -1.0; // reported as a failed candidate; every search here keeps its best measured point
+    }
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -2300,28 +2333,15 @@ void common_moe_calibrate(common_params & params) {
     // the refinements) and each candidate is skipped once the budget is
     // spent. Skipped candidates report as failures, which every search here
     // already handles by keeping the best point actually measured.
-    const auto calibration_start = std::chrono::steady_clock::now();
     const double calibration_budget_s = [] {
         const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_S");
         const double v = e ? atof(e) : 600.0; // 10 minutes
         return v > 0.0 ? v : 600.0;
     }();
-    bool budget_warned = false;
-    auto budget_spent = [&]() -> bool {
-        const double elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - calibration_start).count();
-        if (elapsed < calibration_budget_s) {
-            return false;
-        }
-        if (!budget_warned) {
-            budget_warned = true;
-            LOG_WRN("%s: calibration time budget of %.0fs is spent - skipping remaining candidates and "
-                    "keeping the best configuration measured so far (raise GGML_MOE_CALIBRATE_BUDGET_S "
-                    "for a more exhaustive search)\n", __func__, calibration_budget_s);
-            common_moe_calibration_status_set("time budget spent - finalizing best measured configuration");
-        }
-        return true;
-    };
+    g_moe_calibrate_budget_warned.store(false);
+    g_moe_calibrate_deadline_ms.store(
+            common_moe_steady_now_ms() + (long long) (calibration_budget_s * 1000.0));
+    LOG_INF("%s: time budget for this run: %.0fs (GGML_MOE_CALIBRATE_BUDGET_S)\n", __func__, calibration_budget_s);
 
     const std::string self_exe = common_self_exe_path();
     if (self_exe.empty()) {
@@ -2373,12 +2393,9 @@ void common_moe_calibrate(common_params & params) {
         return tps;
     };
     auto bench_with_retry = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
-        // Single choke point every stage's candidates go through, so the time
-        // budget applies to the whole run without each search needing its own
-        // deadline handling - see calibration_budget_s above.
-        if (budget_spent()) {
-            return -1.0;
-        }
+        // The time budget is enforced inside common_moe_bench_candidate_server
+        // itself - the one function every stage's candidates funnel through,
+        // including the several that bypass this lambda entirely.
         double sum = 0.0;
         int n_ok = 0;
         for (int i = 0; i < n_samples_per_candidate; i++) {
