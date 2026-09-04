@@ -1944,6 +1944,24 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             }
                         }
 
+                        // Diagnostic only (GGML_SCHED_IDS_TRACE=1): hash the routing
+                        // decision as it is read back from the compute backend. Two
+                        // identical greedy requests must route identically; if these
+                        // hashes differ run to run, the divergence is already present
+                        // in the router output (or in this readback), upstream of any
+                        // expert copying. If they match while the output still
+                        // differs, it is downstream.
+                        static const bool ids_trace = getenv("GGML_SCHED_IDS_TRACE") != nullptr;
+                        if (ids_trace) {
+                            uint64_t h = 1469598103934665603ull;
+                            for (size_t k = 0; k < ids.size(); k++) {
+                                h ^= (uint64_t) (uint32_t) ids[k];
+                                h *= 1099511628211ull;
+                            }
+                            fprintf(stderr, "[ids-trace] %s n=%zu hash=%016llx\n",
+                                    ids_tensor->name, ids.size(), (unsigned long long) h);
+                        }
+
                         prev_ids_tensor = ids_tensor;
                     }
 
@@ -2092,6 +2110,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             ggml_moe_cache.track_fetch_pace(split_backend);
                         }
                     };
+
+                    // Diagnostic only (GGML_SCHED_EXPERT_ZERO=1): the sparse copy
+                    // deliberately writes only the routed experts, so every other
+                    // row of the destination holds whatever this VRAM happened to
+                    // contain. That is fine as long as nothing reads them - and
+                    // this pins down whether anything does. Zeroing first makes
+                    // those regions a fixed value, so if a run that was
+                    // nondeterministic becomes deterministic under this flag, the
+                    // copy is leaving rows that are later read. Deliberately not a
+                    // fix: it costs a full-tensor write per input.
+                    static const bool expert_zero_probe = getenv("GGML_SCHED_EXPERT_ZERO") != nullptr;
+                    if (expert_zero_probe) {
+                        ggml_backend_synchronize(split_backend);
+                        ggml_backend_tensor_memset(input_cpy, 0, 0, ggml_nbytes(input_cpy));
+                        ggml_backend_synchronize(split_backend);
+                    }
 
                     int id = 0;
                     while (!ggml_bitset_get(copy_ids.data(), id)) {
