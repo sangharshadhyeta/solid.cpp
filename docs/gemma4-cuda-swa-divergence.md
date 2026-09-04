@@ -1,131 +1,124 @@
-# Gemma-4 produces different logits on CUDA than on CPU
+# Gemma-4 MoE inference is nondeterministic on CUDA
 
-**Status:** open, root cause narrowed but not fixed. Found 2026-09-04.
+**Status:** open, well-bounded, not fixed. Found 2026-09-04.
+
+> **Correction.** An earlier revision of this file named sliding-window
+> attention as the cause, on the strength of `--swa-full` appearing to fix the
+> first divergent token. That was wrong, and the reason it was wrong matters:
+> every one of those comparisons was a *single sample*, and the underlying
+> failure is nondeterministic. Re-tested properly, `--swa-full` is nondeterministic
+> too - it just happened to match CPU on the run that was measured. Do not
+> bisect this bug with single samples.
 
 ## Symptom
 
-A plain chat request to gemma-4-26B-A4B on GPU returns text with raw control
-markers in it, and degenerates into loops:
+Four **identical** requests to the same gemma-4 server, greedy
+(`temperature=0, top_k=1`), same seed, same prompt `"hi"`:
 
 ```
-"hi" -> '<|channel>thought\n<channel|><channel|><channel|>...'
-        'I am Gemma 4, a model trained by Google DeepMind.' x4
-        ' way, way, way, way, way, way, ...'
+run1: ['<|channel>', 'thought', '\n', '<channel|>', 'thought', '\n', '<channel|>', 'thought']
+run2: ['<|channel>', 'thought', '\n', '<channel|>', '\n\n', 'Hello', '!', ' How']
+run3: ['<|channel>', 'thought', '\n', '<channel|>', 'thought', '\n', '<channel|>', '<channel|>']
+run4: ['<|channel>', 'thought', ' even', ' than', 'ju', '-', '\n\n', 'thought']
 ```
 
-The same model, same GGUF, same prompt, same seed, run with `-ngl 0` (pure
-CPU) answers correctly and cleanly:
+Greedy decoding is deterministic by construction. Four different answers to one
+question means the forward pass is returning different numbers each time.
 
-```
-"hi"          -> 'Hello! How can I help you today?'
-"What's 2+2?" -> '2 + 2 = 4'
-```
+User-visible, this looks like a quality problem - looping, leaked control
+markers, `thought- own- own- own-` - which is why it was first mistaken for a
+degenerate-sampling or chat-template issue. It is neither.
 
-So the model file, the chat template, the tokenizer, and the gemma4 PEG chat
-parser are all fine. The divergence is in the CUDA path.
+## Bounding it
 
-## Evidence
-
-Greedy (`temperature=0, top_k=1`), same seed, same prompt "hi", comparing the
-first generated tokens and their top-5 logprobs:
-
-| token | CPU (`-ngl 0`) | GPU (default) |
+| configuration | deterministic? | correct? |
 |---|---|---|
-| 0 | `<|channel>` (0.0) | `<|channel>` (0.0) |
-| 1 | `thought` (-0.0) | `thought` (-0.0) |
-| 2 | `\n` (-0.0) | `\n` (-0.0) |
-| 3 | **`The` (-0.012)**, `<channel\|>` at **-11.204** | **`<channel\|>` (-0.0)**, `The` not in top-5 |
+| gemma-4, `-ngl 0` (pure CPU) | **yes**, 4/4 identical | yes |
+| gemma-4, GPU, default | no, 4/4 differ | no |
+| gemma-4, GPU, substitution off | no | no |
+| gemma-4, GPU, `GGML_CUDA_MOE_CACHE=0` | no | no |
+| gemma-4, GPU, `--swa-full` | no | no |
+| gemma-4, GPU, `GGML_CUDA_DISABLE_GRAPHS=1` | no | no |
+| gemma-4, GPU, `-fa off` | no | no |
+| gemma-4, GPU, `--n-cpu-moe 99` (no expert copies) | no | no |
+| qwen2.5-0.5b (dense), GPU, `-ngl 99` | **yes**, 4/4 identical | yes |
+| qwen2.5-0.5b (dense), GPU, `-ngl 10` (CPU/GPU split) | **yes**, 4/4 identical | yes |
 
-Both sides are *confident*, in opposite directions, with an ~11 nat gap. That
-is not floating-point drift near a decision boundary - it is a different
-computation. The whole distribution is also compressed on GPU (token 0's
-runner-up sits at -25.2 on GPU vs -29.6 on CPU).
+So it is not CUDA in general, not the CPU/GPU graph split in general, and not
+any of the moe-cache machinery: it survives with the cache, substitution,
+prefetch, D2D, flash attention and CUDA graphs all disabled, and with every
+expert placed on the CPU. `test-backend-ops` passes clean against CPU on a free
+GPU. What is left is MoE inference on the CUDA path for this model.
 
-## What it is NOT
+Also ruled out as contributing: `attention.shared_kv_layers` is 0 here, so
+cross-layer KV sharing is not involved.
 
-Each of these was tested and independently ruled out - the divergence persists
-with every one of them disabled:
+## Why nondeterminism points somewhere specific
 
-- moe-cache substitution (`GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=1000000`)
-- the moe-cache itself (`GGML_CUDA_MOE_CACHE=0`)
-- expert prefetch (`GGML_SCHED_PREFETCH_EXPERTS=0`)
-- LFRU D2D (`GGML_CUDA_MOE_CACHE_LFRU_D2D=0`)
-- flash attention (`-fa off`)
-- CUDA graphs (`GGML_CUDA_DISABLE_GRAPHS=1`)
-- MMQ kernel selection (`GGML_CUDA_FORCE_MMQ=1`)
-- expert placement - all experts on CPU (`--n-cpu-moe 99`) still diverges
-- output head placement - `-ngl 10` (head on CPU) still diverges
+Identical inputs producing different outputs is not a numerical-precision
+story. Precision differences are *reproducible* - the same inputs give the same
+slightly-different answer every time. Varying run to run means the computation
+is reading memory whose contents are not fixed: either uninitialized memory, or
+memory being written concurrently by something the reader is not ordered
+against.
 
-`test-backend-ops` passes completely against CPU with a free GPU, so no
-individual op is wrong in isolation. Note that a busy GPU makes that suite
-report spurious `FAIL`s that are really `cudaMalloc ... out of memory` - free
-the VRAM before trusting it.
+That makes the sparse expert-copy path and its async copies the natural place
+to look next, even though disabling the cache and forcing experts to the CPU
+did not clear it - those change *which* copies happen, not whether the split
+path leaves regions of a device tensor unwritten between graph nodes.
 
-## What it IS: sliding-window attention
+## Structural notes on gemma-4
 
-`--swa-full` moves the first divergence from token 3 to token 10:
+Possibly relevant to a layout/stride assumption; not yet tied to the bug.
+Gemma-4 carries two KV geometries in one model:
 
-```
-CPU:            ... '".', '\n', 'This', ' is', ' a', ' standard', ' greeting', '.'
-GPU --swa-full: ... '".', '\n', 'The',  ' user', ' wants', ' to', ' start', ...
-GPU (no flag):  diverges at token 3
-```
-
-Ten matching tokens before parting is consistent with ordinary fp accumulation;
-diverging at token 3 is not. So the SWA KV-cache path is the primary suspect,
-and `--swa-full` is a partial workaround (it does not eliminate the residual
-divergence, and generation still degrades on longer outputs).
-
-Why SWA is a plausible home for this: gemma-4 carries **two different KV
-geometries in one model**, which is unusual and easy for a layout assumption to
-get wrong.
-
-| | SWA layers | full-attention layers |
+| | SWA layers (25) | full-attention layers (5) |
 |---|---|---|
 | `key_length` / `value_length` | 256 | 512 |
 | `head_count_kv` | 8 | 2 |
 
-with `sliding_window = 1024` and a 5-SWA-then-1-full pattern over 30 layers
-(`attention.sliding_window_pattern`). `n_embd_head_k(il)` switches on
-`is_swa(il)` (`src/llama-hparams.cpp:117`), so any place that resolves the head
-dim without the per-layer accessor reads at the wrong stride for 25 of the 30
-layers. Ruled out as contributing: `attention.shared_kv_layers` is 0 for this
-model, so cross-layer KV sharing is not involved.
+`sliding_window = 1024`, 5-SWA-then-1-full over 30 layers. `n_embd_head_k(il)`
+switches on `is_swa(il)` (`src/llama-hparams.cpp:117`), so anything resolving a
+head dimension without the per-layer accessor is wrong for five layers in six.
+It also has per-layer scalar `layer_output_scale.weight` `[1]` tensors and a
+`final_logit_softcapping` of 30.0.
 
-## Reproducing
+## How to test this correctly
 
-```bash
-# broken
-llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -c 2048 --port 8099
-# correct
-llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -c 2048 --port 8099 -ngl 0
-# partially fixed
-llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf -c 2048 --port 8099 --swa-full
-```
-
-Compare with logprobs rather than by eye - the failure is a token-selection
-difference, and short confident prefixes agree even when the run is broken:
+Repeat an identical greedy request at least 4 times and compare token
+sequences. A single sample proves nothing here - short confident prefixes agree
+even on broken runs, and any given run may match CPU by chance.
 
 ```bash
-curl -s localhost:8099/v1/chat/completions -H 'Content-Type: application/json' \
-  --data-binary '{"messages":[{"role":"user","content":"hi"}],"max_tokens":6,
-                  "temperature":0,"top_k":1,"logprobs":true,"top_logprobs":5,"seed":1234}'
+for i in 1 2 3 4; do
+  curl -s localhost:8099/v1/chat/completions -H 'Content-Type: application/json' \
+    --data-binary '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,
+                    "temperature":0,"top_k":1,"logprobs":true,"seed":1234}' \
+  | python3 -c "import sys,json;lp=json.load(sys.stdin)['choices'][0]['logprobs'];print([t['token'] for t in lp['content']])"
+done
 ```
+
+Two process-hygiene traps that produced false results while chasing this:
+
+- `pgrep -f llama-server` matches the *shell running the pattern*, so a
+  kill-then-relaunch script kills itself. Use `pgrep -x llama-server`.
+- Killing only `head -1` of the matches, then waiting on `/health`, can leave a
+  stale server holding the port while the new one dies on bind - so the
+  measurement lands on the old config. Kill every match, wait for the port to
+  clear, then verify the PID that owns the port is the one just launched.
 
 ## Consequence for calibration
 
-The calibration ladder measured gemma-4 at 39-48 tok/s against output it
-believed was healthy. It could not have caught this: its degeneracy guard
-(`common_moe_degeneracy_score`) only scores verbatim 4-gram repetition and
-single-word dominance, and it only ever ran `probe_prompts[0]` - a long,
-substantial instruction - because `n_solo_probes` is 1. Long prompts happen to
-be the case where this failure is least visible. The actual user-visible break
-was a bare `"hi"`.
+Calibration measured gemma-4 at 39-48 tok/s against output it believed healthy.
+It could not have caught this. Its degeneracy guard scores only verbatim 4-gram
+repetition and single-word dominance, and `n_solo_probes` is 1, so the entire
+quality verdict came from `probe_prompts[0]` - a long, substantial instruction,
+the case where this failure is least visible. The user-visible break was a bare
+`"hi"`.
 
-Two changes landed for that gap (see `common/common.cpp`): a short-prompt
-quality pass (`quality_prompts`, scored but never timed), and an output-fidelity
-check that compares each substitution rung against a substitution-free
-reference, with the tolerance measured from the model's own resampling rather
-than hardcoded. Neither of those would have caught *this* bug either, since it
-is present with substitution off - they close a different hole found alongside
-it.
+Two changes landed for that gap (`common/common.cpp`): a short-prompt quality
+pass (`quality_prompts`, scored but never timed) and an output-fidelity check
+against a substitution-free reference, with the tolerance measured from the
+model's own resampling rather than hardcoded. Neither would have caught *this*
+bug - it is present with substitution off - but a repeat-identical-request
+determinism check in calibration would, and does not exist yet.
