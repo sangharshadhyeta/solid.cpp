@@ -2634,11 +2634,64 @@ void common_moe_calibrate(common_params & params) {
         return;
     }
 
-    const uint32_t safe_n = probe.already_fits ? 0 : probe.safe_n;
+    uint32_t safe_n = probe.already_fits ? 0 : probe.safe_n;
     if (!probe.already_fits && !probe.found_safe_n) {
-        LOG_ERR("%s: config does not fit in available device memory even with all MoE experts on CPU; "
-                "reduce -c/--parallel or add VRAM before calibrating\n", __func__);
-        return;
+        // Halve the context until it fits, rather than giving up. Bailing here
+        // meant a bare launch on a model whose default context is larger than
+        // this card can hold skipped calibration entirely and served
+        // unconfigured - observed on Qwen3.8-Flash-Next, where the whole
+        // "point it at a model" path silently produced nothing because the
+        // model's own default context does not fit a 12GB card even with
+        // every expert on the CPU. The serving path already resolves this the
+        // same way (it trades context for placement and says so); there is no
+        // reason calibration should be the one component that refuses.
+        //
+        // Halving rather than a fine search on purpose: each step costs a real
+        // probe, this only has to find a context that FITS so the actual
+        // search can start, and the fit machinery downstream still gets the
+        // final say on placement at whatever context this lands on.
+        const uint32_t requested     = cparams.n_ctx;
+        const uint32_t requested_par = cparams.n_seq_max;
+        bool found = false;
+        // Concurrency first, and context only after. On a hybrid model the
+        // recurrent-state cache is sized by n_seq_max, not by n_ctx, so on
+        // Qwen3.8-Flash-Next the allocation that actually failed was the rs
+        // cache and halving the context could not have helped however far it
+        // went - the first version of this fallback shrank the context to 512
+        // and still gave up, which is what showed the variable was wrong.
+        for (uint32_t try_par = requested_par / 2; try_par >= 1 && !found; try_par /= 2) {
+            cparams.n_seq_max = try_par;
+            probe = common_moe_find_safe_layers(path_model, mparams, cparams, fit_margin);
+            if (probe.already_fits || probe.found_safe_n) {
+                LOG_WRN("%s: %u concurrent slots do not fit this device even with every expert on the CPU "
+                        "- calibrating at %u instead, which does. Pass --parallel explicitly to pin a "
+                        "different number\n", __func__, requested_par, try_par);
+                params.n_parallel = (int32_t) try_par;
+                safe_n = probe.already_fits ? 0 : probe.safe_n;
+                found = true;
+            }
+            if (try_par == 1) {
+                break;
+            }
+        }
+        for (uint32_t try_ctx = requested / 2; try_ctx >= 512 && !found; try_ctx /= 2) {
+            cparams.n_ctx = try_ctx;
+            probe = common_moe_find_safe_layers(path_model, mparams, cparams, fit_margin);
+            if (probe.already_fits || probe.found_safe_n) {
+                LOG_WRN("%s: the requested %u-token context does not fit this device even with every expert "
+                        "on the CPU - calibrating at %u instead, which does. Pass -c explicitly to pin a "
+                        "different one\n", __func__, requested, try_ctx);
+                params.n_ctx = try_ctx;
+                safe_n = probe.already_fits ? 0 : probe.safe_n;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            LOG_ERR("%s: config does not fit in available device memory even with all MoE experts on CPU, "
+                    "one slot and a 512-token context; add VRAM before calibrating\n", __func__);
+            return;
+        }
     }
 
     const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
@@ -3877,14 +3930,21 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out) {
 // this once per MoE tensor found for each atlas-covered layer.
 bool common_moe_cache_set_atlas(
         const void * host_base, const std::vector<int32_t> & expert,
-        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec) {
+        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec,
+        const std::vector<float> & dims, int n_dims) {
     if (!ggml_moe_cache.set_atlas || !host_base || expert.empty()) {
         return false;
     }
     if (expert.size() != x.size() || expert.size() != y.size() || expert.size() != spec.size()) {
         return false;
     }
-    ggml_moe_cache.set_atlas(host_base, expert.data(), x.data(), y.data(), spec.data(), (int) expert.size());
+    // Only pass the embedding through if it is exactly the expected shape -
+    // a short or ragged array would be read past its end per cell. A mismatch
+    // drops to the 2D path rather than failing the registration, since the
+    // 2D pair is still valid data.
+    const bool dims_ok = n_dims > 0 && dims.size() == expert.size() * (size_t) n_dims;
+    ggml_moe_cache.set_atlas(host_base, expert.data(), x.data(), y.data(), spec.data(),
+            dims_ok ? dims.data() : nullptr, dims_ok ? n_dims : 0, (int) expert.size());
     return true;
 }
 
