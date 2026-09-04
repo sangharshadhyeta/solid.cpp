@@ -405,6 +405,21 @@ each substitution rung against a substitution-free reference &mdash; with the to
 the model's own run-to-run resampling rather than written down as a constant.</p>
 </section>
 
+<p class="note"><strong>What the ladder decides now.</strong> Beyond placement, threads, cache size and fit
+margin: the substitution floor, and &mdash; new &mdash; the stand-in quality bar, which is the actual
+wait-or-substitute balance. A miss can either wait for the real expert over PCIe or run immediately on a
+resident one, and the bar decides which. Measured on gemma-4 at the two extremes: always wait gives 32.66
+tok/s with correct output; never wait gives 51.07 tok/s and the model emits nothing but
+<code>*&nbsp;*&nbsp;*&nbsp;*</code>. That is why the bar is searched against the fidelity and reproducibility
+gates rather than set to whatever is fastest.</p>
+
+<p class="note">The stand-in itself is chosen by co-activation now, not by heat. Ranking by heat picked the
+most <em>popular</em> resident expert rather than one that had ever done the same job, which is the mechanism
+behind the quality collapse substitution used to be blamed for. The eviction scan window and protected-segment
+cap stopped being compile-time constants for the same reason, and the Brain view's edge count is cut at the
+largest drop in edge strength per layer instead of at a fixed number &mdash; the same eigengap rule the atlas
+already uses to choose how many axes it wants.</p>
+
 <section id="correctness">
 <h2>A measured configuration is not a correct one</h2>
 
@@ -470,7 +485,25 @@ see <a href="#self-calibrating">the section above</a> for what a bare <code>llam
 works out on its own. This form is what you write when you want to pin a specific value rather than let it be
 measured.</p>
 
-<pre><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
+<pre><code>llama-server -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf</code></pre>
+
+<p class="note">That is the whole command. On a first run it calibrates itself and serves a progress page on
+the port until it is done; afterwards it reads what it measured. From that one line it works out the expert
+placement for the context you asked for, sizes the expert cache, picks the thread count and fit margin, finds
+the MTP draft model sitting beside the target and turns on speculative decoding, keeps a per-model
+co-activation graph and regenerates the atlas from it every few minutes, and enables the expert cache,
+substitution, neuron-reduce and atlas lookahead. Everything below is what those defaults resolve to &mdash;
+pass a flag only to pin a value rather than let it be measured.</p>
+
+<p class="note"><strong>It also refuses to use its own stale measurements.</strong> Calibration entries carry
+the version of the gates they were recorded under. An entry written before the output-fidelity and
+reproducibility checks existed was never tested by them, so its substitution settings are ignored with the
+reason printed, while the placement and sizing from the same entry &mdash; which those gates never had an
+opinion about &mdash; still apply. This is not hypothetical: a gemma-4 entry recorded rank 2 because it was
+fastest, and the fidelity check added later scored that same rank at 0.33.</p>
+
+<pre><code># the same run, with everything pinned by hand instead
+GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
 GGML_CUDA_MOE_CACHE_SUBSTITUTE=1 GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=4 \
 llama-server \
   -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
