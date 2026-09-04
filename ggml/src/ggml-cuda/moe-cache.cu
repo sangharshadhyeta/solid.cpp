@@ -369,7 +369,12 @@ struct moe_cache_prefill_slab {
 // At namespace scope rather than nested in moe_cache_device because the Track
 // 1.5 warm request below has to name it, and that request has to be a complete
 // type before the device that queues it.
-struct moe_cache_atlas_cell { float x = 0.0f, y = 0.0f, spec = 0.0f; };
+struct moe_cache_atlas_cell {
+    float x = 0.0f, y = 0.0f, spec = 0.0f;
+    // The embedding (x,y) was projected from. Empty when the caller did not
+    // supply one, in which case every consumer falls back to the 2D pair.
+    std::vector<float> dims;
+};
 using moe_cache_atlas_row = std::vector<std::pair<int32_t, moe_cache_atlas_cell>>;
 
 // Track 1.5 (docs/plan.md): one deferred atlas-warming pass, handed from the
@@ -513,6 +518,12 @@ struct moe_cache_device {
     float req_dir_x = 0.0f;
     float req_dir_y = 0.0f;
     bool  req_dir_valid = false;
+    // The same running direction in the embedding's own space, folded with
+    // the same decay as the 2D pair. The 2D one stays: the Brain view draws
+    // it, and burst detection is defined against it. This is what SCORING
+    // uses when the atlas supplied an embedding.
+    std::vector<float> req_dir_n;
+    bool  req_dir_n_valid = false;
     // Real routing decisions folded into req_dir since it became valid.
     // req_dir SNAPS to a single expert's raw atlas position on the very
     // first update (see the update site) - one noisy sample, not yet an
@@ -1793,6 +1804,25 @@ static float moe_cache_atlas_align_score(const moe_cache_device & device, const 
         return 0.0f;
     }
     const auto & cell = *cellp;
+    // Score in the embedding's own space when both sides have one. The 2D
+    // projection below is what this used to score against, and it carries
+    // almost none of the structure it was derived from: measured on gemma-4,
+    // corr(2D distance, 28-dim distance) = -0.003. Cosine in the full space
+    // is the same quantity this always meant to compute, against a signal
+    // that actually distinguishes experts.
+    if (!cell.dims.empty() && device.req_dir_n_valid &&
+        device.req_dir_n.size() == cell.dims.size()) {
+        double dot = 0.0, cn = 0.0, rn = 0.0;
+        for (size_t d = 0; d < cell.dims.size(); d++) {
+            dot += (double) cell.dims[d] * (double) device.req_dir_n[d];
+            cn  += (double) cell.dims[d] * (double) cell.dims[d];
+            rn  += (double) device.req_dir_n[d] * (double) device.req_dir_n[d];
+        }
+        if (cn > 1e-12 && rn > 1e-12) {
+            const float score_n = (float) (dot / (std::sqrt(cn) * std::sqrt(rn))) * cell.spec;
+            return score_n > 0.0f ? score_n : 0.0f;
+        }
+    }
     float rx, ry;
     moe_cache_atlas_lookahead(device, rx, ry);
     const float rmag = std::sqrt(rx * rx + ry * ry);
@@ -9231,6 +9261,20 @@ static int moe_cache_plan(
                     device.req_vel_x += moe_cache_device::MOE_CACHE_ATLAS_TREND_DECAY * (step_x - device.req_vel_x);
                     device.req_vel_y += moe_cache_device::MOE_CACHE_ATLAS_TREND_DECAY * (step_y - device.req_vel_y);
                 }
+                // Same fold, in the embedding's own space. Kept alongside
+                // rather than replacing the 2D pair above, which the Brain
+                // view and burst detection are both defined against.
+                if (!cell.dims.empty()) {
+                    if (!device.req_dir_n_valid || device.req_dir_n.size() != cell.dims.size()) {
+                        device.req_dir_n = cell.dims;
+                        device.req_dir_n_valid = true;
+                    } else {
+                        for (size_t d = 0; d < device.req_dir_n.size(); d++) {
+                            device.req_dir_n[d] += moe_cache_device::MOE_CACHE_ATLAS_DECAY *
+                                    (cell.dims[d] - device.req_dir_n[d]);
+                        }
+                    }
+                }
                 device.req_dir_updates++;
                 if (getenv("MOE_CACHE_DEBUG_GATE")) {
                     static std::atomic<long long> n{0};
@@ -11854,7 +11898,8 @@ static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device) {
 // its own (the atlas is a model-wide, not a per-session, property).
 static void moe_cache_set_atlas(
         const void * host_base, const int32_t * expert,
-        const float * x, const float * y, const float * spec, int n_cells) {
+        const float * x, const float * y, const float * spec,
+        const float * dims, int n_dims, int n_cells) {
     if (!host_base || n_cells <= 0 || !expert || !x || !y || !spec) {
         return;
     }
@@ -11878,7 +11923,11 @@ static void moe_cache_set_atlas(
                 if (expert[i] < 0) {
                     continue;
                 }
-                const moe_cache_device::atlas_cell cell{x[i], y[i], spec[i]};
+                moe_cache_device::atlas_cell cell{x[i], y[i], spec[i], {}};
+                if (dims && n_dims > 0) {
+                    cell.dims.assign(dims + (size_t) i * (size_t) n_dims,
+                                     dims + (size_t) (i + 1) * (size_t) n_dims);
+                }
                 const moe_cache_key key{host_base, expert[i]};
                 device.atlas[key] = cell;
                 row->emplace_back(expert[i], cell);

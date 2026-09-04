@@ -370,9 +370,18 @@ struct ggml_moe_cache_api {
     // (host_base) with that tensor's full set of measured cells; a second
     // call for a host_base already registered replaces its entries. NULL-
     // safe. n_cells may be 0 (registers nothing, still valid).
+    // dims/n_dims carry the FULL discovered embedding each (x,y) was
+    // projected from - n_dims floats per cell, row-major, n_cells rows.
+    // Optional: dims may be NULL / n_dims 0, in which case scoring falls back
+    // to the 2D position. Passing it matters because the projection is lossy
+    // to the point of being useless as a signal: measured on gemma-4, the
+    // correlation between 2D atlas distance and distance in the 28-dim
+    // embedding it came from is -0.003, i.e. noise, while the embedding
+    // itself is what the eviction and warming decisions are meant to consult.
     void (*set_atlas)(
             const void * host_base, const int32_t * expert,
-            const float * x, const float * y, const float * spec, int n_cells);
+            const float * x, const float * y, const float * spec,
+            const float * dims, int n_dims, int n_cells);
 
     // Track 1 steps 4a/4b's co-activation data, exported as real (tensor,
     // expert) identity - not the opaque hash the first version of this

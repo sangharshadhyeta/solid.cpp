@@ -1757,6 +1757,7 @@ private:
             if (f) {
                 try {
                     json atlas_json = json::parse(f);
+                    int atlas_n_dims = 0;
                     std::map<int, std::vector<json>> by_layer;
                     for (const auto & cell : atlas_json.at("cells")) {
                         by_layer[cell.at("layer").get<int>()].push_back(cell);
@@ -1770,30 +1771,70 @@ private:
                     size_t tensors_registered = 0;
                     for (const auto & [layer, cells] : by_layer) {
                         std::vector<int32_t> expert;
-                        std::vector<float> x, y, spec;
+                        std::vector<float> x, y, spec, dims;
                         expert.reserve(cells.size());
                         x.reserve(cells.size());
                         y.reserve(cells.size());
                         spec.reserve(cells.size());
+                        // The atlas file has carried the full embedding per
+                        // cell all along and nothing ever read it - only the
+                        // 2D projection was handed to the cache, and that
+                        // projection measures ~0 against the embedding it
+                        // comes from (corr -0.003 on gemma-4), so the eviction
+                        // and warming decisions keyed off it were keyed off
+                        // noise. Pass the real thing; the 2D pair stays for
+                        // the Brain view and burst detection.
+                        int n_dims = 0;
+                        bool dims_ok = true;
                         for (const auto & cell : cells) {
                             expert.push_back(cell.at("expert").get<int32_t>());
                             x.push_back(cell.at("x").get<float>());
                             y.push_back(cell.at("y").get<float>());
                             spec.push_back(cell.at("spec").get<float>());
+                            if (!dims_ok) {
+                                continue;
+                            }
+                            const auto dit = cell.find("dims");
+                            if (dit == cell.end() || !dit->is_array() || dit->empty()) {
+                                dims_ok = false;
+                                continue;
+                            }
+                            if (n_dims == 0) {
+                                n_dims = (int) dit->size();
+                            }
+                            // A ragged file (axis count changed mid-write, or
+                            // hand-edited) drops the whole embedding rather
+                            // than registering rows of different widths.
+                            if ((int) dit->size() != n_dims) {
+                                dims_ok = false;
+                                continue;
+                            }
+                            for (const auto & v : *dit) {
+                                dims.push_back(v.get<float>());
+                            }
                         }
+                        if (!dims_ok) {
+                            dims.clear();
+                            n_dims = 0;
+                        }
+                        atlas_n_dims = n_dims;
                         for (const char * name_fmt : moe_tensor_names) {
                             char name[128];
                             snprintf(name, sizeof(name), name_fmt, layer);
                             const ggml_tensor * t = llama_model_get_tensor(model_tgt, name);
-                            if (t && t->data && common_moe_cache_set_atlas(t->data, expert, x, y, spec)) {
+                            if (t && t->data && common_moe_cache_set_atlas(t->data, expert, x, y, spec, dims, n_dims)) {
                                 tensors_registered++;
                                 atlas_tensor_layer[t->data] = layer;
                             }
                         }
                     }
                     if (tensors_registered > 0) {
-                        SRV_INF("registered atlas topic-affinity data with moe-cache for %zu MoE tensor(s)\n",
-                                tensors_registered);
+                        SRV_INF("registered atlas topic-affinity data with moe-cache for %zu MoE tensor(s)%s\n",
+                                tensors_registered,
+                                atlas_n_dims > 0
+                                    ? string_format(" (scoring against the %d-dim embedding, not the 2D projection)",
+                                                    atlas_n_dims).c_str()
+                                    : " (2D projection only - this atlas file carries no dims)");
                     }
                 } catch (const std::exception & e) {
                     SRV_WRN("failed to register --expert-atlas-file with moe-cache: %s\n", e.what());

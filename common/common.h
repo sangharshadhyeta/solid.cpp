@@ -1029,9 +1029,14 @@ bool common_moe_cache_get_summary(common_moe_cache_summary & out);
 
 // See the .cpp for the full doc comment - step 0 of Atlas-driven cache
 // warming, registers one MoE tensor's measured topic-affinity cells.
+// dims, when non-empty, is the full discovered embedding each (x,y) was
+// projected from: expert.size() rows of n_dims floats, row-major. The cache
+// scores against it in preference to the 2D pair, which is lossy enough to be
+// useless as a signal (see set_atlas in ggml-backend-moe-cache.h).
 bool common_moe_cache_set_atlas(
         const void * host_base, const std::vector<int32_t> & expert,
-        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec);
+        const std::vector<float> & x, const std::vector<float> & y, const std::vector<float> & spec,
+        const std::vector<float> & dims = {}, int n_dims = 0);
 
 // One co-activation edge, tensor identity still raw (const void *) at this
 // layer - the caller (server_context, which already builds a tensor->layer
