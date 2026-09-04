@@ -253,6 +253,15 @@ struct moe_cache_job {
 struct moe_cache_demand {
     uint16_t count = 0;
     size_t expert_size = 0;
+    // Misses on this expert that no resident stand-in could cover. These are
+    // the ones a real fetch actually buys something for: a miss that WAS
+    // substituted already ran, on weights the co-activation data says suit
+    // this input, so its fill only improves exactness later. A miss with no
+    // stand-in fell through to the slow path with nothing standing in for it.
+    // The fill worker is a scarce, permanently-backlogged resource (measured:
+    // queue depth ~3, never empty at pop), so this is what decides who gets
+    // the front of it - see the enqueue in moe_cache_plan.
+    uint16_t unsubstituted = 0;
 };
 
 struct moe_cache_config {
@@ -840,6 +849,7 @@ struct moe_cache_device {
     size_t queued_bytes = 0;
     bool worker_started = false;
     bool inflight = false;
+    long long stale_jobs_dropped = 0; // queued fills whose slot was recycled before the worker reached them
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
     std::thread worker;
@@ -1664,6 +1674,20 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
 // Diagnostic-only per-node routing-width dump. Read once: this is checked in
 // moe_cache_plan(), which runs ~139x/token inside the session lock, and a bare
 // getenv() there walks environ on every call.
+// Fill-queue depth accounting, opt-in via GGML_CUDA_MOE_CACHE_FILL_TIMING_LOG
+// alongside the per-fill breakdown. See the pop site for why depth is the
+// number that decides whether batching fills onto a shared sync is worth its
+// correctness risk.
+static std::atomic<size_t> g_fill_depth_sum{0};
+static std::atomic<size_t> g_fill_depth_n{0};
+static std::atomic<size_t> g_fill_depth_empty{0};
+
+static bool fill_timing_depth_log_init() {
+    const char * e = getenv("GGML_CUDA_MOE_CACHE_FILL_TIMING_LOG");
+    return e && atoi(e) != 0;
+}
+static const bool fill_timing_depth_log = fill_timing_depth_log_init();
+
 static bool moe_cache_width_debug_enabled() {
     static const bool enabled = [] {
         return getenv("GGML_CUDA_MOE_CACHE_WIDTH") != nullptr;
@@ -4049,10 +4073,44 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 break;
             }
 
+            // Queue depth at pop, under the same FILL_TIMING flag. The reason
+            // the per-fill breakdown exists is to decide whether to batch
+            // several fills onto one shared sync; that only pays if the worker
+            // is actually the constraint, i.e. if work is waiting behind the
+            // sync rather than the queue running dry between jobs. Depth at
+            // pop is the direct measure of that and costs a size() on a lock
+            // already held.
+            if (fill_timing_depth_log) {
+                const size_t d = device->queue.size();
+                g_fill_depth_sum.fetch_add(d, std::memory_order_relaxed);
+                g_fill_depth_n.fetch_add(1, std::memory_order_relaxed);
+                if (d == 0) {
+                    g_fill_depth_empty.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
             job = device->queue.front();
             device->queue.pop_front();
             device->queued_bytes = job.bytes <= device->queued_bytes
                 ? device->queued_bytes - job.bytes : 0;
+            // Drop a job whose slot stopped being this expert's while it sat
+            // in the queue. The slot's generation/key were already checked -
+            // but only AFTER the copy, so a job whose slot had been evicted
+            // and recycled behind its back still paid a full PCIe transfer
+            // (~0.30 ms of a worker that is never idle) purely to throw the
+            // result away. With a standing backlog that is not rare: anything
+            // queued is by definition waiting while eviction keeps running.
+            // Checking here costs two comparisons under a lock already held.
+            if (job.pool >= 0 && job.pool < (int) device->pools.size()) {
+                const moe_cache_pool * qpool = device->pools[job.pool].get();
+                if (qpool && job.slot >= 0 && job.slot < qpool->n_slots) {
+                    const moe_cache_slot & qslot = qpool->slots[job.slot];
+                    if (qslot.state != moe_cache_slot_state::copying ||
+                        qslot.generation != job.generation || !(qslot.key == job.key)) {
+                        device->stale_jobs_dropped++;
+                        continue;
+                    }
+                }
+            }
             device->inflight = true;
             device->inflight_source = job.source;
             device->inflight_bytes = job.bytes;
@@ -4486,6 +4544,12 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             static std::atomic<int> logged{0};
             const int n = logged.fetch_add(1);
             if (n < 40 || n % 500 == 0) {
+                const size_t dn = g_fill_depth_n.load(std::memory_order_relaxed);
+                const size_t ds = g_fill_depth_sum.load(std::memory_order_relaxed);
+                const size_t de = g_fill_depth_empty.load(std::memory_order_relaxed);
+                fprintf(stderr, "[moe-cache] FILL_QUEUE avg_depth=%.2f empty_at_pop=%.1f%% n=%zu\n",
+                        dn ? (double) ds / (double) dn : 0.0,
+                        dn ? 100.0 * (double) de / (double) dn : 0.0, dn);
                 fprintf(stderr, "[moe-cache] FILL_TIMING bytes=%zu copy_ms=%.3f canary_ms=%.3f "
                         "finalize_ms=%.3f total_ms=%.3f\n",
                         job.bytes,
@@ -8635,6 +8699,9 @@ static int moe_cache_substitute_pick_hot(
     uint16_t best_heat = 0;
     uint32_t best_count = 0;
     int examined = 0;
+    uint64_t coact_sum = 0;
+    double   coact_sq  = 0.0;
+    int coact_n = 0;
     for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
         uint64_t bits = (*words)[w];
         while (bits && examined < scan_cap) {
@@ -8655,10 +8722,62 @@ static int moe_cache_substitute_pick_hot(
             const auto cit = device.co_activation.find(
                     moe_cache_edge_undirected(mkey, moe_cache_key{host_base, cand}));
             const uint32_t count = cit == device.co_activation.end() ? 0 : cit->second;
-            if (slot.heat > best_heat || (slot.heat == best_heat && count > best_count)) {
+            // Co-activation first, heat only to break ties - the reverse of the
+            // original order, which ranked by heat and used co-activation as
+            // the tiebreak. Heat says an expert is POPULAR, not that it suits
+            // this input, so heat-first hands the router a busy stranger
+            // whenever one is resident. That is the mechanism behind the
+            // quality collapse this gate was blamed for: calibration measured
+            // rank 2 at 43.78 tok/s with output fidelity 0.33 against the
+            // substitution-free reference, i.e. it diverged after a third of
+            // the reference's tokens while still reading as fluent English.
+            // Co-activation is the signal that actually answers "have these
+            // two ever done the same job", so it decides, and popularity only
+            // separates equals.
+            if (count > best_count || (count == best_count && slot.heat > best_heat)) {
                 best_heat  = slot.heat;
                 best_count = count;
                 best_slot  = found->second;
+            }
+            if (count > 0) {
+                coact_sum += count;
+                coact_sq  += (double) count * (double) count;
+                coact_n++;
+            }
+        }
+    }
+    // Decline unless the best candidate is better than a typical resident one.
+    // A fetch is ~0.30 ms of a fill worker that is never idle (measured: queue
+    // depth ~3, empty at pop 0.0% of the time), so serving a miss from a
+    // genuinely related resident expert is worth real throughput - but only
+    // while "related" means something. The bar is the mean co-activation among
+    // the residents actually examined, which needs no constant: it adapts to
+    // whatever this model's traffic looks like, and on a scan where nothing
+    // co-activates with the miss it rejects everything and the fetch happens.
+    // The bar is one standard deviation BELOW the mean, not the mean itself,
+    // and the tolerance matters as much as the bar. Co-activation counts are
+    // sparse and long-tailed: most resident experts have never fired with this
+    // particular one, and a stand-in that co-activates with the missed
+    // expert's own partners is a reasonable stand-in even when the direct pair
+    // has rarely been seen. Requiring strictly above-average direct
+    // co-activation declines almost everything and pushes the work back onto a
+    // fill worker that is already the constraint (queue depth ~3, never idle),
+    // which is the opposite of the point. Mean minus one sigma accepts
+    // anything not clearly worse than typical while still rejecting the
+    // popular-but-unrelated expert that heat-first ranking used to hand back -
+    // and both terms come from the candidates actually examined on this scan,
+    // so nothing here is a constant anybody chose.
+    if (best_slot >= 0) {
+        if (best_count == 0) {
+            return -1; // never seen with this expert at all - fetch it properly
+        }
+        if (coact_n > 1) {
+            const double mean = (double) coact_sum / (double) coact_n;
+            const double var  = coact_sq / (double) coact_n - mean * mean;
+            const double sd   = var > 0.0 ? sqrt(var) : 0.0;
+            const double bar  = mean - sd;
+            if (bar > 0.0 && (double) best_count < bar) {
+                return -1;
             }
         }
     }
@@ -9272,6 +9391,7 @@ static int moe_cache_plan(
                 device.substitute_declined++;
             }
         }
+        const bool covered_by_standin = slot_indices[index] >= 0;
 
         moe_cache_demand * demand = nullptr;
         try {
@@ -9281,6 +9401,9 @@ static int moe_cache_plan(
             continue;
         }
         demand->expert_size = node->expert_size;
+        if (!covered_by_standin && demand->unsubstituted < std::numeric_limits<uint16_t>::max()) {
+            demand->unsubstituted++;
+        }
         if (demand->count < std::numeric_limits<uint16_t>::max()) {
             demand->count++;
         }
@@ -9341,10 +9464,31 @@ static int moe_cache_plan(
 
             const void * source =
                 (const char *)node->host_base + (size_t)expert * node->expert_size;
-            device.queue.push_back({
+            const moe_cache_job job{
                     node->pool_index, slot_index, slot.generation,
                     key, source, node->expert_size,
-                    node->host_base, (size_t) node->n_expert * node->expert_size});
+                    node->host_base, (size_t) node->n_expert * node->expert_size};
+            // An expert nothing could stand in for goes to the front. Both
+            // kinds of miss are real demand, but they are not equally urgent:
+            // a substituted miss already produced a dispatchable row from
+            // weights co-activation says fit this input, so its fetch only
+            // sharpens a later token. An unsubstituted one had nothing, and
+            // every token that keeps missing it keeps paying full price. With
+            // the worker permanently backlogged, FIFO spends that scarce
+            // bandwidth on whichever expert happened to be demanded first
+            // rather than on the ones a fetch actually rescues.
+            // Majority of this expert's misses, not any single one. Keying
+            // off "has ever had an unsubstituted miss" makes the ordering flip
+            // on one token and never flip back, since the counter only grows -
+            // priority that jitters per token is not priority. Asking whether
+            // MOST of its demand went uncovered is a property of the expert's
+            // accumulated history, so it stays stable as more tokens arrive
+            // and still needs no threshold anybody picked.
+            if ((int) demand->unsubstituted * 2 >= (int) demand->count) {
+                device.queue.push_front(job);
+            } else {
+                device.queue.push_back(job);
+            }
             device.queued_bytes += node->expert_size;
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
