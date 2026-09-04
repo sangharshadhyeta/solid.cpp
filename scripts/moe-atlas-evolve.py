@@ -387,7 +387,40 @@ def main():
     # Same square->disc remap as moe-discovered-atlas.py's fix (d162224c4) -
     # rank-normalize x/y independently, then Shirley-Chiu concentric map so
     # corner points land inside the circle the UI actually draws.
+    # Two constraints that fight each other: the marginals should be uniform
+    # (so the disc fills evenly instead of crushing everything to the centre -
+    # the d162224c4 bug) and the layout must carry no layer signal (the Grid
+    # panel already shows layer, and server-context.cpp registers x/y/spec with
+    # the moe-cache as topic affinity, so a layer gradient there makes
+    # same-layer experts look related whatever they co-activate with).
+    #
+    # Applying either once does not hold: centering per layer sets the layer
+    # correlation to exactly zero and is then undone by rank_normalize, which
+    # is nonlinear - layers whose distributions differ in shape, not just mean,
+    # come out with different means again (measured: the shipped atlas had
+    # corr(layer,x) = +0.251 where the centering was meant to guarantee 0).
+    # Centering last instead holds the correlation but shrinks the cloud
+    # (r@50th 0.603 -> 0.395). So alternate the two projections and let them
+    # settle: each rank_normalize restores uniform marginals, each centering
+    # removes the layer mean, and the pair converges to a layout with both.
     sq = np.stack([rank_normalize(xy_raw[:, 0]), rank_normalize(xy_raw[:, 1])], axis=1)
+    for _ in range(6):
+        for lyr in np.unique(layer_of):
+            m = layer_of == lyr
+            sq[m, 0] -= sq[m, 0].mean()
+            sq[m, 1] -= sq[m, 1].mean()
+        # Third projection: rotate onto the principal axes. rank_normalize
+        # fixes each marginal but leaves the two axes correlated, and
+        # Shirley-Chiu below only maps a UNIFORM square to a uniform disc -
+        # hand it a cloud stretched along a diagonal and the mass lands on a
+        # few bearings, which is the spider-web silhouette.
+        c = sq - sq.mean(axis=0)
+        cov = np.cov(c, rowvar=False)
+        if np.all(np.isfinite(cov)):
+            _evals, evecs = np.linalg.eigh(cov)
+            sq = c @ evecs[:, ::-1]
+        sq = np.stack([rank_normalize(sq[:, 0]), rank_normalize(sq[:, 1])], axis=1)
+
     sx, sy = sq[:, 0], sq[:, 1]
     r = np.where(np.abs(sx) > np.abs(sy), sx, sy)
     theta = np.where(
