@@ -1604,9 +1604,11 @@ static std::string common_moe_calibration_key(const char * path_model, const com
 // layer residency - see common_moe_calibration_lookup for why that is worth
 // finding rather than treating as a plain miss.
 static std::string common_moe_calibration_key_prefix(const char * path_model, const common_params & params) {
+    // Everything up to and including the model size - i.e. GPU + model
+    // identity, without the context/parallel/-ngl shape fields that drift.
     const std::string key = common_moe_calibration_key(path_model, params);
-    const size_t cut = key.rfind("|ngl");
-    return cut == std::string::npos ? key : key.substr(0, cut + 4);
+    const size_t cut = key.find("|c");
+    return cut == std::string::npos ? key : key.substr(0, cut);
 }
 
 static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & cal) {
@@ -1708,10 +1710,31 @@ static bool common_moe_calibration_lookup(
             // (see ngl_exact). Prefer the fastest such entry when several
             // -ngl values have been calibrated - they were all measured on
             // this same machine and model.
+            // Match on GPU + model + size only, ignoring the context,
+            // parallelism and -ngl fields. Those three have each drifted in
+            // practice - the GPU signature moved 11900 vs 11909 MiB for one
+            // card, calibration rewrites n_ctx and n_parallel as it adapts, and
+            // -ngl is pinned by the user - and any one of them changing orphans
+            // the entry, so the run re-calibrates and then cannot find what it
+            // just wrote. An entry for this model on this machine is worth more
+            // than a perfect key match: the apply path already refuses anything
+            // that does not transfer (see ngl_exact), so a relaxed hit costs
+            // nothing beyond the values that legitimately carry over.
             const std::string prefix = common_moe_calibration_key_prefix(path_model, params);
+            const size_t model_at = prefix.find('|');
+            const std::string model_part = model_at == std::string::npos
+                    ? prefix : prefix.substr(model_at);
             double best = -1.0;
             for (const auto & item : j.items()) {
-                if (item.key().compare(0, prefix.size(), prefix) != 0) {
+                const size_t item_at = item.key().find('|');
+                const std::string item_model = item_at == std::string::npos
+                        ? item.key() : item.key().substr(item_at);
+                const bool same_prefix = item.key().compare(0, prefix.size(), prefix) == 0;
+                // model_part starts at the first '|' and covers path + size, so
+                // this pins the model file identity while letting the GPU
+                // signature and the trailing shape fields vary.
+                const bool same_model = item_model.compare(0, model_part.size(), model_part) == 0;
+                if (!same_prefix && !same_model) {
                     continue;
                 }
                 const double tps = item.value().value("tok_per_sec", 0.0);
