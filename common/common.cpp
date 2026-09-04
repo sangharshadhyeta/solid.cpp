@@ -1473,6 +1473,14 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
     return result;
 }
 
+// Bumped when calibration gains a check that changes which configurations it
+// is willing to record. An entry written before a gate existed was never
+// tested by it, so the fields that gate protects must not be applied from it.
+// 1 = measured with the degeneracy guard, the short-prompt quality pass, the
+// output-fidelity check against a substitution-free reference, and the
+// repeat-identical-request reproducibility check.
+static constexpr int COMMON_MOE_CALIBRATION_GATES_VERSION = 1;
+
 struct common_moe_calibration_entry {
     int         n_cpu_moe       = 0;
     int         n_threads       = -1;
@@ -1542,6 +1550,8 @@ struct common_moe_calibration_entry {
     // measurements of this machine and this model. See
     // common_moe_calibration_lookup.
     bool        ngl_exact               = true;
+    // 0 for any entry written before gate versioning existed.
+    int         gates_version           = 0;
 };
 
 // Key identifies "the same launch, calibrated before": GPU signature (name +
@@ -1584,6 +1594,28 @@ static std::string common_moe_calibration_key_prefix(const char * path_model, co
 }
 
 static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & cal) {
+    // An entry recorded before the output gates existed says nothing about
+    // output. The substitution floor is the clearest case: a gemma-4 entry
+    // measured at 12:46 recorded rank 2 purely because it was fastest, and
+    // when the fidelity check was added later it scored that same rank 2 at
+    // 0.33 - the output diverged from the substitution-free reference after a
+    // third of its tokens while still reading as fluent English, which is
+    // exactly what the old degeneracy-only guard could not see. Applying it
+    // anyway is how a stale measurement quietly degrades every later launch.
+    //
+    // Deliberately narrow: this skips only the fields the new gates protect.
+    // Placement, thread count, cache size and fit margin are throughput
+    // measurements that the gates never had an opinion about, so they stay
+    // valid and keep being applied from the same entry.
+    if (cal.gates_version < COMMON_MOE_CALIBRATION_GATES_VERSION) {
+        if (cal.substitute_min_rank >= 0 || !std::isnan(cal.substitute_quality_sigma)) {
+            LOG_WRN("%s: ignoring the cached substitution settings - that entry (%s) predates the output "
+                    "fidelity and reproducibility checks, so they were never applied to it. Re-run "
+                    "--moe-calibrate to measure them; everything else from the entry still applies\n",
+                    __func__, cal.calibrated_at.empty() ? "undated" : cal.calibrated_at.c_str());
+        }
+        return;
+    }
     if (cal.substitute_min_rank >= 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK")) {
 #if defined(_WIN32)
         _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
@@ -1689,6 +1721,7 @@ static bool common_moe_calibration_lookup(
         out.neuron_reduce_budget_mb = e.value("neuron_reduce_budget_mb", -1);
         out.n_gpu_layers            = e.value("n_gpu_layers", -1);
         out.calibrated_at   = e.value("calibrated_at", std::string());
+        out.gates_version   = e.value("gates_version", 0);
         return true;
     } catch (const std::exception &) {
         return false;
@@ -1720,6 +1753,7 @@ static void common_moe_calibration_save(
         {"moe_cache_mb",    entry.moe_cache_mb},
         {"substitute_min_rank", entry.substitute_min_rank},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
+        {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
         {"neuron_reduce_k",         entry.neuron_reduce_k},
         {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
