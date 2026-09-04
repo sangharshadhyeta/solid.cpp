@@ -257,6 +257,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // rather than the scarier "server unavailable" it shows for a
         // genuine connection failure.
         httplib::Server calib_srv;
+        // The real server sets this (server-http.cpp) and the status server did not,
+        // which is the entire reason it could not take the port: a server that just
+        // exited leaves 8099 in TIME_WAIT, bind fails, and retrying bind_to_port on
+        // the same httplib::Server does not recover - so the background retry added
+        // earlier spun forever and the progress page never appeared. With
+        // SO_REUSEADDR the first bind succeeds and the retry is a fallback rather
+        // than the mechanism.
+        calib_srv.set_socket_options([](const socket_t sock) {
+            httplib::set_socket_opt(sock, SOL_SOCKET, SO_REUSEADDR, 1);
+        });
         auto status_handler = [](const httplib::Request &, httplib::Response & res) {
             const auto st = common_moe_calibration_status_get_struct();
             nlohmann::json body = {
