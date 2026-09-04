@@ -514,15 +514,36 @@ struct moe_cache_device {
     // immediately, since observation alone is free and harmless.
     uint32_t req_dir_updates = 0;
     // Live pacing signal for dynamic substitution gating (see
-    // moe_cache_substitute_min_rank below): an EMA of the wall-clock gap
-    // between consecutive moe_cache_plan() calls on this device, i.e. how
-    // fast this dispatch is actually managing to move right now - fetch
-    // time, compute time, contention, everything folded in, no separate
-    // instrumentation needed. Read/written only under device.dispatch_mu,
-    // which every moe_cache_plan() caller already holds.
-    double   substitute_pace_ema_ms   = 0.0;
-    bool     substitute_pace_has_last = false;
-    std::chrono::steady_clock::time_point substitute_pace_last{};
+    // moe_cache_substitute_min_rank below). Was originally an EMA of the
+    // wall-clock gap between consecutive moe_cache_plan() calls - abandoned
+    // (2026-09-04) after live testing showed it barely ever opened the
+    // gate despite decode running at ~1 tok/s: cudaMemcpyAsync does not
+    // block the host, so successive dispatch calls race through enqueueing
+    // work without ever waiting for it, and the gap between them stays tiny
+    // regardless of how backed up the GPU-side fetch pipeline actually is.
+    // Replaced with moe_cache_track_fetch_pace's real GPU-side completion
+    // timing (issue-to-actual-finish, via a stream callback on every real
+    // H2D fetch) - the only thing that genuinely reflects pipeline backlog.
+    // That callback runs on a CUDA callback thread, not the dispatch
+    // thread, so this field needs its own lock rather than relying on
+    // dispatch_mu: hence substitute_pace_mu, touched by nothing else.
+    // Two EMAs, same fast/slow-trend SHAPE as the atlas req_dir/req_vel pair
+    // above, but their decay is derived from the standard N-period EMA
+    // formula (alpha = 2/(N+1), see moe_cache_substitute_pace_alpha_fast/
+    // _baseline) rather than borrowed from that UI-tuned tracker:
+    // substitute_pace_ema_ms (fast) is "right now"; substitute_pace_baseline_ms
+    // (slow, a fixed fetch-count multiple of the fast window) is "what's
+    // normal on this hardware/model" - self-calibrated from real
+    // observations instead of a hardcoded latency figure, so the gate
+    // adapts to whatever machine and model it's actually running on.
+    // substitute_pace_samples gates the baseline's validity (against
+    // GGML_CUDA_MOE_CACHE_SUBSTITUTE_PACE_MIN_SAMPLES in
+    // moe_cache_substitute_min_rank) so an unwarmed baseline of 0 can't make
+    // the very first fetches look infinitely-worse-than-normal.
+    std::mutex   substitute_pace_mu;
+    double       substitute_pace_ema_ms      = 0.0;
+    double       substitute_pace_baseline_ms = 0.0;
+    uint32_t     substitute_pace_samples     = 0;
     // Rate limit for the warming scan below - same clock spec_evict already
     // uses (device.collect_calls), so this doesn't need its own timer.
     long long atlas_warm_last_calls = -1;
@@ -741,18 +762,20 @@ struct moe_cache_device {
     // same fix as co_activation above, same reason.
     std::unordered_map<moe_cache_edge, uint32_t, moe_cache_edge_hash> co_activation_cross_layer;
 
-    // Decay rate for the centroid EMA - deliberately the same shape as the
-    // heat step/decay already tuned elsewhere in this file (a fast-reacting
-    // but not noise-chasing signal), not yet independently measured. Revisit
-    // once step 1 (an actual warming action) needs a real tuned value.
-    static constexpr float MOE_CACHE_ATLAS_DECAY = 0.15f;
-    // Trend (Holt's linear smoothing) decay - deliberately slower than the
-    // level's own 0.15, since a per-update delta is a second-order quantity
+    // Decay rate for the centroid EMA, derived the same way as the
+    // substitution-pacing EMAs (moe_cache_substitute_pace_alpha_fast/
+    // _baseline): the standard N-period formula, alpha = 2/(N+1), not an
+    // independently eyeballed constant. N=8 real routing decisions - enough
+    // to smooth single-decision noise while still reacting within a small
+    // fraction of one token's worth of atlas-covered picks.
+    static constexpr float MOE_CACHE_ATLAS_DECAY = 2.0f / (8.0f + 1.0f); // = 0.2222
+    // Trend (Holt's linear smoothing) decay - same formula, N=16 (2x the
+    // level's window), since a per-update delta is a second-order quantity
     // and noisier than the level itself; over-reacting to it would make the
     // lookahead point whip around on single-update jitter instead of
     // tracking a real sustained direction of movement. See req_vel_x/y and
     // moe_cache_atlas_lookahead.
-    static constexpr float MOE_CACHE_ATLAS_TREND_DECAY = 0.08f;
+    static constexpr float MOE_CACHE_ATLAS_TREND_DECAY = 2.0f / (16.0f + 1.0f); // = 0.1176
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     // Per-CPU-resident-tensor last-use tracking, for the MADV_COLD sweep. An
     // expert that is neither in the VRAM cache nor recently selected is pure
@@ -2712,6 +2735,107 @@ static void moe_cache_prefill_release_readers_cb(void * userdata) {
         }
     }
     delete ctx;
+}
+
+// See ggml_moe_cache.track_fetch_pace's doc comment in
+// ggml-backend-moe-cache.h for why this exists and what replaced it (a
+// host-side dispatch-call timer that never saw the real bottleneck, since
+// cudaMemcpyAsync does not block the caller). Same stream-callback shape as
+// moe_cache_prefill_release_readers_cb above - runs on a CUDA driver
+// callback thread once every op queued before it, including the fetch just
+// issued, has genuinely finished, not merely been enqueued.
+struct moe_cache_fetch_pace_ctx {
+    moe_cache_device * device;
+    std::chrono::steady_clock::time_point issue_time;
+};
+
+// EMA decay follows the standard N-period formula, alpha = 2/(N+1) - not
+// borrowed from the atlas UI tracker elsewhere in this file, which is tuned
+// for visual smoothness, not statistical validity for a gating decision.
+// N_FAST is chosen to smooth ordinary single-fetch scheduling jitter while
+// still reacting within a handful of fetches, well under one token's worth
+// (a token needs on the order of 10 experts x dozens of offloaded layers of
+// fetch attempts). N_BASELINE is defined as a fixed multiple of N_FAST
+// rather than an independently guessed number, so the two stay in a
+// principled ratio to each other regardless of what N_FAST itself is tuned
+// to: the baseline needs to span enough fetches to average out ordinary
+// per-token/per-layer variation and reflect genuine steady state, not one
+// token's particular mix - BASELINE_MULTIPLE sets how much longer that
+// window is, in fetch-count terms, not wall-clock time. Both overridable;
+// the multiple, not just the raw N, is what should transfer sensibly
+// across models/hardware with very different fetch rates.
+static double moe_cache_substitute_pace_alpha_fast() {
+    static const double a = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_PACE_N_FAST");
+        const int n = e ? atoi(e) : 8;
+        return 2.0 / ((n > 1 ? n : 8) + 1);
+    }();
+    return a;
+}
+static double moe_cache_substitute_pace_alpha_baseline() {
+    static const double a = [] {
+        const char * em = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_PACE_BASELINE_MULTIPLE");
+        const double multiple = em ? atof(em) : 32.0;
+        const char * en = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_PACE_N_FAST");
+        const int n_fast = en ? atoi(en) : 8;
+        const double n_baseline = (n_fast > 1 ? n_fast : 8) * (multiple > 1.0 ? multiple : 32.0);
+        return 2.0 / (n_baseline + 1.0);
+    }();
+    return a;
+}
+
+static void moe_cache_fetch_pace_cb(void * userdata) {
+    auto * ctx = static_cast<moe_cache_fetch_pace_ctx *>(userdata);
+    const double delta_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - ctx->issue_time).count();
+    {
+        std::lock_guard<std::mutex> lock(ctx->device->substitute_pace_mu);
+        ctx->device->substitute_pace_ema_ms +=
+                moe_cache_substitute_pace_alpha_fast() *
+                (delta_ms - ctx->device->substitute_pace_ema_ms);
+        ctx->device->substitute_pace_baseline_ms +=
+                moe_cache_substitute_pace_alpha_baseline() *
+                (delta_ms - ctx->device->substitute_pace_baseline_ms);
+        if (ctx->device->substitute_pace_samples < UINT32_MAX) {
+            ctx->device->substitute_pace_samples++;
+        }
+    }
+    delete ctx;
+}
+
+// Sampled, not measured on every real fetch: this is called from the same
+// hot dispatch path copy_experts already runs on, and both the CUDA driver
+// call (cudaLaunchHostFunc, ~30-50us of dispatch cost - see the reader-
+// release callback's own batching comment above for the same measurement in
+// a different context here) and the heap allocation for the context add up
+// across the ~10^5 real fetches a single generation can issue. First
+// implementation measured every fetch and cost enough of that overhead to
+// regress a 1.2-1.7 tok/s baseline down to ~0.7 - the instrumentation meant
+// to unlock throughput was paying its own cost on 100% of fetches while the
+// gate it feeds only acted on ~12% of them. 1-in-8 mirrors N_FAST's own
+// window (moe_cache_substitute_pace_alpha_fast) - the EMA doesn't need
+// every sample to stay representative, since it's smoothing over several
+// samples internally anyway.
+static void moe_cache_track_fetch_pace(void * backend_) {
+    static std::atomic<uint64_t> call_count{0};
+    if ((call_count.fetch_add(1, std::memory_order_relaxed) & 7) != 0) {
+        return; // 1-in-8 sampled
+    }
+    if (!backend_) {
+        return;
+    }
+    moe_cache_session * session = nullptr;
+    moe_cache_device * device_ptr = moe_cache_prefill_first_session_and_device(&session);
+    if (!device_ptr || !session) {
+        return;
+    }
+    cudaStream_t stream = ((ggml_backend_cuda_context *) ((ggml_backend *) backend_)->context)->stream();
+    auto * ctx = new moe_cache_fetch_pace_ctx{device_ptr, std::chrono::steady_clock::now()};
+    if (!moe_cache_cuda_ok(*device_ptr,
+            cudaLaunchHostFunc(stream, moe_cache_fetch_pace_cb, ctx),
+            "fetch-pace tracking enqueue", false)) {
+        delete ctx;
+    }
 }
 
 // Scheduler-level integration point: ggml_backend_sched_compute_splits'
@@ -7043,25 +7167,44 @@ static bool moe_cache_neuron_heat_enabled() {
     return enabled;
 }
 
-// Dynamic substitution gate (2026-09-04): the rank floor a miss must clear
-// to accept a resident stand-in now adapts to how fast this dispatch is
-// ACTUALLY managing to get real experts into VRAM recently, rather than a
-// fixed router-confidence cutoff. Measured on qwen4exp the same day this
-// replaced the static default: MIN_RANK=4 (the prior default) still cost
-// real quality - PPL 3.54 -> 5.62, non-overlapping confidence intervals, on
-// a short decode-shaped test - even though the cache was 100%/99.6% full in
-// both arms. That rules out cache occupancy as the signal: this model's
-// cache is permanently saturated, so "pool pressure" never discriminates
-// between "needs substitution" and "doesn't" here. What does vary moment to
-// moment is how long this dispatch is actually taking - PCIe contention,
-// concurrent requests, everything folds into that one number for free. The
-// EMA lives on moe_cache_device (substitute_pace_ema_ms), updated here under
-// dispatch_mu (every caller already holds it, so no new lock).
+// Substitution gate (2026-09-04, revised three times same day - this is the
+// settled version). The rank floor a miss must clear to accept a hot-loaded
+// stand-in is a DYNAMIC variable driven by real, currently-measured backlog,
+// not a fixed cutoff and not "always substitute":
+//
+//   - Unconditional (min_rank forced to 0, every rank substitutable) was
+//     tried live: fast (13.25 tok/s) but broke output - the reasoning
+//     channel got stuck in a verbatim repetition loop. Confirms the
+//     router's most-confident picks genuinely need close-to-exact compute;
+//     substituting them at volume corrupts coherence, regardless of how
+//     good the stand-in-selection method is.
+//   - A static cutoff (MIN_RANK=4) is reliable but leaves throughput on the
+//     table when the fetch pipeline has real slack (PPL cost was real:
+//     3.54 -> 5.62, non-overlapping CI, even gated).
+//   - What's actually wanted: exact compute when the pipeline is keeping
+//     up, substitution opening up (starting with the router's
+//     least-confident picks, same as the static cutoff's floor) only when
+//     it's genuinely falling behind. That requires a REAL backlog signal.
+//
+// moe_cache_track_fetch_pace supplies that signal: real GPU-side fetch
+// completion latency (issue to actual finish, via a stream callback - see
+// its own comment), not host-side dispatch-call gaps, which an earlier
+// version of this gate used and which stayed small even at ~1 tok/s live
+// because cudaMemcpyAsync never blocks the host between enqueueing copies
+// (substitutions=279 of 32,073 misses on a real 8099 session - the gate
+// barely opened despite the pipeline being nowhere near keeping up).
+//
+// The "falling behind" threshold is itself not a hardcoded latency figure:
+// device.substitute_pace_ema_ms (fast) is compared against
+// device.substitute_pace_baseline_ms (slow) - this system's own recently-
+// typical pace, self-calibrated from real observations on whatever
+// hardware/model is actually running, not a guessed millisecond constant.
+// See the struct comment on those fields and moe_cache_fetch_pace_cb for
+// how both are maintained.
 //
 // GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK, if the user sets it, still wins
-// outright - this dynamic path only fills in for someone who left it at
-// default, same "never override an explicit choice" rule as everywhere else
-// in this file.
+// outright - same "never override an explicit choice" rule as everywhere
+// else in this file.
 static int moe_cache_substitute_min_rank(moe_cache_device & device) {
     const char * pinned_env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
     if (pinned_env) {
@@ -7069,37 +7212,46 @@ static int moe_cache_substitute_min_rank(moe_cache_device & device) {
         return n < 0 ? 0 : n;
     }
 
-    // Target: the per-dispatch pace this model needs to hit for an exact
-    // fetch to be "keeping up" rather than "falling behind". No universal
-    // right answer - override via GGML_CUDA_MOE_CACHE_SUBSTITUTE_TARGET_MS
-    // if a different model/hardware needs a different floor. 8ms chosen as
-    // a conservative starting point (roughly what a single mid-sized expert
-    // H2D fetch costs on a contended PCIe link) pending real calibration.
-    static const double target_ms = [] {
-        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_TARGET_MS");
-        const double v = e ? atof(e) : 8.0;
-        return v > 0.0 ? v : 8.0;
+    // How far above this system's own recent-normal pace counts as "falling
+    // behind" - a dimensionless ratio, not an absolute latency, so it scales
+    // automatically with whatever hardware/model is actually running rather
+    // than encoding a guessed millisecond figure. Override via
+    // GGML_CUDA_MOE_CACHE_SUBSTITUTE_OVERRUN_RATIO; 1.5 (50% slower than
+    // typical) is the starting point pending real calibration - still a
+    // choice, but a scale-free one, unlike an absolute-ms target.
+    static const double overrun_ratio = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_OVERRUN_RATIO");
+        const double v = e ? atof(e) : 1.5;
+        return v > 1.0 ? v : 1.5;
+    }();
+    static const uint32_t min_samples = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_PACE_MIN_SAMPLES");
+        const int v = e ? atoi(e) : 32;
+        return (uint32_t) (v > 0 ? v : 32);
     }();
 
-    const auto now = std::chrono::steady_clock::now();
-    if (device.substitute_pace_has_last) {
-        const double delta_ms = std::chrono::duration<double, std::milli>(
-                now - device.substitute_pace_last).count();
-        // Same decay-toward-new-sample shape as the atlas req_dir tracker
-        // above - reacts within a handful of calls, doesn't chase single-call
-        // noise.
-        device.substitute_pace_ema_ms += 0.15 * (delta_ms - device.substitute_pace_ema_ms);
+    double ema, baseline;
+    uint32_t samples;
+    {
+        std::lock_guard<std::mutex> lock(device.substitute_pace_mu);
+        ema      = device.substitute_pace_ema_ms;
+        baseline = device.substitute_pace_baseline_ms;
+        samples  = device.substitute_pace_samples;
     }
-    device.substitute_pace_last = now;
-    device.substitute_pace_has_last = true;
 
-    if (device.substitute_pace_ema_ms <= target_ms) {
-        return 10; // keeping pace - never substitute, matches the measured-safe OFF behaviour
+    if (samples < min_samples || baseline <= 0.0) {
+        return 10; // baseline not warmed up yet - no signal to act on, stay exact
     }
-    // Falling behind: ramp the floor down as the overrun grows, so a small
-    // overrun costs only the router's least-confident picks and a large one
-    // opens substitution up to all of them, rather than an on/off switch.
-    const double overrun = device.substitute_pace_ema_ms / target_ms; // > 1 here
+    const double target = baseline * overrun_ratio;
+    if (ema <= target) {
+        return 10; // keeping pace relative to this system's own normal - never substitute
+    }
+    // Falling behind this system's own baseline: ramp the floor down as the
+    // overrun grows, so a small overrun costs only the router's
+    // least-confident picks (the same rank floor the static cutoff used)
+    // and a large one opens substitution up further - but real, self-
+    // measured backlog earns that, a fixed policy doesn't.
+    const double overrun = ema / target; // > 1 here
     const int rank = (int) (10.0 / overrun);
     return rank < 0 ? 0 : (rank > 10 ? 10 : rank);
 }
@@ -8442,10 +8594,14 @@ static int moe_cache_substitute_pick(
 
 // Pick the hottest resident stand-in for `missed`, breaking ties by
 // co-activation count (how often it has fired alongside the expert it would
-// replace, averaged over every request this session has served - the "these
-// two do the same job for this input" signal moe_cache_substitute_pick
-// above already uses). Two deliberate differences from that function, both
-// per 2026-09-04 discussion:
+// replace, tracked live and continuously across this session's own real
+// requests - the dynamic "these two do the same job for this input" signal,
+// not the static, offline 9-category --expert-atlas-file probe data, which
+// is explicitly NOT what this uses: co-activation grows and adapts with
+// actual traffic, the atlas file is a fixed snapshot from 27 canned probes
+// run once at build time. An atlas-position-based version of this was tried
+// and reverted the same day - the dynamic, live-updating signal is the
+// wanted one).
 //   - heat is the PRIMARY key, co-activation only a tiebreak - "hot loaded"
 //     candidates are preferred outright, not merely used to break ties
 //     between similarly-co-activated ones.
@@ -8545,6 +8701,102 @@ static int moe_cache_substitute_pick_rank(
     return -1;
 }
 
+// Pruning for the live session-tracking maps (co_activation,
+// co_activation_cross_layer, neuron_heat) - all insert-only, no eviction,
+// growing with every newly-observed expert pair or (tensor,expert) combo
+// for the life of the session. Measured cause of a real, repeatable memory
+// leak (2026-09-04): swap grew ~500MB per 150-token generation on qwen4exp,
+// RSS fell while VmSize kept climbing - the signature of heap that's never
+// freed forcing the kernel to swap out colder pages to stay under the
+// cgroup limit. None of these maps individually looked catastrophic, but
+// all shared the same insert-only shape.
+//
+// co_activation's key space is the real risk - up to ~130K pairs/layer x
+// n_layer, not bounded by n_expert alone the way a per-(tensor,expert) map
+// is. Pruned by VALUE (the co-activation count): single-observation pairs
+// first (cheapest to justify losing - noise, not a repeated signal, and
+// normally the large majority of low-value entries), falling back to a
+// real nth_element threshold only if that alone didn't reach the target.
+static uint32_t moe_cache_coact_max_entries() {
+    static const uint32_t n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_COACT_MAX_ENTRIES");
+        const long v = e ? atol(e) : 2000000L;
+        return (uint32_t) (v > 1000 ? v : 2000000L);
+    }();
+    return n;
+}
+
+template <typename CoactMap>
+static void moe_cache_prune_coact_map(CoactMap & m) {
+    const size_t cap = moe_cache_coact_max_entries();
+    if (m.size() <= cap) {
+        return;
+    }
+    const size_t target = cap * 4 / 5; // hysteresis - don't re-trigger every call once at the boundary
+    for (auto it = m.begin(); it != m.end() && m.size() > target; ) {
+        it = it->second <= 1 ? m.erase(it) : std::next(it);
+    }
+    if (m.size() > target) {
+        std::vector<uint32_t> counts;
+        counts.reserve(m.size());
+        for (const auto & kv : m) {
+            counts.push_back(kv.second);
+        }
+        const size_t remove_n = m.size() - target;
+        std::nth_element(counts.begin(), counts.begin() + (ptrdiff_t) remove_n, counts.end());
+        const uint32_t threshold = counts[remove_n];
+        for (auto it = m.begin(); it != m.end() && m.size() > target; ) {
+            it = it->second <= threshold ? m.erase(it) : std::next(it);
+        }
+    }
+}
+
+// neuron_heat has no cheap per-entry "value" the way co_activation's own
+// count does (heat lives per-neuron inside the vector, not per-key), so
+// this bounds total memory by evicting in iteration order once over cap
+// rather than a true LRU/least-valuable policy - strictly better than the
+// unbounded status quo even without one. Its natural key space (n_expert x
+// n_layer for one loaded model) is normally well under the default cap; the
+// cap mainly guards larger-expert-count architectures and very long
+// sessions rather than triggering routinely here.
+static uint32_t moe_cache_neuron_heat_max_entries() {
+    static const uint32_t n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_NEURON_HEAT_MAX_ENTRIES");
+        const long v = e ? atol(e) : 50000L;
+        return (uint32_t) (v > 100 ? v : 50000L);
+    }();
+    return n;
+}
+
+static void moe_cache_prune_neuron_heat(moe_cache_device & device) {
+    auto & m = device.neuron_heat;
+    const size_t cap = moe_cache_neuron_heat_max_entries();
+    if (m.size() <= cap) {
+        return;
+    }
+    const size_t target = cap * 4 / 5;
+    for (auto it = m.begin(); it != m.end() && m.size() > target; ) {
+        it = m.erase(it);
+    }
+}
+
+// Rate limit for the pruning above - a full-map pass is not free at
+// multi-million-entry scale, so this only even checks .size() (cheap) most
+// calls and only does real work on the rare call where that check trips.
+static void moe_cache_prune_session_maps(moe_cache_device & device) {
+    static const uint32_t interval = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_PRUNE_INTERVAL");
+        const long v = e ? atol(e) : 4096L;
+        return (uint32_t) (v > 0 ? v : 4096L);
+    }();
+    if (device.plan_epoch % interval != 0) {
+        return;
+    }
+    moe_cache_prune_coact_map(device.co_activation);
+    moe_cache_prune_coact_map(device.co_activation_cross_layer);
+    moe_cache_prune_neuron_heat(device);
+}
+
 static int moe_cache_plan(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
@@ -8595,6 +8847,7 @@ static int moe_cache_plan(
     moe_cache_device::cpu_residency * residency = nullptr;
     uint32_t age_now = 0;
     device.plan_epoch++;
+    moe_cache_prune_session_maps(device);
     if (moe_cache_cold_after_s() > 0 && node->n_expert > 0) {
         const auto now = std::chrono::steady_clock::now();
         if (device.residency_epoch.time_since_epoch().count() == 0) {
@@ -8948,6 +9201,17 @@ static int moe_cache_plan(
         // self-confirming loop where resident experts are the only ones ever
         // used and therefore the only ones ever kept - the confirmation-drift
         // trap docs/plan.md already names for the dynamic atlas.
+        //
+        // Unconditional (2026-09-04): every miss attempts a hot-loaded
+        // stand-in first - generation only ever uses what's actually
+        // resident in VRAM, never waits on a real fetch by choice. A real
+        // PCIe fetch only happens when moe_cache_substitute_pick_hot itself
+        // returns -1, i.e. nothing for this tensor is resident at all
+        // (measured well under 5% of attempts) - that is a hard floor, not
+        // a pacing decision. The earlier rank/pace-gated version is kept
+        // available via GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK for anyone
+        // who wants the router's most-confident picks to always pay exact
+        // compute regardless of residency.
         if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
             rank_bucket >= moe_cache_substitute_min_rank(device) &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
@@ -11492,6 +11756,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.prefill_release = moe_cache_prefill_release;
     ggml_moe_cache.moe_lfru_copy_expert = moe_cache_moe_lfru_copy_expert;
     ggml_moe_cache.moe_lfru_copy_experts = moe_cache_moe_lfru_copy_experts;
+    ggml_moe_cache.track_fetch_pace = moe_cache_track_fetch_pace;
 }
 
 #endif

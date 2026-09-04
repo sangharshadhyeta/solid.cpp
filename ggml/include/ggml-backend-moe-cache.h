@@ -326,6 +326,21 @@ struct ggml_moe_cache_api {
             const void * host_base, size_t expert_size, const int32_t * ids, int n_ids,
             void * dst_base, uint8_t * out_hit, void * backend);
 
+    // Real-fetch pacing signal for the dynamic substitution gate (see
+    // moe_cache_substitute_min_rank in moe-cache.cu): call this once, right
+    // after issuing a genuine H2D fetch (a cache miss that could not be
+    // served D2D), passing the backend the copy was issued on. Enqueues a
+    // stream callback - same cudaLaunchHostFunc mechanism the reader-release
+    // pins already use - that fires once every op queued before it,
+    // including the fetch just issued, has actually finished on the GPU.
+    // The callback measures real wall-clock elapsed time (issue to genuine
+    // completion, not merely to enqueue) and folds it into the device's
+    // pacing EMA, which is what decides how far the substitution gate opens.
+    // Deliberately does not block the caller - the whole point is to learn
+    // how backed up the fetch pipeline really is without adding a wait of
+    // its own. NULL-safe; a no-op if no CUDA moe-cache session exists.
+    void (*track_fetch_pace)(void * backend);
+
     // Aggregate cache health summary - see ggml_moe_cache_summary. Always
     // writes *out (zeroed on failure). NULL-safe like the other optional
     // entries here.

@@ -2082,6 +2082,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
+                        if (ggml_moe_cache.track_fetch_pace) {
+                            ggml_moe_cache.track_fetch_pace(split_backend);
+                        }
                     };
 
                     int id = 0;
