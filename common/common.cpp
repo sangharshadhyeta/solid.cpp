@@ -2526,14 +2526,24 @@ static std::vector<common_moe_calibration_decision> g_moe_calib_decisions;
 
 void common_moe_calibration_status_note(
         const std::string & lever, const std::string & value,
-        const std::string & result, bool accepted) {
+        const std::string & result, bool accepted, bool chosen) {
     std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
     // Bounded: a long run on a slow model can produce a lot of these, and the
     // page only ever renders them. Oldest first out, newest kept.
     if (g_moe_calib_decisions.size() >= 64) {
         g_moe_calib_decisions.erase(g_moe_calib_decisions.begin());
     }
-    g_moe_calib_decisions.push_back({lever, value, result, accepted});
+    if (chosen) {
+        // Only one winner per lever: a later commit for the same lever
+        // supersedes an earlier one (the confirmation step can step the
+        // substitution floor back after the ladder already picked it).
+        for (auto & d : g_moe_calib_decisions) {
+            if (d.lever == lever) {
+                d.chosen = false;
+            }
+        }
+    }
+    g_moe_calib_decisions.push_back({lever, value, result, accepted, chosen});
 }
 
 void common_moe_calibration_status_candidate_done() {
@@ -3150,6 +3160,13 @@ void common_moe_calibrate(common_params & params) {
         // confirm that instead.
         while (best_min_rank >= 0 && !common_moe_calibrate_budget_spent()) {
             const int confirm_predict = n_predict * 4;
+            // Say so. This step re-runs the winner at 4x the probe length and
+            // on a slow model that is several minutes during which the stage
+            // line and the decisions table both sat unchanged, which reads as
+            // a stall rather than as the longest single check in the run.
+            common_moe_calibration_status_set(string_format(
+                    "confirming substitution floor rank %d over %d tokens",
+                    best_min_rank, confirm_predict));
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
                     confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank);
@@ -3157,12 +3174,19 @@ void common_moe_calibrate(common_params & params) {
             if (tps > 0) {
                 LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
                         __func__, best_min_rank, confirm_predict, tps);
+                common_moe_calibration_status_note("substitution floor",
+                        string_format("rank %d", best_min_rank),
+                        string_format("confirmed over %d tokens - %.2f tok/s", confirm_predict, tps), true);
                 break;
             }
             // Degenerate (or failed) at length: step toward the safe end.
             const int safer = best_min_rank < 2 ? 2 : (best_min_rank < 4 ? 4 : (best_min_rank < 6 ? 6 : 10));
             LOG_WRN("%s:   rank %d did NOT hold over %d tokens - stepping back to rank %d\n",
                     __func__, best_min_rank, confirm_predict, safer);
+            common_moe_calibration_status_note("substitution floor",
+                    string_format("rank %d", best_min_rank),
+                    string_format("did not hold over %d tokens - stepping back to rank %d",
+                            confirm_predict, safer), false);
             if (safer == best_min_rank || safer > 10) {
                 best_min_rank = -1; // nothing survived confirmation; leave the runtime default in place
                 break;
@@ -3172,6 +3196,10 @@ void common_moe_calibrate(common_params & params) {
         if (best_min_rank >= 0) {
             LOG_INF("%s: substitution floor: rank %d at %.2f tok/s - carried into the remaining stages\n",
                     __func__, best_min_rank, best_min_rank_tps);
+            common_moe_calibration_status_note("substitution floor",
+                    string_format("rank %d", best_min_rank),
+                    string_format("SELECTED - %.2f tok/s, carried into the remaining stages", best_min_rank_tps),
+                    true, /* chosen */ true);
             // Everything measured from here on is measured at this floor, so
             // the later knobs are tuned against the configuration that will
             // actually be served.
@@ -3238,6 +3266,9 @@ void common_moe_calibrate(common_params & params) {
             if (!std::isnan(best_sigma)) {
                 LOG_INF("%s: stand-in quality bar: %.1f sigma at %.2f tok/s\n",
                         __func__, best_sigma, best_sigma_tps);
+                common_moe_calibration_status_note("stand-in quality bar",
+                        string_format("%+.1f sigma", best_sigma),
+                        string_format("SELECTED - %.2f tok/s", best_sigma_tps), true, /* chosen */ true);
                 best_tps = std::max(best_tps, best_sigma_tps);
             }
         }

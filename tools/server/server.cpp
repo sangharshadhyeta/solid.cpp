@@ -297,6 +297,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
                                 {"value",    d.value},
                                 {"result",   d.result},
                                 {"accepted", d.accepted},
+                                {"chosen",   d.chosen},
                             });
                         }
                         return arr;
@@ -338,6 +339,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "#dec td{padding:.3rem .5rem .3rem 0;border-bottom:1px solid #1b1b1e;color:#c8c8cc}"
                 "#dec td.r{color:#4ed6a5}"
                 "#dec tr.no td{color:#8a8a8f}"
+                "#dec tr.sel td{color:#e9fbf4;background:#12241d;font-weight:600}"
+                "#dec tr.sel td:first-child::before{content:'\\2713 ';color:#4ed6a5}"
                 "#dec tr.no td.r{color:#d67a7a}"
                 "#dec-wrap{display:none}"
                 "#dec{margin-top:1.2rem;width:100%;border-collapse:collapse;font-size:.78rem}"
@@ -381,7 +384,7 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "document.getElementById('dec-wrap').style.display='block';"
                 "var h='';"
                 "for(var i=ds.length-1;i>=0;i--){var d=ds[i];"
-                "h+=\"<tr class='\"+(d.accepted?'yes':'no')+\"'><td>\"+d.lever+\"</td><td>\"+d.value+\"</td>\"+"
+                "h+=\"<tr class='\"+(d.chosen?'sel':(d.accepted?'yes':'no'))+\"'><td>\"+d.lever+\"</td><td>\"+d.value+\"</td>\"+"
                 "\"<td class='r'>\"+d.result+\"</td></tr>\";}"
                 "document.getElementById('dec-body').innerHTML=h;"
                 "}"
