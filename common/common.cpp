@@ -2423,13 +2423,31 @@ void common_moe_calibrate(common_params & params) {
     // best of what was truly measured" check, but with no averaging to
     // absorb a plain bad-luck sample within one candidate.
     constexpr int n_samples_per_candidate = 1;
+    // The substitution floor decided so far, carried into every later stage's
+    // candidates. Stages are supposed to build on each other's decisions, not
+    // each measure a different machine: without this the ladder settles on a
+    // rank, and then the -ngl, thread, cache-size and fit-margin stages all
+    // benchmark with substitution back at the runtime default. Seen plainly on
+    // gemma-4 - the ladder peaked at 42.70 tok/s and every stage after it
+    // measured ~36, not because anything degraded but because they had quietly
+    // dropped the setting the ladder had just established, and then tuned
+    // cache size against a configuration that is not the one being served.
+    int active_min_rank = -1;
+    // Same reasoning for the GPU-resident layer count: it is decided by its
+    // own stage and then every later stage passed a hardcoded 99 (full
+    // residency), so thread count, cache size and fit margin were all tuned
+    // against a layer placement the server will not be using. 99 remains the
+    // pre-decision default, matching the parameter's own default.
+    int active_ngl = 99;
     auto bench_one_sample = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
         double tps = common_moe_bench_candidate_server(
-                self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency);
+                self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
+                -1, -1, active_ngl, active_min_rank);
         if (tps < 0) {
             LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency);
+                    self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
+                    -1, -1, active_ngl, active_min_rank);
         }
         return tps;
     };
@@ -2645,7 +2663,7 @@ void common_moe_calibrate(common_params & params) {
             }
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
-                    concurrency, -1, -1, 99, rank);
+                    concurrency, -1, -1, active_ngl, rank);
             LOG_INF("%s:   substitute-min-rank=%d -> %s\n", __func__, rank,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate");
             common_moe_calibration_status_candidate_done();
@@ -2667,7 +2685,7 @@ void common_moe_calibrate(common_params & params) {
             const int confirm_predict = n_predict * 4;
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
-                    confirm_predict, concurrency, -1, -1, 99, best_min_rank);
+                    confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank);
             common_moe_calibration_status_candidate_done();
             if (tps > 0) {
                 LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
@@ -2685,7 +2703,13 @@ void common_moe_calibrate(common_params & params) {
             best_min_rank = safer;
         }
         if (best_min_rank >= 0) {
-            LOG_INF("%s: substitution floor: rank %d at %.2f tok/s\n", __func__, best_min_rank, best_min_rank_tps);
+            LOG_INF("%s: substitution floor: rank %d at %.2f tok/s - carried into the remaining stages\n",
+                    __func__, best_min_rank, best_min_rank_tps);
+            // Everything measured from here on is measured at this floor, so
+            // the later knobs are tuned against the configuration that will
+            // actually be served.
+            active_min_rank = best_min_rank;
+            best_tps = std::max(best_tps, best_min_rank_tps);
         }
     }
 
@@ -2706,11 +2730,11 @@ void common_moe_calibrate(common_params & params) {
             for (int i = 0; i < n_samples_per_candidate; i++) {
                 double tps = common_moe_bench_candidate_server(
                         self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
-                        concurrency, -1, -1, n);
+                        concurrency, -1, -1, n, active_min_rank);
                 if (tps < 0) {
                     tps = common_moe_bench_candidate_server(
                             self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
-                            concurrency, -1, -1, n);
+                            concurrency, -1, -1, n, active_min_rank);
                 }
                 if (tps > 0) { sum += tps; n_ok++; }
             }
@@ -2763,11 +2787,11 @@ void common_moe_calibrate(common_params & params) {
                 auto measure_ncmoe2 = [&](int n) -> double {
                     double tps = common_moe_bench_candidate_server(
                             self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
-                            concurrency, -1, -1, (int) best_ngl);
+                            concurrency, -1, -1, (int) best_ngl, active_min_rank);
                     if (tps < 0) {
                         tps = common_moe_bench_candidate_server(
                                 self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
-                                concurrency, -1, -1, (int) best_ngl);
+                                concurrency, -1, -1, (int) best_ngl, active_min_rank);
                     }
                     LOG_INF("%s:   ncmoe=%d (ngl=%u) -> %s\n", __func__, n, best_ngl,
                             tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
@@ -2793,6 +2817,11 @@ void common_moe_calibrate(common_params & params) {
         } else {
             LOG_INF("%s: full GPU residency still wins (%.2f tok/s) - -ngl left at default\n", __func__, best_tps);
             best_ngl = ngl_hi;
+        }
+        // Carry it forward, so the thread / cache-size / fit-margin stages
+        // below measure at the layer residency actually chosen.
+        if (best_ngl <= (uint32_t) probe.n_layer) {
+            active_ngl = (int) best_ngl;
         }
     }
 
@@ -2930,11 +2959,11 @@ void common_moe_calibrate(common_params & params) {
         const int mb = cache_candidates_mb[i];
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                best_threads, next_port(), ctx, n_predict, concurrency, mb);
+                best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
         if (tps < 0) {
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                    best_threads, next_port(), ctx, n_predict, concurrency, mb);
+                    best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
         }
         LOG_INF("%s:   moe-cache=%dMiB -> %s\n", __func__, mb,
                 tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
@@ -3010,7 +3039,7 @@ void common_moe_calibrate(common_params & params) {
             }
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, safe_n, n_max_for_threads,
-                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, mb);
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, mb, active_ngl, active_min_rank);
             LOG_INF("%s:   fitt=%dMiB -> %s\n", __func__, mb,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
             common_moe_calibration_status_candidate_done();
