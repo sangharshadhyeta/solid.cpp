@@ -4729,12 +4729,45 @@ void server_routes::atlas_regen_loop(std::string atlas_file, std::string coact_f
         return 180;
     }();
 
-    // llama.cpp's own source tree location relative to this binary isn't
-    // tracked at runtime, so the script is found the same way a user would
-    // invoke it themselves: relative to the current working directory the
-    // server was launched from. Matches how scripts/ is documented to be run
-    // (docs/index.html's own example commands are all repo-root-relative).
-    const std::string script_path = "scripts/moe-atlas-evolve.py";
+    // Resolve the script by trying the CWD-relative path first (how a user
+    // running from the repo root would invoke it, and how docs/index.html's
+    // examples are written), then relative to this binary's own location.
+    // CWD-only was a real bug: a server started by systemd-run, a service
+    // manager, or from any directory other than the repo root got a working
+    // directory where "scripts/..." does not exist, so python3 exited 2
+    // (surfacing here as rc 512) on EVERY regen interval - the dynamic atlas
+    // silently never regenerated, and the Brain view fell back to its
+    // fixed-grid layout with no indication why.
+    const std::string script_rel = "scripts/moe-atlas-evolve.py";
+    std::string script_path;
+    {
+        std::vector<std::filesystem::path> candidates = { std::filesystem::path(script_rel) };
+        std::error_code exe_ec;
+        const auto exe = std::filesystem::read_symlink("/proc/self/exe", exe_ec);
+        if (!exe_ec) {
+            const auto bin_dir = exe.parent_path();
+            // build/bin/llama-server -> repo root is two levels up; also try
+            // one level up for flatter install layouts.
+            candidates.push_back(bin_dir / ".." / ".." / script_rel);
+            candidates.push_back(bin_dir / ".." / script_rel);
+            candidates.push_back(bin_dir / script_rel);
+        }
+        for (const auto & cand : candidates) {
+            std::error_code ec;
+            if (std::filesystem::exists(cand, ec) && !ec) {
+                script_path = std::filesystem::weakly_canonical(cand, ec).string();
+                if (ec || script_path.empty()) {
+                    script_path = cand.string();
+                }
+                break;
+            }
+        }
+        if (script_path.empty()) {
+            SRV_WRN("atlas-regen: could not find %s (looked relative to the working directory and to "
+                    "this binary) - the dynamic atlas will not regenerate\n", script_rel.c_str());
+            return;
+        }
+    }
 
     SRV_INF("atlas-regen: will regenerate '%s' from '%s' every %ds (state: '%s')\n",
             atlas_file.c_str(), coact_file.c_str(), interval_s, state_path.string().c_str());
