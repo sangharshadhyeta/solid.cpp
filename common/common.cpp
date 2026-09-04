@@ -2650,8 +2650,14 @@ void common_moe_calibrate(common_params & params) {
         // probe, this only has to find a context that FITS so the actual
         // search can start, and the fit machinery downstream still gets the
         // final say on placement at whatever context this lands on.
-        const uint32_t requested     = cparams.n_ctx;
-        const uint32_t requested_par = cparams.n_seq_max;
+        // Resolve both the way the rest of this file does. A bare launch
+        // leaves n_ctx at 0 meaning "the model's own trained context", and
+        // reading it raw made `requested / 2` zero, so the loops below never
+        // executed even once - which is why this still reported "does not fit
+        // even at 512" while an explicit -c 2048 --parallel 1 fitted
+        // immediately. Same for n_seq_max.
+        const uint32_t requested     = cparams.n_ctx     > 0 ? cparams.n_ctx     : 4096;
+        const uint32_t requested_par = cparams.n_seq_max > 0 ? cparams.n_seq_max : 1;
         bool found = false;
         // Concurrency first, and context only after. On a hybrid model the
         // recurrent-state cache is sized by n_seq_max, not by n_ctx, so on
