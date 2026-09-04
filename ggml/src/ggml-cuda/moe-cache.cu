@@ -1661,6 +1661,16 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
 // moe_cache_atlas_rank and moe_cache_atlas_align_score only ever use it
 // through a cosine similarity, which normalizes magnitude away - only the
 // direction the horizon bends it toward does.
+// Diagnostic-only per-node routing-width dump. Read once: this is checked in
+// moe_cache_plan(), which runs ~139x/token inside the session lock, and a bare
+// getenv() there walks environ on every call.
+static bool moe_cache_width_debug_enabled() {
+    static const bool enabled = [] {
+        return getenv("GGML_CUDA_MOE_CACHE_WIDTH") != nullptr;
+    }();
+    return enabled;
+}
+
 static bool moe_cache_atlas_lookahead_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_ATLAS_LOOKAHEAD");
@@ -8887,7 +8897,7 @@ static int moe_cache_plan(
     // really are selecting every expert, n_ids is not n_tokens*top_k but something
     // far larger, and several 4096-sized arrays on both sides of the handshake are
     // undersized for it.
-    if (getenv("GGML_CUDA_MOE_CACHE_WIDTH")) {
+    if (moe_cache_width_debug_enabled()) {
         // Ring buffer of the last 48 layer-2 dispatches, dumped at the first
         // identity flip so we can see what the cache was doing in the moments
         // BEFORE the fault, not after it.
