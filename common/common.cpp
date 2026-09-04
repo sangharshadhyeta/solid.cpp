@@ -2480,7 +2480,7 @@ void common_moe_calibrate(common_params & params) {
         int est = ncmoe_will_search
                 ? common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi)
                 : 1;
-        est += 3; // substitution-floor ladder (rank 10 / 4 / 2)
+        est += 7; // substitution-floor ladder (6 rungs) + long-probe confirmation
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
         est += common_golden_section_eval_estimate((int) ngl_lo_est, (int) ngl_hi_est); // -ngl search
@@ -2633,11 +2633,13 @@ void common_moe_calibrate(common_params & params) {
         // Coarse ladder rather than a golden-section search: the response is
         // a quality cliff, not a smooth curve, and each point costs a full
         // server spawn on a budget that is already tight for slow models.
-        // Three points spanning the range (never / moderate / aggressive)
-        // rather than four: on a slow model each costs a full server spawn,
-        // and the response is a cliff, so a denser ladder buys resolution
-        // where there is none to find.
-        for (const int rank : {10, 4, 2}) {
+        // Descend to 0, not to a floor picked in advance. An earlier version
+        // stopped at 2 because live testing had shown rank 0 producing word
+        // salad - but that made the floor an assumption baked into the code
+        // rather than something this run measured, on a machine and model it
+        // may not hold for. The degeneracy guard rejects whatever actually
+        // breaks, so the ladder can safely ask the question instead.
+        for (const int rank : {10, 6, 4, 2, 1, 0}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
@@ -2651,6 +2653,36 @@ void common_moe_calibrate(common_params & params) {
                 best_min_rank_tps = tps;
                 best_min_rank     = rank;
             }
+        }
+        // Confirm the winner over a LONGER generation before committing it.
+        // The ladder's own probes are short (n_predict, kept small so more
+        // levers fit the budget), and short-probe coherence does not prove
+        // long-generation coherence: every degenerate output observed by hand
+        // on this model appeared at 150-250 tokens, well past where these
+        // probes stop looking. Rather than leave that as a known blind spot,
+        // re-measure the winner at 4x the probe length and, if the guard
+        // rejects it there, fall back one rung toward the safe end and
+        // confirm that instead.
+        while (best_min_rank >= 0 && !common_moe_calibrate_budget_spent()) {
+            const int confirm_predict = n_predict * 4;
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                    confirm_predict, concurrency, -1, -1, 99, best_min_rank);
+            common_moe_calibration_status_candidate_done();
+            if (tps > 0) {
+                LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
+                        __func__, best_min_rank, confirm_predict, tps);
+                break;
+            }
+            // Degenerate (or failed) at length: step toward the safe end.
+            const int safer = best_min_rank < 2 ? 2 : (best_min_rank < 4 ? 4 : (best_min_rank < 6 ? 6 : 10));
+            LOG_WRN("%s:   rank %d did NOT hold over %d tokens - stepping back to rank %d\n",
+                    __func__, best_min_rank, confirm_predict, safer);
+            if (safer == best_min_rank || safer > 10) {
+                best_min_rank = -1; // nothing survived confirmation; leave the runtime default in place
+                break;
+            }
+            best_min_rank = safer;
         }
         if (best_min_rank >= 0) {
             LOG_INF("%s: substitution floor: rank %d at %.2f tok/s\n", __func__, best_min_rank, best_min_rank_tps);
