@@ -1286,7 +1286,21 @@ void        common_moe_calibration_status_set_total(int total_candidates);
 // Call once each time a real benchmark candidate finishes (success or
 // failure - both cost the same wall-clock time), regardless of stage.
 void        common_moe_calibration_status_candidate_done();
+// Record what a finished candidate settled on, for the status page's results
+// table. A progress bar says the run is alive; this says what it is learning -
+// which is the part worth watching, and the part that shows a candidate being
+// rejected rather than merely being slow.
+void        common_moe_calibration_status_note(
+                const std::string & lever, const std::string & value,
+                const std::string & result, bool accepted);
 std::string common_moe_calibration_status_get(); // human-readable, includes elapsed time, progress, and ETA
+
+struct common_moe_calibration_decision {
+    std::string lever;    // "expert placement", "substitution floor", ...
+    std::string value;    // "ncmoe=20", "rank 2", ...
+    std::string result;   // "54.90 tok/s", "rejected - not reproducible (2/5)"
+    bool        accepted = true;
+};
 
 struct common_moe_calibration_status {
     std::string stage;
@@ -1294,6 +1308,7 @@ struct common_moe_calibration_status {
     int         done;
     int         total;    // 0 = no estimate yet
     long long   eta_s;    // -1 = not enough data yet for an estimate
+    std::vector<common_moe_calibration_decision> decisions;
 };
 // Same underlying state as common_moe_calibration_status_get(), as raw
 // fields - for a caller (the --moe-calibrate status page) that wants to

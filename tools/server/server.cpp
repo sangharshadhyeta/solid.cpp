@@ -285,6 +285,22 @@ int llama_server(common_params & params, int argc, char ** argv) {
                     {"done",      st.done},
                     {"total",     st.total}, // 0 = no estimate yet
                     {"eta_s",     st.eta_s}, // -1 = not enough data yet
+                    // What each finished candidate settled on. The bar says
+                    // the run is alive; this says what it is learning, and
+                    // makes a rejection visible as a rejection rather than as
+                    // a candidate that merely scored badly.
+                    {"decisions", [&] {
+                        json arr = json::array();
+                        for (const auto & d : st.decisions) {
+                            arr.push_back({
+                                {"lever",    d.lever},
+                                {"value",    d.value},
+                                {"result",   d.result},
+                                {"accepted", d.accepted},
+                            });
+                        }
+                        return arr;
+                    }()},
                 }},
             };
             res.status = 503;
@@ -316,11 +332,31 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "#bar-track{background:#232326;border-radius:999px;height:.5rem;overflow:hidden;margin:.7rem 0}"
                 "#bar-fill{background:#4ed6a5;height:100%;width:0%;transition:width .4s ease;border-radius:999px}"
                 "#stats{display:flex;justify-content:space-between;font-size:.78rem;color:#8a8a8f}"
+                "#dec{margin-top:1.2rem;width:100%;border-collapse:collapse;font-size:.78rem}"
+                "#dec th{text-align:left;color:#8a8a8f;font-weight:500;padding:.3rem .5rem .3rem 0;"
+                "border-bottom:1px solid #232326}"
+                "#dec td{padding:.3rem .5rem .3rem 0;border-bottom:1px solid #1b1b1e;color:#c8c8cc}"
+                "#dec td.r{color:#4ed6a5}"
+                "#dec tr.no td{color:#8a8a8f}"
+                "#dec tr.no td.r{color:#d67a7a}"
+                "#dec-wrap{display:none}"
+                "#dec{margin-top:1.2rem;width:100%;border-collapse:collapse;font-size:.78rem}"
+                "#dec th{text-align:left;color:#8a8a8f;font-weight:500;padding:.3rem .5rem .3rem 0;"
+                "border-bottom:1px solid #232326}"
+                "#dec td{padding:.3rem .5rem .3rem 0;border-bottom:1px solid #1b1b1e;color:#c8c8cc}"
+                "#dec tr.no td{color:#8a8a8f}"
+                "#dec td.r{color:#4ed6a5}"
+                "#dec tr.no td.r{color:#d67a7a}"
+                "#dec-wrap{display:none}"
                 "</style></head><body><main>"
                 "<h1><span class='spin'></span>Calibrating MoE placement</h1>"
                 "<p id='stage'>Contacting status endpoint ...</p>"
                 "<div id='bar-track'><div id='bar-fill'></div></div>"
                 "<div id='stats'><span id='count'></span><span id='eta'></span></div>"
+                "<div id='dec-wrap'><table id='dec'><thead><tr><th>Decided</th><th>Tried</th>"
+                "<th>Result</th></tr></thead><tbody id='dec-body'></tbody></table></div>"
+                "<div id='dec-wrap'><table id='dec'><thead><tr><th>Decided</th><th>Tried</th>"
+                "<th>Result</th></tr><tbody id='dec-body'></tbody></table></div>"
                 "<p style='font-size:.78rem'>This page refreshes itself every 3 seconds - no action needed. "
                 "The progress bar is a rough estimate, not exact - some search stages only get sized once "
                 "earlier ones finish.</p>"
@@ -340,6 +376,25 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "if(c.eta_s>=0){const tm=Math.floor(c.eta_s/60),ts=c.eta_s%60;"
                 "etaTxt+=' - ~'+tm+'m'+String(ts).padStart(2,'0')+'s left';}"
                 "document.getElementById('eta').textContent=etaTxt;"
+                "var ds=c.decisions||[];"
+                "if(ds.length){"
+                "document.getElementById('dec-wrap').style.display='block';"
+                "var h='';"
+                "for(var i=ds.length-1;i>=0;i--){var d=ds[i];"
+                "h+=\"<tr class='\"+(d.accepted?'yes':'no')+\"'><td>\"+d.lever+\"</td><td>\"+d.value+\"</td>\"+"
+                "\"<td class='r'>\"+d.result+\"</td></tr>\";}"
+                "document.getElementById('dec-body').innerHTML=h;"
+                "}"
+                "const ds=c.decisions||[];"
+                "if(ds.length){"
+                "document.getElementById('dec-wrap').style.display='block';"
+                "let h='';"
+                // newest first: the interesting row is the one that just landed
+                "for(let i=ds.length-1;i>=0;i--){const d=ds[i];"
+                "h+=\"<tr class='\"+(d.accepted?'yes':'no')+\"'><td>\"+d.lever+\"</td><td>\"+d.value+"
+                "\"</td><td class='r'>\"+d.result+\"</td></tr>\";}"
+                "document.getElementById('dec-body').innerHTML=h;"
+                "}"
                 "}else if(j.default_generation_settings||j.model_path){"
                 // Calibration finished: this same process stopped the status
                 // server and started real serving on the same port, so /props
