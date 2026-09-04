@@ -74,20 +74,29 @@ wrong, the experts are reaching the GPU by some other route.
 
 ## It scales with the number of offloaded GPU layers
 
-| `-ngl` | deterministic? | matches CPU? |
-|---|---|---|
-| 0 | yes, 4/4 | yes (reference) |
-| 1 | yes, 4/4 | yes |
-| 5 | yes, 4/4 | yes |
-| 10 | yes, 4/4 | no - stable but different (ordinary fp difference from a different split point) |
-| 20 | yes, 4/4 | yes |
-| 25 | **no** | no - one run reproduced `thought- own- own- own-` exactly |
-| 30 / auto | **no** | no |
+Reported as failure *rates*, not verdicts. An earlier revision of this file
+recorded these as binary deterministic/not, from four samples each. That was
+wrong in the same way the SWA claim was: the failure is probabilistic, so four
+samples cannot tell "deterministic" from "usually fine", and two configurations
+were mislabelled on that basis.
 
-Note `-ngl 20` is deterministic *and* correct even though experts are still
-CPU-offloaded there, so plain weight offload is not sufficient to trigger it.
-The failure appears somewhere above 20 layers, as VRAM fills (8.9 GiB of 12 GiB
-in use at `-ngl 25`). Still nondeterministic at `--no-op-offload`.
+Twelve identical greedy requests per configuration, counting distinct answers:
+
+| `-ngl` | samples | distinct | most common | reading |
+|---|---|---|---|---|
+| 0 (pure CPU) | 12 | 1 | 12/12 | no failure observed |
+| 20 | 12 | 2 | 11/12 | ~8% |
+| 20 + MTP/`-bs`/q8_0 KV | 28 | - | 27/28 | ~4% |
+| default (all layers) | 12 | 9 | 4/12 | ~67% |
+
+So it is a gradient, not a threshold. Note also that no configuration is
+perfectly reproducible - a pure-CPU run disagrees with itself occasionally at
+short lengths, which is why the calibration gate added alongside this asks for
+majority agreement rather than unanimity.
+
+A single-sample sweep across `-ngl` 0/1/5/10/20 read as "deterministic at all of
+them"; the rates above show that was luck at 20 and the sweep could not have
+distinguished the cases it was being used to distinguish.
 
 ## Why nondeterminism points somewhere specific
 

@@ -438,13 +438,13 @@ differences are <em>reproducible</em>. Varying run to run means something is rea
 not fixed.</p>
 
 <table>
-<thead><tr><th>Configuration</th><th>Deterministic?</th></tr></thead>
+<thead><tr><th>Configuration</th><th>Samples</th><th>Distinct</th><th>Most common</th></tr></thead>
 <tbody>
-<tr><td>gemma-4, <code>-ngl 0</code> (pure CPU)</td><td>yes &mdash; 4/4 identical, correct</td></tr>
-<tr><td>qwen2.5-0.5b dense, <code>-ngl 99</code> (all GPU)</td><td>yes &mdash; 4/4 identical</td></tr>
-<tr><td>qwen2.5-0.5b dense, <code>-ngl 10</code> (CPU/GPU split)</td><td>yes &mdash; 4/4 identical</td></tr>
-<tr><td>gemma-4 on GPU &mdash; default, substitution off, moe-cache off, <code>--swa-full</code>,
-<code>-fa off</code>, graphs off, all experts on CPU</td><td class="delta-neg">no &mdash; every one of them</td></tr>
+<tr><td>gemma-4, <code>-ngl 0</code> (pure CPU)</td><td class="num">12</td><td class="num">1</td><td class="num">12/12</td></tr>
+<tr><td>gemma-4, <code>-ngl 20</code></td><td class="num">12</td><td class="num">2</td><td class="num">11/12</td></tr>
+<tr><td>gemma-4, <code>-ngl 20</code> + MTP / <code>-bs</code> / q8_0 KV</td><td class="num">28</td><td class="num">&mdash;</td><td class="num">27/28</td></tr>
+<tr><td>gemma-4, default (all layers on GPU)</td><td class="num">12</td><td class="num">9</td><td class="num delta-neg">4/12</td></tr>
+<tr><td>qwen2.5-0.5b dense, <code>-ngl 99</code> / <code>-ngl 10</code></td><td class="num">12</td><td class="num">1</td><td class="num">12/12</td></tr>
 </tbody>
 </table>
 
