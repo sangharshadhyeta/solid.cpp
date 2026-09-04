@@ -273,6 +273,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 <a class="nav-link" href="#run-it">Run it</a>
 <a class="nav-link" href="#proof">Proof</a>
 <a class="nav-link" href="#self-calibrating">Self-calibrating</a>
+<a class="nav-link" href="#correctness">Correctness</a>
 <a class="nav-link" href="#brain-atlas">Brain / Atlas</a>
 <a class="nav-link" href="#docs">Docs</a>
 <a class="btn btn-shine" href="https://github.com/sangharshadhyeta/solid.cpp">GitHub</a>
@@ -393,6 +394,55 @@ Qwen3.8-Flash-Next.</p>
 200-token run), and no cache policy removes that. Gemma-4 reaches 39.45 tok/s on the same GPU because it fits.
 Calibration's job is to find the best configuration available on the hardware you have &mdash; not to pretend
 the hardware is different.</p>
+
+<p class="note"><strong>What the guard could not see.</strong> That degeneracy score is a lexical health check:
+verbatim 4-gram repeats and single-word dominance. It was also only ever shown one prompt &mdash;
+<code>n_solo_probes</code> is 1, so the whole quality verdict rested on <code>probe_prompts[0]</code>, a long
+substantial instruction. Long prompts are the <em>easy</em> case: the model has a paragraph of task anchoring
+every next token. Two gaps closed since: a short-prompt pass (<code>"hi"</code>, <code>"thanks!"</code>,
+<code>"What's 2 + 2?"</code>) scored for quality but never for speed, and an output-fidelity check that compares
+each substitution rung against a substitution-free reference &mdash; with the tolerance <em>measured</em> from
+the model's own run-to-run resampling rather than written down as a constant.</p>
+</section>
+
+<section id="correctness">
+<h2>A measured configuration is not a correct one</h2>
+
+<p>Calibration measured Gemma-4 at 39&ndash;48 tok/s against output it believed was healthy. A bare
+<code>"hi"</code> to that same server answers <em>&ldquo;I am Gemma 4, a model trained by Google
+DeepMind.&rdquo;</em> four times over, then drifts into <code>&lt;|channel&gt;thought</code> markers and
+<code>way, way, way, way</code>. The throughput numbers were real. The output was not.</p>
+
+<p>The same GGUF, same prompt, same seed, on <code>-ngl 0</code>:</p>
+
+<table>
+<thead><tr><th>Prompt</th><th>CPU (<code>-ngl 0</code>)</th><th>GPU (default)</th></tr></thead>
+<tbody>
+<tr><td><code>hi</code></td><td>Hello! How can I help you today?</td><td class="delta-neg">markers, then loops</td></tr>
+<tr><td><code>What's 2 + 2?</code></td><td>2 + 2 = 4</td><td class="delta-neg">markers, then loops</td></tr>
+</tbody>
+</table>
+
+<p>So the model file, the chat template, the tokenizer and the gemma4 chat parser are all fine &mdash; the
+divergence is in the CUDA path. Comparing greedy logprobs token by token puts a number on it: the two agree for
+three tokens, then at token 3 the CPU picks <code>The</code> at &minus;0.012 with <code>&lt;channel|&gt;</code>
+down at <strong>&minus;11.204</strong>, while the GPU picks <code>&lt;channel|&gt;</code> at &minus;0.0. Both
+confident, opposite directions, an ~11 nat gap. That is not drift near a decision boundary; it is a different
+computation.</p>
+
+<p>Ruled out, each tested with the divergence surviving: substitution, the moe-cache itself, expert prefetch,
+LFRU D2D, flash attention, CUDA graphs, MMQ selection, expert placement (all experts on CPU), and output-head
+placement. <code>test-backend-ops</code> passes clean against CPU, so no individual op is wrong in isolation.
+What does move it is <code>--swa-full</code>, which pushes the first divergence from token 3 out to token 10
+&mdash; ten matching tokens before parting is ordinary fp accumulation; parting at token 3 is not.</p>
+
+<p class="note">Sliding-window attention is the remaining suspect, and Gemma-4 is an awkward case for it: the
+model carries <strong>two KV geometries at once</strong> &mdash; 256-wide heads with 8 KV heads on the 25 SWA
+layers, 512-wide with 2 KV heads on the 5 full-attention layers, in a 5-then-1 pattern.
+<code>n_embd_head_k(il)</code> switches on <code>is_swa(il)</code>, so anywhere that resolves a head dimension
+without the per-layer accessor reads at the wrong stride for five layers in six. Open, written up in
+<code>docs/gemma4-cuda-swa-divergence.md</code> with the repro. Published here unfixed because a benchmark
+number that nobody has checked the output of is the thing this whole project is supposed to be against.</p>
 </section>
 
 <section id="run-it">
