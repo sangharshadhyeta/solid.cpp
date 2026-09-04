@@ -55,7 +55,7 @@ def load_traces(paths, keep=K_SELECTED):
     return out
 
 
-def fold_coact(paths, nodes, edges):
+def fold_coact(paths, nodes, edges, coact_seen=None):
     """Fold co-activation edges emitted by the running server itself
     (GGML_CUDA_MOE_CACHE_COACT_FILE) straight into the persisted graph.
 
@@ -78,6 +78,12 @@ def fold_coact(paths, nodes, edges):
             i = len(nodes)
             nodes[k] = i
         return i
+    # coact_seen holds the cumulative per-edge weight already folded by
+    # previous runs - see load_state's comment for why folding the file
+    # wholesale every run is wrong (the file is cumulative-by-rewrite, so it
+    # re-counts everything and over-weights the earliest traffic).
+    if coact_seen is None:
+        coact_seen = {}
     folded = 0
     for p in paths:
         with open(p) as f:
@@ -93,30 +99,60 @@ def fold_coact(paths, nodes, edges):
                 a_i, b_i = nid(la, ea), nid(lb, eb)
                 if a_i == b_i:
                     continue
-                edges[(min(a_i, b_i), max(a_i, b_i))] += float(w)
+                # Keyed by (layer, expert) identity rather than node index:
+                # indices are assigned in first-seen order and would shift
+                # between runs, silently mis-attributing deltas.
+                seen_key = (int(la), int(ea), int(lb), int(eb))
+                total = float(w)
+                delta = total - coact_seen.get(seen_key, 0.0)
+                coact_seen[seen_key] = total
+                if delta <= 0.0:
+                    continue  # already folded (or the server's counter reset/rotated)
+                edges[(min(a_i, b_i), max(a_i, b_i))] += delta
                 folded += 1
     return folded
 
 
 def load_state(path):
-    """Persisted (node index, edge weights) - empty if this is the first run."""
+    """Persisted (node index, edge weights, last-folded coact totals) - empty
+    if this is the first run.
+
+    coact_seen is the per-edge cumulative weight this state has ALREADY folded
+    from the server's coact file. That file is cumulative-by-rewrite (the
+    server merges prior contents and rewrites ever-growing totals), so folding
+    it wholesale on every run re-adds everything already counted: an edge at
+    weight 100, then 150, then 200 lands as 100, 250, 450 instead of 100, 150,
+    200. That inflates super-linearly and systematically over-weights whatever
+    traffic arrived earliest, drowning out newer signal the longer a
+    deployment runs - the opposite of the accumulate-and-keep-learning
+    behaviour this script exists for. Keeping the last-folded totals lets
+    fold_coact add only the delta.
+    """
     if not path or not os.path.exists(path):
-        return {}, defaultdict(float)
+        return {}, defaultdict(float), {}
     z = np.load(path, allow_pickle=True)
     nodes = {tuple(int(x) for x in k): int(v) for k, v in zip(z['keys'], z['vals'])}
     edges = defaultdict(float)
     for a, b, w in zip(z['edge_a'], z['edge_b'], z['edge_w']):
         edges[(int(a), int(b))] = float(w)
-    return nodes, edges
+    coact_seen = {}
+    if 'coact_key' in z and 'coact_w' in z:
+        for k, w in zip(z['coact_key'], z['coact_w']):
+            coact_seen[tuple(int(x) for x in k)] = float(w)
+    return nodes, edges, coact_seen
 
 
-def save_state(path, nodes, edges):
+def save_state(path, nodes, edges, coact_seen=None):
     keys = np.array(list(nodes.keys()))
     vals = np.array(list(nodes.values()))
     ea = np.fromiter((e[0] for e in edges), dtype=np.int64, count=len(edges))
     eb = np.fromiter((e[1] for e in edges), dtype=np.int64, count=len(edges))
     ew = np.fromiter(edges.values(), dtype=np.float64, count=len(edges))
-    np.savez(path, keys=keys, vals=vals, edge_a=ea, edge_b=eb, edge_w=ew)
+    coact_seen = coact_seen or {}
+    ck = np.array(list(coact_seen.keys()), dtype=np.int64).reshape(-1, 4)
+    cw = np.fromiter(coact_seen.values(), dtype=np.float64, count=len(coact_seen))
+    np.savez(path, keys=keys, vals=vals, edge_a=ea, edge_b=eb, edge_w=ew,
+             coact_key=ck, coact_w=cw)
 
 
 def fold_in(seq, nodes, edges):
@@ -255,7 +291,7 @@ def main():
                           'the eigengap heuristic still picks the real count within this bound')
     a = ap.parse_args()
 
-    nodes, edges = load_state(a.state)
+    nodes, edges, coact_seen = load_state(a.state)
     prior_nodes, prior_edges = len(nodes), len(edges)
     if prior_nodes:
         print(f"resumed state: {prior_nodes:,} nodes, {prior_edges:,} edges")
@@ -263,8 +299,8 @@ def main():
         print("no prior state - starting fresh")
 
     if a.coact:
-        n_edges = fold_coact(a.coact, nodes, edges)
-        print(f"folded in {n_edges:,} co-activation edges from {len(a.coact)} live-traffic file(s)")
+        n_edges = fold_coact(a.coact, nodes, edges, coact_seen)
+        print(f"folded in {n_edges:,} NEW co-activation edge-deltas from {len(a.coact)} live-traffic file(s)")
         print(f"graph now: {len(nodes):,} nodes ({len(nodes) - prior_nodes:+,}), "
               f"{len(edges):,} edges ({len(edges) - prior_edges:+,})")
         prior_nodes, prior_edges = len(nodes), len(edges)
@@ -282,7 +318,7 @@ def main():
     else:
         print("no new --traces - re-deciding dimensionality on the existing graph only")
 
-    save_state(a.state, nodes, edges)
+    save_state(a.state, nodes, edges, coact_seen)
 
     emb, vals, deg = spectral(nodes, edges, a.max_dims)
     k, gaps = eigengap_k(vals, a.min_dims, a.max_dims)

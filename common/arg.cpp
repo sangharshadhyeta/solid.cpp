@@ -2878,8 +2878,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_env("LLAMA_ARG_MOE_CACHE"));
     add_opt(common_arg(
         {"--expert-atlas-file"}, "FNAME",
-        "path to a topic-affinity atlas produced by llama-expert-atlas; "
-        "when set, /experts includes measured per-(layer,expert) positions for the Brain view",
+        "path to a topic-affinity atlas; /experts serves it to the Brain view, and moe-cache uses it "
+        "for atlas-driven warming. Defaults to a per-model path under the cache directory, which the "
+        "server keeps up to date from live traffic (scripts/moe-atlas-evolve.py) - set this only to "
+        "override that location",
         [](common_params & params, const std::string & value) {
             params.expert_atlas_file = value;
         }

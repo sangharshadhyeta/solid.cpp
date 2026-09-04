@@ -1991,9 +1991,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // this for archs where it was already measured safe
                     // (Ornith-1.5-35B-A3B, Nemotron, GLM-5.2 - all <=256
                     // experts) until the qwen4exp-specific bug is found.
+                    // DEFAULT ON as of 2026-09-04: the qwen4exp corruption that
+                    // forced this off was root-caused (the D2D path never wrote
+                    // the trailing MMQ padding the H2D path always writes - see
+                    // the padding refresh below) and fixed. Verified clean on
+                    // qwen4exp, the arch that reproduced it most reliably.
+                    // GGML_CUDA_MOE_CACHE_LFRU_D2D=0 turns it back off.
                     static const bool lfru_d2d_enabled = [] {
                         const char * e = getenv("GGML_CUDA_MOE_CACHE_LFRU_D2D");
-                        return e && atoi(e) != 0;
+                        return e ? atoi(e) != 0 : true;
                     }();
                     if (lfru_d2d_enabled && ggml_moe_cache.moe_lfru_copy_experts) {
                         lfru_candidate_ids.clear();
