@@ -385,16 +385,6 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "\"<td class='r'>\"+d.result+\"</td></tr>\";}"
                 "document.getElementById('dec-body').innerHTML=h;"
                 "}"
-                "const ds=c.decisions||[];"
-                "if(ds.length){"
-                "document.getElementById('dec-wrap').style.display='block';"
-                "let h='';"
-                // newest first: the interesting row is the one that just landed
-                "for(let i=ds.length-1;i>=0;i--){const d=ds[i];"
-                "h+=\"<tr class='\"+(d.accepted?'yes':'no')+\"'><td>\"+d.lever+\"</td><td>\"+d.value+"
-                "\"</td><td class='r'>\"+d.result+\"</td></tr>\";}"
-                "document.getElementById('dec-body').innerHTML=h;"
-                "}"
                 "}else if(j.default_generation_settings||j.model_path){"
                 // Calibration finished: this same process stopped the status
                 // server and started real serving on the same port, so /props
