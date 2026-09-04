@@ -1527,6 +1527,13 @@ struct common_moe_calibration_entry {
     // common_moe_calibrate): a model with room to spare has nothing to trade.
     int         n_gpu_layers            = -1;
     std::string calibrated_at;
+    // False when this entry was found by the -ngl-relaxed fallback below, i.e.
+    // it was measured at a different -ngl than this launch is using. The
+    // fields that depend on layer residency (placement, VRAM sizing) are then
+    // not applicable and must be skipped; the ones that don't are still real
+    // measurements of this machine and this model. See
+    // common_moe_calibration_lookup.
+    bool        ngl_exact               = true;
 };
 
 // Key identifies "the same launch, calibrated before": GPU signature (name +
@@ -1558,6 +1565,45 @@ static std::string common_moe_calibration_key(const char * path_model, const com
             gpu_sig.c_str(), path_model, model_size, params.n_ctx, params.n_parallel, params.n_gpu_layers);
 }
 
+// The same key with the -ngl component removed. Used to find an entry
+// measured on this GPU, this model and this context shape but at a different
+// layer residency - see common_moe_calibration_lookup for why that is worth
+// finding rather than treating as a plain miss.
+static std::string common_moe_calibration_key_prefix(const char * path_model, const common_params & params) {
+    const std::string key = common_moe_calibration_key(path_model, params);
+    const size_t cut = key.rfind("|ngl");
+    return cut == std::string::npos ? key : key.substr(0, cut + 4);
+}
+
+static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & cal) {
+    if (cal.substitute_min_rank >= 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK")) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                std::to_string(cal.substitute_min_rank).c_str());
+#else
+        setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
+                std::to_string(cal.substitute_min_rank).c_str(), 1);
+#endif
+        LOG_WRN("%s: using calibrated substitution floor of rank %d\n", __func__, cal.substitute_min_rank);
+    }
+    if (cal.neuron_reduce_k > 0 && cal.neuron_reduce_budget_mb > 0 &&
+        !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1");
+        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str());
+        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                std::to_string(cal.neuron_reduce_budget_mb).c_str());
+#else
+        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1", 1);
+        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str(), 1);
+        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                std::to_string(cal.neuron_reduce_budget_mb).c_str(), 1);
+#endif
+        LOG_WRN("%s: using calibrated neuron-reduce k=%d / %d MiB\n",
+                __func__, cal.neuron_reduce_k, cal.neuron_reduce_budget_mb);
+    }
+}
+
 static std::string common_moe_calibration_cache_path() {
     return fs_get_cache_directory() + "moe-calibration.json";
 }
@@ -1572,10 +1618,38 @@ static bool common_moe_calibration_lookup(
         nlohmann::json j;
         f >> j;
         const std::string key = common_moe_calibration_key(path_model, params);
-        if (!j.contains(key)) {
-            return false;
+        bool exact = j.contains(key);
+        std::string use_key = key;
+        if (!exact) {
+            // Relaxed retry: same GPU, model and context shape, different
+            // -ngl. Pinning -ngl used to discard the entire entry, because
+            // -ngl is part of the key - so `-ngl 20` on a box calibrated at
+            // the default threw away the measured thread count, substitution
+            // floor and neuron-reduce settings along with the placement, and
+            // silently fell back to runtime defaults for all of them. Only
+            // some of those values depend on layer residency. Find the entry
+            // anyway and let the apply path take the parts that still hold
+            // (see ngl_exact). Prefer the fastest such entry when several
+            // -ngl values have been calibrated - they were all measured on
+            // this same machine and model.
+            const std::string prefix = common_moe_calibration_key_prefix(path_model, params);
+            double best = -1.0;
+            for (const auto & item : j.items()) {
+                if (item.key().compare(0, prefix.size(), prefix) != 0) {
+                    continue;
+                }
+                const double tps = item.value().value("tok_per_sec", 0.0);
+                if (tps > best) {
+                    best    = tps;
+                    use_key = item.key();
+                }
+            }
+            if (best < 0.0) {
+                return false;
+            }
         }
-        const auto & e = j.at(key);
+        const auto & e = j.at(use_key);
+        out.ngl_exact = exact;
         out.n_cpu_moe       = e.value("n_cpu_moe", 0);
         out.n_threads       = e.value("n_threads", -1);
         out.n_threads_batch = e.value("n_threads_batch", -1);
@@ -3689,10 +3763,23 @@ static bool common_maybe_autoplace_moe_cpu(
     if (common_moe_calibration_lookup(path_model, params, cached)) {
         std::vector<ggml_backend_dev_t> devs;
         uint32_t hp_ngl = 0, hp_n_ctx_train = 0, hp_n_expert = 0;
-        if (common_moe_fits_with_n(path_model, mparams, cparams, (uint32_t) cached.n_cpu_moe,
-                                    devs, hp_ngl, hp_n_ctx_train, hp_n_expert)) {
-            params.tensor_buft_overrides = common_moe_build_cpu_overrides((uint32_t) cached.n_cpu_moe);
-            mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+        // Placement and VRAM sizing are only meaningful at the -ngl they were
+        // measured under - how many layers sit on the GPU is precisely what
+        // decides how much room is left for experts and cache. The rest of the
+        // entry is not layer-residency dependent: thread count is a property
+        // of this CPU, the substitution floor is a router-quality boundary
+        // (see the ladder's own comment), and neuron-reduce is a magnitude
+        // threshold on expert weights. Those stay valid, so a relaxed match
+        // applies them rather than dropping the whole entry on the floor and
+        // silently reverting every knob to its default.
+        const bool use_placement = cached.ngl_exact &&
+            common_moe_fits_with_n(path_model, mparams, cparams, (uint32_t) cached.n_cpu_moe,
+                                    devs, hp_ngl, hp_n_ctx_train, hp_n_expert);
+        if (use_placement || !cached.ngl_exact) {
+            if (use_placement) {
+                params.tensor_buft_overrides = common_moe_build_cpu_overrides((uint32_t) cached.n_cpu_moe);
+                mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
+            }
             if (cached.n_threads > 0) {
                 params.cpuparams.n_threads = cached.n_threads;
             }
@@ -3714,7 +3801,7 @@ static bool common_maybe_autoplace_moe_cpu(
             // already decided and calibration should not second-guess it.
             const char * cache_mode_env = getenv("GGML_CUDA_MOE_CACHE_MODE");
             const bool cache_mode_is_auto = !cache_mode_env || std::string(cache_mode_env) == "auto";
-            if (cached.moe_cache_mb > 0 && cache_mode_is_auto) {
+            if (cached.moe_cache_mb > 0 && cache_mode_is_auto && use_placement) {
 #if defined(_WIN32)
                 _putenv_s("GGML_CUDA_MOE_CACHE", "1");
                 _putenv_s("GGML_CUDA_MOE_CACHE_MODE", "on");
@@ -3774,11 +3861,24 @@ static bool common_maybe_autoplace_moe_cpu(
             // fewer GPU-resident layers only ever *reduces* VRAM demand, so a
             // placement that already fit at the (higher) default -ngl still
             // fits at the calibrated (lower) one.
-            const bool applied_ngl = cached.n_gpu_layers >= 0 && params.n_gpu_layers == -1;
+            const bool applied_ngl = use_placement && cached.n_gpu_layers >= 0 && params.n_gpu_layers == -1;
             if (applied_ngl) {
                 params.n_gpu_layers  = cached.n_gpu_layers;
                 mparams.n_gpu_layers = cached.n_gpu_layers;
             }
+            if (!use_placement) {
+                // Relaxed match: the machine-level knobs above are applied,
+                // but placement was measured at a different -ngl and does not
+                // transfer. Fall through to the live probe to decide it -
+                // returning here would leave the model unplaced.
+                LOG_WRN("%s: -ngl was pinned to %d, but this machine/model was calibrated at a different "
+                        "-ngl; applied the values that do not depend on it (n_threads=%d%s%s%s) and "
+                        "placing the experts live - run --moe-calibrate with this -ngl for a measured placement\n",
+                        __func__, params.n_gpu_layers, cached.n_threads,
+                        cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
+                        applied_neuron_reduce ? string_format(", neuron-reduce=k%d/%dMiB", cached.neuron_reduce_k, cached.neuron_reduce_budget_mb).c_str() : "",
+                        applied_subst_rank ? string_format(", substitute-min-rank=%d", cached.substitute_min_rank).c_str() : "");
+            } else {
             LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
@@ -3790,8 +3890,10 @@ static bool common_maybe_autoplace_moe_cpu(
                     cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
                     cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;
+            }
+        } else {
+            LOG_WRN("%s: cached calibration no longer fits current conditions - recalibrating placement live\n", __func__);
         }
-        LOG_WRN("%s: cached calibration no longer fits current conditions - recalibrating placement live\n", __func__);
     }
 
     common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
@@ -3880,7 +3982,8 @@ static bool common_maybe_raise_moe_for_ctx(
     // below already follows.
     {
         common_moe_calibration_entry cal_fit;
-        if (common_moe_calibration_lookup(path_model, params, cal_fit) && cal_fit.fit_target_mb > 0) {
+        if (common_moe_calibration_lookup(path_model, params, cal_fit) && cal_fit.fit_target_mb > 0 &&
+            cal_fit.ngl_exact) {
             const size_t want = (size_t) cal_fit.fit_target_mb * 1024 * 1024;
             if (want < params.fit_params_target[0]) {
                 LOG_WRN("%s: using calibrated fit margin of %d MiB per device (default %zu MiB) - "
@@ -3907,9 +4010,24 @@ static bool common_maybe_raise_moe_for_ctx(
     // only consults what it recorded; it does not guess past "fits" on its own,
     // because the right number is hardware- and model-specific and the honest
     // way to find it is to measure it.
+    // Quality knobs first, and independently of whether the placement below is
+    // usable. Neither depends on layer residency: the substitution floor is a
+    // router-quality boundary and neuron-reduce is a magnitude threshold on
+    // expert weights, so both survive an -ngl the entry was not measured at.
+    // They used to live inside the placement branch, which meant pinning -ngl
+    // (or any placement mismatch) silently dropped them - the same class of
+    // gap as the one recorded in that branch's own comment, where a measured
+    // substitute_min_rank was cached and then never applied at serving.
+    {
+        common_moe_calibration_entry cal_q;
+        if (common_moe_calibration_lookup(path_model, params, cal_q)) {
+            common_moe_apply_quality_knobs(cal_q);
+        }
+    }
+
     {
         common_moe_calibration_entry cal;
-        if (common_moe_calibration_lookup(path_model, params, cal) && cal.n_cpu_moe > 0) {
+        if (common_moe_calibration_lookup(path_model, params, cal) && cal.n_cpu_moe > 0 && cal.ngl_exact) {
             std::vector<ggml_backend_dev_t> cdevs;
             uint32_t c_ngl = 0, c_nct = 0, c_nex = 0;
             // Keep the full fit margin here. Dropping it to 0 -- on the
@@ -3965,32 +4083,6 @@ static bool common_maybe_raise_moe_for_ctx(
                 // then served 0.66 tok/s with substitutions=0 because this
                 // branch never applied it. Same "only fill in what the user
                 // left at default" rule as everywhere else.
-                if (cal.substitute_min_rank >= 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK")) {
-#if defined(_WIN32)
-                    _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
-                            std::to_string(cal.substitute_min_rank).c_str());
-#else
-                    setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
-                            std::to_string(cal.substitute_min_rank).c_str(), 1);
-#endif
-                    LOG_WRN("%s: using calibrated substitution floor of rank %d\n", __func__, cal.substitute_min_rank);
-                }
-                if (cal.neuron_reduce_k > 0 && cal.neuron_reduce_budget_mb > 0 &&
-                    !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
-#if defined(_WIN32)
-                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1");
-                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str());
-                    _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
-                            std::to_string(cal.neuron_reduce_budget_mb).c_str());
-#else
-                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1", 1);
-                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str(), 1);
-                    setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
-                            std::to_string(cal.neuron_reduce_budget_mb).c_str(), 1);
-#endif
-                    LOG_WRN("%s: using calibrated neuron-reduce k=%d / %d MiB\n",
-                            __func__, cal.neuron_reduce_k, cal.neuron_reduce_budget_mb);
-                }
                 params.tensor_buft_overrides  = common_moe_build_cpu_overrides((uint32_t) cal.n_cpu_moe);
                 mparams.tensor_buft_overrides = params.tensor_buft_overrides.data();
                 // c_ngl was filled by the fit probe above with the model's real
