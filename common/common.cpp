@@ -1579,8 +1579,14 @@ static std::string common_moe_calibration_key(const char * path_model, const com
     if (stat(path_model, &st) == 0) {
         model_size = (long long) st.st_size;
     }
+    // Resolve the context the same way every other consumer here does. Left
+    // raw, a bare launch (n_ctx == 0, "the context the model was trained
+    // with") built a key of c0 that could never match an entry cached at a
+    // resolved context, so it re-calibrated from scratch every start and then
+    // could not find what it had just written.
+    const uint32_t key_ctx = params.n_ctx > 0 ? params.n_ctx : 4096;
     return string_format("%s|%s|%lld|c%u|p%u|ngl%d",
-            gpu_sig.c_str(), path_model, model_size, params.n_ctx, params.n_parallel, params.n_gpu_layers);
+            gpu_sig.c_str(), path_model, model_size, key_ctx, params.n_parallel, params.n_gpu_layers);
 }
 
 // The same key with the -ngl component removed. Used to find an entry
@@ -4282,9 +4288,34 @@ static bool common_maybe_autoplace_moe_cpu(
 static bool common_maybe_raise_moe_for_ctx(
         const char * path_model, common_params & params,
         llama_model_params & mparams, const llama_context_params & cparams) {
+    // Quality knobs first, and independently of whether the placement below is
+    // usable. Neither depends on layer residency: the substitution floor is a
+    // router-quality boundary and neuron-reduce is a magnitude threshold on
+    // expert weights, so both survive an -ngl the entry was not measured at.
+    // They used to live inside the placement branch, which meant pinning -ngl
+    // (or any placement mismatch) silently dropped them - the same class of
+    // gap as the one recorded in that branch's own comment, where a measured
+    // substitute_min_rank was cached and then never applied at serving.
+    {
+        common_moe_calibration_entry cal_q;
+        if (common_moe_calibration_lookup(path_model, params, cal_q)) {
+            common_moe_apply_quality_knobs(cal_q);
+        }
+    }
+
     // Only meaningful for an explicit request. n_ctx == 0 ("auto") means the
     // user expressed no preference, so there is no context to protect and the
     // existing post-fit autoplace path already handles it.
+    //
+    // The quality knobs above are deliberately applied BEFORE this returns.
+    // They do not depend on the context at all - the substitution floor is a
+    // router-quality boundary and neuron-reduce is a magnitude threshold - and
+    // leaving them behind this guard meant a launch with no -c at all silently
+    // discarded every one of them. That is exactly the launch this project
+    // tells people to use: measured on a bare `llama-server -m model.gguf`,
+    // substitutions were 0 and declined 0, i.e. the gate never even ran, while
+    // the same binary with `-c 4096` applied the floor and used it. The
+    // fewer flags you passed, the more of the calibration was thrown away.
     if (params.n_ctx == 0) {
         return false;
     }
@@ -4350,21 +4381,6 @@ static bool common_maybe_raise_moe_for_ctx(
     // only consults what it recorded; it does not guess past "fits" on its own,
     // because the right number is hardware- and model-specific and the honest
     // way to find it is to measure it.
-    // Quality knobs first, and independently of whether the placement below is
-    // usable. Neither depends on layer residency: the substitution floor is a
-    // router-quality boundary and neuron-reduce is a magnitude threshold on
-    // expert weights, so both survive an -ngl the entry was not measured at.
-    // They used to live inside the placement branch, which meant pinning -ngl
-    // (or any placement mismatch) silently dropped them - the same class of
-    // gap as the one recorded in that branch's own comment, where a measured
-    // substitute_min_rank was cached and then never applied at serving.
-    {
-        common_moe_calibration_entry cal_q;
-        if (common_moe_calibration_lookup(path_model, params, cal_q)) {
-            common_moe_apply_quality_knobs(cal_q);
-        }
-    }
-
     {
         common_moe_calibration_entry cal;
         if (common_moe_calibration_lookup(path_model, params, cal) && cal.n_cpu_moe > 0 && cal.ngl_exact) {

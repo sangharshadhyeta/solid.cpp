@@ -331,7 +331,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 <div class="hero-zero-grid">
 <div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">68.75<small> tok/s</small></span><span class="hz-note">ncmoe 20, rank&nbsp;1, &minus;1&sigma; bar</span></div>
-<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">2.65<small> tok/s</small></span><span class="hz-note">was 0.66 before it was applied</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">0.60<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;1, single-stream</span></div>
 </div>
 <p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
 &mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
@@ -362,20 +362,22 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <thead><tr><th>Decided</th><th>Gemma-4 26B-A4B <span class="note">(17GB, fits)</span></th><th>Qwen3.8-Flash-Next <span class="note">(87GB, does not)</span></th></tr></thead>
 <tbody>
 <tr><td>Expert placement</td><td>searched 21/20/19 &rarr; <strong>20 CPU layers</strong></td><td>only [47,48] fit the margin &rarr; <strong>47</strong>, decided by probe, not benchmarked</td></tr>
-<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0, <strong>rank 2 @ 1.64 tok/s</strong></td></tr>
-<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong> (1.0&sigma; and 0.0&sigma; rejected on fidelity)</td><td>not reached &mdash; budget spent earlier</td></tr>
-<tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td>word salad, <strong>rejected by the guard</strong></td></tr>
-<tr><td>Rejected outright</td><td><strong>3 candidates</strong> &mdash; one degenerate (0.53), two not reproducible (2 of 5 agreed) at 38.46 and 50.62 tok/s</td><td>rank 0, degenerate</td></tr>
+<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0 (0.28/0.28/0.30/0.29/<strong>0.40</strong>/0.31), <strong>rank 1</strong>, held over 128 tokens</td></tr>
+<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong> (1.0&sigma; and 0.0&sigma; rejected on fidelity)</td><td>all five measured &mdash; +2&sigma; 0.12, +1&sigma; 0.24, <strong>0&sigma; 0.39</strong>, &minus;1&sigma; 0.31, &minus;2&sigma; 0.34 &mdash; budget spent before one was committed</td></tr>
+<tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td>0.31 tok/s &mdash; measured, and beaten by rank 1</td></tr>
+<tr><td>Rejected outright</td><td><strong>3 candidates</strong> &mdash; one degenerate (0.53), two not reproducible (2 of 5 agreed) at 38.46 and 50.62 tok/s</td><td>every <code>-ngl</code> candidate failed to load &rarr; full residency kept</td></tr>
 <tr><td>Draft model</td><td>found beside the target by itself &rarr; <strong>spec-draft-n-max 6</strong></td><td>none present</td></tr>
-<tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td>truncated by budget, <strong>~12 min</strong></td></tr>
-<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">2.65 tok/s</td></tr>
+<tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td>12 candidates in <strong>91 min</strong>, then budget spent</td></tr>
+<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">0.60 tok/s <span class="note">single-stream</span></td></tr>
 </tbody>
 </table>
 </div>
 
 <p class="note">Two things that only exist because a throughput-only search would get them wrong. Substitution
 &mdash; serving a cache miss from a resident stand-in rather than fetching the exact expert &mdash; is the
-largest single lever on a model that does not fit (0.66 &rarr; 2.65 tok/s once it was actually being applied),
+largest single lever on a model that does not fit &mdash; and the one most easily lost, since it is applied from a
+cached entry rather than measured live: a bare launch with no <code>-c</code> discarded it entirely until that was
+fixed, serving 0.60 tok/s with the gate never running &mdash;
 and it is also the one that destroys output when pushed too far: on Qwen3.8-Flash-Next, rank 0 emits
 <em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym is&rdquo;</em> at a very
 respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams, single-word dominance) and
