@@ -2628,11 +2628,22 @@ static int common_golden_section_eval_estimate(int lo, int hi) {
     return evals + 3; // close-out linear scan of the final <=3-point range
 }
 
+static void common_enforce_moe_cache_parallel_limit(common_params & params, llama_context_params & cparams);
+
 void common_moe_calibrate(common_params & params) {
     common_moe_calibration_status_start();
     const char * path_model = params.model.path.c_str();
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+    // Clamp concurrency BEFORE measuring anything. Serving applies this limit
+    // on its own (the moe-cache corrupts output above it), so calibrating
+    // above it measures a configuration that can never run - and worse, every
+    // candidate carries the memory cost of slots that will be thrown away.
+    // Observed on Qwen3.8-Flash-Next: calibration benchmarked at --parallel 4,
+    // reported 0.17 aggregate tok/s, and then every -ngl candidate after the
+    // first failed outright, while serving clamped the very same run to 2. The
+    // cached entry described a concurrency the server refuses to use.
+    common_enforce_moe_cache_parallel_limit(params, cparams);
     const int concurrency = std::max(1, (int) params.n_parallel);
 
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
