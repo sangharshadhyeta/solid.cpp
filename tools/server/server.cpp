@@ -315,14 +315,34 @@ int llama_server(common_params & params, int argc, char ** argv) {
         });
 
         std::thread calib_http_thread;
-        if (calib_srv.bind_to_port(params.hostname, params.port)) {
+        // Retry the bind rather than giving up on the first failure. A restart
+        // typically leaves the previous server's socket in TIME_WAIT for a few
+        // seconds, and failing straight through means the user opens the port
+        // and sees nothing at all for however long calibration takes - with
+        // the only explanation buried in a log line they are not reading.
+        // Observed exactly that: a server restarted 2s after its predecessor
+        // calibrated for minutes with no page, looking indistinguishable from
+        // a hang.
+        bool calib_bound = false;
+        for (int attempt = 0; attempt < 15 && !calib_bound; attempt++) {
+            calib_bound = calib_srv.bind_to_port(params.hostname, params.port);
+            if (!calib_bound) {
+                if (attempt == 0) {
+                    SRV_INF("--moe-calibrate: %s:%d still held by a previous process - waiting for it to "
+                            "free up so the status page can come up\n", params.hostname.c_str(), params.port);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(1));
+            }
+        }
+        if (calib_bound) {
             calib_http_thread = std::thread([&calib_srv] { calib_srv.listen_after_bind(); });
             SRV_INF("--moe-calibrate: status server listening on http://%s:%d/props while calibrating "
                     "(this same process starts real serving on the same port once calibration completes)\n",
                     params.hostname.c_str(), params.port);
         } else {
-            SRV_WRN("--moe-calibrate: could not bind %s:%d for the status server (port busy?) - "
-                    "calibration will still run, just without live status on that port\n",
+            SRV_WRN("--moe-calibrate: could not bind %s:%d for the status server after 15s (port held by "
+                    "another process?) - calibration will still run, but that URL will show nothing until "
+                    "it finishes and real serving starts\n",
                     params.hostname.c_str(), params.port);
         }
 
