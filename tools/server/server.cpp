@@ -341,6 +341,61 @@ int llama_server(common_params & params, int argc, char ** argv) {
         // matters for router mode, which re-reads params per spawned
         // instance - it must not re-enter calibration on every one.
         params.moe_calibrate = false;
+
+        // Build the atlas from the traffic calibration just generated, before
+        // serving starts. The candidate subprocesses inherit
+        // GGML_CUDA_MOE_CACHE_COACT_FILE (defaulted above, so this needs no
+        // flags) and each writes real routing co-activation while it is
+        // benchmarked - by the time calibration finishes there is a genuine,
+        // model-specific graph sitting there. Without this the first serving
+        // session runs with no atlas at all and has to wait for the
+        // background regen loop's first interval, which is precisely the
+        // "everything is ready except the one thing that needed traffic"
+        // gap. Bounded and best-effort: a failure here costs the initial
+        // atlas, not the server, and the regen loop will try again anyway.
+        if (!params.expert_atlas_file.empty()) {
+            const char * coact = getenv("GGML_CUDA_MOE_CACHE_COACT_FILE");
+            std::error_code ec;
+            const bool have_traffic = coact && std::filesystem::exists(coact, ec) &&
+                                      !ec && std::filesystem::file_size(coact, ec) > 0 && !ec;
+            if (have_traffic) {
+                const std::string script_rel = "scripts/moe-atlas-evolve.py";
+                std::string script_path;
+                std::vector<std::filesystem::path> candidates = { std::filesystem::path(script_rel) };
+                std::error_code exe_ec;
+                const auto exe = std::filesystem::read_symlink("/proc/self/exe", exe_ec);
+                if (!exe_ec) {
+                    const auto bin_dir = exe.parent_path();
+                    candidates.push_back(bin_dir / ".." / ".." / script_rel);
+                    candidates.push_back(bin_dir / ".." / script_rel);
+                    candidates.push_back(bin_dir / script_rel);
+                }
+                for (const auto & cand : candidates) {
+                    std::error_code cec;
+                    if (std::filesystem::exists(cand, cec) && !cec) {
+                        script_path = cand.string();
+                        break;
+                    }
+                }
+                if (!script_path.empty()) {
+                    const std::filesystem::path atlas_path(params.expert_atlas_file);
+                    const auto state_path = atlas_path.parent_path() / "atlas-evolve-state.npz";
+                    SRV_INF("%s", "building the initial expert atlas from the traffic calibration just "
+                            "generated ...\n");
+                    const std::string cmd = "python3 '" + script_path + "'"
+                        " --coact '" + std::string(coact) + "'"
+                        " --state '" + state_path.string() + "'"
+                        " --out '"   + params.expert_atlas_file + "' >/dev/null 2>&1";
+                    const int rc = std::system(cmd.c_str());
+                    if (rc == 0) {
+                        SRV_INF("initial expert atlas written to '%s'\n", params.expert_atlas_file.c_str());
+                    } else {
+                        SRV_WRN("initial atlas build exited %d - the background regen loop will retry\n", rc);
+                    }
+                }
+            }
+        }
+
         SRV_INF("%s", "--moe-calibrate: calibration complete, starting real serving now on the same port "
                 "with the placement just measured\n");
     }
