@@ -330,6 +330,17 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "if(c.eta_s>=0){const tm=Math.floor(c.eta_s/60),ts=c.eta_s%60;"
                 "etaTxt+=' - ~'+tm+'m'+String(ts).padStart(2,'0')+'s left';}"
                 "document.getElementById('eta').textContent=etaTxt;"
+                "}else if(j.default_generation_settings||j.model_path){"
+                // Calibration finished: this same process stopped the status
+                // server and started real serving on the same port, so /props
+                // is now the ordinary server's. Without this the page kept
+                // polling a perfectly healthy server, found no `calibration`
+                // key, and sat on "Calibrating ..." forever - the run was done
+                // and the tab never showed it.
+                "document.getElementById('stage').textContent='Calibration complete - loading the UI ...';"
+                "document.getElementById('bar-fill').style.width='100%';"
+                "setTimeout(function(){location.reload();},600);"
+                "return;"
                 "}else{"
                 "document.getElementById('stage').textContent="
                 "(j.error&&j.error.message)||'Calibrating ...';"
@@ -353,41 +364,41 @@ int llama_server(common_params & params, int argc, char ** argv) {
         });
 
         std::thread calib_http_thread;
-        // Retry the bind rather than giving up on the first failure. A restart
-        // typically leaves the previous server's socket in TIME_WAIT for a few
-        // seconds, and failing straight through means the user opens the port
-        // and sees nothing at all for however long calibration takes - with
-        // the only explanation buried in a log line they are not reading.
-        // Observed exactly that: a server restarted 2s after its predecessor
-        // calibrated for minutes with no page, looking indistinguishable from
-        // a hang.
-        bool calib_bound = false;
-        for (int attempt = 0; attempt < 15 && !calib_bound; attempt++) {
-            calib_bound = calib_srv.bind_to_port(params.hostname, params.port);
-            if (!calib_bound) {
-                if (attempt == 0) {
-                    SRV_INF("--moe-calibrate: %s:%d still held by a previous process - waiting for it to "
-                            "free up so the status page can come up\n", params.hostname.c_str(), params.port);
+        std::atomic<bool> calib_bind_stop{false};
+        // Keep retrying in the background for as long as calibration runs,
+        // rather than giving up after a fixed window. A restart leaves the
+        // previous server's socket held for a few seconds, and a bounded retry
+        // loses the race whenever that takes a moment longer than the window -
+        // observed directly: a 15s loop expired, and the page then stayed blank
+        // for the whole 10-minute run, which is indistinguishable from a hang
+        // and is exactly what the retry existed to prevent. A background
+        // retry has no such cliff: the page comes up the moment the port frees,
+        // whenever that is, and calibration is never blocked waiting for it.
+        calib_http_thread = std::thread([&] {
+            bool announced_wait = false;
+            while (!calib_bind_stop.load(std::memory_order_relaxed)) {
+                if (calib_srv.bind_to_port(params.hostname, params.port)) {
+                    SRV_INF("--moe-calibrate: status server listening on http://%s:%d/ while calibrating "
+                            "(this same process starts real serving on the same port once calibration "
+                            "completes)\n", params.hostname.c_str(), params.port);
+                    calib_srv.listen_after_bind();
+                    return;
+                }
+                if (!announced_wait) {
+                    announced_wait = true;
+                    SRV_INF("--moe-calibrate: %s:%d is still held (a previous server shutting down?) - "
+                            "retrying in the background; the progress page appears as soon as it frees\n",
+                            params.hostname.c_str(), params.port);
                 }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
             }
-        }
-        if (calib_bound) {
-            calib_http_thread = std::thread([&calib_srv] { calib_srv.listen_after_bind(); });
-            SRV_INF("--moe-calibrate: status server listening on http://%s:%d/props while calibrating "
-                    "(this same process starts real serving on the same port once calibration completes)\n",
-                    params.hostname.c_str(), params.port);
-        } else {
-            SRV_WRN("--moe-calibrate: could not bind %s:%d for the status server after 15s (port held by "
-                    "another process?) - calibration will still run, but that URL will show nothing until "
-                    "it finishes and real serving starts\n",
-                    params.hostname.c_str(), params.port);
-        }
+        });
 
         common_moe_calibrate(params);
 
+        calib_bind_stop.store(true, std::memory_order_relaxed);
+        calib_srv.stop();
         if (calib_http_thread.joinable()) {
-            calib_srv.stop();
             calib_http_thread.join();
         }
 

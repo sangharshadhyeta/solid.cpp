@@ -2978,6 +2978,24 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calibration_status_candidate_done();
             if (!ref_alt_text.empty()) {
                 fidelity_bar = common_moe_output_fidelity(ref_text, ref_alt_text);
+                // A bar of 1.0 is not a strict measurement, it is the absence
+                // of one. It means the two reference runs came back identical,
+                // so this model showed no answer-to-answer variation to
+                // calibrate a tolerance from - and a bar of exactly 1.0 then
+                // demands that a candidate reproduce the reference token for
+                // token, which no substitution can do however good its
+                // stand-ins are. Observed live: the bar measured 1.00 and the
+                // ladder rejected every rung at fidelity 0.62, including ones
+                // that may well have been fine. With no evidence about natural
+                // variation, the honest move is to not gate on it and let the
+                // degeneracy and reproducibility checks carry the decision,
+                // rather than to invent a tolerance here.
+                if (fidelity_bar >= 1.0) {
+                    LOG_INF("%s:   the two reference runs were identical, so there is no measured "
+                            "answer-to-answer variation to set a fidelity tolerance from - judging the "
+                            "ladder on degeneracy and reproducibility alone\n", __func__);
+                    fidelity_bar = -1.0;
+                }
             }
         }
         if (ref_tps > 0) {
