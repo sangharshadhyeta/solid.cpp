@@ -1851,25 +1851,81 @@ static double common_moe_degeneracy_reject_threshold() {
     return v;
 }
 
+// Agreement between a candidate's greedy output and a substitution-free
+// reference's, as the fraction of the reference that the candidate reproduces
+// before the two part ways.
+//
+// This exists because the degeneracy guard above cannot see the failure mode
+// substitution actually causes. That guard is a lexical health check: it
+// catches verbatim 4-gram repeats and single-word hammering. Serving expert
+// A's weights where the router asked for B does not produce either - it
+// produces fluent, varied, grammatical text that says the wrong thing, which
+// scores near zero on both components and passes the gate untouched. A
+// throughput ladder gated only on degeneracy will therefore happily pick a
+// rung that hallucinates, which is exactly what was observed on gemma-4 after
+// calibration settled on rank 2.
+//
+// Greedy decoding makes divergence sticky: once two runs pick different
+// tokens the contexts differ and they rarely reconverge. So the length of the
+// shared prefix is the natural measure of "at what point did substitution
+// change the model's mind", and it needs no notion of what a good answer is -
+// only that this configuration says what the unsubstituted one would have
+// said. Compared word-wise rather than byte-wise so that whitespace and
+// tokenizer boundaries don't register as disagreement.
+static double common_moe_output_fidelity(const std::string & reference, const std::string & candidate) {
+    auto split = [](const std::string & s) {
+        std::vector<std::string> out;
+        std::istringstream iss(s);
+        std::string w;
+        while (iss >> w) {
+            out.push_back(w);
+        }
+        return out;
+    };
+    const std::vector<std::string> a = split(reference);
+    const std::vector<std::string> b = split(candidate);
+    if (a.empty()) {
+        return 1.0; // no reference to disagree with - don't reject on noise
+    }
+    size_t common = 0;
+    while (common < a.size() && common < b.size() && a[common] == b[common]) {
+        common++;
+    }
+    return (double) common / (double) a.size();
+}
+
 struct common_moe_bench_result {
     double predicted_n  = -1.0;
     double predicted_ms = 0.0;
     double degeneracy   = 0.0;
+    // What the model actually emitted, for the fidelity comparison in the
+    // substitution ladder. See common_moe_output_fidelity().
+    std::string text;
 };
 
-static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict);
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed = 1234);
 
 static std::pair<double, double> common_moe_bench_one_request(int port, const char * prompt, int n_predict) {
     const auto r = common_moe_bench_one_request_full(port, prompt, n_predict);
     return {r.predicted_n, r.predicted_ms};
 }
 
-static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict) {
+static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed) {
     nlohmann::json req = {
         {"messages", nlohmann::json::array({
             {{"role", "user"}, {"content", prompt}}
         })},
         {"max_tokens", n_predict},
+        // Seeded, but sampling params deliberately left alone: whatever the
+        // model ships as its recommended sampling (unsloth's GGUF metadata for
+        // these quants, or the user's own flags) is the condition it will
+        // actually be served under, so that is the condition the ladder has to
+        // measure. Pinning the seed is enough to make two runs of the SAME
+        // config comparable, which is all the fidelity check needs - and it
+        // avoids tuning the substitution floor against a greedy regime nobody
+        // runs. Residual run-to-run wobble is measured, not assumed: see the
+        // reference self-fidelity noise floor in the substitution ladder.
+        {"seed", seed},
     };
     const std::string req_body = req.dump();
     char req_cmd[4096];
@@ -1902,7 +1958,14 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
                 double worst = 0.0;
                 for (const char * field : {"content", "reasoning_content"}) {
                     if (msg.contains(field) && msg[field].is_string()) {
-                        worst = std::max(worst, common_moe_degeneracy_score(msg[field].get<std::string>()));
+                        const std::string s = msg[field].get<std::string>();
+                        worst = std::max(worst, common_moe_degeneracy_score(s));
+                        if (!s.empty()) {
+                            if (!r.text.empty()) {
+                                r.text += ' ';
+                            }
+                            r.text += s;
+                        }
                     }
                 }
                 r.degeneracy = worst;
@@ -1948,7 +2011,7 @@ static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
         int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99,
-        int substitute_min_rank = -1) {
+        int substitute_min_rank = -1, std::string * out_sample = nullptr, int probe_seed = 1234) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2088,6 +2151,24 @@ static double common_moe_bench_candidate_server(
     };
     static constexpr int n_probe_prompts = sizeof(probe_prompts) / sizeof(probe_prompts[0]);
 
+    // Short, low-context prompts, scored for quality but never for speed.
+    //
+    // Every prompt above is a substantial instruction, and a model with a
+    // paragraph of task to hold onto is the EASY case for degeneracy: there is
+    // plenty of context anchoring the next token. The failure that actually
+    // reached a user on gemma-4 was a bare "hi" answered with the same
+    // sentence four times over plus leaked "Input:/Output:" scaffolding -
+    // classic repetition the guard above catches easily, on a kind of prompt
+    // the ladder had never once put in front of it. Cheap to add: the prompts
+    // are tiny, and a healthy reply to them is short, so the only runs that
+    // cost real time here are the broken ones worth catching.
+    static const char * const quality_prompts[] = {
+        "hi",
+        "thanks!",
+        "What's 2 + 2?",
+    };
+    static constexpr int n_quality_prompts = sizeof(quality_prompts) / sizeof(quality_prompts[0]);
+
     double result_tps = -1.0;
     if (n_concurrency <= 1) {
         // Solo path: average per-request predicted_per_second across
@@ -2101,7 +2182,7 @@ static double common_moe_bench_candidate_server(
         int n_ok = 0;
         double worst_degeneracy = 0.0;
         for (int i = 0; i < n_solo_probes; i++) {
-            const auto r = common_moe_bench_one_request_full(port, probe_prompts[i], n_predict);
+            const auto r = common_moe_bench_one_request_full(port, probe_prompts[i], n_predict, probe_seed);
             if (r.predicted_n > 0 && r.predicted_ms > 0) {
                 sum_tps += r.predicted_n / (r.predicted_ms / 1000.0);
                 worst_degeneracy = std::max(worst_degeneracy, r.degeneracy);
@@ -2109,6 +2190,25 @@ static double common_moe_bench_candidate_server(
             }
         }
         result_tps = n_ok > 0 ? sum_tps / n_ok : -1.0;
+        // Quality-only pass over the short prompts. Kept out of the timing
+        // average deliberately: these generate few tokens when healthy, so
+        // folding them into tok/s would measure prompt length, not decode
+        // rate. The fidelity sample is taken from here rather than from the
+        // timing probe because this is the harder case - with almost no
+        // context to anchor on, a configuration that has damaged the model's
+        // routing shows it here first.
+        if (result_tps > 0) {
+            for (int i = 0; i < n_quality_prompts; i++) {
+                const auto q = common_moe_bench_one_request_full(port, quality_prompts[i], n_predict, probe_seed);
+                if (q.predicted_n <= 0) {
+                    continue;
+                }
+                worst_degeneracy = std::max(worst_degeneracy, q.degeneracy);
+                if (out_sample && i == 0) {
+                    *out_sample = q.text;
+                }
+            }
+        }
         // Reject rather than rank: a candidate that generates degenerate text
         // is not a slower-but-valid point on the throughput curve, it is not a
         // usable configuration at all, so it must not be able to win on speed.
@@ -2657,16 +2757,72 @@ void common_moe_calibrate(common_params & params) {
         // rather than something this run measured, on a machine and model it
         // may not hold for. The degeneracy guard rejects whatever actually
         // breaks, so the ladder can safely ask the question instead.
+        // Establish what this model says when nothing is substituted, and how
+        // much its own sampling moves the answer around. A rank floor above
+        // top_k can never fire, so this is a genuinely substitution-free run.
+        //
+        // Two reference runs, same config, different seeds: the first is the
+        // reference text, the second measures how far apart two legitimate
+        // answers from this model already sit. That distance becomes the
+        // tolerance - a candidate has to stay at least as close to the
+        // reference as the model's own resampling does. Measuring the bar
+        // instead of picking one keeps it honest across models and hardware:
+        // a model that answers near-identically run to run gets a strict bar
+        // automatically, a chattier one gets a loose one, and neither number
+        // is written down here.
+        constexpr int subst_off_rank = 1000000;
+        std::string ref_text;
+        std::string ref_alt_text;
+        double fidelity_bar = -1.0;
+        const double ref_tps = common_moe_bench_candidate_server(
+                self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                concurrency, -1, -1, active_ngl, subst_off_rank, &ref_text, 1234);
+        common_moe_calibration_status_candidate_done();
+        if (ref_tps > 0 && !ref_text.empty() && !common_moe_calibrate_budget_spent()) {
+            common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    concurrency, -1, -1, active_ngl, subst_off_rank, &ref_alt_text, 5678);
+            common_moe_calibration_status_candidate_done();
+            if (!ref_alt_text.empty()) {
+                fidelity_bar = common_moe_output_fidelity(ref_text, ref_alt_text);
+            }
+        }
+        if (ref_tps > 0) {
+            LOG_INF("%s:   substitution off -> %.2f tok/s (reference)%s\n", __func__, ref_tps,
+                    fidelity_bar >= 0.0
+                        ? string_format(", fidelity bar %.2f from the model's own resampling", fidelity_bar).c_str()
+                        : ", no fidelity bar - candidates judged on degeneracy alone");
+            best_min_rank_tps = ref_tps;
+            best_min_rank     = subst_off_rank;
+        }
+
         for (const int rank : {10, 6, 4, 2, 1, 0}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
+            std::string cand_text;
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
-                    concurrency, -1, -1, active_ngl, rank);
-            LOG_INF("%s:   substitute-min-rank=%d -> %s\n", __func__, rank,
-                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate");
+                    concurrency, -1, -1, active_ngl, rank, &cand_text, 1234);
             common_moe_calibration_status_candidate_done();
+            // Fidelity is a rejection, not a ranking term - same rule as the
+            // degeneracy guard. A rung that drifts further from the reference
+            // than the model's own resampling does is not a faster point on
+            // the quality curve, it is a different (and unasked-for) model.
+            double fidelity = -1.0;
+            if (tps > 0 && fidelity_bar >= 0.0 && !cand_text.empty()) {
+                fidelity = common_moe_output_fidelity(ref_text, cand_text);
+                if (fidelity < fidelity_bar) {
+                    LOG_WRN("%s:   substitute-min-rank=%d rejected - output diverges from the "
+                            "substitution-free reference (fidelity %.2f < %.2f) at %.2f tok/s; this is the "
+                            "fluent-but-wrong failure the degeneracy guard cannot see\n",
+                            __func__, rank, fidelity, fidelity_bar, tps);
+                    continue;
+                }
+            }
+            LOG_INF("%s:   substitute-min-rank=%d -> %s%s\n", __func__, rank,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate",
+                    fidelity >= 0.0 ? string_format(" (fidelity %.2f)", fidelity).c_str() : "");
             if (tps > best_min_rank_tps) {
                 best_min_rank_tps = tps;
                 best_min_rank     = rank;
