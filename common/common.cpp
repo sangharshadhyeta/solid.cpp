@@ -2543,6 +2543,51 @@ void common_moe_calibrate(common_params & params) {
     // instead of the expert-placement axis. Reaching this point already means
     // the model did not fit fully on GPU (probe.already_fits was false), so
     // there is always something to trade here.
+    // Substitution aggressiveness, measured BEFORE the -ngl / thread / cache
+    // stages rather than after them. Serving a cache miss with a resident
+    // stand-in is the largest throughput lever measured on this model
+    // (0.6 -> ~12 tok/s at its most aggressive) AND the one that destroys
+    // output when overused, so it is also the one most worth spending a
+    // constrained budget on. Ordering it last meant a slow model never
+    // reached it: a real clean-slate run spent its whole budget on the
+    // placement and -ngl searches and recorded substitute_min_rank=-1,
+    // having measured the biggest lever not at all while fully exploring
+    // -ngl, which moved almost nothing on the same model.
+    //
+    // Benchmarked at the winning placement with the other knobs still at
+    // their defaults, which is sound because this is a router-quality
+    // boundary (which picks may be served approximately) rather than a
+    // memory-sizing decision - it does not depend on the thread count or
+    // cache budget chosen later.
+    int best_min_rank = -1;
+    double best_min_rank_tps = 0.0;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring substitution aggressiveness at ncmoe=%u (degenerate output is rejected, "
+                "not ranked) ...\n", __func__, best_n);
+        common_moe_calibration_status_set("measuring substitution aggressiveness");
+        // Coarse ladder rather than a golden-section search: the response is
+        // a quality cliff, not a smooth curve, and each point costs a full
+        // server spawn on a budget that is already tight for slow models.
+        for (const int rank : {10, 6, 4, 2}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    concurrency, -1, -1, 99, rank);
+            LOG_INF("%s:   substitute-min-rank=%d -> %s\n", __func__, rank,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate");
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_min_rank_tps) {
+                best_min_rank_tps = tps;
+                best_min_rank     = rank;
+            }
+        }
+        if (best_min_rank >= 0) {
+            LOG_INF("%s: substitution floor: rank %d at %.2f tok/s\n", __func__, best_min_rank, best_min_rank_tps);
+        }
+    }
+
     uint32_t best_ngl = (uint32_t) probe.n_layer + 1; // "all" - mirrors llama_model::n_gpu_layers()'s own +1
     {
         const uint32_t ngl_hi = best_ngl;
@@ -2877,47 +2922,6 @@ void common_moe_calibrate(common_params & params) {
                 best_fit_tps = tps;
                 best_fit_mb  = mb;
             }
-        }
-    }
-
-    // Substitution aggressiveness. Serving a cache miss with a resident
-    // stand-in instead of fetching the exact expert is the single biggest
-    // throughput lever measured on this model (0.6 -> ~12 tok/s at its most
-    // aggressive) AND the one that destroys output when overused, so the
-    // balance point is exactly the kind of thing that has to be measured per
-    // model rather than picked: on qwen4exp rank 0 produced word salad and
-    // rank 10 (never substitute) was coherent but slow. Searched from the
-    // safest end downward, keeping the fastest setting whose output the
-    // degeneracy guard accepts - candidates that generate degenerate text
-    // come back as failures from the benchmark, so a broken-but-fast setting
-    // simply cannot win here.
-    int best_min_rank = -1;
-    double best_min_rank_tps = 0.0;
-    if (!common_moe_calibrate_budget_spent()) {
-        LOG_INF("%s: measuring substitution aggressiveness at ncmoe=%u (degenerate output is rejected, "
-                "not ranked) ...\n", __func__, best_n);
-        common_moe_calibration_status_set("measuring substitution aggressiveness");
-        // Coarse ladder rather than a golden-section search: the response is
-        // a quality cliff, not a smooth curve, and each point costs a full
-        // server spawn on a budget that is already tight for slow models.
-        for (const int rank : {10, 6, 4, 2}) {
-            if (common_moe_calibrate_budget_spent()) {
-                break;
-            }
-            const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, "", best_n, 0, best_threads, next_port(), ctx, n_predict,
-                    concurrency, best_cache_mb, best_fit_mb, best_ngl <= (uint32_t) probe.n_layer ? (int) best_ngl : 99,
-                    rank);
-            LOG_INF("%s:   substitute-min-rank=%d -> %s\n", __func__, rank,
-                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate");
-            common_moe_calibration_status_candidate_done();
-            if (tps > best_min_rank_tps) {
-                best_min_rank_tps = tps;
-                best_min_rank     = rank;
-            }
-        }
-        if (best_min_rank >= 0) {
-            LOG_INF("%s: substitution floor: rank %d at %.2f tok/s\n", __func__, best_min_rank, best_min_rank_tps);
         }
     }
 
