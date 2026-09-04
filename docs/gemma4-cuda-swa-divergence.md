@@ -53,6 +53,42 @@ GPU. What is left is MoE inference on the CUDA path for this model.
 Also ruled out as contributing: `attention.shared_kv_layers` is 0 here, so
 cross-layer KV sharing is not involved.
 
+## The sparse expert-copy path is not it (excluded by instrumentation)
+
+The obvious suspect was the sparse expert-copy path in
+`ggml_backend_sched_compute_splits()`: it deliberately writes only the routed
+experts, leaving every other row of the destination tensor holding whatever the
+VRAM previously contained. Two probes, both env-gated and left in the tree:
+
+- `GGML_SCHED_EXPERT_ZERO=1` zeroes the destination before the sparse copy, so
+  any region the copy does not write becomes a fixed value instead of stale
+  VRAM. **Output stayed nondeterministic.** So nothing is reading uninitialized
+  expert rows.
+- `GGML_SCHED_IDS_TRACE=1` hashes each routing decision as it is read back.
+  Across many requests, in the default configuration and again with
+  `GGML_CUDA_MOE_CACHE=0`, it printed **zero lines** - the sparse copy path
+  never executes here at all, while the output is nondeterministic throughout.
+
+So that path is excluded, not by argument but by measurement. Whatever is
+wrong, the experts are reaching the GPU by some other route.
+
+## It scales with the number of offloaded GPU layers
+
+| `-ngl` | deterministic? | matches CPU? |
+|---|---|---|
+| 0 | yes, 4/4 | yes (reference) |
+| 1 | yes, 4/4 | yes |
+| 5 | yes, 4/4 | yes |
+| 10 | yes, 4/4 | no - stable but different (ordinary fp difference from a different split point) |
+| 20 | yes, 4/4 | yes |
+| 25 | **no** | no - one run reproduced `thought- own- own- own-` exactly |
+| 30 / auto | **no** | no |
+
+Note `-ngl 20` is deterministic *and* correct even though experts are still
+CPU-offloaded there, so plain weight offload is not sufficient to trigger it.
+The failure appears somewhere above 20 layers, as VRAM fills (8.9 GiB of 12 GiB
+in use at `-ngl 25`). Still nondeterministic at `--no-op-offload`.
+
 ## Why nondeterminism points somewhere specific
 
 Identical inputs producing different outputs is not a numerical-precision
@@ -62,10 +98,11 @@ is reading memory whose contents are not fixed: either uninitialized memory, or
 memory being written concurrently by something the reader is not ordered
 against.
 
-That makes the sparse expert-copy path and its async copies the natural place
-to look next, even though disabling the cache and forcing experts to the CPU
-did not clear it - those change *which* copies happen, not whether the split
-path leaves regions of a device tensor unwritten between graph nodes.
+The sparse expert-copy path was the natural first suspect on that reasoning
+and has now been excluded outright (see above). The remaining shape of the
+evidence - clean below ~20 GPU layers, nondeterministic above, scaling with
+VRAM occupancy - points at something that only engages once enough of the
+model is resident, rather than at a specific op.
 
 ## Structural notes on gemma-4
 
