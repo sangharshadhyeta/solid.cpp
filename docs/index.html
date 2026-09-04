@@ -155,6 +155,33 @@ header.hero .tagline{color:var(--muted);font-size:1.14rem;max-width:34rem;margin
 .btn-ghost:hover{color:var(--fg);border-color:var(--muted-2);}
 
 .badges{display:flex;gap:.5rem;justify-content:center;flex-wrap:wrap;}
+.hero-zero{
+  margin:2.5rem auto 0;max-width:44rem;text-align:left;
+  background:var(--card);background-image:var(--shine);
+  border:1px solid var(--border);border-radius:16px;padding:1.4rem 1.5rem;
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.06), 0 20px 50px -30px rgba(0,0,0,.8);
+}
+.hero-zero-head{display:flex;align-items:baseline;gap:.6rem;flex-wrap:wrap;margin-bottom:.85rem;}
+.hero-zero-tag{
+  font-family:var(--font-mono);font-size:.68rem;letter-spacing:.08em;text-transform:uppercase;
+  color:var(--hot);border:1px solid var(--hot-dim);border-radius:999px;padding:.2rem .6rem;
+}
+.hero-zero-sub{color:var(--muted);font-size:.86rem;}
+.hero-zero-cmd{margin:0 0 .85rem;padding:.7rem .9rem;font-size:.82rem;background:var(--card-2);border-radius:10px;border:1px solid var(--border);overflow-x:auto;}
+.hero-zero-cmd code{white-space:nowrap;}
+.hero-zero-flow{margin:0 0 1.1rem;font-size:.85rem;line-height:1.6;color:var(--muted);}
+.hero-zero-flow strong{color:var(--fg);font-weight:600;}
+.hero-zero-grid{display:grid;grid-template-columns:1fr 1fr;gap:.9rem;margin-bottom:1rem;}
+.hero-zero-grid > div{
+  display:flex;flex-direction:column;gap:.18rem;
+  background:var(--card-2);border:1px solid var(--border);border-radius:12px;padding:.8rem .9rem;
+}
+.hz-model{font-weight:600;font-size:.88rem;}
+.hz-note{color:var(--muted);font-size:.74rem;}
+.hz-num{font-family:var(--font-display);font-size:1.6rem;font-weight:700;color:var(--hot);line-height:1.1;font-variant-numeric:tabular-nums;margin-top:.15rem;}
+.hz-num small{font-size:.8rem;color:var(--muted);font-weight:600;}
+.hero-zero-foot{margin:0;font-size:.8rem;line-height:1.6;color:var(--muted);}
+@media (max-width:560px){.hero-zero-grid{grid-template-columns:1fr;}}
 .pill{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);border:1px solid var(--border-soft);background:var(--bg-2);padding:.28rem .65rem;border-radius:999px;}
 
 /* ---------- sections ---------- */
@@ -295,6 +322,24 @@ footer a{color:var(--muted);text-decoration:underline;}
 <span class="pill">MIT licensed</span>
 <span class="pill">based on llama.cpp</span>
 <span class="pill">CUDA · Metal · Vulkan · CPU</span>
+</div>
+
+<div class="hero-zero">
+<div class="hero-zero-head">
+<span class="hero-zero-tag">zero config</span>
+<span class="hero-zero-sub">point it at a model &mdash; it works the rest out</span>
+</div>
+<pre class="hero-zero-cmd"><code>llama-server -m model.gguf --port 8080</code></pre>
+<p class="hero-zero-flow">no calibration cached &rarr; <strong>calibrates on that port</strong>, progress live &rarr; caches it &rarr;
+builds the expert atlas from its own traffic &rarr; <strong>serves the chat UI on the same port</strong>.
+Every launch after starts straight into serving.</p>
+<div class="hero-zero-grid">
+<div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">39.45<small> tok/s</small></span><span class="hz-note">full search, 4m45s</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">2.65<small> tok/s</small></span><span class="hz-note">was 0.66 before it was applied</span></div>
+</div>
+<p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
+&mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
+on one and <em>rejecting it as degenerate</em> on the other. <a href="#self-calibrating">What it decides, and how</a>.</p>
 </div>
 </div>
 </header>
