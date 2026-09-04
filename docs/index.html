@@ -327,15 +327,11 @@ footer a{color:var(--muted);text-decoration:underline;}
 
 <div class="hero-zero">
 <div class="hero-zero-head">
-<span class="hero-zero-tag">zero config</span>
-<span class="hero-zero-sub">point it at a model &mdash; it works the rest out</span>
+<span class="hero-zero-tag">measured</span>
+<span class="hero-zero-sub">what one plain launch works out, per model</span>
 </div>
-<pre class="hero-zero-cmd"><code>llama-server -m model.gguf --port 8080</code></pre>
-<p class="hero-zero-flow">no calibration cached &rarr; <strong>calibrates on that port</strong>, progress live &rarr; caches it &rarr;
-builds the expert atlas from its own traffic &rarr; <strong>serves the chat UI on the same port</strong>.
-Every launch after starts straight into serving.</p>
 <div class="hero-zero-grid">
-<div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">39.45<small> tok/s</small></span><span class="hz-note">full search, 4m45s</span></div>
+<div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">68.75<small> tok/s</small></span><span class="hz-note">ncmoe 20, rank&nbsp;1, &minus;1&sigma; bar</span></div>
 <div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">2.65<small> tok/s</small></span><span class="hz-note">was 0.66 before it was applied</span></div>
 </div>
 <p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
@@ -367,12 +363,13 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <thead><tr><th>Decided</th><th>Gemma-4 26B-A4B <span class="note">(17GB, fits)</span></th><th>Qwen3.8-Flash-Next <span class="note">(87GB, does not)</span></th></tr></thead>
 <tbody>
 <tr><td>Expert placement</td><td>searched 21/20/19 &rarr; <strong>20 CPU layers</strong></td><td>only [47,48] fit the margin &rarr; <strong>47</strong>, decided by probe, not benchmarked</td></tr>
-<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 2 @ 42.70 tok/s</strong></td><td>ladder 10&rarr;0, <strong>rank 2 @ 1.64 tok/s</strong></td></tr>
-<tr><td>Fully aggressive (rank 0)</td><td>42.27 tok/s, <strong>accepted</strong></td><td>word salad, <strong>rejected by the guard</strong></td></tr>
-<tr><td>GPU-resident layers</td><td>full residency won &rarr; default</td><td><strong>ngl=43</strong> &mdash; trading layers for cache paid here</td></tr>
-<tr><td>Expert-cache size</td><td>knee at <strong>2048 MiB</strong> (36.86, falls off after)</td><td>budget spent before this stage</td></tr>
-<tr><td>Whole run</td><td>full search, <strong>4m45s</strong></td><td>truncated by budget, <strong>~12 min</strong></td></tr>
-<tr><td>Then serving at</td><td class="num">39.45 tok/s</td><td class="num">2.65 tok/s</td></tr>
+<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0, <strong>rank 2 @ 1.64 tok/s</strong></td></tr>
+<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong> (1.0&sigma; and 0.0&sigma; rejected on fidelity)</td><td>not reached &mdash; budget spent earlier</td></tr>
+<tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td>word salad, <strong>rejected by the guard</strong></td></tr>
+<tr><td>Rejected outright</td><td><strong>3 candidates</strong> &mdash; one degenerate (0.53), two not reproducible (2 of 5 agreed) at 38.46 and 50.62 tok/s</td><td>rank 0, degenerate</td></tr>
+<tr><td>Draft model</td><td>found beside the target by itself &rarr; <strong>spec-draft-n-max 6</strong></td><td>none present</td></tr>
+<tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td>truncated by budget, <strong>~12 min</strong></td></tr>
+<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">2.65 tok/s</td></tr>
 </tbody>
 </table>
 </div>
@@ -386,12 +383,14 @@ respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-gra
 <strong>rejected outright</strong> rather than ranked &mdash; speed bought with broken generation cannot win.
 And because those probes are short while the failures show up at 150&ndash;250 tokens, the winner is
 re-confirmed over 4&times; the probe length before being committed, stepping back toward the safe end if it does
-not hold. On Gemma-4 that confirmation passed at 41.32 tok/s; the same guard is what rejects rank 0 on
-Qwen3.8-Flash-Next.</p>
+not hold. The gates reject on their own evidence: in the gemma-4 run above, three candidates were thrown out
+&mdash; one for degenerate output, and two because the same request at the same seed, sampled greedily, agreed
+only 2 times in 5. Those two measured 38.46 and 50.62 tok/s and would otherwise have been recorded as
+results.</p>
 
 <p class="note">The honest limit: on Qwen3.8-Flash-Next this hardware is the binding constraint, not the tuning.
 55GB of experts against 30GB of RAM means real swap traffic during generation (634k major faults in one
-200-token run), and no cache policy removes that. Gemma-4 reaches 39.45 tok/s on the same GPU because it fits.
+200-token run), and no cache policy removes that. Gemma-4 reaches 68.75 tok/s on the same GPU because it fits.
 Calibration's job is to find the best configuration available on the hardware you have &mdash; not to pretend
 the hardware is different.</p>
 
@@ -523,7 +522,7 @@ llama-server \
 <tr><td><code>-c 65536</code></td><td>The context you want. Expert placement is derived <em>from</em> this &mdash; ask for more and the fork moves experts to CPU RAM to fit it, rather than silently shrinking your context. <strong>No <code>-ncmoe</code> needed:</strong> it resolved to 21 CPU layers on its own.</td></tr>
 <tr><td><code>--moe-cache auto</code></td><td>GPU-resident cache for the CPU-offloaded experts, LFRU eviction. 79% hit rate warm. Also enables router-lookahead prefetch, which predicts the next layer's experts and fetches them during the current layer's compute.</td></tr>
 <tr><td><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1</code></td><td>Live-activation predictor: a small linear layer per model, trained online on the real hidden state each routing decision came from, feeding the same free-slot-only warming path the atlas uses. Self-tuning (no rate constant to guess) and persists its learned weights across restarts. Measured separately, on Ornith-1.5-35B: +0.12pp hit rate, 3/4 rounds &mdash; see the proof table below, not part of this command's own gemma-4 numbers.</td></tr>
-<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in instead of paying CPU fallback, gated so the router's most consequential picks still get exact compute. <strong>The rank is calibrated per model now</strong> &mdash; both Gemma-4 and Qwen3.8-Flash-Next measured to rank 2, and the same search rejects rank 0 on Qwen3.8-Flash-Next while accepting it on Gemma-4. Set this by hand only to override. Measured separately on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction).</td></tr>
+<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in instead of paying CPU fallback, gated so the router's most consequential picks still get exact compute. <strong>The rank is calibrated per model now</strong>, and so is the stand-in quality bar that decides when a miss waits for the real expert instead &mdash; gemma-4 measured rank 1 with a &minus;1&sigma; bar, Qwen3.8-Flash-Next rank 2, and rank 0 is rejected on Qwen while merely being slower on gemma-4 (32.71 vs 68.75). Set this by hand only to override. Measured separately on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction).</td></tr>
 <tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
 <tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
 <tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
