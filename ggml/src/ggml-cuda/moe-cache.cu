@@ -1463,7 +1463,29 @@ static constexpr uint32_t MOE_CACHE_HEAT_STEP = 4;
 // bounded costs (decay is O(pool size) but runs rarely; the eviction scan
 // is O(window), not O(pool size), on every eviction).
 static constexpr long long MOE_CACHE_HEAT_DECAY_EVERY = 512;
-static constexpr int MOE_CACHE_EVICT_WINDOW = 8;
+// Upper bound only - this sizes the stack arrays below, so it must stay a
+// compile-time constant. The window actually scanned is
+// moe_cache_evict_window(), which is a runtime knob clamped to this.
+static constexpr int MOE_CACHE_EVICT_WINDOW = 32;
+
+// How many coldest-recency slots the eviction scan considers, and what
+// fraction of a pool protected_ may hold. Both were fixed numbers, and both
+// are exactly the kind of thing that should be measured per model and per
+// card rather than written here: the right window depends on pool size (how
+// many slots a 12GB card even has for this model's expert width) and the
+// right cap depends on how concentrated the routing is. Prior measurements
+// are recorded at MOE_CACHE_PROTECTED_CAP_PCT's own comment - they are why
+// the defaults are 8 and 50, and they were taken on one model on one card,
+// which is the point. Calibration searches them now; these values only apply
+// when it has not run.
+static int moe_cache_evict_window() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_EVICT_WINDOW");
+        const int v = e ? atoi(e) : 8;
+        return v < 1 ? 1 : (v > MOE_CACHE_EVICT_WINDOW ? MOE_CACHE_EVICT_WINDOW : v);
+    }();
+    return n;
+}
 
 // Two things were tried and measured here before landing on this one:
 // letting decay alone regulate protected_'s population, with no fixed
@@ -1893,6 +1915,15 @@ static double moe_cache_weighted_heat(const moe_cache_device & device, const moe
 // candidates gets picked when several are in contention.
 static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
 
+static int moe_cache_protected_cap_pct() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_PROTECTED_CAP_PCT");
+        const int v = e ? atoi(e) : MOE_CACHE_PROTECTED_CAP_PCT;
+        return v < 1 ? 1 : (v > 99 ? 99 : v);
+    }();
+    return n;
+}
+
 // Coldest-first, bounded-window pick from a segment, skipping anything with
 // active readers. Shared by real-miss eviction and, now, speculative-fill
 // eviction: same criterion used to choose what to keep should decide what to
@@ -1947,7 +1978,7 @@ static int moe_cache_pick_by_coverage(const moe_cache_device & device, moe_cache
     const int heads[2] = { head, pool.protected_head };
     for (int h = 0; h < 2; h++) {
         int taken = 0;
-        for (int c = heads[h]; c >= 0 && taken < MOE_CACHE_EVICT_WINDOW; c = pool.slots[c].next) {
+        for (int c = heads[h]; c >= 0 && taken < moe_cache_evict_window(); c = pool.slots[c].next) {
             if (pool.slots[c].readers > 0) {
                 continue;
             }
@@ -2029,7 +2060,7 @@ static int moe_cache_pick_coldest_unpinned(moe_cache_device & device, moe_cache_
     int n = 0;
     double window_max_base = 0.0;
     int candidate = head;
-    for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next) {
+    for (int seen = 0; candidate >= 0 && seen < moe_cache_evict_window(); candidate = pool.slots[candidate].next) {
         if (pool.slots[candidate].readers > 0) {
             continue;
         }
@@ -2101,7 +2132,7 @@ static int moe_cache_pick_coldest_unpinned(moe_cache_device & device, moe_cache_
 
 static void moe_cache_promote_to_protected(const moe_cache_device & device, moe_cache_pool & pool, int index) {
     moe_cache_segment_remove(pool, index);
-    const int cap = std::max(1, pool.n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100);
+    const int cap = std::max(1, pool.n_slots * moe_cache_protected_cap_pct() / 100);
     if (pool.protected_count >= cap && pool.protected_head >= 0) {
         // Same two-pass window-local cap reference as
         // moe_cache_pick_coldest_unpinned - see that function's comment.
@@ -2110,7 +2141,7 @@ static void moe_cache_promote_to_protected(const moe_cache_device & device, moe_
         int n = 0;
         double window_max_base = 0.0;
         int candidate = pool.protected_head;
-        for (int seen = 0; candidate >= 0 && seen < MOE_CACHE_EVICT_WINDOW; candidate = pool.slots[candidate].next, seen++) {
+        for (int seen = 0; candidate >= 0 && seen < moe_cache_evict_window(); candidate = pool.slots[candidate].next, seen++) {
             const double base = (double) pool.slots[candidate].heat * moe_cache_cost_tier_weight(device, pool.slots[candidate].key);
             cand[n] = candidate;
             cand_base[n] = base;

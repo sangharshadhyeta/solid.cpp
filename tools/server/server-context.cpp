@@ -4953,16 +4953,45 @@ void server_routes::init_routes() {
                 if (by_layer.empty()) {
                     return arr;
                 }
-                // Same total edge budget as before - this is a rendering cost
-                // bound, not a claim about how many edges matter - just spread
-                // over the layers that actually have any.
-                const size_t budget = 96;
-                const size_t quota  = std::max<size_t>(1, budget / by_layer.size());
+                // How many edges matter is decided per layer by the data, not
+                // by a number chosen here. A fixed budget - 64 before, then 96 -
+                // is the same mistake twice: it draws exactly as many edges as
+                // it was told to, whether the layer has three meaningful links
+                // or thirty. Instead sort the layer's edges by strength and cut
+                // at the largest relative drop, which is the same eigengap
+                // reasoning moe-atlas-evolve.py already uses to decide its own
+                // axis count - everything before the cliff is structure,
+                // everything after is the tail. A layer whose edges are all
+                // alike has no cliff and contributes its strongest few; a layer
+                // with a clear elite contributes exactly those.
+                const size_t hard_cap = 64; // per layer, rendering-cost bound only
                 for (auto & [lyr, rows] : by_layer) {
                     std::sort(rows.begin(), rows.end(),
                             [](const edge_row & a, const edge_row & b) { return a.count > b.count; });
                     const double top = rows.front().count > 0.0 ? rows.front().count : 1.0;
-                    const size_t take = std::min(quota, rows.size());
+                    size_t take = std::min(hard_cap, rows.size());
+                    double best_drop = 0.0;
+                    size_t cut = take;
+                    for (size_t i = 1; i < take; i++) {
+                        const double prev = rows[i - 1].count;
+                        const double cur  = rows[i].count;
+                        if (prev <= 0.0) {
+                            continue;
+                        }
+                        const double drop = (prev - cur) / prev;
+                        if (drop > best_drop) {
+                            best_drop = drop;
+                            cut = i;
+                        }
+                    }
+                    // Only honour the cliff if it is actually a cliff. With
+                    // near-uniform weights the "largest" drop is noise, and
+                    // cutting on it would keep an arbitrary one or two edges;
+                    // in that case the whole set is equally meaningful and the
+                    // cap is what limits it.
+                    if (best_drop > 0.5) {
+                        take = cut;
+                    }
                     for (size_t i = 0; i < take; i++) {
                         const edge_row & r = rows[i];
                         arr.push_back(json{
