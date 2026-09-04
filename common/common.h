@@ -1292,7 +1292,7 @@ void        common_moe_calibration_status_candidate_done();
 // rejected rather than merely being slow.
 void        common_moe_calibration_status_note(
                 const std::string & lever, const std::string & value,
-                const std::string & result, bool accepted);
+                const std::string & result, bool accepted, bool chosen = false);
 std::string common_moe_calibration_status_get(); // human-readable, includes elapsed time, progress, and ETA
 
 struct common_moe_calibration_decision {
@@ -1300,6 +1300,10 @@ struct common_moe_calibration_decision {
     std::string value;    // "ncmoe=20", "rank 2", ...
     std::string result;   // "54.90 tok/s", "rejected - not reproducible (2/5)"
     bool        accepted = true;
+    // The value this stage actually committed to and carried forward. A table
+    // of every rung tried does not say which one won, which is the one thing
+    // a reader wants from it.
+    bool        chosen   = false;
 };
 
 struct common_moe_calibration_status {
