@@ -20,6 +20,7 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <map>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
@@ -4919,18 +4920,61 @@ void server_routes::init_routes() {
                 auto it = ctx_server.atlas_tensor_layer.find(tensor);
                 return it == ctx_server.atlas_tensor_layer.end() ? -1 : it->second;
             };
+            // Sample per layer, and normalise weight within each layer.
+            //
+            // Taking the global top 64 sounds neutral and is not: co-activation
+            // counts differ by an order of magnitude BETWEEN layers, so the
+            // busiest layer takes every slot. Measured on gemma-4, the 64
+            // within-layer edges drawn spanned 26 distinct experts and were
+            // almost entirely layer 4, with every weight inside a 6% band
+            // (4202..4467) - so the view showed one layer's mutual clique, and
+            // the opacity/width scaling that is supposed to encode strength
+            // encoded nothing. Closed loops among a handful of hubs, drawn as
+            // chords across the disc, are the clover-leaf shape.
+            //
+            // Quota per layer instead, and each layer's weights divided by its
+            // own maximum. Note this deliberately does NOT put layer back into
+            // the picture: the edges are drawn between the experts' existing
+            // atlas positions, which are layer-decorrelated by construction
+            // (see moe-atlas-evolve.py), so sampling evenly across layers
+            // changes WHICH edges are shown, never where anything sits.
             auto to_json = [&](bool cross_layer) {
-                json arr = json::array();
-                for (const auto & e : common_moe_cache_get_co_activation(cross_layer, 64)) {
+                struct edge_row { int lf, ef, lt, et; double count; };
+                std::map<int, std::vector<edge_row>> by_layer;
+                for (const auto & e : common_moe_cache_get_co_activation(cross_layer, 2048)) {
                     const int lf = layer_of(e.tensor_from);
                     const int lt = layer_of(e.tensor_to);
                     if (lf < 0 || lt < 0) {
                         continue;
                     }
-                    arr.push_back(json{
-                            {"layer_from", lf}, {"expert_from", e.expert_from},
-                            {"layer_to", lt}, {"expert_to", e.expert_to},
-                            {"count", e.count}});
+                    by_layer[std::min(lf, lt)].push_back({lf, e.expert_from, lt, e.expert_to, (double) e.count});
+                }
+                json arr = json::array();
+                if (by_layer.empty()) {
+                    return arr;
+                }
+                // Same total edge budget as before - this is a rendering cost
+                // bound, not a claim about how many edges matter - just spread
+                // over the layers that actually have any.
+                const size_t budget = 96;
+                const size_t quota  = std::max<size_t>(1, budget / by_layer.size());
+                for (auto & [lyr, rows] : by_layer) {
+                    std::sort(rows.begin(), rows.end(),
+                            [](const edge_row & a, const edge_row & b) { return a.count > b.count; });
+                    const double top = rows.front().count > 0.0 ? rows.front().count : 1.0;
+                    const size_t take = std::min(quota, rows.size());
+                    for (size_t i = 0; i < take; i++) {
+                        const edge_row & r = rows[i];
+                        arr.push_back(json{
+                                {"layer_from", r.lf}, {"expert_from", r.ef},
+                                {"layer_to", r.lt}, {"expert_to", r.et},
+                                {"count", (long long) r.count},
+                                // Strength relative to the strongest edge in
+                                // THIS layer, so the UI can scale by something
+                                // comparable across layers instead of by a raw
+                                // count whose scale is per-layer.
+                                {"weight", r.count / top}});
+                    }
                 }
                 return arr;
             };

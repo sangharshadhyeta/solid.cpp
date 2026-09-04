@@ -230,12 +230,20 @@ export interface ApiCoActivationEdge {
 	layer_to: number;
 	expert_to: number;
 	count: number;
+	/** Strength relative to the strongest edge in the SAME layer, 0..1.
+	 * Raw counts are not comparable across layers - they differ by an order of
+	 * magnitude - so scaling line opacity by a global max made every drawn edge
+	 * look identical. Optional: absent from servers predating per-layer edge
+	 * sampling. */
+	weight?: number;
 }
 
 /** One measured (layer,expert) topic-affinity cell from llama-expert-atlas.
- * x/y are a weighted centroid over category anchors on a unit circle - see
- * tools/expert-atlas/expert-atlas.cpp - so magnitude reflects how specialized
- * the expert is (near 0,0 = generalist, near the rim = a topic specialist). */
+ * x/y come from the discovered co-activation embedding, projected to a disc by
+ * scripts/moe-atlas-evolve.py (the static 9-topic generator this used to cite
+ * was removed). Magnitude reflects how specialized the expert is (near 0,0 =
+ * generalist, near the rim = a topic specialist); the layer component is
+ * removed from the layout deliberately, since the Grid panel already shows it. */
 export interface ApiExpertAtlasCell {
 	layer: number;
 	expert: number;
