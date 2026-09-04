@@ -3186,6 +3186,31 @@ static bool common_maybe_autoplace_moe_cpu(
 #endif
                 params.moe_cache_force = true;
             }
+            // Same rule again: only apply calibrated neuron-reduce settings
+            // when the user hasn't already set the env var themselves - an
+            // explicit GGML_CUDA_MOE_CACHE_NEURON_REDUCE (on or off) is a
+            // deliberate choice calibration should not second-guess. This
+            // was a real, confirmed gap until now: calibration has recorded
+            // these fields since neuron_reduce_k/_budget_mb were added to
+            // common_moe_calibration_entry, but nothing ever read them back
+            // on a normal launch - an entry with real measured values (e.g.
+            // gemma-4's k=256, budget_mb=256) sat unused every time.
+            const bool neuron_reduce_is_default = !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
+            const bool applied_neuron_reduce =
+                    cached.neuron_reduce_k > 0 && cached.neuron_reduce_budget_mb > 0 && neuron_reduce_is_default;
+            if (applied_neuron_reduce) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1");
+                _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cached.neuron_reduce_k).c_str());
+                _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                        std::to_string(cached.neuron_reduce_budget_mb).c_str());
+#else
+                setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1", 1);
+                setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cached.neuron_reduce_k).c_str(), 1);
+                setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
+                        std::to_string(cached.neuron_reduce_budget_mb).c_str(), 1);
+#endif
+            }
             // Same rule again: only apply the calibrated -ngl when the user
             // left it at the default (-1, "auto"/all) - an explicit -ngl is a
             // deliberate choice calibration should never silently override.
@@ -3198,12 +3223,13 @@ static bool common_maybe_autoplace_moe_cpu(
                 params.n_gpu_layers  = cached.n_gpu_layers;
                 mparams.n_gpu_layers = cached.n_gpu_layers;
             }
-            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s, measured %.2f %s on %s) "
+            LOG_WRN("%s: using calibrated MoE placement from cache (ncmoe=%d, n_threads=%d%s%s%s%s%s, measured %.2f %s on %s) "
                     "- run --moe-calibrate again if hardware/model/context changed\n",
                     __func__, cached.n_cpu_moe, cached.n_threads,
                     cached.spec_n_max > 0 ? string_format(", spec-draft-n-max=%d", cached.spec_n_max).c_str() : "",
                     cached.moe_cache_mb > 0 && cache_mode_is_auto ? string_format(", moe-cache=%dMiB", cached.moe_cache_mb).c_str() : "",
                     applied_ngl ? string_format(", ngl=%d", cached.n_gpu_layers).c_str() : "",
+                    applied_neuron_reduce ? string_format(", neuron-reduce=k%d/%dMiB", cached.neuron_reduce_k, cached.neuron_reduce_budget_mb).c_str() : "",
                     cached.concurrency > 1 ? string_format(", concurrency=%d", cached.concurrency).c_str() : "",
                     cached.tok_per_sec, cached.concurrency > 1 ? "aggregate tok/s" : "tok/s", cached.calibrated_at.c_str());
             return true;
