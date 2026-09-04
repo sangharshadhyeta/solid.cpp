@@ -165,6 +165,44 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // models doesn't feed one model's co-activation graph into another's
     // atlas). An explicit --expert-atlas-file still wins, same rule as
     // everywhere else here.
+    // Same "should work out of the box" rule for the MTP draft model. It is
+    // the single largest thing a bare launch was still missing: measured on
+    // gemma-4, adding it took decode from 24 to 34 tok/s, and the only reason
+    // it needed a flag is that the file has a different name. Unsloth ships it
+    // beside the model as mtp-<model>.gguf, so look there and use it if it
+    // exists. An explicit -md still wins, and a model with no such sibling is
+    // unaffected - this only fills in a path the user would otherwise have to
+    // type themselves.
+    if (!params.speculative.has_dft() && !params.model.path.empty()) {
+        // The draft is NOT named after the target: unsloth ships gemma-4's as
+        // mtp-gemma-4-26B-A4B-it-Q8_0.gguf beside a target quantised
+        // UD-Q4_K_M, so matching on "mtp-<target filename>" finds nothing
+        // (checked - that was this code's first version). Scan the directory
+        // for mtp-*.gguf instead and take it only when there is exactly one:
+        // with a single candidate the intent is unambiguous, and with several
+        // there is a real choice to make that belongs to the user rather than
+        // to a guess here.
+        const std::filesystem::path mp(params.model.path);
+        std::error_code ec;
+        std::filesystem::path found;
+        int n_found = 0;
+        for (const auto & de : std::filesystem::directory_iterator(mp.parent_path(), ec)) {
+            const std::string fn = de.path().filename().string();
+            if (fn.rfind("mtp-", 0) == 0 && de.path().extension() == ".gguf") {
+                found = de.path();
+                n_found++;
+            }
+        }
+        if (n_found == 1) {
+            params.speculative.draft.mparams.path = found.string();
+            params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+            SRV_INF("found an MTP draft model beside the target and enabled speculative decoding: %s "
+                    "(pass -md to override, or --spec-type none to disable)\n", found.string().c_str());
+        } else if (n_found > 1) {
+            SRV_INF("%d mtp-*.gguf files sit beside the target - pass -md to choose one\n", n_found);
+        }
+    }
+
     {
         std::string model_tag = std::filesystem::path(params.model.path).stem().string();
         if (model_tag.empty()) {
