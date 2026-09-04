@@ -1482,6 +1482,14 @@ struct common_moe_calibration_entry {
     double      tok_per_sec     = 0.0;
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
     int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
+    // Stand-in quality bar, in standard deviations below the mean
+    // co-activation of the residents examined. This is the continuous form of
+    // the wait-or-substitute balance: high = wait for the real expert, low =
+    // run with whatever is resident. NaN/unset = not calibrated. Searched
+    // separately from the rank floor because they gate different things -
+    // rank is about how much the ROUTER wanted this expert, sigma is about
+    // how good the available replacement actually is.
+    double      substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN();
     // Per-device fit margin (-fitt/--fit-target, MiB). -1 = not calibrated.
     //
     // This is not a minor knob: common_maybe_raise_moe_for_ctx reserves
@@ -1586,6 +1594,18 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
 #endif
         LOG_WRN("%s: using calibrated substitution floor of rank %d\n", __func__, cal.substitute_min_rank);
     }
+    if (!std::isnan(cal.substitute_quality_sigma) &&
+        !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA")) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA",
+                std::to_string(cal.substitute_quality_sigma).c_str());
+#else
+        setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA",
+                std::to_string(cal.substitute_quality_sigma).c_str(), 1);
+#endif
+        LOG_WRN("%s: using calibrated stand-in quality bar of %.1f sigma\n",
+                __func__, cal.substitute_quality_sigma);
+    }
     if (cal.neuron_reduce_k > 0 && cal.neuron_reduce_budget_mb > 0 &&
         !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
 #if defined(_WIN32)
@@ -1658,6 +1678,8 @@ static bool common_moe_calibration_lookup(
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
+        out.substitute_quality_sigma = e.value("substitute_quality_sigma",
+                std::numeric_limits<double>::quiet_NaN());
         // Absent in entries written before these were calibrated - the
         // value() defaults keep such an entry loadable rather than making
         // it a hard cache miss, since the fields it DOES carry are still
@@ -1697,6 +1719,7 @@ static void common_moe_calibration_save(
         {"tok_per_sec",     entry.tok_per_sec},
         {"moe_cache_mb",    entry.moe_cache_mb},
         {"substitute_min_rank", entry.substitute_min_rank},
+        {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"fit_target_mb",           entry.fit_target_mb},
         {"neuron_reduce_k",         entry.neuron_reduce_k},
         {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
@@ -2093,7 +2116,8 @@ static double common_moe_bench_candidate_server(
         const std::string & self_exe, const std::string & path_model, const std::string & mtp_path,
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
         int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99,
-        int substitute_min_rank = -1, std::string * out_sample = nullptr, int probe_seed = 1234) {
+        int substitute_min_rank = -1, std::string * out_sample = nullptr, int probe_seed = 1234,
+        double substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN()) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2159,6 +2183,12 @@ static double common_moe_bench_candidate_server(
     // subprocess must see the value being benchmarked, not whatever this
     // calibrating process happens to have inherited.
     std::string subst_env;
+    if (!std::isnan(substitute_quality_sigma)) {
+        char qbuf[96];
+        snprintf(qbuf, sizeof(qbuf), "GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA=%g ",
+                substitute_quality_sigma);
+        subst_env += qbuf;
+    }
     if (substitute_min_rank >= 0) {
         char buf[96];
         snprintf(buf, sizeof(buf), "GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=%d ", substitute_min_rank);
@@ -2658,6 +2688,10 @@ void common_moe_calibrate(common_params & params) {
     // dropped the setting the ladder had just established, and then tuned
     // cache size against a configuration that is not the one being served.
     int active_min_rank = -1;
+    // Carried into the later stages the same way active_min_rank is, so
+    // everything measured after this point is measured at the balance that
+    // will actually be served.
+    double active_quality_sigma = std::numeric_limits<double>::quiet_NaN();
     // Same reasoning for the GPU-resident layer count: it is decided by its
     // own stage and then every later stage passed a hardcoded 99 (full
     // residency), so thread count, cache size and fit margin were all tuned
@@ -2992,6 +3026,60 @@ void common_moe_calibrate(common_params & params) {
             active_min_rank = best_min_rank;
             best_tps = std::max(best_tps, best_min_rank_tps);
         }
+
+        // Stand-in quality bar, measured at the floor just chosen. The rank
+        // floor answers "how much did the router want this expert"; this
+        // answers "is the replacement on offer actually any good", and it is
+        // the one that decides when inference waits for a real fetch and when
+        // it runs on what is already resident. Descending order because the
+        // strict end is the safe end: a high sigma demands a stand-in far
+        // better than typical and mostly declines, which costs throughput and
+        // nothing else, while the permissive end is where output dies - on
+        // this hardware an ungated run reaches 51 tok/s emitting "* * * *"
+        // and nothing more. Every rung goes through the same degeneracy,
+        // fidelity and reproducibility gates as the ladder above, so the
+        // permissive end is rejected on evidence rather than avoided by a
+        // number written here.
+        double best_sigma = std::numeric_limits<double>::quiet_NaN();
+        double best_sigma_tps = best_min_rank_tps;
+        if (!common_moe_calibrate_budget_spent()) {
+            LOG_INF("%s: measuring stand-in quality bar at rank %d (this is the wait-or-substitute "
+                    "balance) ...\n", __func__, active_min_rank);
+            common_moe_calibration_status_set("measuring stand-in quality bar");
+            for (const double sigma : {2.0, 1.0, 0.0, -1.0, -2.0}) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                std::string cand_text;
+                const double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                        concurrency, -1, -1, active_ngl, active_min_rank, &cand_text, 1234, sigma);
+                common_moe_calibration_status_candidate_done();
+                double fidelity = -1.0;
+                if (tps > 0 && fidelity_bar >= 0.0 && !cand_text.empty()) {
+                    fidelity = common_moe_output_fidelity(ref_text, cand_text);
+                    if (fidelity < fidelity_bar) {
+                        LOG_WRN("%s:   quality-sigma=%.1f rejected - diverges from the substitution-free "
+                                "reference (fidelity %.2f < %.2f) at %.2f tok/s\n",
+                                __func__, sigma, fidelity, fidelity_bar, tps);
+                        continue;
+                    }
+                }
+                LOG_INF("%s:   quality-sigma=%.1f -> %s%s\n", __func__, sigma,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected",
+                        fidelity >= 0.0 ? string_format(" (fidelity %.2f)", fidelity).c_str() : "");
+                if (tps > best_sigma_tps) {
+                    best_sigma_tps = tps;
+                    best_sigma     = sigma;
+                }
+            }
+            if (!std::isnan(best_sigma)) {
+                LOG_INF("%s: stand-in quality bar: %.1f sigma at %.2f tok/s\n",
+                        __func__, best_sigma, best_sigma_tps);
+                best_tps = std::max(best_tps, best_sigma_tps);
+            }
+        }
+        active_quality_sigma = best_sigma;
     }
 
     uint32_t best_ngl = (uint32_t) probe.n_layer + 1; // "all" - mirrors llama_model::n_gpu_layers()'s own +1
@@ -3361,6 +3449,7 @@ void common_moe_calibrate(common_params & params) {
     entry.tok_per_sec     = std::max({best_threads_tps, best_fit_tps, best_min_rank_tps});
     entry.moe_cache_mb    = best_cache_mb;
     entry.substitute_min_rank = best_min_rank;
+    entry.substitute_quality_sigma = active_quality_sigma;
     entry.fit_target_mb   = best_fit_mb;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up

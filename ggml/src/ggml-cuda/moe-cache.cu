@@ -7333,6 +7333,24 @@ static int moe_cache_substitute_min_rank(moe_cache_device & device) {
 // How many resident candidates the stand-in search may examine. The offline
 // cost model put the useful window near 64; beyond that the scan cost on the
 // dispatch path outweighs what a better stand-in is worth.
+// How strict the stand-in quality bar is, in standard deviations ABOVE the
+// mean co-activation of the candidates examined. Positive = demand a stand-in
+// better than typical (substitute rarely, wait for the fetch); negative =
+// accept below-average ones (rarely wait). Sign verified by measurement, not
+// assumed: at rank 0, +1 sigma accepts 66% of attempts and -3 accepts 93%. So this one
+// number IS the wait-or-substitute balance, on a continuous axis, and it is
+// not ours to pick: calibration searches it against the fidelity and
+// degeneracy gates the same way it searches the rank floor. The default here
+// only applies when calibration has not run - it is a starting point, not a
+// decision.
+static double moe_cache_substitute_quality_sigma() {
+    static const double k = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA");
+        return e ? atof(e) : 1.0;
+    }();
+    return k;
+}
+
 static int moe_cache_substitute_scan() {
     static const int n = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_SCAN");
@@ -8775,7 +8793,7 @@ static int moe_cache_substitute_pick_hot(
             const double mean = (double) coact_sum / (double) coact_n;
             const double var  = coact_sq / (double) coact_n - mean * mean;
             const double sd   = var > 0.0 ? sqrt(var) : 0.0;
-            const double bar  = mean - sd;
+            const double bar  = mean + moe_cache_substitute_quality_sigma() * sd;
             if (bar > 0.0 && (double) best_count < bar) {
                 return -1;
             }
