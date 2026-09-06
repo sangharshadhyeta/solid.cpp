@@ -4761,7 +4761,19 @@ static std::string server_shell_quote(const std::string & s) {
 // special-case on this side.
 void server_routes::atlas_regen_loop(std::string atlas_file, std::string coact_file) {
     const std::filesystem::path atlas_path(atlas_file);
-    const std::filesystem::path state_path = atlas_path.parent_path() / "atlas-evolve-state.npz";
+    // Derived from the atlas filename, not a fixed name, for the same reason
+    // the atlas and coact files are already per-model: this state IS the
+    // accumulated co-activation graph, and moe-atlas-evolve.py deliberately
+    // adds each run's traffic on top of whatever it already holds. Under one
+    // shared name that accumulation crosses models. It did: a gemma-4 atlas
+    // on this box came back with 20292 cells over layers 0..47 and experts
+    // 0..511 on 46 axes, when gemma-4 has 30 layers, 128 experts and measured
+    // 28 axes - those are qwen's dimensions, merged in because qwen had run
+    // here too. Every model's atlas was a blend of every model that had ever
+    // served on the machine, and the layout being judged was computed from
+    // two models' routing at once.
+    const std::filesystem::path state_path =
+        atlas_path.parent_path() / (atlas_path.stem().string() + "-evolve-state.npz");
 
     const int interval_s = [] () -> int {
         if (const char * env = getenv("GGML_MOE_ATLAS_REGEN_INTERVAL")) {
