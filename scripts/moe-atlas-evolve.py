@@ -421,14 +421,33 @@ def main():
             sq = c @ evecs[:, ::-1]
         sq = np.stack([rank_normalize(sq[:, 0]), rank_normalize(sq[:, 1])], axis=1)
 
+    # Angle from the projection, radius by rank.
+    #
+    # The Shirley-Chiu concentric map used here before splits the square into
+    # four wedges on |sx| > |sy| and maps each to a quadrant. It preserves
+    # area only for a UNIFORM square, and this square is not uniform - so the
+    # wedge boundaries printed themselves onto the output as a four-fold
+    # modulation of the radius. Measured on the layout it produced: the k=4
+    # angular harmonic was 12.7% against 1-3% for k=1,2,3, with per-sector mean
+    # radius swinging 0.657 to 0.754 while the per-sector COUNTS stayed even
+    # (426-515). Points reached further out at 0/90/180/270 and pulled in on
+    # the diagonals. That is the quatrefoil, and it is an artifact of the map,
+    # not something in the data.
+    #
+    # Splitting the two removes it by construction. Angle is the half that
+    # carries meaning - which experts are alike - and comes through untouched.
+    # Radius only says how far out to draw, so assigning it by rank as
+    # sqrt((rank + 0.5) / n) fills the disc at exactly uniform density: no
+    # hollow centre (the inner equal-area rings were at 72% and 78% of their
+    # share), no wedge modulation, and nothing angular disturbed.
     sx, sy = sq[:, 0], sq[:, 1]
-    r = np.where(np.abs(sx) > np.abs(sy), sx, sy)
-    theta = np.where(
-        np.abs(sx) > np.abs(sy),
-        (np.pi / 4) * np.divide(sy, sx, out=np.zeros_like(sy), where=sx != 0),
-        (np.pi / 2) - (np.pi / 4) * np.divide(sx, sy, out=np.zeros_like(sx), where=sy != 0),
-    )
-    xy = np.stack([r * np.cos(theta), r * np.sin(theta)], axis=1)
+    ang = np.arctan2(sy, sx)
+    rad = np.hypot(sx, sy)
+    order = np.argsort(rad)
+    rank = np.empty(len(rad), dtype=np.float64)
+    rank[order] = np.arange(len(rad))
+    rr = np.sqrt((rank + 0.5) / len(rad))
+    xy = np.stack([rr * np.cos(ang), rr * np.sin(ang)], axis=1)
     xy[(sx == 0) & (sy == 0)] = 0.0
 
     cells = []
