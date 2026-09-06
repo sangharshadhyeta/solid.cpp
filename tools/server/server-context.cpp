@@ -5017,7 +5017,15 @@ void server_routes::init_routes() {
                 // everything after is the tail. A layer whose edges are all
                 // alike has no cliff and contributes its strongest few; a layer
                 // with a clear elite contributes exactly those.
-                const size_t hard_cap = 64; // per layer, rendering-cost bound only
+                // Total, not per layer. The cliff cut below only fires when a
+                // layer HAS a cliff; with near-uniform weights it falls through
+                // to this cap, and applying 64 per layer across 23 layers drew
+                // 1299 chords over the disc - denser than the global-64 it
+                // replaced, and unreadable. Spread a whole-view budget across
+                // the layers that have edges, so each layer still gets
+                // represented and the total stays legible.
+                const size_t view_budget = 160;
+                const size_t hard_cap = std::max<size_t>(2, view_budget / by_layer.size());
                 for (auto & [lyr, rows] : by_layer) {
                     std::sort(rows.begin(), rows.end(),
                             [](const edge_row & a, const edge_row & b) { return a.count > b.count; });
