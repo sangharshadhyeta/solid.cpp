@@ -854,6 +854,9 @@ struct moe_cache_device {
     // start time.
     std::chrono::steady_clock::time_point budget_checked_at{};
     size_t allocated_bytes = 0;
+    // Consecutive idle ticks seen below the VRAM floor - see
+    // moe_cache_relieve_vram_pressure.
+    int vram_pressure_ticks = 0;
     moe_cache_scratch scratch_reserve;
 
     std::deque<moe_cache_job> queue;
@@ -3437,6 +3440,10 @@ static const void * moe_cache_prefill_wait(
 // routing-relative threshold the useful signal changes on the order of seconds.
 static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{3};
 
+// Defined further down, next to the other cache-policy helpers; used by the
+// fill worker's idle tick above it.
+static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cache_device & device);
+
 // How many routing decisions an expert may go unselected before it is declared
 // dormant. One tick per MoE node planned, so with ~46 CPU-resident MoE tensors
 // this is roughly (value / 46) tokens. Default ~100 tokens' worth: long enough
@@ -4127,6 +4134,9 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (now_tick - device->last_cold_sweep >= MOE_CACHE_COLD_SWEEP_INTERVAL) {
                     device->last_cold_sweep = now_tick;
                     moe_cache_cold_sweep(*device, now_tick);
+                    // Same tick, same lock: check whether this cache is now
+                    // standing on VRAM another process needs.
+                    moe_cache_relieve_vram_pressure(*session, *device);
                 }
             }
             if ((session->stopping || device->dead.load()) &&
@@ -7274,6 +7284,96 @@ static bool moe_cache_partner_index_enabled() {
 // making the miss into a hit). Rank-gated by moe_cache_substitute_min_rank()
 // so the router's most confident picks always get exact compute.
 // GGML_CUDA_MOE_CACHE_SUBSTITUTE=0 turns it off.
+
+// Give VRAM back when something else on the card needs it.
+//
+// The expert cache sizes itself once, from free VRAM at startup, and then
+// holds that allocation for the life of the session. That is right on a box
+// running one model and actively harmful the moment a second process appears:
+// measured here, gemma-4 serving alone ran at 51.7 tok/s, and launching a
+// 156 MiB embedding model beside it dropped it to 6.6 - a 7.8x collapse, not
+// because the cache was wrong (it was still hitting 78.8%) but because free
+// VRAM fell to 134 MiB and every token then fought for compute buffers.
+//
+// Releasing a pool is the whole fix, because pools are allocated lazily and
+// sized from LIVE free VRAM: drop one under pressure and the next dispatch
+// rebuilds it at whatever now fits. No resize path, no partial slab, and the
+// cache re-warms on its own.
+//
+// Safety: this runs on the fill worker with the session lock held, and
+// synchronizes the device first so no kernel or copy can still be reading the
+// slab being freed. Pools with pinned readers are skipped rather than waited
+// on - the next tick will catch them.
+static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cache_device & device) {
+    static const bool enabled = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_YIELD_VRAM");
+        return !e || atoi(e) != 0; // on by default
+    }();
+    if (!enabled || device.pools.empty()) {
+        return false;
+    }
+    size_t free_memory = 0, total_memory = 0;
+    if (cudaMemGetInfo(&free_memory, &total_memory) != cudaSuccess || total_memory == 0) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    // The same headroom the initial sizing reserves, so this yields exactly
+    // when the card no longer has what that sizing assumed it would keep.
+    size_t floor_bytes = (total_memory / 20);
+    floor_bytes = std::min<size_t>(floor_bytes, 1024ull << 20);
+    floor_bytes = std::max<size_t>(floor_bytes, 128ull << 20);
+    if (free_memory >= floor_bytes) {
+        device.vram_pressure_ticks = 0;
+        return false;
+    }
+    // Hysteresis: one dip is a transient allocation somewhere, two in a row
+    // three seconds apart is another process that intends to stay.
+    if (++device.vram_pressure_ticks < 2) {
+        return false;
+    }
+    device.vram_pressure_ticks = 0;
+
+    int victim = -1;
+    size_t victim_bytes = 0;
+    for (size_t i = 0; i < device.pools.size(); i++) {
+        moe_cache_pool * pool = device.pools[i].get();
+        if (!pool || !pool->slab || pool->n_slots <= 0) {
+            continue;
+        }
+        bool pinned = false;
+        for (const moe_cache_slot & slot : pool->slots) {
+            if (slot.readers > 0) { pinned = true; break; }
+        }
+        if (pinned) {
+            continue;
+        }
+        const size_t bytes = (size_t) pool->n_slots * pool->slot_stride;
+        if (bytes > victim_bytes) { victim_bytes = bytes; victim = (int) i; }
+    }
+    if (victim < 0) {
+        return false;
+    }
+
+    cudaDeviceSynchronize();
+    moe_cache_pool * pool = device.pools[victim].get();
+    cudaFree(pool->slab);
+    pool->slab = nullptr;
+    pool->n_slots = 0;
+    pool->slots.clear();
+    pool->free_slots.clear();
+    pool->map.clear();
+    device.allocated_bytes = device.allocated_bytes > victim_bytes
+            ? device.allocated_bytes - victim_bytes : 0;
+    device.pools.erase(device.pools.begin() + victim);
+    (void) session;
+    fprintf(stderr, "[moe-cache] free VRAM fell to %zu MiB (below the %zu MiB this cache reserves) - "
+            "released a %zu MiB expert pool so the rest of the card can be used; it will be rebuilt "
+            "to whatever fits once there is room\n",
+            free_memory >> 20, floor_bytes >> 20, victim_bytes >> 20);
+    fflush(stderr);
+    return true;
+}
+
 static bool moe_cache_substitute_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");
