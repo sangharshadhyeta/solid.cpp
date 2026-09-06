@@ -857,6 +857,10 @@ struct moe_cache_device {
     // Consecutive idle ticks seen below the VRAM floor - see
     // moe_cache_relieve_vram_pressure.
     int vram_pressure_ticks = 0;
+    // High-water mark of (free VRAM + what this cache holds) - i.e. what the
+    // card would have if the cache released everything. Only an external
+    // allocation moves it down. See moe_cache_relieve_vram_pressure.
+    size_t vram_external_baseline = 0;
     moe_cache_scratch scratch_reserve;
 
     std::deque<moe_cache_job> queue;
@@ -7322,7 +7326,26 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     size_t floor_bytes = (total_memory / 20);
     floor_bytes = std::min<size_t>(floor_bytes, 1024ull << 20);
     floor_bytes = std::max<size_t>(floor_bytes, 128ull << 20);
-    if (free_memory >= floor_bytes) {
+    // Judge pressure on what OTHER processes hold, not on raw free memory.
+    // Raw free is self-triggering: this cache allocates until free VRAM is
+    // low, then sees free VRAM is low and releases itself. It did exactly
+    // that with nothing else on the card - a 1715 MiB pool dropped while
+    // gemma-4 was the only process running, taking the Brain view's hot/warm/
+    // cold counts to zero with it.
+    //
+    // free + what we hold is what the card would have if this cache gave
+    // everything back. Watching that quantity isolates external demand: it
+    // does not move when we allocate, and it drops exactly when someone else
+    // takes memory.
+    const size_t free_if_we_released = free_memory + device.allocated_bytes;
+    if (device.vram_external_baseline == 0 || free_if_we_released > device.vram_external_baseline) {
+        device.vram_external_baseline = free_if_we_released;
+    }
+    // Another process has taken more than the headroom we reserve.
+    const bool external_pressure =
+        device.vram_external_baseline > free_if_we_released &&
+        (device.vram_external_baseline - free_if_we_released) > floor_bytes;
+    if (!external_pressure) {
         device.vram_pressure_ticks = 0;
         return false;
     }
@@ -7366,10 +7389,11 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
             ? device.allocated_bytes - victim_bytes : 0;
     device.pools.erase(device.pools.begin() + victim);
     (void) session;
-    fprintf(stderr, "[moe-cache] free VRAM fell to %zu MiB (below the %zu MiB this cache reserves) - "
-            "released a %zu MiB expert pool so the rest of the card can be used; it will be rebuilt "
-            "to whatever fits once there is room\n",
-            free_memory >> 20, floor_bytes >> 20, victim_bytes >> 20);
+    fprintf(stderr, "[moe-cache] another process took %zu MiB of this card (free would be %zu MiB with this "
+            "cache emptied, was %zu MiB) - released a %zu MiB expert pool so it can be used; the pool is "
+            "rebuilt to whatever fits on the next miss\n",
+            (device.vram_external_baseline - free_if_we_released) >> 20,
+            free_if_we_released >> 20, device.vram_external_baseline >> 20, victim_bytes >> 20);
     fflush(stderr);
     return true;
 }
