@@ -1800,6 +1800,11 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             LOG_WRN("%s: using calibrated %s\n", __func__, kv.c_str());
         }
     }
+    if (cal.atlas_prewarm_k > 0 && !getenv("LLAMA_PROMPT_CACHE_MOE_PREWARM")) {
+        set_env_int("LLAMA_PROMPT_CACHE_MOE_PREWARM", 1);
+        set_env_int("LLAMA_PROMPT_CACHE_MOE_PREWARM_K", cal.atlas_prewarm_k);
+        LOG_WRN("%s: using calibrated atlas prewarm, top_k %d per tensor\n", __func__, cal.atlas_prewarm_k);
+    }
     if (cal.substitute_atlas > 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS")) {
         set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", cal.substitute_atlas);
         LOG_WRN("%s: choosing stand-ins by atlas similarity (mode %d)\n", __func__, cal.substitute_atlas);
@@ -3853,6 +3858,7 @@ void common_moe_calibrate(common_params & params) {
         est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
         est += 4; // prediction ring: 0, 5, 10 percent (one load) + the winner answer-checked
         est += 4; // stand-in selection: heat / atlas+fallback / atlas-only + answer check
+        est += 3; // atlas prewarm: off, top_k 4, top_k 16
         est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
         est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
         // The constant sweep shares ONE server: 1 launch + 15 live measurements +
@@ -5421,6 +5427,64 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Atlas prewarm on a restored prefix. The atlas is the only thing that can say
+    // anything BEFORE a request has routed anything: the lookahead predicts from
+    // the current hidden state and has nothing to work with at turn zero, and the
+    // ring can only hold what has already been predicted. On a restored
+    // prompt-cache prefix the saved topic hint names the neighbourhood the next
+    // tokens will want, so the cache can be warmed toward it instead of
+    // rediscovering it a miss at a time.
+    //
+    // Wired end to end since the prompt-cache work and shipped OFF, never measured
+    // - the same state neuron subsetting was in. Measured where it can matter: a
+    // second turn on a prefix the first turn cached, which is what the probe loop
+    // does naturally (it repeats its prompts).
+    int best_prewarm_k = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring atlas prewarm on a restored prefix (it ships off, unmeasured) ...\n", __func__);
+        common_moe_calibration_status_set("measuring atlas prewarm");
+        common_moe_stage_begin("atlas prewarm", 3);
+        double best_prewarm_tps = -1.0;
+        // LLAMA_PROMPT_CACHE_MOE_PREWARM is latched at first use (it gates a
+        // startup-time decision path), so each value needs its own candidate.
+        for (const int k : { 0, 4, 16 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const std::string env = k == 0
+                ? std::string("LLAMA_PROMPT_CACHE_MOE_PREWARM=0")
+                : string_format("LLAMA_PROMPT_CACHE_MOE_PREWARM=1 LLAMA_PROMPT_CACHE_MOE_PREWARM_K=%d", k);
+            common_moe_calib_set_env(env);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   atlas prewarm %s -> %s\n", __func__,
+                    k == 0 ? "off" : string_format("top_k %d", k).c_str(),
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("atlas prewarm",
+                    k == 0 ? std::string("off") : string_format("top_k %d", k),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_prewarm_tps) {
+                best_prewarm_tps = tps;
+                best_prewarm_k   = k;
+            }
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.atlas_prewarm_k = best_prewarm_k;
+        checkpoint("atlas prewarm");
+        if (best_prewarm_k >= 0) {
+            LOG_INF("%s: atlas prewarm: %s at %.2f tok/s\n", __func__,
+                    best_prewarm_k == 0 ? "off" : string_format("top_k %d", best_prewarm_k).c_str(),
+                    best_prewarm_tps);
+            common_moe_calibration_status_note("atlas prewarm",
+                    best_prewarm_k == 0 ? std::string("off") : string_format("top_k %d", best_prewarm_k),
+                    string_format("SELECTED - %.2f tok/s", best_prewarm_tps), true, true);
+        }
+    }
+
     // Prediction ring: how much of each pool the router lookahead may use. At full
     // occupancy a prediction otherwise has nowhere to go; too large a ring takes
     // slots from experts that were really demanded. Measured on decode, as served
@@ -5902,6 +5966,7 @@ void common_moe_calibrate(common_params & params) {
     entry.tuned_constants        = tuned_constants;
     entry.draft_share_pct        = best_share_pct;
     entry.substitute_atlas       = best_sub_atlas;
+    entry.atlas_prewarm_k        = best_prewarm_k;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
