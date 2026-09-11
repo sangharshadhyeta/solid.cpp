@@ -24,6 +24,10 @@ void ggml_moe_cache_unregister(const void * owner) {
 }
 
 #include <assert.h>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -2126,6 +2130,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         ggml_backend_tensor_memset(input_cpy, 0, 0, ggml_nbytes(input_cpy));
                         ggml_backend_synchronize(split_backend);
                     }
+
+#if defined(__linux__)
+                    // The copies below read the routed experts out of host memory one
+                    // run at a time, and a copy from pageable memory does not return
+                    // until its bytes are read. When the weights are an mmap of a model
+                    // bigger than RAM, the loader has switched read-around off for these
+                    // ranges, so each missing page would be its own 4 KiB read - a
+                    // 66-token prompt on Qwen3.8-Flash-Next fell from 1.78 to 0.74 tok/s.
+                    // Ask for every run first, so the kernel reads them all in large
+                    // requests at once, then copy. On cached pages this is a lookup.
+                    {
+                        static const bool willneed = [] {
+                            const char * env = getenv("GGML_SCHED_EXPERT_WILLNEED");
+                            return !env || atoi(env) != 0;
+                        }();
+                        static const uintptr_t page = (uintptr_t) sysconf(_SC_PAGESIZE);
+                        if (willneed && page > 0) {
+                            int64_t e = 0;
+                            while (e < n_expert) {
+                                if (!ggml_bitset_get(copy_ids.data(), e)) {
+                                    e++;
+                                    continue;
+                                }
+                                int64_t r = e;
+                                while (r + 1 < n_expert && ggml_bitset_get(copy_ids.data(), r + 1)) {
+                                    r++;
+                                }
+                                const uintptr_t b = (uintptr_t) input->data + (uintptr_t) e * expert_size;
+                                const uintptr_t first = b & ~(page - 1);
+                                const uintptr_t last  = (b + (uintptr_t) (r - e + 1) * expert_size + page - 1) & ~(page - 1);
+                                posix_madvise((void *) first, (size_t) (last - first), POSIX_MADV_WILLNEED);
+                                e = r + 1;
+                            }
+                        }
+                    }
+#endif
 
                     int id = 0;
                     while (!ggml_bitset_get(copy_ids.data(), id)) {
