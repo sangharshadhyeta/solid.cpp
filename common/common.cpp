@@ -3545,6 +3545,124 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // The draft first. With a draft model attached, speculative decoding is the
+    // regime this model is served in, and every lever after this - substitution
+    // above all - has to be measured inside it. The draft itself is served exact
+    // (a draft scheduler's scope never substitutes, see
+    // ggml_backend_sched_set_moe_cache_exact), so whatever the target's stand-ins
+    // cost, the measurement below sees it with MTP doing its share of the work
+    // rather than assuming what that share is. Ordering the depth search after
+    // substitution meant the substitution floor was chosen for a no-draft
+    // configuration the server would never run.
+    int best_n_max = -1;
+    if (params.speculative.has_dft()) {
+        {
+            // Find the envelope: double n_max until throughput drops below
+            // half the n_max=1 baseline (the real n_max=8 collapse we
+            // measured went from ~80% cache health to ~14-21% - a >2x
+            // throughput cliff, not a gentle decline, so "less than half"
+            // is a safe, real signal for "past the edge" rather than
+            // ordinary run-to-run noise).
+            LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
+            common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
+            std::map<int, double> nmax_trace;
+            double baseline = -1.0;
+            int last_good = 1;
+            // The baseline is the first depth that actually benchmarks, not
+            // specifically n=1. Measured on qwen4exp: n=1 failed to come up
+            // twice (a draft depth of 1 is the oddest configuration in the
+            // sweep, and a candidate that fails to load is not evidence about
+            // depth), baseline stayed <= 0, and that single probe silently
+            // skipped the golden-section search, --spec-prob-accept and the
+            // drafter cascade with it - four MTP knobs behind one fragile
+            // candidate. A failure now costs only its own rung.
+            int n_failures = 0;
+            for (int n = 1; n <= 32; n *= 2) {
+                const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
+                nmax_trace[n] = tps;
+                LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                common_moe_calibration_status_candidate_done();
+                if (tps > 0 && baseline <= 0.0) {
+                    baseline = tps; // first depth that stood up anchors the collapse test
+                }
+                if (tps < 0) {
+                    // Two consecutive failures means something is wrong with the
+                    // draft itself rather than with this depth - stop paying for it.
+                    if (++n_failures >= 2) {
+                        LOG_WRN("%s: two spec-draft-n-max candidates in a row failed - stopping the envelope search\n", __func__);
+                        break;
+                    }
+                    continue;
+                }
+                n_failures = 0;
+                if (baseline > 0 && tps < baseline * 0.5) {
+                    break;
+                }
+                last_good = n;
+            }
+            const int nmax_hi = std::max(1, last_good);
+
+            if (baseline > 0) {
+                LOG_INF("%s: golden-section search for spec-draft-n-max in [1, %d] at ncmoe=%u ...\n",
+                        __func__, nmax_hi, best_n);
+                auto measure_nmax = [&](int n) -> double {
+                    auto it = nmax_trace.find(n);
+                    if (it != nmax_trace.end()) {
+                        return it->second;
+                    }
+                    const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
+                    LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                    common_moe_calibration_status_candidate_done();
+                    return tps;
+                };
+                best_n_max = common_golden_section_search_max(1, nmax_hi, measure_nmax, nmax_trace);
+                // Validate against the full trace, not just what
+                // golden-section converged to - see the comment on the
+                // identical check after the ncmoe search above. This is
+                // the fix for a confirmed real bug: the envelope-doubling
+                // phase above already measures n=1,2,4,8,... before
+                // golden-section ever runs, but golden-section's own
+                // bisection can (and, measured once, did: n_max=2 scored
+                // 56.06 tok/s vs the bisection's own pick of n_max=9 at
+                // 54.55) narrow away from those low values without ever
+                // reconsidering them.
+                for (const auto & kv : nmax_trace) {
+                    if (kv.second > nmax_trace.at(best_n_max)) {
+                        best_n_max = kv.first;
+                    }
+                }
+                LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
+                // The whole speculative-decoding stage wrote no row, so a model
+                // with a draft head showed nothing for it in the decisions table
+                // even though it is one of the largest levers such a model has.
+                for (const auto & kv : nmax_trace) {
+                    common_moe_calibration_status_note("speculative depth",
+                            string_format("n-max %d", kv.first),
+                            kv.second > 0 ? string_format("%.2f tok/s", kv.second) : std::string("failed"),
+                            kv.second > 0, /* chosen */ kv.first == best_n_max);
+                }
+                // The n_max search's own winning number (MTP active) is the
+                // real answer for this deployment, not the earlier ncmoe-only
+                // number (MTP off) - carry it forward so the final report and
+                // cache entry don't undersell what was actually found.
+                if (nmax_trace.at(best_n_max) > best_tps) {
+                    best_tps = nmax_trace.at(best_n_max);
+                }
+            } else {
+                LOG_WRN("%s: spec-draft-n-max=1 itself failed to benchmark - skipping n_max calibration\n", __func__);
+            }
+        }
+    }
+
+    // The draft every later candidate runs with - the substitution ladder, its
+    // answer bar, the stand-in quality bar and the -ngl search. The depth the
+    // search found, or the configured depth when it found nothing.
+    const bool        sub_draft    = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
+    const std::string sub_mtp_path = sub_draft ? params.speculative.draft.mparams.path : std::string();
+    const int         sub_n_max    = !sub_draft ? 0 : (best_n_max > 0 ? best_n_max : std::max(1, params.speculative.draft.n_max));
+
     // Trade GPU-resident dense/attention-layer compute for VRAM the expert
     // cache converts into hit rate. The ncmoe search above only ever moved
     // MoE EXPERT weights off GPU - every layer's attention/dense compute
@@ -3606,12 +3724,12 @@ void common_moe_calibrate(common_params & params) {
         std::string ref_alt_text;
         double fidelity_bar = -1.0;
         const double ref_tps = common_moe_bench_candidate_server(
-                self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                 concurrency, -1, -1, active_ngl, subst_off_rank, &ref_text, 1234);
         common_moe_calibration_status_candidate_done();
         if (ref_tps > 0 && !ref_text.empty() && !common_moe_calibrate_budget_spent()) {
             common_moe_bench_candidate_server(
-                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                     concurrency, -1, -1, active_ngl, subst_off_rank, &ref_alt_text, 5678);
             common_moe_calibration_status_candidate_done();
             if (!ref_alt_text.empty()) {
@@ -3659,7 +3777,7 @@ void common_moe_calibrate(common_params & params) {
             ladder_ran = true;
             std::string cand_text;
             const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                     concurrency, -1, -1, active_ngl, rank, &cand_text, 1234);
             common_moe_calibration_status_candidate_done();
             // Reported, not a veto - the same mistake the reproducibility check
@@ -3780,7 +3898,7 @@ void common_moe_calibrate(common_params & params) {
                 }
                 common_moe_calibration_status_set("measuring the answer bar with substitution off");
                 common_moe_bench_candidate_server(
-                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx,
                         confirm_predict, concurrency, -1, -1, active_ngl, subst_off_rank,
                         nullptr, seed, std::numeric_limits<double>::quiet_NaN(),
                         /* verify_answers */ true, /* with_reasoning */ true);
@@ -3806,7 +3924,7 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calibration_status_set(string_format(
                     "confirming substitution floor rank %d over %d tokens", cand.first, confirm_predict));
             const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx,
                     confirm_predict, concurrency, -1, -1, active_ngl, cand.first,
                     nullptr, 1234, std::numeric_limits<double>::quiet_NaN(),
                     /* verify_answers */ true, /* with_reasoning */ true);
@@ -3856,7 +3974,7 @@ void common_moe_calibrate(common_params & params) {
                 common_moe_calibration_status_set(string_format(
                         "confirming substitution floor rank %d over %d tokens", best_min_rank, confirm_predict));
                 const double tps = common_moe_bench_candidate_server(
-                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx,
                         confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank,
                         nullptr, 1234, std::numeric_limits<double>::quiet_NaN(),
                         /* verify_answers */ true, /* with_reasoning */ true);
@@ -3913,7 +4031,7 @@ void common_moe_calibrate(common_params & params) {
                 }
                 std::string cand_text;
                 const double tps = common_moe_bench_candidate_server(
-                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                         concurrency, -1, -1, active_ngl, active_min_rank, &cand_text, 1234, sigma);
                 common_moe_calibration_status_candidate_done();
                 // Reported, not a veto - the same fix the substitution ladder needed,
@@ -3958,7 +4076,7 @@ void common_moe_calibrate(common_params & params) {
                         "confirming stand-in quality bar %+.1f sigma over %d tokens",
                         best_sigma, sigma_confirm_predict));
                 const double ctps = common_moe_bench_candidate_server(
-                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx,
                         sigma_confirm_predict, concurrency, -1, -1, active_ngl, active_min_rank,
                         nullptr, 1234, best_sigma, /* verify_answers */ true, /* with_reasoning */ true);
                 common_moe_calibration_status_candidate_done();
@@ -4009,12 +4127,12 @@ void common_moe_calibrate(common_params & params) {
             double sum = 0.0; int n_ok = 0;
             for (int i = 0; i < n_samples_per_candidate; i++) {
                 double tps = common_moe_bench_candidate_server(
-                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                         concurrency, -1, -1, n, active_min_rank);
                 // Retry only an infrastructure failure - a quality rejection is deterministic.
                 if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
                     tps = common_moe_bench_candidate_server(
-                            self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                            self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, n, active_min_rank);
                 }
                 if (tps > 0) { sum += tps; n_ok++; }
@@ -4075,12 +4193,12 @@ void common_moe_calibrate(common_params & params) {
                 std::map<int, double> ncmoe_trace2;
                 auto measure_ncmoe2 = [&](int n) -> double {
                     double tps = common_moe_bench_candidate_server(
-                            self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
+                            self_exe, path_model, sub_mtp_path, (uint32_t) n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, (int) best_ngl, active_min_rank);
                     // Retry only an infrastructure failure - a quality rejection is deterministic.
                     if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
                         tps = common_moe_bench_candidate_server(
-                                self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
+                                self_exe, path_model, sub_mtp_path, (uint32_t) n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                                 concurrency, -1, -1, (int) best_ngl, active_min_rank);
                     }
                     LOG_INF("%s:   ncmoe=%d (ngl=%u) -> %s\n", __func__, n, best_ngl,
@@ -4113,108 +4231,6 @@ void common_moe_calibrate(common_params & params) {
         // below measure at the layer residency actually chosen.
         if (best_ngl <= (uint32_t) probe.n_layer) {
             active_ngl = (int) best_ngl;
-        }
-    }
-
-    int best_n_max = -1;
-    if (params.speculative.has_dft()) {
-        {
-            // Find the envelope: double n_max until throughput drops below
-            // half the n_max=1 baseline (the real n_max=8 collapse we
-            // measured went from ~80% cache health to ~14-21% - a >2x
-            // throughput cliff, not a gentle decline, so "less than half"
-            // is a safe, real signal for "past the edge" rather than
-            // ordinary run-to-run noise).
-            LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
-            common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
-            std::map<int, double> nmax_trace;
-            double baseline = -1.0;
-            int last_good = 1;
-            // The baseline is the first depth that actually benchmarks, not
-            // specifically n=1. Measured on qwen4exp: n=1 failed to come up
-            // twice (a draft depth of 1 is the oddest configuration in the
-            // sweep, and a candidate that fails to load is not evidence about
-            // depth), baseline stayed <= 0, and that single probe silently
-            // skipped the golden-section search, --spec-prob-accept and the
-            // drafter cascade with it - four MTP knobs behind one fragile
-            // candidate. A failure now costs only its own rung.
-            int n_failures = 0;
-            for (int n = 1; n <= 32; n *= 2) {
-                const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
-                nmax_trace[n] = tps;
-                LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
-                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
-                common_moe_calibration_status_candidate_done();
-                if (tps > 0 && baseline <= 0.0) {
-                    baseline = tps; // first depth that stood up anchors the collapse test
-                }
-                if (tps < 0) {
-                    // Two consecutive failures means something is wrong with the
-                    // draft itself rather than with this depth - stop paying for it.
-                    if (++n_failures >= 2) {
-                        LOG_WRN("%s: two spec-draft-n-max candidates in a row failed - stopping the envelope search\n", __func__);
-                        break;
-                    }
-                    continue;
-                }
-                n_failures = 0;
-                if (baseline > 0 && tps < baseline * 0.5) {
-                    break;
-                }
-                last_good = n;
-            }
-            const int nmax_hi = std::max(1, last_good);
-
-            if (baseline > 0) {
-                LOG_INF("%s: golden-section search for spec-draft-n-max in [1, %d] at ncmoe=%u ...\n",
-                        __func__, nmax_hi, best_n);
-                auto measure_nmax = [&](int n) -> double {
-                    auto it = nmax_trace.find(n);
-                    if (it != nmax_trace.end()) {
-                        return it->second;
-                    }
-                    const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
-                    LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
-                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
-                    common_moe_calibration_status_candidate_done();
-                    return tps;
-                };
-                best_n_max = common_golden_section_search_max(1, nmax_hi, measure_nmax, nmax_trace);
-                // Validate against the full trace, not just what
-                // golden-section converged to - see the comment on the
-                // identical check after the ncmoe search above. This is
-                // the fix for a confirmed real bug: the envelope-doubling
-                // phase above already measures n=1,2,4,8,... before
-                // golden-section ever runs, but golden-section's own
-                // bisection can (and, measured once, did: n_max=2 scored
-                // 56.06 tok/s vs the bisection's own pick of n_max=9 at
-                // 54.55) narrow away from those low values without ever
-                // reconsidering them.
-                for (const auto & kv : nmax_trace) {
-                    if (kv.second > nmax_trace.at(best_n_max)) {
-                        best_n_max = kv.first;
-                    }
-                }
-                LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
-                // The whole speculative-decoding stage wrote no row, so a model
-                // with a draft head showed nothing for it in the decisions table
-                // even though it is one of the largest levers such a model has.
-                for (const auto & kv : nmax_trace) {
-                    common_moe_calibration_status_note("speculative depth",
-                            string_format("n-max %d", kv.first),
-                            kv.second > 0 ? string_format("%.2f tok/s", kv.second) : std::string("failed"),
-                            kv.second > 0, /* chosen */ kv.first == best_n_max);
-                }
-                // The n_max search's own winning number (MTP active) is the
-                // real answer for this deployment, not the earlier ncmoe-only
-                // number (MTP off) - carry it forward so the final report and
-                // cache entry don't undersell what was actually found.
-                if (nmax_trace.at(best_n_max) > best_tps) {
-                    best_tps = nmax_trace.at(best_n_max);
-                }
-            } else {
-                LOG_WRN("%s: spec-draft-n-max=1 itself failed to benchmark - skipping n_max calibration\n", __func__);
-            }
         }
     }
 
