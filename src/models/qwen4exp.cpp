@@ -6,6 +6,37 @@
 #include <algorithm>
 #include <cinttypes>
 
+// bad metadata must be catchable: GGML_ASSERT aborts the whole process
+static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
+    if (value == 0) {
+        throw std::runtime_error(format("%s must be greater than zero, got %u", ml.llm_kv(kid).c_str(), value));
+    }
+}
+
+// get_arr() copies a short array as-is, leaving a zero tail the n-gram hash silently drops
+static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32_t n_min) {
+    uint32_t n_arr = 0;
+    ml.get_arr_n(kid, n_arr, true);
+    if (n_arr < n_min) {
+        throw std::runtime_error(format("%s has %u entries, but at least %u are required",
+                                        ml.llm_kv(kid).c_str(), n_arr, n_min));
+    }
+}
+
+// a draft head may ship without the embeddings and the LM head and borrow the target's instead.
+// the target is only reachable at graph build, through the context the draft is speculating for.
+static const llama_model & qwen4exp_shared_model(const llama_cparams & cparams, const llama_model & model, const char * name) {
+    if (cparams.ctx_other == nullptr) {
+        throw std::runtime_error(format("QWEN4EXP MTP: this draft head has no '%s' of its own; "
+                                        "load it as a draft of its target model (-md), not on its own", name));
+    }
+    const llama_model & other = *llama_get_model(cparams.ctx_other);
+    if (other.hparams.n_embd != model.hparams.n_embd || other.vocab.n_tokens() != model.vocab.n_tokens()) {
+        throw std::runtime_error(format("QWEN4EXP MTP: draft and target disagree on the shape of '%s'", name));
+    }
+    return other;
+}
+
 void llama_model_qwen4exp::load_arch_hparams(llama_model_loader & ml) {
     // NextN/MTP: an extra decoder block appended past the trunk. Read this first, since
     // n_layer() == n_layer_all - n_layer_nextn feeds every per-layer array below.
@@ -120,15 +151,24 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     const int64_t hc_dim = hc * n_embd;
     const int64_t hc_lr  = hparams.hc_low_rank;
 
-    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, 0);
+    // a draft-only export declares the full block count but ships the MTP block alone,
+    // so the trunk is described and absent. same probe as qwen35.
+    const bool mtp_only    = (hparams.n_layer_nextn > 0) && (ml.get_weight("blk.0.hc_attn_norm.weight") == nullptr);
+    const int  trunk_flags = mtp_only ? TENSOR_NOT_REQUIRED : 0;
 
-    // there is no output_norm: the final hyper-connection mixer carries it
-    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, 0);
-    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, 0);
-    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, 0);
+    // a draft may also drop the embeddings and the head and borrow the target's at graph build
+    tok_embd = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, trunk_flags);
+
+    // there is no output_norm: the final hyper-connection mixer carries it. the MTP head
+    // has its own in nextn.hc_head_*, so a draft-only file does not carry these
+    hc_head_norm = create_tensor(tn(LLM_TENSOR_HC_HEAD_NORM, "weight"), { hc_dim }, trunk_flags);
+    hc_head_down = create_tensor(tn(LLM_TENSOR_HC_HEAD_DOWN, "weight"), { hc_dim, hc_lr }, trunk_flags);
+    hc_head_up   = create_tensor(tn(LLM_TENSOR_HC_HEAD_UP,   "weight"), { hc_lr, hc_dim }, trunk_flags);
 
     output = create_tensor(tn(LLM_TENSOR_OUTPUT, "weight"), { n_embd, n_vocab }, TENSOR_NOT_REQUIRED);
-    if (output == NULL) {
+    // tie_word_embeddings is false here, so this only fires for a file that ships neither; do not
+    // tie a borrowing draft's head to a token_embd it does not have either
+    if (output == NULL && tok_embd != NULL) {
         output = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD, "weight"), { n_embd, n_vocab }, TENSOR_DUPLICATED);
     }
 
@@ -156,7 +196,7 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         // the MTP block is structurally a trunk block: is_recr()/is_ple() are both false past
         // the trunk, so it takes the full-attention + MoE path below with no special casing
-        const int flags = il < n_layer ? 0 : mtp_flags;
+        const int flags = il < n_layer ? trunk_flags : mtp_flags;
 
         // scalar here, per-layer array upstream - see load_arch_hparams
         const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
@@ -250,6 +290,13 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 std::unique_ptr<llm_graph_context> llama_model_qwen4exp::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
         return std::make_unique<graph_mtp>(*this, params);
+    }
+    // a draft-only export declares the trunk but ships the MTP block alone, so the trunk
+    // tensors are null and only the MTP graph above is buildable. a self-contained draft
+    // keeps token_embd, so it passes the borrow check and would reach here and walk nulls.
+    if (hc_head_norm == nullptr) {
+        throw std::runtime_error("this model is an MTP draft head without a trunk; "
+                                 "load it as a draft of its target model (-md), not on its own");
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -499,6 +546,9 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_set_name(inp->h, "mtp_h_input");
 
     ggml_tensor * tok_embd_w = layer.nextn.embed_tokens ? layer.nextn.embed_tokens : model.tok_embd;
+    if (tok_embd_w == nullptr) {
+        tok_embd_w = qwen4exp_shared_model(cparams, model, "token_embd.weight").tok_embd;
+    }
     ggml_tensor * tok_embd   = ggml_get_rows(ctx0, tok_embd_w, inp->tokens);
     cb(tok_embd, "mtp_tok_embd", il);
 
@@ -636,7 +686,12 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
-    GGML_ASSERT(head_w && "QWEN4EXP MTP: missing LM head (nextn.shared_head_head or model.output)");
+    if (head_w == nullptr) {
+        const llama_model & other = qwen4exp_shared_model(cparams, model, "output.weight");
+        head_w = other.output;
+        head_s = other.output_s;
+        GGML_ASSERT(head_w && "QWEN4EXP MTP: the target model has no LM head to borrow");
+    }
 
     cur = build_lora_mm(head_w, cur, head_s);
     cb(cur, "result_output", -1);
