@@ -1539,6 +1539,17 @@ struct common_moe_calibration_entry {
     // prediction ring, GGML_CUDA_MOE_CACHE_RING_PCT). -1 = not calibrated, 0 =
     // measured and off. Chosen on decode throughput and then answer-checked.
     int         moe_cache_ring_pct = -1;
+    // Features that were on, or fixed at a number, with nothing measured behind
+    // them. -1 = not calibrated; 0 = measured off/default; >0 = the measured value.
+    // neuron_reduce_k already existed as a stored field but was only ever read back
+    // from the environment - it is searched now, and 0 means "measured off".
+    int         group_admit      = -1;
+    int         coverage_evict   = -1;
+    int         host_expert_mb   = -1;
+    // Whether the MTP draft is served exact experts. Only measured when the draft's
+    // experts are CPU-offloaded; on the GPU nothing of the draft reaches the cache.
+    int         draft_exact      = -1;
+    int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1718,21 +1729,48 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         LOG_WRN("%s: using calibrated stand-in quality bar of %.1f sigma\n",
                 __func__, cal.substitute_quality_sigma);
     }
-    if (cal.neuron_reduce_k > 0 && cal.neuron_reduce_budget_mb > 0 &&
-        !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
+    auto set_env_int = [](const char * name, long long v) {
 #if defined(_WIN32)
-        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1");
-        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str());
-        _putenv_s("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
-                std::to_string(cal.neuron_reduce_budget_mb).c_str());
+        _putenv_s(name, std::to_string(v).c_str());
 #else
-        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", "1", 1);
-        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", std::to_string(cal.neuron_reduce_k).c_str(), 1);
-        setenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB",
-                std::to_string(cal.neuron_reduce_budget_mb).c_str(), 1);
+        setenv(name, std::to_string(v).c_str(), 1);
 #endif
-        LOG_WRN("%s: using calibrated neuron-reduce k=%d / %d MiB\n",
-                __func__, cal.neuron_reduce_k, cal.neuron_reduce_budget_mb);
+    };
+    // Neuron subsetting. 0 is a measured answer ("off won"), and the feature
+    // defaults to ON, so it has to be switched off explicitly - the old form only
+    // ever turned it on, which meant a measured-off result could not be expressed.
+    // The budget is applied only when one was recorded; it is not searched yet.
+    if (cal.neuron_reduce_k >= 0 && !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE")) {
+        if (cal.neuron_reduce_k == 0) {
+            set_env_int("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", 0);
+            LOG_WRN("%s: neuron subsetting measured slower than off - disabling it\n", __func__);
+        } else {
+            set_env_int("GGML_CUDA_MOE_CACHE_NEURON_REDUCE", 1);
+            set_env_int("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K", cal.neuron_reduce_k);
+            if (cal.neuron_reduce_budget_mb > 0) {
+                set_env_int("GGML_CUDA_MOE_CACHE_NEURON_REDUCE_BUDGET_MB", cal.neuron_reduce_budget_mb);
+            }
+            LOG_WRN("%s: using calibrated neuron subsetting K=%d\n", __func__, cal.neuron_reduce_k);
+        }
+    }
+    // The off-by-default cache features, each recorded only if it beat the
+    // incumbent by a real margin. 0 means measured and not worth it, so nothing
+    // is set and the runtime default (off) stands.
+    if (cal.group_admit == 1 && !getenv("GGML_CUDA_MOE_CACHE_GROUP_ADMIT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_GROUP_ADMIT", 1);
+        LOG_WRN("%s: using calibrated group admission (on)\n", __func__);
+    }
+    if (cal.coverage_evict == 1 && !getenv("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT", 1);
+        LOG_WRN("%s: using calibrated coverage eviction (on)\n", __func__);
+    }
+    if (cal.draft_exact == 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_EXACT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_EXACT", 0);
+        LOG_WRN("%s: stand-ins measured faster than exact experts in the draft - allowing them\n", __func__);
+    }
+    if (cal.host_expert_mb > 0 && !getenv("GGML_CUDA_MOE_CACHE_HOST_MB")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_HOST_MB", cal.host_expert_mb);
+        LOG_WRN("%s: using calibrated host hot-expert buffer of %d MiB\n", __func__, cal.host_expert_mb);
     }
 }
 
@@ -1841,6 +1879,11 @@ static bool common_moe_calibration_lookup(
         out.n_ubatch             = e.value("n_ubatch", -1);
         out.sched_prefetch_experts = e.value("sched_prefetch_experts", -1);
         out.moe_cache_ring_pct     = e.value("moe_cache_ring_pct", -1);
+        out.group_admit            = e.value("group_admit", -1);
+        out.coverage_evict         = e.value("coverage_evict", -1);
+        out.host_expert_mb         = e.value("host_expert_mb", -1);
+        out.draft_exact            = e.value("draft_exact", -1);
+        out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1903,6 +1946,11 @@ static void common_moe_calibration_save(
         {"n_ubatch", entry.n_ubatch},
         {"sched_prefetch_experts", entry.sched_prefetch_experts},
         {"moe_cache_ring_pct", entry.moe_cache_ring_pct},
+        {"group_admit", entry.group_admit},
+        {"coverage_evict", entry.coverage_evict},
+        {"host_expert_mb", entry.host_expert_mb},
+        {"draft_exact", entry.draft_exact},
+        {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2361,6 +2409,19 @@ static std::atomic<bool>      g_moe_calib_prefill_xlong{false};
 static std::atomic<bool>      g_moe_calib_prefetch{false};
 // GGML_CUDA_MOE_CACHE_RING_PCT every candidate launches with from here on (-1 = unset).
 static std::atomic<int>       g_moe_calib_ring_pct{-1};
+// Arbitrary extra environment every candidate launches with from here on, for the
+// feature stages below: a stage sets one knob, measures, then keeps its winner or
+// clears it. Calibration runs one candidate at a time.
+static std::mutex             g_moe_calib_env_mu;
+static std::string            g_moe_calib_extra_env;
+static void common_moe_calib_set_env(const std::string & kv) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_env_mu);
+    g_moe_calib_extra_env = kv.empty() ? std::string() : kv + " ";
+}
+static std::string common_moe_calib_get_env() {
+    std::lock_guard<std::mutex> lock(g_moe_calib_env_mu);
+    return g_moe_calib_extra_env;
+}
 
 // A candidate can end badly in two different ways and they must not be
 // conflated. -1.0 means the run did not happen (server failed to come up, port
@@ -2428,10 +2489,18 @@ static void common_moe_maybe_derive_budget() {
     }
     const double per_candidate_s =
             (double) g_moe_candidate_ms_sum.load(std::memory_order_relaxed) / 2.0 / 1000.0;
+    // The cap is the last line of defence, not the budget: want_s below asks for
+    // what the planned candidates actually cost, and the cap only stops a runaway.
+    // It was 3600s while the stages planned ~78 candidates at ~49s - 3822s - so the
+    // cap, not the measurement, decided that the last stages never ran, and they
+    // were then recorded as "failed", which a cached entry cannot tell apart from
+    // "measured and no good". Raised to 2h now that the stages measure far more;
+    // a model whose candidates are cheap (gemma-4 fits in ~600s) is unaffected,
+    // because want_s is derived per model.
     const double cap_s = [] {
         const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_MAX_S");
-        const double v = e ? atof(e) : 3600.0;
-        return v > 0.0 ? v : 3600.0;
+        const double v = e ? atof(e) : 7200.0;
+        return v > 0.0 ? v : 7200.0;
     }();
     // Slack for the stages that cost more than a plain candidate - the
     // substitution confirm step runs at 4x the probe length.
@@ -2624,6 +2693,7 @@ static double common_moe_bench_candidate_server(
     if (g_moe_calib_ring_pct.load() > 0) {
         env_prefix = string_format("GGML_CUDA_MOE_CACHE_RING_PCT=%d ", g_moe_calib_ring_pct.load()) + env_prefix;
     }
+    env_prefix = common_moe_calib_get_env() + env_prefix;
     char log_path[256];
     snprintf(log_path, sizeof(log_path), "%s/llama-moe-calib-candidate-%d.log",
              getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", port);
@@ -3448,6 +3518,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_prefill_xlong.store(false);
     g_moe_calib_prefetch.store(false);
     g_moe_calib_ring_pct.store(-1);
+    common_moe_calib_set_env(std::string());
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -3588,6 +3659,8 @@ void common_moe_calibrate(common_params & params) {
         est += 5; // offload threshold: 32, 64, 128, 256, 400
         est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
         est += 4; // prediction ring: 0, 5, 10 percent, then the winner answer-checked
+        est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
+        est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -3597,7 +3670,7 @@ void common_moe_calibrate(common_params & params) {
         }
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
-            est += 2;                                                 // no-draft baseline + draft placement
+            est += 3;                                                 // no-draft baseline, draft placement, draft stand-ins
             est += 2;                                                 // depth winner + runner-up measured again
             est += 2;                                                 // depth re-check after substitution (top two)
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
@@ -4005,6 +4078,7 @@ void common_moe_calibrate(common_params & params) {
     // expert bytes come straight out of the target's expert cache, so it is measured
     // against the other placement rather than assumed.
     int best_draft_cpu_moe = -1;
+    int best_draft_exact   = -1; // -1 not calibrated, 1 exact only, 0 stand-ins allowed
     if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring draft expert placement (GPU vs CPU) at spec-draft-n-max=%d ...\n", __func__, best_n_max);
         common_moe_calibration_status_set("measuring draft expert placement");
@@ -4018,6 +4092,24 @@ void common_moe_calibrate(common_params & params) {
         g_moe_calib_draft_cpu_moe.store(best_draft_cpu_moe == 1);
         common_moe_calibration_status_note("draft placement", best_draft_cpu_moe ? "experts on CPU" : "on GPU",
                 string_format("SELECTED - %.2f tok/s", best_draft_cpu_moe ? cpu_tps : best_n_max_tps), true, true);
+
+        // Only meaningful once the draft's experts are CPU-offloaded: on the GPU
+        // none of the draft reaches the expert cache, so there is nothing to stand
+        // in for. Offloaded, the trade reverses - a draft miss costs a host/NVMe
+        // read, against a slightly worse guess whose only cost is a lost
+        // acceptance - so it is measured rather than assumed either way.
+        if (best_draft_cpu_moe == 1 && cpu_tps > 0 && !common_moe_calibrate_budget_spent()) {
+            common_moe_calib_set_env("GGML_CUDA_MOE_CACHE_DRAFT_EXACT=0");
+            const double sub_tps = bench_with_retry(best_n, best_n_max, params.speculative.draft.mparams.path, n_threads_default);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   stand-ins allowed in the draft -> %s (exact: %.2f tok/s)\n", __func__,
+                    sub_tps > 0 ? string_format("%.2f tok/s", sub_tps).c_str() : "failed", cpu_tps);
+            best_draft_exact = sub_tps > cpu_tps ? 0 : 1;
+            common_moe_calib_set_env(best_draft_exact ? std::string() : std::string("GGML_CUDA_MOE_CACHE_DRAFT_EXACT=0"));
+            common_moe_calibration_status_note("draft experts",
+                    best_draft_exact ? "exact only" : "stand-ins allowed",
+                    string_format("SELECTED - %.2f tok/s", best_draft_exact ? cpu_tps : sub_tps), true, true);
+        }
     }
 
     // The draft every later candidate runs with - the substitution ladder, its
@@ -5102,6 +5194,114 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Features that were shipping on a number nobody measured. Each is one knob at
+    // a time against the configuration chosen above, so a winner is a real win in
+    // the regime actually served rather than in isolation. Throughput decides;
+    // the degeneracy guard still rejects broken output, and none of these changes
+    // which expert is computed - they change which are kept, when, and at what
+    // width - except neuron reduction, which is confirmed at length below.
+    auto measure_feature = [&](const char * label, const char * value, const std::string & env) -> double {
+        common_moe_calib_set_env(env);
+        const double tps = common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+        common_moe_calibration_status_candidate_done();
+        LOG_INF("%s:   %s=%s -> %s%s\n", __func__, label, value,
+                tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+        common_moe_calibration_status_note(label, value,
+                tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+        return tps;
+    };
+
+    // Heat-aware neuron subsetting: keep only the K highest-mass neurons of an
+    // expert so more experts fit the same VRAM. It has been ON by default with
+    // K = 256 and a 256 MiB budget, neither ever measured - and unlike the others
+    // here it changes the arithmetic, so its winner is confirmed at full length
+    // with the answer check before it is kept.
+    int best_neuron_k = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring heat-aware neuron subsetting (it has been on at K=256, unmeasured) ...\n", __func__);
+        common_moe_calibration_status_set("measuring neuron subsetting");
+        double best_neuron_tps = -1.0;
+        for (const int k : { 0, 128, 256, 512 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const std::string env = k == 0
+                ? std::string("GGML_CUDA_MOE_CACHE_NEURON_REDUCE=0")
+                : string_format("GGML_CUDA_MOE_CACHE_NEURON_REDUCE=1 GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K=%d", k);
+            const double tps = measure_feature("neuron subsetting",
+                    k == 0 ? "off" : string_format("K=%d", k).c_str(), env);
+            if (tps > best_neuron_tps) {
+                best_neuron_tps = tps;
+                best_neuron_k   = k;
+            }
+        }
+        if (best_neuron_k > 0 && !common_moe_calibrate_budget_spent()) {
+            common_moe_calib_set_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_NEURON_REDUCE=1 GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K=%d", best_neuron_k));
+            const double checked = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict * 4, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                    /* verify_answers */ true, /* with_reasoning */ true);
+            common_moe_calibration_status_candidate_done();
+            if (checked <= 0) {
+                LOG_WRN("%s:   neuron subsetting K=%d did not pass the answer check - recording it off\n",
+                        __func__, best_neuron_k);
+                common_moe_calibration_status_note("neuron subsetting", string_format("K=%d", best_neuron_k),
+                        "rejected by the answer check", false);
+                best_neuron_k = 0;
+            }
+        }
+        if (best_neuron_k >= 0) {
+            common_moe_calib_set_env(best_neuron_k > 0
+                    ? string_format("GGML_CUDA_MOE_CACHE_NEURON_REDUCE=1 GGML_CUDA_MOE_CACHE_NEURON_REDUCE_K=%d", best_neuron_k)
+                    : std::string("GGML_CUDA_MOE_CACHE_NEURON_REDUCE=0"));
+            LOG_INF("%s: neuron subsetting: %s\n", __func__,
+                    best_neuron_k > 0 ? string_format("K=%d", best_neuron_k).c_str() : "off");
+            common_moe_calibration_status_note("neuron subsetting",
+                    best_neuron_k > 0 ? string_format("K=%d", best_neuron_k) : std::string("off"),
+                    string_format("SELECTED - %.2f tok/s", best_neuron_tps), true, true);
+        }
+    }
+    const std::string neuron_env = common_moe_calib_get_env();
+
+    // The remaining knobs, each on/off against the incumbent. All three have been
+    // off since they were written, with no measurement either way: group admission
+    // (admit an expert's whole co-activation group at once), coverage eviction
+    // (evict by how well the rest of the pool already covers a slot's routing
+    // neighbourhood), and the host hot-expert buffer (a RAM tier below VRAM).
+    int best_group_admit = -1, best_coverage_evict = -1, best_host_mb = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the cache features that ship off (group admit, coverage evict, host buffer) ...\n", __func__);
+        common_moe_calibration_status_set("measuring the off-by-default cache features");
+        const double incumbent = measure_feature("cache features", "none (incumbent)", neuron_env);
+        struct feature { const char * label; const char * value; const char * env; int * out; };
+        const feature features[] = {
+            { "group admit",    "on",      "GGML_CUDA_MOE_CACHE_GROUP_ADMIT=1",    &best_group_admit    },
+            { "coverage evict", "on",      "GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1", &best_coverage_evict },
+            { "host buffer",    "512 MiB", "GGML_CUDA_MOE_CACHE_HOST_MB=512",      &best_host_mb        },
+        };
+        for (const auto & f : features) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = measure_feature(f.label, f.value, neuron_env + " " + f.env);
+            // Only adopted on a real gain over the incumbent - a tie keeps the
+            // simpler configuration, and every one of these costs memory or work.
+            const bool win = tps > 0 && incumbent > 0 && tps > incumbent * 1.02;
+            *f.out = win ? (strcmp(f.label, "host buffer") == 0 ? 512 : 1) : 0;
+            if (win) {
+                common_moe_calibration_status_note(f.label, f.value,
+                        string_format("SELECTED - %.2f tok/s vs %.2f", tps, incumbent), true, true);
+            }
+        }
+        common_moe_calib_set_env(neuron_env);
+    }
+
     common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
@@ -5141,6 +5341,11 @@ void common_moe_calibrate(common_params & params) {
     entry.n_ubatch             = best_ubatch;
     entry.sched_prefetch_experts = best_prefetch;
     entry.moe_cache_ring_pct     = best_ring_pct;
+    entry.neuron_reduce_k        = best_neuron_k;
+    entry.group_admit            = best_group_admit;
+    entry.coverage_evict         = best_coverage_evict;
+    entry.host_expert_mb         = best_host_mb;
+    entry.draft_exact            = best_draft_exact;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
