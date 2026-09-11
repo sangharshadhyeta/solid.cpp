@@ -660,6 +660,9 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session);
         moe_cache_session = nullptr;
     }
+    // A draft context predicts its target, so it is served exact experts: a
+    // stand-in there only lowers acceptance. The target keeps substitution.
+    ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -699,6 +702,7 @@ void llama_context::sched_reserve() {
                 if (moe_cache_session_retry) {
                     ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session_retry);
                 }
+                ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
