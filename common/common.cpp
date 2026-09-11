@@ -1515,6 +1515,11 @@ struct common_moe_calibration_entry {
     // measured multi-x slowdown at a deep one. Calibrated together with depth,
     // since letting a deeper draft pay is the whole point of the gate.
     double      spec_p_min = -1.0;
+    // Draft expert placement: -1 = not calibrated, 0 = on the GPU (the draft's
+    // default), 1 = on the CPU. The GPU placement costs the target's expert cache
+    // the draft's expert bytes (~1.7 GB on Qwen3.8-Flash-Next); whether that trade
+    // pays is measured, not assumed.
+    int         spec_draft_cpu_moe = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1812,6 +1817,7 @@ static bool common_moe_calibration_lookup(
         out.spec_prob_accept    = e.value("spec_prob_accept", -1);
         out.spec_types          = e.value("spec_types", std::string());
         out.spec_p_min          = e.value("spec_p_min", -1.0);
+        out.spec_draft_cpu_moe  = e.value("spec_draft_cpu_moe", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1869,6 +1875,7 @@ static void common_moe_calibration_save(
         {"spec_prob_accept", entry.spec_prob_accept},
         {"spec_types", entry.spec_types},
         {"spec_p_min", entry.spec_p_min},
+        {"spec_draft_cpu_moe", entry.spec_draft_cpu_moe},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2290,6 +2297,12 @@ static std::atomic<int>       g_moe_planned_candidates{0};
 static std::atomic<int>       g_moe_verifiable_ref{-1};
 static std::atomic<int>       g_moe_verifiable_ref2{-1};         // second reference run, for the tolerance
 static std::atomic<bool>      g_moe_verifying_reference{false};  // the next verifications set the bar
+// Where every draft candidate places the draft's experts from here on: false =
+// on the GPU (the draft's own default), true = on the CPU (--spec-draft-cpu-moe).
+// Calibration-wide rather than a per-call argument so that once the placement
+// stage picks one, every later stage measures with it instead of silently
+// falling back to the default.
+static std::atomic<bool>      g_moe_calib_draft_cpu_moe{false};
 
 // A candidate can end badly in two different ways and they must not be
 // conflated. -1.0 means the run did not happen (server failed to come up, port
@@ -2435,6 +2448,9 @@ static double common_moe_bench_candidate_server(
         }
         if (spec_p_min >= 0.0) {
             mtp_args += string_format("--spec-draft-p-min %.2f ", spec_p_min);
+        }
+        if (g_moe_calib_draft_cpu_moe.load()) {
+            mtp_args += "--spec-draft-cpu-moe ";
         }
     }
     std::string threads_args;
@@ -3276,6 +3292,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_verifiable_ref.store(-1);
     g_moe_verifiable_ref2.store(-1);
     g_moe_verifying_reference.store(false);
+    g_moe_calib_draft_cpu_moe.store(false);
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -3422,6 +3439,7 @@ void common_moe_calibrate(common_params & params) {
         }
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
+            est += 2;                                                 // no-draft baseline + draft placement
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
             est += 2;                                                 // spec-prob-accept: off, on
             est += 2;                                                 // drafter cascade: mtp alone, ngram-suffix in front
@@ -3554,7 +3572,9 @@ void common_moe_calibrate(common_params & params) {
     // rather than assuming what that share is. Ordering the depth search after
     // substitution meant the substitution floor was chosen for a no-draft
     // configuration the server would never run.
-    int best_n_max = -1;
+    int    best_n_max     = -1; // -1 not calibrated; 0 measured: no draft beat every depth
+    double best_n_max_tps = -1.0;
+    double no_draft_tps   = -1.0;
     if (params.speculative.has_dft()) {
         {
             // Find the envelope: double n_max until throughput drops below
@@ -3565,6 +3585,15 @@ void common_moe_calibrate(common_params & params) {
             // ordinary run-to-run noise).
             LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
             common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
+            // No draft at all, measured exactly like every depth below. Without it
+            // the search can only rank depths against each other, so it would ship
+            // a depth even on a machine where speculative decoding loses outright.
+            no_draft_tps = bench_with_retry(best_n, 0, std::string(), n_threads_default);
+            LOG_INF("%s:   no draft (speculative decoding off) -> %s\n", __func__,
+                    no_draft_tps > 0 ? string_format("%.2f tok/s", no_draft_tps).c_str() : "failed");
+            common_moe_calibration_status_note("speculative decoding", "off",
+                    no_draft_tps > 0 ? string_format("%.2f tok/s", no_draft_tps) : std::string("failed"), no_draft_tps > 0);
+            common_moe_calibration_status_candidate_done();
             std::map<int, double> nmax_trace;
             double baseline = -1.0;
             int last_good = 1;
@@ -3650,16 +3679,49 @@ void common_moe_calibrate(common_params & params) {
                 if (nmax_trace.at(best_n_max) > best_tps) {
                     best_tps = nmax_trace.at(best_n_max);
                 }
+                best_n_max_tps = nmax_trace.at(best_n_max);
             } else {
                 LOG_WRN("%s: spec-draft-n-max=1 itself failed to benchmark - skipping n_max calibration\n", __func__);
             }
         }
     }
 
+    // Proven, not promised: the best depth has to beat no draft at all.
+    if (best_n_max > 0 && no_draft_tps > 0.0 && best_n_max_tps <= no_draft_tps) {
+        LOG_WRN("%s: the best draft depth (%d, %.2f tok/s) does not beat no draft at all (%.2f tok/s) on this "
+                "machine - recording speculative decoding as measured slower; later stages run without it\n",
+                __func__, best_n_max, best_n_max_tps, no_draft_tps);
+        common_moe_calibration_status_note("speculative decoding", "off",
+                string_format("SELECTED - %.2f tok/s beats the best draft depth's %.2f", no_draft_tps, best_n_max_tps),
+                true, true);
+        best_n_max = 0;
+    }
+
+    // Draft placement, at the chosen depth. The draft defaults to fully GPU-resident
+    // (its own n_gpu_layers, and the target's -ncmoe override is not applied to it),
+    // which is almost certainly right for a head that runs on every step - but its
+    // expert bytes come straight out of the target's expert cache, so it is measured
+    // against the other placement rather than assumed.
+    int best_draft_cpu_moe = -1;
+    if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring draft expert placement (GPU vs CPU) at spec-draft-n-max=%d ...\n", __func__, best_n_max);
+        common_moe_calibration_status_set("measuring draft expert placement");
+        g_moe_calib_draft_cpu_moe.store(true);
+        const double cpu_tps = bench_with_retry(best_n, best_n_max, params.speculative.draft.mparams.path, n_threads_default);
+        common_moe_calibration_status_candidate_done();
+        LOG_INF("%s:   draft experts on CPU -> %s%s (on GPU: %.2f tok/s)\n", __func__,
+                cpu_tps > 0 ? string_format("%.2f tok/s", cpu_tps).c_str() : "failed",
+                cpu_tps > 0 ? common_moe_last_acceptance_str().c_str() : "", best_n_max_tps);
+        best_draft_cpu_moe = cpu_tps > best_n_max_tps ? 1 : 0;
+        g_moe_calib_draft_cpu_moe.store(best_draft_cpu_moe == 1);
+        common_moe_calibration_status_note("draft placement", best_draft_cpu_moe ? "experts on CPU" : "on GPU",
+                string_format("SELECTED - %.2f tok/s", best_draft_cpu_moe ? cpu_tps : best_n_max_tps), true, true);
+    }
+
     // The draft every later candidate runs with - the substitution ladder, its
     // answer bar, the stand-in quality bar and the -ngl search. The depth the
     // search found, or the configured depth when it found nothing.
-    const bool        sub_draft    = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
+    const bool        sub_draft    = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty() && best_n_max != 0;
     const std::string sub_mtp_path = sub_draft ? params.speculative.draft.mparams.path : std::string();
     const int         sub_n_max    = !sub_draft ? 0 : (best_n_max > 0 ? best_n_max : std::max(1, params.speculative.draft.n_max));
 
@@ -4247,7 +4309,7 @@ void common_moe_calibrate(common_params & params) {
     // where one failed n_max=1 probe silently turned the whole run into a
     // calibration of the wrong thing. Fall back to the depth the run is configured
     // with instead; spec_n_max simply stays uncalibrated.
-    const bool  mtp_configured   = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
+    const bool  mtp_configured   = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty() && best_n_max != 0;
     const std::string mtp_path_for_threads = mtp_configured ? params.speculative.draft.mparams.path : std::string();
     const int n_max_for_threads = best_n_max > 0
             ? best_n_max
@@ -4671,6 +4733,7 @@ void common_moe_calibrate(common_params & params) {
     entry.spec_prob_accept = best_prob_accept;
     entry.spec_types      = best_spec_types;
     entry.spec_p_min      = best_p_min;
+    entry.spec_draft_cpu_moe = best_draft_cpu_moe;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -5160,6 +5223,19 @@ static bool common_maybe_autoplace_moe_cpu(
             if (cached.spec_n_max > 0 && params.speculative.has_dft() &&
                 params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
                 params.speculative.draft.n_max = cached.spec_n_max;
+            }
+            // 0 is a measured answer: no draft beat every depth on this machine.
+            // Same guard - only when the user left the depth at its default.
+            if (cached.spec_n_max == 0 && params.speculative.has_dft() &&
+                params.speculative.draft.n_max == 3) {
+                LOG_WRN("%s: calibration measured speculative decoding slower than none on this machine - "
+                        "serving without it (pass --spec-draft-n-max to override; the draft model is still loaded)\n",
+                        __func__);
+                params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
+            }
+            if (cached.spec_draft_cpu_moe == 1 && params.speculative.has_dft() &&
+                params.speculative.draft.tensor_buft_overrides.empty()) {
+                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
             }
             // Same rule again: only for someone who already has a draft
             // configured, and only when they left acceptance at its default.
