@@ -1491,6 +1491,7 @@ struct common_moe_calibration_entry {
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
     int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
     int         admit_after         = -1; // -1 = not calibrated, use the runtime default (2)
+    int         spec_prob_accept    = -1; // -1 = not calibrated; 0 = exact-match only, 1 = probabilistic
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1785,6 +1786,7 @@ static bool common_moe_calibration_lookup(
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
         out.admit_after         = e.value("admit_after", -1);
+        out.spec_prob_accept    = e.value("spec_prob_accept", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1839,6 +1841,7 @@ static void common_moe_calibration_save(
         {"moe_cache_mb",    entry.moe_cache_mb},
         {"substitute_min_rank", entry.substitute_min_rank},
         {"admit_after", entry.admit_after},
+        {"spec_prob_accept", entry.spec_prob_accept},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2337,7 +2340,8 @@ static double common_moe_bench_candidate_server(
         double substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN(),
         bool verify_answers = false,
         bool with_reasoning = false,
-        const std::string & extra_env = std::string()) {
+        const std::string & extra_env = std::string(),
+        int spec_prob_accept = -1) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2358,6 +2362,13 @@ static double common_moe_bench_candidate_server(
         snprintf(buf, sizeof(buf), "--model-draft '%s' --spec-type draft-mtp --spec-draft-n-max %d ",
                 mtp_path.c_str(), n_max);
         mtp_args = buf;
+        // Only ever appended for a candidate that is explicitly measuring this
+        // lever; -1 leaves the server on its own default (off, exact-match).
+        if (spec_prob_accept == 1) {
+            mtp_args += "--spec-prob-accept ";
+        } else if (spec_prob_accept == 0) {
+            mtp_args += "--no-spec-prob-accept ";
+        }
     }
     std::string threads_args;
     if (n_threads > 0) {
@@ -3271,6 +3282,7 @@ void common_moe_calibrate(common_params & params) {
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
+            est += 2;                                                 // spec-prob-accept: off, on
         }
         est += 2; // thread-count candidates
         // Expert-cache size knee. Counted from the ladder that will actually run
@@ -4258,6 +4270,51 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Probabilistic draft acceptance. Only meaningful with a draft model, and
+    // only worth measuring at the sampling actually served: at greedy the target
+    // almost always reproduces the drafted token anyway, so exact-match already
+    // captures nearly everything and this looks like a no-op. The probes run at
+    // COMMON_MOE_PROBE_TEMP, which is where the two paths diverge.
+    //
+    // The flag's own help says it "only ever raises or matches the accept rate
+    // versus exact-match, never lowers it". That is a claim about acceptance,
+    // not about throughput - a higher accept rate still has to pay for the
+    // probability bookkeeping - so measure the thing we care about rather than
+    // trusting the monotonicity argument.
+    int    best_prob_accept     = -1;
+    double best_prob_accept_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
+    if (!mtp_path_for_threads.empty() && best_n_max > 0 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring probabilistic draft acceptance (--spec-prob-accept) ...\n", __func__);
+        common_moe_calibration_status_set("measuring probabilistic draft acceptance");
+        for (const int candidate : {0, 1}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234,
+                    std::numeric_limits<double>::quiet_NaN(), false, false, std::string(), candidate);
+            LOG_INF("%s:   spec-prob-accept=%s -> %s\n", __func__, candidate ? "on" : "off",
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("draft acceptance",
+                    candidate ? std::string("probabilistic") : std::string("exact-match"),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_prob_accept_tps) {
+                best_prob_accept_tps = tps;
+                best_prob_accept     = candidate;
+            }
+        }
+        if (best_prob_accept >= 0) {
+            LOG_INF("%s: draft acceptance: %s at %.2f tok/s\n", __func__,
+                    best_prob_accept ? "probabilistic" : "exact-match", best_prob_accept_tps);
+            common_moe_calibration_status_note("draft acceptance",
+                    best_prob_accept ? std::string("probabilistic") : std::string("exact-match"),
+                    string_format("SELECTED - %.2f tok/s", best_prob_accept_tps), true, true);
+        }
+    }
+
     common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
@@ -4289,6 +4346,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_quality_sigma = active_quality_sigma;
     entry.fit_target_mb   = best_fit_mb;
     entry.admit_after     = best_admit_after;
+    entry.spec_prob_accept = best_prob_accept;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -4778,6 +4836,14 @@ static bool common_maybe_autoplace_moe_cpu(
             if (cached.spec_n_max > 0 && params.speculative.has_dft() &&
                 params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
                 params.speculative.draft.n_max = cached.spec_n_max;
+            }
+            // Same rule again: only for someone who already has a draft
+            // configured, and only when they left acceptance at its default.
+            // 0 is a real measured answer ("exact-match won"), so the guard is
+            // >= 0, not > 0 - unlike n_max above, where 0 is not a valid depth.
+            if (cached.spec_prob_accept >= 0 && params.speculative.has_dft() &&
+                !params.speculative.draft.prob_accept) {
+                params.speculative.draft.prob_accept = cached.spec_prob_accept != 0;
             }
             // Same rule as spec_n_max above: only refine --moe-cache's own
             // "auto" intent, never override a size the user explicitly
