@@ -288,12 +288,17 @@ struct moe_cache_config {
     size_t min_expert_bytes = 256u << 10;
     // Default is derived live from g_max_batch_hint (the real n_seq_max of
     // the context, set before session_create() runs) - see
-    // moe_cache_read_config(). Floor of 8 so ordinary prefill/decode batches
-    // engage the cache even with no hint given; ceiling of
-    // MOE_CACHE_MAX_BATCH_CEILING (64) because that's a real buffer-size
-    // limit, not a conservative guess. GGML_CUDA_MOE_CACHE_MAX_BATCH
-    // overrides this exactly as before when explicitly set.
-    int max_batch = 8;
+    // moe_cache_read_config(). The floor is the CUDA backend's op-offload
+    // threshold (moe_cache_batch_floor): a MoE op with fewer tokens stays on
+    // the CPU, which is exactly the set this cache can serve, and one at or
+    // above it is offloaded to the GPU by the scheduler anyway. The floor used
+    // to be 8, so every prompt chunk of 9-31 tokens skipped the cache and read
+    // all its experts from the host mapping: on Qwen3.8-Flash-Next, 15-20 token
+    // prompts ran 340-600 ms per token against 136 ms for a single decoded
+    // token. Ceiling MOE_CACHE_MAX_BATCH_CEILING (GGML_MOE_CACHE_MAX_BATCH_ROWS,
+    // 4096 rows), which sizes the scratch and the CPU-side stack arrays.
+    // GGML_CUDA_MOE_CACHE_MAX_BATCH overrides this when explicitly set.
+    int max_batch = 32;
     int inserts_per_plan = 8;
     int admit_after = 2;
     int readmit_after = 8;
@@ -1311,10 +1316,16 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_MAX_BATCH", 1, MOE_CACHE_MAX_BATCH_CEILING, value)) {
         config.max_batch = (int)value;
     } else {
-        const int hint = g_max_batch_hint.load(std::memory_order_relaxed);
-        if (hint > 0) {
-            config.max_batch = std::max(8, hint);
-        }
+        // The largest MoE batch that can reach this cache at all is one token
+        // short of the op-offload threshold - anything bigger is offloaded to the
+        // GPU before the CPU op (and this cache) ever sees it. Read from the same
+        // variable the CUDA backend reads, with the same default, so the two
+        // boundaries cannot drift apart.
+        const char * offload_env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+        const int    offload_min = offload_env ? atoi(offload_env) : 32;
+        const int    floor       = std::max(8, std::min(offload_min, MOE_CACHE_MAX_BATCH_CEILING));
+        const int    hint        = g_max_batch_hint.load(std::memory_order_relaxed);
+        config.max_batch = std::min(MOE_CACHE_MAX_BATCH_CEILING, std::max(floor, hint));
     }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_INSERTS", 1, 1024, value)) {
         config.inserts_per_plan = (int)value;
