@@ -4326,6 +4326,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, const std::string & value) {
             const auto types_str = string_split<std::string>(value, ',');
             auto types = common_speculative_types_from_names(types_str);
+            // The default list is { none }. Appending to it left "none" at the head of
+            // every explicit list - reported as "none" while drafting - so an explicit
+            // --spec-type replaces the default rather than extending it. Repeated
+            // --spec-type flags still accumulate.
+            if (params.speculative.types.size() == 1 &&
+                params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+                params.speculative.types.clear();
+            }
             params.speculative.types.insert(params.speculative.types.end(), types.begin(), types.end());
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_TYPE"));

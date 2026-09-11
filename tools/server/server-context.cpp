@@ -1616,6 +1616,12 @@ private:
             model_name = *params_base.model_alias.begin();
         } else if (!params_base.model.get_name().empty()) {
             model_name = params_base.model.get_name();
+        } else if (char gname[256]; model_tgt &&
+                   llama_model_meta_val_str(model_tgt, "general.name", gname, sizeof(gname)) > 0 && gname[0]) {
+            // The model's own name from its GGUF metadata. A local split model was
+            // otherwise named after its first shard ("...-00001-of-00003.gguf"),
+            // which is the file the loader opened, not what the model is called.
+            model_name = gname;
         } else {
             // fallback: derive model name from file name
             auto model_path = std::filesystem::path(params_base.model.path);
@@ -5377,7 +5383,10 @@ void server_routes::init_routes() {
         GGML_UNUSED(ctx_server);
 
         task_params tparams;
-        tparams.sampling = params.sampling;
+        tparams.sampling    = params.sampling;
+        // Without this every speculative setting reported its built-in default -
+        // "speculative.types: none" on a server drafting with MTP.
+        tparams.speculative = params.speculative;
         json default_generation_settings_for_props = json {
             { "params", tparams.to_json(true) },
             { "n_ctx",  meta->slot_n_ctx },
