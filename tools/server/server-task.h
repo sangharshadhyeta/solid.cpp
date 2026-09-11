@@ -624,6 +624,16 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // Expert-cache topic hint, snapshotted from the live moe-cache when this
+    // state was checkpointed (see ggml_moe_cache.get_topic). Empty when the
+    // model has no expert cache, or nothing had routed yet. Consumed on
+    // restore by ggml_moe_cache.prewarm_from_topic - a free-slot-only
+    // suggestion of which experts this prompt's continuation is likely to
+    // need again, so decode does not have to rediscover them one cold fault
+    // at a time. See docs/feature-interaction-audit.md, "prompt cache ->
+    // expert cache prewarm".
+    std::vector<float> moe_topic_hint;
+
     size_t size() const {
         size_t res = data.size();
 

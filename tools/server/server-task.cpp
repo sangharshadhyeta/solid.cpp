@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "ggml-backend-moe-cache.h"
 
 using json = nlohmann::ordered_json;
 
@@ -1729,6 +1730,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         return nullptr;
     }
 
+    // Snapshot the live topic position, if the model has an expert cache and
+    // has routed at least once. This is what prewarm_from_topic() is seeded
+    // from when this exact state is restored later - see the field comment
+    // on moe_topic_hint. Encoding: [0]=x, [1]=y, [2..]=the fuller embedding
+    // (may be absent, leaving just the two floats). Failure (no expert cache,
+    // e.g. a dense model, or a fresh session with nothing routed yet) leaves
+    // it empty, which the restore side already treats as "no hint, do nothing".
+    std::vector<float> moe_topic_hint;
+    if (ggml_moe_cache.get_topic) {
+        float tx = 0.0f, ty = 0.0f;
+        float dims[64];
+        int n_dims = 0;
+        if (ggml_moe_cache.get_topic(&tx, &ty, dims, (int) (sizeof(dims) / sizeof(dims[0])), &n_dims)) {
+            moe_topic_hint.reserve(2 + n_dims);
+            moe_topic_hint.push_back(tx);
+            moe_topic_hint.push_back(ty);
+            moe_topic_hint.insert(moe_topic_hint.end(), dims, dims + n_dims);
+        }
+    }
+
     states.push_back({
         /*.prompt =*/ {
             /*.tokens      =*/ prompt.tokens.clone(),
@@ -1738,6 +1759,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
         },
+        /*.moe_topic_hint =*/ std::move(moe_topic_hint),
     });
 
     return &states.back();
@@ -1817,6 +1839,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
                 data.clear();
                 data.shrink_to_fit();
+            }
+        }
+
+        // Off by default: this link is new and has not been A/B'd (the atlas
+        // warm path it reuses shipped the same way - see GGML_CUDA_MOE_CACHE_
+        // ATLAS_WARM's own comment - and earned its default only after
+        // measurement). Free-slot-only and never-evicting either way, so the
+        // worst case with it on is a wasted lookup, never a worse decode.
+        if (it_best->moe_topic_hint.size() >= 2 && ggml_moe_cache.prewarm_from_topic) {
+            static const bool prewarm_enabled = [] {
+                const char * e = getenv("LLAMA_PROMPT_CACHE_MOE_PREWARM");
+                return e && atoi(e) != 0;
+            }();
+            if (prewarm_enabled) {
+                static const int top_k = [] {
+                    const char * e = getenv("LLAMA_PROMPT_CACHE_MOE_PREWARM_K");
+                    const int v = e ? atoi(e) : 4;
+                    return v > 0 ? v : 4;
+                }();
+                ggml_moe_cache.prewarm_from_topic(it_best->moe_topic_hint[0], it_best->moe_topic_hint[1], top_k);
             }
         }
 

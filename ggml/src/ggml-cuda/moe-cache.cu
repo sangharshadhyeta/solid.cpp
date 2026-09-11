@@ -8183,6 +8183,86 @@ static int moe_cache_atlas_rank_k(float confidence) {
     confidence = moe_cache_atlas_burst_confidence_clamp(confidence);
     return steady + (int) std::lround((double) (burst - steady) * confidence);
 }
+// See the header comment. Reads the first live device's req_dir - a
+// process-wide snapshot is what a server layer wants (it does not know or
+// care about our internal device enumeration), and multi-device setups all
+// share one routing stream from the model's perspective.
+static bool moe_cache_get_topic(float * out_x, float * out_y, float * dims, int max_dims, int * out_n_dims) {
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::unique_lock<std::mutex> lock(session->mu, std::try_to_lock);
+        if (!lock.owns_lock() || session->stopping) {
+            continue;
+        }
+        for (const auto & device_ptr : session->devices) {
+            const moe_cache_device & device = *device_ptr;
+            if (device.dead.load() || !device.req_dir_valid) {
+                continue;
+            }
+            if (out_x) *out_x = device.req_dir_x;
+            if (out_y) *out_y = device.req_dir_y;
+            if (out_n_dims) *out_n_dims = 0;
+            if (dims && max_dims > 0 && device.req_dir_n_valid) {
+                const int n = std::min(max_dims, (int) device.req_dir_n.size());
+                std::copy(device.req_dir_n.begin(), device.req_dir_n.begin() + n, dims);
+                if (out_n_dims) *out_n_dims = n;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+// See the header comment. Off-hot-path (called from a server restoring a
+// cached prompt, not from decode), so a full linear scan per tensor is fine -
+// this runs at most once per restore, not once per token.
+static void moe_cache_prewarm_from_topic(float x, float y, int top_k_per_tensor) {
+    if (top_k_per_tensor <= 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::unique_lock<std::mutex> lock(session->mu, std::try_to_lock);
+        if (!lock.owns_lock() || session->stopping) {
+            continue; // never block decode for a restore-time suggestion
+        }
+        for (const auto & device_ptr : session->devices) {
+            moe_cache_device & device = *device_ptr;
+            if (device.dead.load()) {
+                continue;
+            }
+            for (auto & [host_base, atlas_vec_ptr] : device.atlas_by_tensor) {
+                if (!atlas_vec_ptr || atlas_vec_ptr->empty()) {
+                    continue;
+                }
+                const auto seen = device.seen_tensors.find(host_base);
+                if (seen == device.seen_tensors.end()) {
+                    continue;
+                }
+                const int pool_index = moe_cache_find_pool(device, seen->second.expert_size, seen->second.wtype);
+                if (pool_index < 0) {
+                    continue;
+                }
+                moe_cache_pool & pool = *device.pools[pool_index];
+                const int k = std::min(top_k_per_tensor, MOE_CACHE_ATLAS_RANK_K);
+                moe_cache_atlas_cand best[MOE_CACHE_ATLAS_RANK_K];
+                // INT64_MAX for n_expert: atlas_rank uses it only to discard a
+                // stale entry left over from a different model's expert count
+                // (expert >= n_expert). atlas_by_tensor is already keyed per
+                // tensor pointer, so every candidate here belongs to this
+                // model's own tensor and that guard cannot fire wrongly.
+                const int n_best = moe_cache_atlas_rank(*atlas_vec_ptr, x, y, INT64_MAX, best, k);
+                if (n_best > 0) {
+                    moe_cache_atlas_admit(device, pool, pool_index, host_base, seen->second.expert_size,
+                            best, n_best, k, 0);
+                }
+            }
+        }
+    }
+}
+
+
+
 static int moe_cache_atlas_admit_k(float confidence) {
     static const int steady = [] {
         const char * e = getenv("GGML_CUDA_MOE_CACHE_ATLAS_WARM_ADMIT_K");
@@ -12432,6 +12512,8 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.invalidate = moe_cache_invalidate;
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
     ggml_moe_cache.set_host_oversubscribed = moe_cache_set_host_oversubscribed;
+    ggml_moe_cache.get_topic = moe_cache_get_topic;
+    ggml_moe_cache.prewarm_from_topic = moe_cache_prewarm_from_topic;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_substitute_map = moe_cache_get_substitute_map;
