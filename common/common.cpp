@@ -2246,11 +2246,15 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
         req["top_k"] = 1;
     }
     const std::string req_body = req.dump();
-    char req_cmd[4096];
-    snprintf(req_cmd, sizeof(req_cmd),
+    // Built as a string, not into a fixed buffer. It was char[4096], so any
+    // request body longer than ~4 KB was silently cut mid-JSON and the server
+    // answered a malformed request with no timings: the prompt micro-batch stage's
+    // ~8000-character probe failed every candidate in seconds, and with no winner
+    // the expert-prefetch candidate after it never ran.
+    const std::string req_cmd = string_format(
         "curl -s http://127.0.0.1:%d/v1/chat/completions -H 'Content-Type: application/json' --data-binary %s",
         port, common_shell_quote(req_body).c_str());
-    FILE * rp = popen(req_cmd, "r");
+    FILE * rp = popen(req_cmd.c_str(), "r");
     if (!rp) {
         return {};
     }
@@ -2517,12 +2521,17 @@ static double common_moe_bench_candidate_server(
     // the caller's n_ctx here would starve most slots down to a handful of
     // tokens each and force truncation/failure well before this is a real
     // concurrent-throughput measurement.
-    std::string parallel_args;
+    // Always pass the slot count, 1 included. llama-server's own default is
+    // "auto" (-1), which it resolves to 4 slots with a unified KV cache - so a
+    // candidate launched at concurrency 1 with no --parallel ran with 4 slots
+    // (clamped to 2 by the moe-cache's concurrency limit: "n_slots = 2,
+    // kv_unified = 'true'" in every candidate log), while the configuration it
+    // was calibrating serves with exactly 1. The extra slot's KV cache came out
+    // of the VRAM the expert cache is sized from, and the batch hints followed
+    // the wrong slot count, so every stage measured a deployment nobody runs.
+    std::string parallel_args = string_format("--parallel %d ", std::max(1, n_concurrency));
     uint32_t ctx_for_launch = n_ctx;
     if (n_concurrency > 1) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "--parallel %d ", n_concurrency);
-        parallel_args = buf;
         ctx_for_launch = std::max<uint32_t>(n_ctx, (uint32_t) n_concurrency * 384);
     }
     char cmd[4096];
