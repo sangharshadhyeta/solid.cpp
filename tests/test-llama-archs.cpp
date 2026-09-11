@@ -162,7 +162,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         std::vector<uint32_t> n_head_kv_per_layer;
         n_head_kv_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
-            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head_kv);
+            n_head_kv_per_layer.push_back(il == 1 ? 0 : n_head);
         }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT,    n_head);
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_kv_per_layer);
@@ -182,22 +182,6 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
         ms.add_kv(LLM_KV_ROPE_DIMENSION_COUNT,       uint32_t(64));
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA,   uint32_t(192));
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA, uint32_t(128));
-        if (arch == LLM_ARCH_DOTS3NOTE) {
-            // SWA layers reuse the same MLA geometry as the full layers in this fixture
-            ms.add_kv(LLM_KV_ATTENTION_KV_LORA_RANK_SWA,     uint32_t(512));
-            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_SWA,       uint32_t(576));
-            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_SWA,     uint32_t(512));
-            ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH_MLA_SWA,   uint32_t(192));
-            ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH_MLA_SWA, uint32_t(128));
-            ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,             10000.0f);
-            // indexer on the full-attention layers (inverse of the swa pattern)
-            std::vector<uint32_t> indexer_types;
-            indexer_types.reserve(n_layer);
-            for (uint32_t il = 0; il < n_layer; il++) {
-                indexer_types.push_back(il % 2 ? 0 : 1);
-            }
-            ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
-        }
     } else if (arch == LLM_ARCH_GLM5NEXT) {
         // nope-only MLA: the cache holds the bare latent, so no rope width is added on top of
         // the kv LoRA rank and n_rot has to be an explicit 0, not the head size default
