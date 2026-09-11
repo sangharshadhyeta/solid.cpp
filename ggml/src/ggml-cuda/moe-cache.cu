@@ -9551,6 +9551,31 @@ static int moe_cache_plan(
         device.rank_misses[rank_bucket]++;
         note_layer(false);
 
+#if defined(__linux__)
+        // The CPU computes this expert next. When the experts do not all fit in
+        // RAM its pages may still be on disk, and the compute threads would
+        // fault them in one read-around window at a time - on Qwen3.8-Flash-Next
+        // that pulled 8 MiB per miss for a ~0.8 MiB expert slice, 1.3 GiB per
+        // token in all. Ask for exactly this expert's bytes now instead, so the
+        // kernel reads them in large asynchronous requests while earlier rows
+        // compute. On already-cached pages this is a lookup and no I/O. Pairs
+        // with the loader marking expert ranges MADV_RANDOM (no blind
+        // read-around) in the bigger-than-RAM case.
+        {
+            static const bool cpu_prefetch = [] {
+                const char * env = getenv("GGML_CUDA_MOE_CACHE_CPU_PREFETCH");
+                return !env || atoi(env) != 0;
+            }();
+            static const long page_size_p = sysconf(_SC_PAGESIZE);
+            if (cpu_prefetch && page_size_p > 0 && node->host_base && node->expert_size > 0) {
+                const uintptr_t begin = (uintptr_t) node->host_base + (uintptr_t) expert * node->expert_size;
+                const uintptr_t first = begin & ~((uintptr_t) page_size_p - 1);
+                const uintptr_t last  = (begin + node->expert_size + page_size_p - 1) & ~((uintptr_t) page_size_p - 1);
+                posix_madvise((void *) first, (size_t) (last - first), POSIX_MADV_WILLNEED);
+            }
+        }
+#endif
+
         // Substitution. Deliberately does NOT skip the admission bookkeeping
         // below: the router still wanted this expert, and admission must keep
         // following what the router wanted rather than what it was forced to

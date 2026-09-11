@@ -29,6 +29,10 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include <cmath>
 #include <functional>
 #include <map>
@@ -1773,6 +1777,45 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
+        }
+    }
+
+    // CPU-resident experts on a model bigger than RAM are read a slice at a time,
+    // in whatever order the router picks, so the kernel's read-around - sized for
+    // sequential files, 4-8 MiB per fault under common tuned profiles - reads
+    // mostly neighbouring experts nothing asked for, and evicts useful ones to
+    // make room. On Qwen3.8-Flash-Next (88 GiB, 30 GiB RAM) that was 1.3 GiB of
+    // disk per token. Turn read-around off for exactly those ranges; the
+    // moe-cache asks for each selected expert's bytes itself (see its
+    // CPU_PREFETCH). Same bigger-than-RAM gate as the pinning below.
+    if (ml.use_mmap && !mmap_prefetch) {
+        const char * env = getenv("LLAMA_MMAP_EXPERT_RANDOM");
+        if (!env || atoi(env) != 0) {
+#if defined(__linux__)
+            const uintptr_t page_size = (uintptr_t) sysconf(_SC_PAGESIZE);
+            size_t n_advised = 0, advised_bytes = 0;
+            for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
+                for (ggml_tensor * t = ggml_get_first_tensor(&*ctx); t; t = ggml_get_next_tensor(&*ctx, t)) {
+                    if (!t->data || !t->buffer || !ggml_backend_buffer_is_host(t->buffer) ||
+                            strstr(ggml_get_name(t), "_exps") == nullptr) {
+                        continue;
+                    }
+                    uintptr_t first = (uintptr_t) t->data;
+                    uintptr_t last  = first + ggml_nbytes(t);
+                    first = (first + page_size - 1) & ~(page_size - 1);
+                    last  = last & ~(page_size - 1);
+                    if (last > first && posix_madvise((void *) first, last - first, POSIX_MADV_RANDOM) == 0) {
+                        n_advised++;
+                        advised_bytes += last - first;
+                    }
+                }
+            }
+            if (n_advised > 0) {
+                LLAMA_LOG_WARN("%s: no read-around on %zu CPU expert tensor(s) (%.2f GiB) - the model is larger "
+                        "than RAM, so each fault reads only what was selected\n",
+                        __func__, n_advised, advised_bytes / 1024.0 / 1024.0 / 1024.0);
+            }
+#endif
         }
     }
 
