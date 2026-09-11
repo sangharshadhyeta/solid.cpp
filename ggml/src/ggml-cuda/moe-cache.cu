@@ -11883,6 +11883,66 @@ static int moe_cache_get_expert_map(uint8_t * out_bytes, int max_bytes, int * ou
 // READ-AND-CLEARED: each call reports what happened since the previous
 // call, then empties every device's substituted_recently set - correct
 // for exactly one poller, which is what the /experts handler is.
+// Which (layer,expert) cells belong to the speculative draft rather than the
+// target. A live snapshot, not read-and-cleared: role never changes for a given
+// tensor, so a poller may read it whenever it likes. Same shape and failure
+// convention as get_expert_map.
+//
+// Exists so the Brain view can show the draft in its own colours: the draft's
+// experts live in the same atlas and obey the same rules, but in their own pools,
+// and being able to see which slots they hold is the difference between knowing
+// that and guessing it.
+static int moe_cache_get_draft_map(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols) {
+    if (out_rows) *out_rows = 0;
+    if (out_cols) *out_cols = 0;
+    if (g_session_count.load(std::memory_order_acquire) == 0) {
+        return 0;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    for (moe_cache_session * session : g_sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        if (session->tensor_layer.empty() || session->n_expert_hint <= 0) {
+            continue;
+        }
+        int n_rows = 0;
+        for (const auto & kv : session->tensor_layer) {
+            n_rows = std::max(n_rows, kv.second + 1);
+        }
+        const int n_cols = (int) std::min<int64_t>(session->n_expert_hint, INT_MAX);
+        if (n_rows <= 0 || n_cols <= 0) {
+            continue;
+        }
+        const long long n_cells = (long long) n_rows * (long long) n_cols;
+        const long long need = (n_cells + 7) / 8;
+        if (need > max_bytes) {
+            if (out_rows) *out_rows = n_rows;
+            if (out_cols) *out_cols = n_cols;
+            return 0;
+        }
+        std::fill(out_bits, out_bits + need, (uint8_t) 0);
+        for (auto & device_ptr : session->devices) {
+            for (const auto & kv : device_ptr->seen_tensors) {
+                if (!kv.second.draft) {
+                    continue;
+                }
+                const auto rit = session->tensor_layer.find(kv.first);
+                if (rit == session->tensor_layer.end() || rit->second < 0 || rit->second >= n_rows) {
+                    continue;
+                }
+                // every expert of a draft tensor belongs to the draft
+                for (int e = 0; e < n_cols; e++) {
+                    const long long cell = (long long) rit->second * n_cols + e;
+                    out_bits[cell >> 3] |= (uint8_t) (1u << (cell & 7));
+                }
+            }
+        }
+        if (out_rows) *out_rows = n_rows;
+        if (out_cols) *out_cols = n_cols;
+        return 1;
+    }
+    return 0;
+}
+
 static int moe_cache_get_substitute_map(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols) {
     if (out_rows) *out_rows = 0;
     if (out_cols) *out_cols = 0;
@@ -12889,6 +12949,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_substitute_map = moe_cache_get_substitute_map;
+    ggml_moe_cache.get_draft_map = moe_cache_get_draft_map;
     ggml_moe_cache.get_neuron_concentration_map = moe_cache_get_neuron_concentration_map;
     ggml_moe_cache.verify_rows    = moe_cache_verify_rows;
     ggml_moe_cache.get_summary = moe_cache_get_summary;

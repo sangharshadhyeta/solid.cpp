@@ -222,6 +222,11 @@ struct ggml_moe_cache_api {
     // with the real shape in out_rows/out_cols if out_bits is too small).
     int (*get_substitute_map)(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols);
 
+    // Which (layer,expert) cells belong to the speculative draft rather than the
+    // target - a bitset, same shape as get_expert_map. A live snapshot (role does
+    // not change), so unlike get_substitute_map it is not read-and-cleared.
+    int (*get_draft_map)(uint8_t * out_bits, int max_bytes, int * out_rows, int * out_cols);
+
     // Live per-(layer,expert) neuron concentration, for the Brain/Atlas
     // view - a cheap O(n) dead-neuron-fraction proxy (0.0-1.0, share of
     // this expert's neurons contributing under 1% of its own mean value),

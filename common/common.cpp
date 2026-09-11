@@ -2448,6 +2448,21 @@ static std::atomic<int>       g_moe_calib_ring_pct{-1};
 // Arbitrary extra environment every candidate launches with from here on, for the
 // feature stages below: a stage sets one knob, measures, then keeps its winner or
 // clears it. Calibration runs one candidate at a time.
+// The candidate kept alive for live sweeps: its port, and the pid to kill when
+// the allocation configuration changes and it has to be replaced.
+static int   g_moe_live_port = -1;
+static pid_t g_moe_live_pid  = -1;
+
+static void common_moe_live_stop() {
+    if (g_moe_live_pid > 0) {
+        kill(g_moe_live_pid, SIGKILL);
+        int status = 0;
+        waitpid(g_moe_live_pid, &status, 0);
+    }
+    g_moe_live_pid  = -1;
+    g_moe_live_port = -1;
+}
+
 static std::mutex             g_moe_calib_env_mu;
 static std::string            g_moe_calib_extra_env;
 static void common_moe_calib_set_env(const std::string & kv) {
@@ -2584,7 +2599,15 @@ static double common_moe_bench_candidate_server(
         const std::string & extra_env = std::string(),
         int spec_prob_accept = -1,
         const std::string & spec_types = std::string(),
-        double spec_p_min = -1.0) {
+        double spec_p_min = -1.0,
+        // Live sweeps. live_port > 0 measures on an already-running candidate
+        // instead of launching one, after applying live_tunables through
+        // POST /moe-tuning; keep_alive leaves this candidate running so later
+        // calls can reuse it. About 80% of a candidate is loading the model, and
+        // policy knobs do not need a reload - see moe_cache_set_tunable.
+        int live_port = -1,
+        const std::string & live_tunables = std::string(),
+        bool keep_alive = false) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2740,22 +2763,46 @@ static double common_moe_bench_candidate_server(
         "--port %d --no-webui > '%s' 2>&1 & echo $!",
         env_prefix.c_str(), subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port, log_path);
-    FILE * pf = popen(cmd, "r");
-    if (!pf) {
-        return -1.0;
-    }
-    char pidbuf[32] = {0};
-    const bool got_pid = fgets(pidbuf, sizeof(pidbuf), pf) != nullptr;
-    pclose(pf);
-    if (!got_pid) {
-        return -1.0;
-    }
-    const pid_t pid = (pid_t) atol(pidbuf);
-    if (pid <= 0) {
-        return -1.0;
+    pid_t pid = -1;
+    const bool reuse = live_port > 0;
+    if (reuse) {
+        // Measure on a candidate that is already loaded. Only policy knobs can
+        // change this way; everything the launch line decides (placement, cache
+        // size, ubatch, draft) must already match, which is the caller's job.
+        port = live_port;
+        if (!live_tunables.empty()) {
+            const std::string tune_cmd = string_format(
+                    "curl -s -o /dev/null -m 10 -X POST http://127.0.0.1:%d/moe-tuning "
+                    "-H 'Content-Type: application/json' --data-binary %s",
+                    port, common_shell_quote(live_tunables).c_str());
+            if (system(tune_cmd.c_str()) != 0) {
+                LOG_WRN("%s: could not apply live tunables on port %d\n", __func__, port);
+                return -1.0;
+            }
+        }
+    } else {
+        FILE * pf = popen(cmd, "r");
+        if (!pf) {
+            return -1.0;
+        }
+        char pidbuf[32] = {0};
+        const bool got_pid = fgets(pidbuf, sizeof(pidbuf), pf) != nullptr;
+        pclose(pf);
+        if (!got_pid) {
+            return -1.0;
+        }
+        pid = (pid_t) atol(pidbuf);
+        if (pid <= 0) {
+            return -1.0;
+        }
     }
 
+    // A reused or kept-alive candidate is not torn down here: the first is not
+    // ours to kill, the second is about to be measured again.
     auto cleanup = [&]() {
+        if (reuse || keep_alive || pid <= 0) {
+            return;
+        }
         kill(pid, SIGKILL);
         int status = 0;
         waitpid(pid, &status, 0);
@@ -2776,9 +2823,9 @@ static double common_moe_bench_candidate_server(
     // that has exited), and a live one is given room, so the ceiling stops being a
     // judgement about how long loading ought to take and becomes a backstop
     // against a genuine hang.
-    bool ready = false;
+    bool ready = !reuse ? false : true;   // a reused candidate is already serving
     bool child_exited = false;
-    for (int i = 0; i < 300 && !child_exited; i++) {
+    for (int i = 0; !ready && i < 300 && !child_exited; i++) {
         FILE * hp = popen(health_cmd, "r");
         if (hp) {
             char code[8] = {0};
@@ -3208,6 +3255,11 @@ static double common_moe_bench_candidate_server(
         result_tps = (n_ok == n_concurrency && wall_s > 0) ? total_tokens / wall_s : -1.0;
     }
 
+    if (keep_alive && !reuse && pid > 0) {
+        common_moe_live_stop();          // replace any previous live candidate
+        g_moe_live_pid  = pid;
+        g_moe_live_port = port;
+    }
     cleanup();
     return result_tps;
 }
@@ -3697,7 +3749,10 @@ void common_moe_calibrate(common_params & params) {
         est += 4; // prediction ring: 0, 5, 10 percent, then the winner answer-checked
         est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
         est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
-        est += 15; // tuning-constant sweep: 5 knobs x 3 values
+        // The constant sweep shares ONE server: 1 launch + 15 live measurements +
+        // 5 settle calls. Still 21 units of the budget's time accounting, but only
+        // one model load, which is ~80% of what a launched candidate costs.
+        est += 21; // tuning-constant sweep: 1 launch, 5 knobs x 3 values, 5 settles
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -5392,7 +5447,24 @@ void common_moe_calibrate(common_params & params) {
             // how often the cold sweep runs
             { "cold sweep",         "GGML_CUDA_MOE_CACHE_COLD_SWEEP_S",         { "1",   "3",   "10"   } },
         };
+        // One server for the whole sweep. Every knob below is a live policy knob,
+        // so a value change is a POST rather than an 88 GB reload - the difference
+        // between 15 launches and 1. The first call launches and keeps it alive;
+        // the rest reuse it. Each measurement still runs the same probe, and the
+        // candidate is warmed by the one before it, which is the regime served.
         std::string carried = neuron_env;
+        common_moe_calib_set_env(carried);
+        double live_incumbent = common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
+                /* live_port */ -1, std::string(), /* keep_alive */ true);
+        common_moe_calibration_status_candidate_done();
+        if (live_incumbent <= 0 || g_moe_live_port <= 0) {
+            LOG_WRN("%s: could not hold a candidate open for the constant sweep - skipping it\n", __func__);
+            common_moe_live_stop();
+        } else {
         for (const auto & k : knobs) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
@@ -5403,12 +5475,33 @@ void common_moe_calibrate(common_params & params) {
                 if (common_moe_calibrate_budget_spent()) {
                     break;
                 }
-                const double tps = measure_feature(k.label, v,
-                        carried + " " + std::string(k.env) + "=" + v);
+                const std::string body = string_format("{\"%s\": \"%s\"}", k.env, v);
+                const double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                        best_threads, g_moe_live_port, ctx, n_predict, concurrency, best_cache_mb, -1,
+                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                        false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
+                        g_moe_live_port, body, /* keep_alive */ true);
+                common_moe_calibration_status_candidate_done();
+                LOG_INF("%s:   %s=%s -> %s\n", __func__, k.label, v,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                common_moe_calibration_status_note(k.label, v,
+                        tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
                 if (tps > best_tps) {
                     best_tps   = tps;
                     best_value = v;
                 }
+            }
+            // Leave the knob on its winner for the knobs that follow, so each is
+            // measured against the configuration the earlier ones chose.
+            if (best_value) {
+                const std::string body = string_format("{\"%s\": \"%s\"}", k.env, best_value);
+                (void) common_moe_bench_candidate_server(
+                        self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                        best_threads, g_moe_live_port, ctx, 1, concurrency, best_cache_mb, -1,
+                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                        false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
+                        g_moe_live_port, body, /* keep_alive */ true);
             }
             // The middle entry of each row is the shipped default; only carry a
             // winner forward when it actually beat it, so the sweep cannot drift
@@ -5427,6 +5520,8 @@ void common_moe_calibrate(common_params & params) {
                 LOG_INF("%s:   %s: the default %s stands\n", __func__, k.label, k.values[1]);
             }
         }
+        }
+        common_moe_live_stop();
         common_moe_calib_set_env(carried);
     }
 
