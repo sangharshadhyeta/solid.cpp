@@ -1552,6 +1552,10 @@ struct common_moe_calibration_entry {
     // Ranking and timing constants that shipped as guesses. Stored as the winning
     // value, or -1 when the sweep did not run. Empty string = nothing measured.
     std::string tuned_constants;
+    // What share of the expert-cache budget the MTP draft's own pools may take.
+    // -1 = not calibrated (the weight-based split, which gives the draft ~2%
+    // purely because it has 3 tensors against the target's 144).
+    int         draft_share_pct = -1;
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1788,6 +1792,10 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             LOG_WRN("%s: using calibrated %s\n", __func__, kv.c_str());
         }
     }
+    if (cal.draft_share_pct > 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", cal.draft_share_pct);
+        LOG_WRN("%s: using calibrated draft cache share of %d%%\n", __func__, cal.draft_share_pct);
+    }
     if (cal.draft_exact == 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_EXACT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_EXACT", 0);
         LOG_WRN("%s: stand-ins measured faster than exact experts in the draft - allowing them\n", __func__);
@@ -1908,6 +1916,7 @@ static bool common_moe_calibration_lookup(
         out.host_expert_mb         = e.value("host_expert_mb", -1);
         out.draft_exact            = e.value("draft_exact", -1);
         out.tuned_constants        = e.value("tuned_constants", std::string());
+        out.draft_share_pct        = e.value("draft_share_pct", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -1976,6 +1985,7 @@ static void common_moe_calibration_save(
         {"host_expert_mb", entry.host_expert_mb},
         {"draft_exact", entry.draft_exact},
         {"tuned_constants", entry.tuned_constants},
+        {"draft_share_pct", entry.draft_share_pct},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -3697,7 +3707,7 @@ void common_moe_calibrate(common_params & params) {
         }
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
-            est += 3;                                                 // no-draft baseline, draft placement, draft stand-ins
+            est += 5;                                                 // no-draft baseline, placement, stand-ins, 2 cache shares
             est += 2;                                                 // depth winner + runner-up measured again
             est += 2;                                                 // depth re-check after substitution (top two)
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
@@ -3923,7 +3933,7 @@ void common_moe_calibrate(common_params & params) {
     // regime this model is served in, and every lever after this - substitution
     // above all - has to be measured inside it. The draft itself is served exact
     // (a draft scheduler's scope never substitutes, see
-    // ggml_backend_sched_set_moe_cache_exact), so whatever the target's stand-ins
+    // ggml_backend_sched_set_moe_cache_scope), so whatever the target's stand-ins
     // cost, the measurement below sees it with MTP doing its share of the work
     // rather than assuming what that share is. Ordering the depth search after
     // substitution meant the substitution floor was chosen for a no-draft
@@ -4106,6 +4116,7 @@ void common_moe_calibrate(common_params & params) {
     // against the other placement rather than assumed.
     int best_draft_cpu_moe = -1;
     int best_draft_exact   = -1; // -1 not calibrated, 1 exact only, 0 stand-ins allowed
+    int best_share_pct     = -1; // draft's share of the expert-cache budget
     if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring draft expert placement (GPU vs CPU) at spec-draft-n-max=%d ...\n", __func__, best_n_max);
         common_moe_calibration_status_set("measuring draft expert placement");
@@ -4136,6 +4147,35 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calibration_status_note("draft experts",
                     best_draft_exact ? "exact only" : "stand-ins allowed",
                     string_format("SELECTED - %.2f tok/s", best_draft_exact ? cpu_tps : sub_tps), true, true);
+
+            // How much of the expert cache the draft may hold. Left alone the split
+            // is by tensor count, which hands the draft ~2% for no measured reason
+            // while it runs on every decode step. Measured only when its experts are
+            // CPU-offloaded, because that is the only case where it holds any.
+            double best_share_tps = std::max(cpu_tps, sub_tps);
+            const std::string exact_env = best_draft_exact ? std::string() : std::string(" GGML_CUDA_MOE_CACHE_DRAFT_EXACT=0");
+            for (const int pct : { 10, 25 }) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                common_moe_calib_set_env(string_format("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT=%d", pct) + exact_env);
+                const double tps = bench_with_retry(best_n, best_n_max, params.speculative.draft.mparams.path, n_threads_default);
+                common_moe_calibration_status_candidate_done();
+                LOG_INF("%s:   draft cache share %d%% -> %s\n", __func__, pct,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                common_moe_calibration_status_note("draft cache share", string_format("%d%%", pct),
+                        tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+                if (tps > best_share_tps) {
+                    best_share_tps = tps;
+                    best_share_pct = pct;
+                }
+            }
+            common_moe_calib_set_env(exact_env.empty() ? std::string() : exact_env.substr(1));
+            if (best_share_pct > 0) {
+                LOG_INF("%s: draft cache share: %d%% at %.2f tok/s\n", __func__, best_share_pct, best_share_tps);
+                common_moe_calibration_status_note("draft cache share", string_format("%d%%", best_share_pct),
+                        string_format("SELECTED - %.2f tok/s", best_share_tps), true, true);
+            }
         }
     }
 
@@ -5435,6 +5475,7 @@ void common_moe_calibrate(common_params & params) {
     entry.host_expert_mb         = best_host_mb;
     entry.draft_exact            = best_draft_exact;
     entry.tuned_constants        = tuned_constants;
+    entry.draft_share_pct        = best_share_pct;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.

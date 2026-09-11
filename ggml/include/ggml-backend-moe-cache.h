@@ -103,11 +103,14 @@ struct ggml_moe_cache_api {
     // NULL and dormant sessions still create a suppressing thread-local scope.
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
-    // As session_enter, but every expert in this scope is served exact - no
-    // stand-ins. For a speculative draft sharing its target's session: the
-    // draft predicts the target, so a stand-in only lowers acceptance. Leave
-    // with session_leave as usual.
-    void   (*session_enter_exact)(void * session);
+    // As session_enter, but tags the scope with what is computing in it:
+    //   bit 0 - serve exact experts only, no stand-ins
+    //   bit 1 - this is a speculative draft
+    // The draft bit is independent of the exact bit: a draft keeps its own pools,
+    // its own heat and its own knob values (a knob may be given a "<NAME>_DRAFT"
+    // override) whether or not stand-ins are allowed in it - the same rules as the
+    // target, applied within itself. Leave with session_leave as usual.
+    void   (*session_enter_scope)(void * session, int flags);
 
     // Set a policy knob at runtime, overriding the environment; an empty or NULL
     // value clears the override. Only knobs that do not decide an allocation can

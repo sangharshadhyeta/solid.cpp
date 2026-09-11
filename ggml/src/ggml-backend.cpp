@@ -884,7 +884,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
-    bool   moe_cache_exact; // serve exact experts only (a speculative draft) - see ggml_backend_sched_set_moe_cache_exact
+    int    moe_cache_scope_flags; // bit0 exact, bit1 draft - see ggml_backend_sched_set_moe_cache_scope
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1792,13 +1792,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         void * session;
         void (*leave)(void *);
 
-        explicit moe_cache_scope(void * session, bool exact)
+        explicit moe_cache_scope(void * session, int flags)
             : session(session), leave(ggml_moe_cache.session_leave) {
-            auto enter = exact && ggml_moe_cache.session_enter_exact
-                    ? ggml_moe_cache.session_enter_exact
-                    : ggml_moe_cache.session_enter;
-            if (enter && leave) {
-                enter(session);
+            if (!leave) {
+                return;
+            }
+            if (flags && ggml_moe_cache.session_enter_scope) {
+                ggml_moe_cache.session_enter_scope(session, flags);
+            } else if (ggml_moe_cache.session_enter) {
+                ggml_moe_cache.session_enter(session);
             } else {
                 leave = nullptr;
             }
@@ -1809,7 +1811,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 leave(session);
             }
         }
-    } cache_scope(sched->moe_cache_session, sched->moe_cache_exact);
+    } cache_scope(sched->moe_cache_session, sched->moe_cache_scope_flags);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -2372,9 +2374,9 @@ bool ggml_moe_cache_set_tunable(const char * name, const char * value) {
     return true;
 }
 
-void ggml_backend_sched_set_moe_cache_exact(ggml_backend_sched_t sched, bool exact) {
+void ggml_backend_sched_set_moe_cache_scope(ggml_backend_sched_t sched, int flags) {
     if (sched) {
-        sched->moe_cache_exact = exact;
+        sched->moe_cache_scope_flags = flags;
     }
 }
 
