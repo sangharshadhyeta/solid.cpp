@@ -1389,19 +1389,47 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
     ggml_tensor * conv_input = ggml_concat(ctx0, state, ggml_transpose(ctx0, x), 0);
 
     // keep the last state_cols columns for the next ubatch
-    const size_t row_size = ggml_row_size(conv_states_all->type, row_total);
+    const size_t   row_size = ggml_row_size(conv_states_all->type, row_total);
+    const uint32_t mem_size = mctx_cur->get_size();
 
-    ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
-            state_cols, channels, n_seqs,
-            conv_input->nb[1], conv_input->nb[2],
-            ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols));
+    // With a draft attached the recurrent memory keeps K = n_rs_seq + 1 rollback
+    // groups, and a rejected draft token rolls a sequence back by pointing it at
+    // group `rollback` (llama_memory_recurrent::seq_rm -> set_rs_idx). Every state
+    // that rolls back has to have written all K groups, or the rollback reads rows
+    // nothing ever wrote.
+    //
+    // This used to write group 0 only. The delta-net SSM state goes through
+    // build_recurrent_attn, which writes all K, so after every rejected draft the
+    // SSM state rewound correctly while this conv state and the PLE n-gram history
+    // (both built here) came back from stale rows - two halves of the model's
+    // memory disagreeing about where the sequence is. Measured on
+    // Qwen3.8-Flash-Next with the MTP draft: answers vanished after </think> and a
+    // one-line factual question ran past 600 tokens, and only with a draft
+    // attached, which is the only configuration that ever rolls back.
+    //
+    // Same layout and slot order as llm_build_delta_net_base::build_conv_state:
+    // group g holds the state as of K-1-g tokens before the end of the ubatch, so
+    // group 0 is the newest. split_equal() keeps the last K tokens of a sequence
+    // in one ubatch ([TAG_RECURRENT_ROLLBACK_SPLITS]), which is what makes every
+    // one of those states visible here.
+    const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+    for (int64_t t = 1; t <= K; ++t) {
+        // for K == 1 this is exactly the old single write: the last state_cols columns into group 0
+        const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - state_cols - K + t);
+        const int64_t s_slot = K - t;
 
-    ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
-            state_cols * channels, n_seqs,
-            conv_states_all->nb[1],
-            kv_head * row_size);
+        ggml_tensor * tail = ggml_view_3d(ctx0, conv_input,
+                state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, s_idx));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        ggml_tensor * dst = ggml_view_2d(ctx0, conv_states_all,
+                state_cols * channels, n_seqs,
+                conv_states_all->nb[1],
+                ((size_t) s_slot * mem_size + kv_head) * row_size);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    }
 
     return conv_input;
 }
