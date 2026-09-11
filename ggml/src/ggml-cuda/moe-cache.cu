@@ -1032,6 +1032,14 @@ struct moe_cache_device {
 };
 
 struct moe_cache_session {
+    // How many schedulers hold this session. Normally 1 - a session is created
+    // per scheduler and freed with it. A speculative setup shares one session
+    // between the target and its draft (see moe_cache_session_share) so that
+    // both models' experts live in one pool, under one budget, ranked against
+    // each other by the same LFRU heat instead of each getting a slice decided
+    // by whichever context happened to initialise first.
+    int refcount = 1;
+
     moe_cache_config config;
     std::mutex hostreg_mu;
     // region base -> the page-aligned [begin,end) actually registered. Stored as
@@ -6267,6 +6275,23 @@ static void moe_cache_neuron_heat_report(moe_cache_device & device) {
 // moe_cache_session_create is the natural one-shot-per-device trigger point.
 static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device);
 
+// Take an additional reference to an existing session. Returns the same
+// pointer, so the caller can treat it exactly like a session_create() result -
+// including passing it to session_destroy(), which now only tears down on the
+// last release.
+static void * moe_cache_session_share(void * opaque) {
+    moe_cache_session * session = (moe_cache_session *) opaque;
+    if (!session) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+    if (g_sessions.find(session) == g_sessions.end()) {
+        return nullptr; // already torn down, or never ours
+    }
+    session->refcount++;
+    return session;
+}
+
 static void * moe_cache_session_create(void * const * backends, int n_backends) {
     try {
         moe_cache_config config = moe_cache_read_config();
@@ -6489,6 +6514,14 @@ static void moe_cache_session_destroy(void * opaque) {
     moe_cache_session * session = (moe_cache_session *)opaque;
     if (!session) {
         return;
+    }
+
+    // Shared sessions: every holder calls this, only the last one tears down.
+    {
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        if (g_sessions.find(session) != g_sessions.end() && --session->refcount > 0) {
+            return;
+        }
     }
 
     // Residency readback. /experts gives this on the server, but a
@@ -12505,6 +12538,7 @@ void ggml_moe_cache_register(const void * owner) {
     }
     ggml_moe_cache.owner = owner;
     ggml_moe_cache.session_create = moe_cache_session_create;
+    ggml_moe_cache.session_share = moe_cache_session_share;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;

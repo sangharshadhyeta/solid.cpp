@@ -640,6 +640,21 @@ void llama_context::sched_reserve() {
     // not to this scheduler object, so carry it over instead of losing it on every rebuild.
     void * moe_cache_session = sched ? ggml_backend_sched_take_moe_cache_session(sched.get()) : nullptr;
 
+    // Speculative decoding runs a draft head in its own context (cparams.ctx_other points at
+    // the target). Left alone each context builds its own moe-cache session, which means two
+    // separate expert pools with the VRAM budget split by whichever initialised first, and no
+    // shared ranking between the draft's experts and the target's - even though the draft runs
+    // on every decode step and its experts are the hottest weights in the model. Share the
+    // target's session so both are one cache: residency, substitution and the atlas then rank
+    // draft and target experts against each other on measured access, not on which context
+    // they happen to live in.
+    if (!moe_cache_session && cparams.ctx_other && cparams.ctx_other->get_sched()) {
+        moe_cache_session = ggml_backend_sched_share_moe_cache_session(cparams.ctx_other->get_sched());
+        if (moe_cache_session) {
+            LLAMA_LOG_INFO("%s: sharing the moe-cache session with the target context\n", __func__);
+        }
+    }
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     if (moe_cache_session) {
         ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session);

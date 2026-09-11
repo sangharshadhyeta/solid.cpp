@@ -326,6 +326,9 @@ extern "C" {
     // no session was attached.
     GGML_API void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched);
     GGML_API void   ggml_backend_sched_adopt_moe_cache_session(ggml_backend_sched_t sched, void * session);
+    // Take an extra reference to sched's session without removing it, so a second scheduler
+    // can adopt the same expert cache (speculative decoding: draft and target as one model).
+    GGML_API void * ggml_backend_sched_share_moe_cache_session(ggml_backend_sched_t sched);
 
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
