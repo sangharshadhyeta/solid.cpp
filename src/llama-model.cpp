@@ -23,6 +23,7 @@
 
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "ggml-backend-moe-cache.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1640,6 +1641,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     __func__, total_mapped >> 20, avail_bytes >> 20);
         }
     }
+    // Publish the decision instead of letting the cache re-derive it. Both were
+    // asking "does this model fit in host RAM"; two answers to one question can
+    // disagree, and the cache's copy drives budgets that matter (see
+    // moe_cache_pin_budget_bytes).
+    if (ggml_moe_cache.set_host_oversubscribed) {
+        ggml_moe_cache.set_host_oversubscribed(ml.use_mmap && !mmap_prefetch ? 1 : 0);
+    }
+
     ml.init_mappings(mmap_prefetch, use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 

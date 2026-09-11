@@ -144,6 +144,13 @@ struct ggml_moe_cache_api {
     // entries here.
     void (*set_max_batch_hint)(int n_seq_max);
 
+    // The loader already decides whether the model exceeds a safe fraction of
+    // host RAM (it disables eager mmap prefetch on that basis). The cache used to
+    // re-derive the same fact from /proc/meminfo for its own budgets, so two
+    // independent estimates of one thing could disagree. The loader publishes its
+    // answer here; -1 means "not told", which keeps the old self-derived path.
+    void (*set_host_oversubscribed)(int oversubscribed);
+
     // Aggregate hit/miss counts summed across every currently-live session's
     // devices. Meant for calibration/benchmarking callers that create one
     // context at a time (the common case there), not general production
