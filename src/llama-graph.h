@@ -1071,7 +1071,11 @@ struct llm_graph_context {
     // can require a genuinely closer confirmation rather than merely "seen
     // twice" - see the comment on ggml_moe_cache.prefetch.
     struct moe_lookahead_userdata {
-        void * host_base;
+        // One entry per expert weight tensor of the predicted layer. A model with
+        // separate gate/up/down experts (qwen4exp) needs all three prefetched, or a
+        // prediction brings in a third of each expert.
+        void * host_bases[3];
+        int    n_host_bases;
         int    depth;
     };
 
@@ -1088,7 +1092,9 @@ struct llm_graph_context {
             ggml_tensor * next_exp_probs_b,   // may be null: models without a load-balancing bias
                 int64_t   n_expert_used,
                     int   il,
-                    int   depth = 1) const;   // layers ahead being predicted; also gates cross-depth-agreement eviction
+                    int   depth = 1,           // layers ahead being predicted; also gates cross-depth-agreement eviction
+            ggml_tensor * next_exps_b = nullptr,   // further expert tensors of the same layer (gate/up when
+            ggml_tensor * next_exps_c = nullptr) const; //   separate from down) - prefetched with the same prediction
 
     // Full-layer prefill double buffer: unlike router lookahead above (which
     // predicts which *experts* the next layer needs, since decode only ever

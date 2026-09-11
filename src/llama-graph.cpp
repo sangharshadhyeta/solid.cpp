@@ -1888,7 +1888,9 @@ void llm_graph_context::moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a
     // Only the first token's row is used: prefetching is per-layer, and the
     // experts the first token routes to are as good a sample as any for what
     // the layer is about to touch.
-    ggml_moe_cache.prefetch(ud->host_base, (const int32_t *) a->data, (int) a->ne[0], ud->depth);
+    for (int t = 0; t < ud->n_host_bases; t++) {
+        ggml_moe_cache.prefetch(ud->host_bases[t], (const int32_t *) a->data, (int) a->ne[0], ud->depth);
+    }
 }
 
 
@@ -1913,7 +1915,9 @@ void llm_graph_context::build_moe_lookahead(
         ggml_tensor * next_exp_probs_b,
             int64_t   n_expert_used,
                 int   il,
-                int   depth) const {
+                int   depth,
+        ggml_tensor * next_exps_b,
+        ggml_tensor * next_exps_c) const {
     if (!ggml_moe_cache.prefetch || !cur || !next_gate_inp || !next_exps || !next_exps->data) {
         return;
     }
@@ -1936,7 +1940,13 @@ void llm_graph_context::build_moe_lookahead(
     // depth) pair at graph build time (bounded: at most n_layers * 3) and
     // deliberately never freed, the same lifetime the raw tensor-pointer
     // userdata this replaces already had implicitly.
-    auto * ud = new llm_graph_context::moe_lookahead_userdata{next_exps->data, depth};
+    auto * ud = new llm_graph_context::moe_lookahead_userdata{};
+    ud->depth = depth;
+    for (ggml_tensor * t : { next_exps, next_exps_b, next_exps_c }) {
+        if (t && t->data && ud->n_host_bases < 3) {
+            ud->host_bases[ud->n_host_bases++] = t->data;
+        }
+    }
 
     // Fires in graph order - while this layer is still computing and before the
     // next layer's expert matmul is reached, which is the whole point.
