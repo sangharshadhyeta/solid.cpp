@@ -1508,6 +1508,13 @@ struct common_moe_calibration_entry {
     // actually pays depends on how repetitive the traffic is, which is exactly
     // the kind of thing this fork measures rather than assumes.
     std::string spec_types;                   // "" = not calibrated
+    // Draft confidence gate (--spec-draft-p-min): stop drafting once the draft's
+    // own top probability falls below this. -1 = not calibrated. Its default of
+    // 0 can never stop anything (see common_warn_p_min_disabled), so every step
+    // drafts to n_max whatever its confidence - harmless at a shallow depth, a
+    // measured multi-x slowdown at a deep one. Calibrated together with depth,
+    // since letting a deeper draft pay is the whole point of the gate.
+    double      spec_p_min = -1.0;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1804,6 +1811,7 @@ static bool common_moe_calibration_lookup(
         out.admit_after         = e.value("admit_after", -1);
         out.spec_prob_accept    = e.value("spec_prob_accept", -1);
         out.spec_types          = e.value("spec_types", std::string());
+        out.spec_p_min          = e.value("spec_p_min", -1.0);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1860,6 +1868,7 @@ static void common_moe_calibration_save(
         {"admit_after", entry.admit_after},
         {"spec_prob_accept", entry.spec_prob_accept},
         {"spec_types", entry.spec_types},
+        {"spec_p_min", entry.spec_p_min},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2140,6 +2149,12 @@ struct common_moe_bench_result {
     // What the model actually emitted, for the fidelity comparison in the
     // substitution ladder. See common_moe_output_fidelity().
     std::string text;
+    // Speculative decoding, when a draft is attached: how many tokens were
+    // drafted and how many the target accepted. The speed multiplier is made
+    // of this, so a candidate that wins on tok/s without it cannot say why.
+    // -1 when the server reported no drafting.
+    double draft_n          = -1.0;
+    double draft_n_accepted = -1.0;
     // The answer channel alone: `content`, i.e. what follows </think>. `text`
     // joins content and reasoning for the degeneracy and fidelity checks, which
     // is right for them - but a correctness check that reads it counts an answer
@@ -2147,6 +2162,20 @@ struct common_moe_bench_result {
     // as correct. That is exactly the failure it exists to catch.
     std::string answer;
 };
+
+// The draft acceptance of the most recent candidate, for the stages that measure
+// MTP levers to log beside their tok/s. Written by the candidate spawner, read
+// by the stage that called it; calibration runs one candidate at a time.
+static double g_moe_last_draft_n          = -1.0;
+static double g_moe_last_draft_n_accepted = -1.0;
+
+static std::string common_moe_last_acceptance_str() {
+    if (g_moe_last_draft_n <= 0.0 || g_moe_last_draft_n_accepted < 0.0) {
+        return std::string();
+    }
+    return string_format(", draft acceptance %.2f (%.0f of %.0f)",
+            g_moe_last_draft_n_accepted / g_moe_last_draft_n, g_moe_last_draft_n_accepted, g_moe_last_draft_n);
+}
 
 static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed = 1234, bool greedy = false);
 
@@ -2202,6 +2231,10 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
             common_moe_bench_result r;
             r.predicted_n  = j["timings"]["predicted_n"].get<double>();
             r.predicted_ms = j["timings"]["predicted_ms"].get<double>();
+            if (j["timings"].contains("draft_n") && j["timings"].contains("draft_n_accepted")) {
+                r.draft_n          = j["timings"]["draft_n"].get<double>();
+                r.draft_n_accepted = j["timings"]["draft_n_accepted"].get<double>();
+            }
             // Score whatever the model actually emitted. Reasoning models put
             // most of a short probe's tokens in reasoning_content rather than
             // content, and a degenerate run is degenerate in either channel -
@@ -2371,7 +2404,8 @@ static double common_moe_bench_candidate_server(
         bool with_reasoning = false,
         const std::string & extra_env = std::string(),
         int spec_prob_accept = -1,
-        const std::string & spec_types = std::string()) {
+        const std::string & spec_types = std::string(),
+        double spec_p_min = -1.0) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2398,6 +2432,9 @@ static double common_moe_bench_candidate_server(
             mtp_args += "--spec-prob-accept ";
         } else if (spec_prob_accept == 0) {
             mtp_args += "--no-spec-prob-accept ";
+        }
+        if (spec_p_min >= 0.0) {
+            mtp_args += string_format("--spec-draft-p-min %.2f ", spec_p_min);
         }
     }
     std::string threads_args;
@@ -2649,12 +2686,18 @@ static double common_moe_bench_candidate_server(
         double sum_tps = 0.0;
         int n_ok = 0;
         double worst_degeneracy = 0.0;
+        g_moe_last_draft_n          = -1.0;
+        g_moe_last_draft_n_accepted = -1.0;
         for (int i = 0; i < n_solo_probes; i++) {
             const auto r = common_moe_bench_one_request_full(port, probe_prompts[i], n_predict, probe_seed);
             if (r.predicted_n > 0 && r.predicted_ms > 0) {
                 sum_tps += r.predicted_n / (r.predicted_ms / 1000.0);
                 worst_degeneracy = std::max(worst_degeneracy, r.degeneracy);
                 n_ok++;
+                if (r.draft_n > 0) {
+                    g_moe_last_draft_n          = std::max(0.0, g_moe_last_draft_n) + r.draft_n;
+                    g_moe_last_draft_n_accepted = std::max(0.0, g_moe_last_draft_n_accepted) + r.draft_n_accepted;
+                }
             }
         }
         result_tps = n_ok > 0 ? sum_tps / n_ok : -1.0;
@@ -3382,6 +3425,7 @@ void common_moe_calibrate(common_params & params) {
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
             est += 2;                                                 // spec-prob-accept: off, on
             est += 2;                                                 // drafter cascade: mtp alone, ngram-suffix in front
+            est += 4;                                                 // confidence gate: p_min 0.5/0.8 x depth d/2d
         }
         est += 2; // thread-count candidates
         est += 3; // admission-delay candidates (1, 2, 4)
@@ -4098,7 +4142,8 @@ void common_moe_calibrate(common_params & params) {
             for (int n = 1; n <= 32; n *= 2) {
                 const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                 nmax_trace[n] = tps;
-                LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
                 common_moe_calibration_status_candidate_done();
                 if (tps > 0 && baseline <= 0.0) {
                     baseline = tps; // first depth that stood up anchors the collapse test
@@ -4129,7 +4174,8 @@ void common_moe_calibrate(common_params & params) {
                         return it->second;
                     }
                     const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
-                    LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                    LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
                     common_moe_calibration_status_candidate_done();
                     return tps;
                 };
@@ -4455,8 +4501,9 @@ void common_moe_calibrate(common_params & params) {
                     best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
                     active_ngl, active_min_rank, nullptr, 1234,
                     std::numeric_limits<double>::quiet_NaN(), false, false, std::string(), candidate);
-            LOG_INF("%s:   spec-prob-accept=%s -> %s\n", __func__, candidate ? "on" : "off",
-                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            LOG_INF("%s:   spec-prob-accept=%s -> %s%s\n", __func__, candidate ? "on" : "off",
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                    tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
             common_moe_calibration_status_note("draft acceptance",
                     candidate ? std::string("probabilistic") : std::string("exact-match"),
                     tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
@@ -4499,8 +4546,9 @@ void common_moe_calibrate(common_params & params) {
                     active_ngl, active_min_rank, nullptr, 1234,
                     std::numeric_limits<double>::quiet_NaN(), false, false, std::string(),
                     best_prob_accept, candidate);
-            LOG_INF("%s:   spec-type=%s -> %s\n", __func__, candidate,
-                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            LOG_INF("%s:   spec-type=%s -> %s%s\n", __func__, candidate,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                    tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
             common_moe_calibration_status_note("drafter cascade", std::string(candidate),
                     tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
             common_moe_calibration_status_candidate_done();
@@ -4514,6 +4562,62 @@ void common_moe_calibrate(common_params & params) {
                     best_spec_types.c_str(), best_spec_types_tps);
             common_moe_calibration_status_note("drafter cascade", best_spec_types,
                     string_format("SELECTED - %.2f tok/s", best_spec_types_tps), true, true);
+        }
+    }
+
+    // Draft confidence gate, searched jointly with depth. The depth search above
+    // ran with p_min at its default of 0, which never stops a draft early, so it
+    // could only find the depth that pays when every step drafts in full. The gate
+    // changes that trade: a deeper draft that stops once the draft is unsure keeps
+    // the cheap, confident tokens and skips the ones verification would reject -
+    // and on this hardware each rejected token also widened the verify pass's
+    // expert set for nothing. So each rung is tried at the chosen depth and at
+    // twice it; the incumbent is the chosen depth with no gate.
+    double best_p_min     = -1.0;
+    int    best_p_min_nmax = n_max_for_threads;
+    if (!mtp_path_for_threads.empty() && n_max_for_threads > 0 && !common_moe_calibrate_budget_spent()) {
+        double best_p_min_tps = std::max(best_spec_types_tps, best_prob_accept_tps);
+        LOG_INF("%s: measuring the draft confidence gate (--spec-draft-p-min) with depth ...\n", __func__);
+        common_moe_calibration_status_set("measuring the draft confidence gate");
+        const int depths[] = { n_max_for_threads, std::min(32, n_max_for_threads * 2) };
+        for (const int depth : depths) {
+            for (const double p_min : {0.5, 0.8}) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                const double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, mtp_path_for_threads, best_n, depth,
+                        best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                        active_ngl, active_min_rank, nullptr, 1234,
+                        std::numeric_limits<double>::quiet_NaN(), false, false, std::string(),
+                        best_prob_accept, best_spec_types, p_min);
+                LOG_INF("%s:   spec-draft-p-min=%.2f at spec-draft-n-max=%d -> %s%s\n", __func__, p_min, depth,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                        tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                common_moe_calibration_status_note("draft confidence gate",
+                        string_format("p_min %.2f, depth %d", p_min, depth),
+                        tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+                common_moe_calibration_status_candidate_done();
+                if (tps > best_p_min_tps) {
+                    best_p_min_tps  = tps;
+                    best_p_min      = p_min;
+                    best_p_min_nmax = depth;
+                }
+            }
+            if (depths[1] == depths[0]) {
+                break; // depth already at the cap - the second pass would repeat the first
+            }
+        }
+        if (best_p_min >= 0.0) {
+            LOG_INF("%s: draft confidence gate: p_min %.2f at depth %d, %.2f tok/s\n", __func__,
+                    best_p_min, best_p_min_nmax, best_p_min_tps);
+            common_moe_calibration_status_note("draft confidence gate",
+                    string_format("p_min %.2f, depth %d", best_p_min, best_p_min_nmax),
+                    string_format("SELECTED - %.2f tok/s", best_p_min_tps), true, true);
+            // a deeper draft won only because of the gate, so the two are saved together
+            if (best_n_max > 0 || best_p_min_nmax != n_max_for_threads) {
+                best_n_max = best_p_min_nmax;
+            }
         }
     }
 
@@ -4550,6 +4654,7 @@ void common_moe_calibrate(common_params & params) {
     entry.admit_after     = best_admit_after;
     entry.spec_prob_accept = best_prob_accept;
     entry.spec_types      = best_spec_types;
+    entry.spec_p_min      = best_p_min;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -5052,6 +5157,12 @@ static bool common_maybe_autoplace_moe_cpu(
             // and only when the user left --spec-type at its default, which parses
             // as the single NONE entry that the launcher then replaces with
             // draft-mtp. An explicit --spec-type is the user's decision.
+            // And the confidence gate: only for a run with a draft model that left
+            // --spec-draft-p-min at its default of 0.
+            if (cached.spec_p_min >= 0.0 && params.speculative.has_dft() &&
+                params.speculative.draft.p_min == 0.0f) {
+                params.speculative.draft.p_min = (float) cached.spec_p_min;
+            }
             if (!cached.spec_types.empty() && params.speculative.has_dft() &&
                 params.speculative.types.size() == 1 &&
                 params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
