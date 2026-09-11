@@ -151,6 +151,23 @@ struct ggml_moe_cache_api {
     // answer here; -1 means "not told", which keeps the old self-derived path.
     void (*set_host_oversubscribed)(int oversubscribed);
 
+    // Live topic position, for the prompt-cache prewarm link (see
+    // prewarm_from_topic below). Copies the decaying (x, y) centroid and, if
+    // dims/max_dims are non-null, the fuller embedding it was projected from.
+    // Returns false if no routing has happened yet on this session (nothing
+    // to save). This is a snapshot for the CALLER to persist - it does not
+    // change what the running session is doing.
+    bool (*get_topic)(float * out_x, float * out_y, float * dims, int max_dims, int * out_n_dims);
+
+    // Restore a topic position saved earlier (see get_topic) and prewarm the
+    // experts nearest it, into free VRAM slots only - the same admission
+    // primitive and the same never-evict rule the live atlas warm path uses
+    // (moe_cache_atlas_admit), just seeded from a caller-supplied position
+    // instead of the session's own live req_dir. Meant for a server restoring
+    // a long-idle cached prompt: the topic it saved when that prompt went
+    // idle is usually still a good prior for what its continuation needs.
+    void (*prewarm_from_topic)(float x, float y, int top_k_per_tensor);
+
     // Aggregate hit/miss counts summed across every currently-live session's
     // devices. Meant for calibration/benchmarking callers that create one
     // context at a time (the common case there), not general production
