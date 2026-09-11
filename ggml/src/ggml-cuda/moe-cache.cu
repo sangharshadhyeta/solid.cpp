@@ -7638,6 +7638,41 @@ static double moe_cache_substitute_quality_sigma() {
     return k;
 }
 
+// Do we positively know this expert's pages are NOT in the page cache? False
+// whenever we have no opinion, so every caller keeps its prior behaviour unless
+// the sample says otherwise.
+static bool moe_cache_expert_known_cold(const moe_cache_device & device,
+        const void * host_base, int expert) {
+    if (expert < 0) {
+        return false;
+    }
+    const auto it = device.residency.find(host_base);
+    if (it == device.residency.end()) {
+        return false;
+    }
+    const auto & res = it->second;
+    const size_t e = (size_t) expert;
+    return e < res.is_resident.size() && !res.is_resident[e];
+}
+
+// Deliberately NOT wired into admission, and not for a measurement reason.
+//
+// Admission is a fetch decision, so cost_tier is in its valid domain, and the
+// arithmetic is sound: a miss on a non-resident expert costs an NVMe read on top
+// of the CPU compute, so it is worth more resident. That reasoning led to
+// letting such an expert clear the lower demand bar while the pool was full.
+//
+// It is still wrong, because it subverts how this cache decides. Admission is
+// earned by demand->count - an expert moves up the pipeline because the router
+// kept asking for it, and the thresholds are secondary to that mechanism.
+// Letting a candidate skip the bar on a property it happens to have, rather than
+// on demand it demonstrated, lets residency jump the queue ahead of experts that
+// actually proved they were wanted.
+//
+// If fetch cost should influence admission at all, it belongs somewhere that
+// does not displace the demand signal - breaking ties between equally-demanded
+// candidates, or in eviction, which already weighs it (moe_cache_weighted_heat).
+
 // NOT WIRED IN, and the measurement is why - kept because the reasoning that
 // produced it is the kind worth being able to re-read.
 //
