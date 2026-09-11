@@ -331,7 +331,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 <div class="hero-zero-grid">
 <div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">68.75<small> tok/s</small></span><span class="hz-note">ncmoe 20, rank&nbsp;1, &minus;1&sigma; bar</span></div>
-<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">12.82<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;2, cache 2048&nbsp;MiB</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">12.85<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;2, cache 2048&nbsp;MiB</span></div>
 </div>
 <p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
 &mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
@@ -363,12 +363,12 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <tbody>
 <tr><td>Expert placement</td><td>searched 21/20/19 &rarr; <strong>20 CPU layers</strong></td><td>only [47,48] fit the margin &rarr; <strong>47</strong>, decided by probe, not benchmarked</td></tr>
 <tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0 (7.51/8.13/7.54/8.60/<strong>8.72</strong>/degenerate), then the top of that shortlist re-measured at full length: rank 1 &rarr; 9.23, <strong>rank 2 &rarr; 11.53</strong></td></tr>
-<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong></td><td>all five measured (7.90/8.11/8.61/<strong>8.68</strong>/8.39) and none committed &mdash; a <a href="#gates-were-wrong">known defect</a>: these are short-probe numbers compared against a full-length incumbent, so none can win</td></tr>
+<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong></td><td>all five measured, and <strong>deliberately not committed</strong>: the winning bar passed every short probe, then served an empty answer and a bare <code>&lt;/think&gt;</code> once confirmed with reasoning on. It is now confirmed in the served regime or left uncalibrated</td></tr>
 <tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td><strong>rejected as degenerate</strong> &mdash; the one gate that still vetoes, and it still bites</td></tr>
-<tr><td>Rejected outright</td><td><strong>1 candidate</strong>, degenerate (0.53). Two more were thrown out for &ldquo;not reproducible&rdquo; at 38.46 and 50.62 tok/s &mdash; <a href="#gates-were-wrong">that check has since been removed as wrong</a></td><td><strong>rank 0</strong>, degenerate. Every <code>-ngl</code> candidate now runs and is measured (6.08&ndash;7.99); full residency still wins</td></tr>
+<tr><td>Rejected outright</td><td><strong>1 candidate</strong>, degenerate (0.53). Two more were thrown out for &ldquo;not reproducible&rdquo; at 38.46 and 50.62 tok/s &mdash; <a href="#gates-were-wrong">that check has since been removed as wrong</a></td><td><strong>rank 0</strong>, degenerate. Every <code>-ngl</code> candidate now runs and is measured (6.50&ndash;7.52) against an incumbent measured on the same probe (8.44) &mdash; full residency wins on a like-for-like comparison, where before it won by construction</td></tr>
 <tr><td>Draft model</td><td>found beside the target by itself &rarr; <strong>spec-draft-n-max 6</strong></td><td>none present</td></tr>
 <tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td><strong>30 candidates in 20m24s</strong>, every stage reached &mdash; on a budget the run derived for itself (31s/candidate &times; 30)</td></tr>
-<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">12.82 tok/s <span class="note">plain launch, no flags</span></td></tr>
+<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">12.85 tok/s <span class="note">plain launch, no flags; 12.8&ndash;13.2 across runs</span></td></tr>
 <tr><td>With substitution off</td><td class="note">n/a</td><td class="num delta-neg">8.3 tok/s</td></tr>
 <tr><td>With the expert cache off</td><td class="note">n/a</td><td class="num delta-neg">3.7 tok/s</td></tr>
 </tbody>
@@ -377,7 +377,7 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 
 <p class="note">Substitution &mdash; serving a cache miss from a resident stand-in rather than fetching the
 exact expert &mdash; is the largest single lever on a model that does not fit. Measured on the same binary and
-the same model: rank&nbsp;2 serves <strong>12.82 tok/s</strong>, substitution off <strong>8.3</strong>, and with
+the same model: rank&nbsp;2 serves <strong>12.85 tok/s</strong>, substitution off <strong>8.3</strong>, and with
 the expert cache off entirely <strong>3.7</strong>. It is also the lever that destroys output when pushed too
 far: rank&nbsp;0 emits <em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym
 is&rdquo;</em> at a very respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams,
@@ -394,7 +394,7 @@ loader was page-locking mmap-backed experts on a model larger than RAM, which br
 18.4&nbsp;GiB of weights into unevictable copies; and every page fault pulled the kernel's 4&nbsp;MiB
 sequential read-around for a 0.88&nbsp;MiB expert slice, so a token read 1.2&ndash;1.5&nbsp;GiB of disk. Fixing
 both, plus a calibration that could finally reach its own substitution floor, took the same model on the same
-card from <strong>2.81 to 12.82 tok/s</strong>. What remains true: 87&nbsp;GB does not fit in 12, so it will
+card from <strong>2.81 to 12.85 tok/s</strong>. What remains true: 87&nbsp;GB does not fit in 12, so it will
 not reach the 68.75 tok/s a model that fits gets. Blaming the hardware was the comfortable answer, and it stood
 here unexamined from 4 September until it was measured.</p>
 
@@ -435,6 +435,17 @@ repeated 4-grams, single-word dominance &mdash; still runs on every candidate, a
 the validating run, so removing the other two removed no protection. It is also the only check that ever caught
 a real bug: the one memory corruption this fork has hit produced <em>deterministic</em> garbage, which an
 agreement test cannot see by construction.</p>
+<p class="note">A second failure mode, found the same day and worth stating because it cuts the other way: a
+check can also <em>pass</em> something that is broken. Calibration ranks candidates on short probes with
+reasoning disabled, because that is ~30% cheaper and a short probe then contains a real answer instead of a
+thinking preamble. The stand-in quality bar was chosen in that regime, passed every probe and the degeneracy
+guard &mdash; and then, served with reasoning on, returned an <strong>empty answer</strong> with 200 tokens of
+unterminated reasoning, and a bare <code>&lt;/think&gt;</code> for the next prompt. Speed was fine. The failure
+simply cannot exist in the regime it was measured in. So the cheap probes now only <em>shortlist</em>: anything
+within 15% of the best is re-measured at full length in the configuration actually served, and that is what
+decides. Measured necessity &mdash; in one run the cheap probe ranked the eventual winner <em>third</em>, and it
+went on to win the confirm by 54%.</p>
+
 <p class="note">The cost was concrete. Rank&nbsp;2 &mdash; the winner &mdash; was rejected three separate ways,
 and calibration cached something slower in its place. Worse, a rejection was signalled with the same value a
 crashed server returns, and four stages retry on that, so every wrong rejection was paid for twice; that is
