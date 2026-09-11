@@ -93,6 +93,28 @@ The lesson is narrower than "connect everything": **a signal is only safe to
 share if both ends agree what it measures.** Four of the five failures above came
 from sharing a number across a boundary it was not valid across.
 
+## 3b. A rule that came out of getting this wrong twice
+
+Both attempts to consume the disk-cost signal failed the same way, and the cost
+model was only half of it.
+
+- **Substitution** is gated on `rank_bucket >= substitute_min_rank`: the router's
+  confidence ordering decides what may be stood in for. The gate added residency
+  as an extra veto, so an expert the router had already ranked as substitutable
+  could be refused a stand-in for a reason the router knows nothing about.
+- **Admission** is gated on `demand->count`: an expert earns a slot because the
+  router kept asking for it. The bias let residency skip that bar, so a candidate
+  could jump the queue ahead of experts that had actually proved they were wanted.
+
+In both the mechanism is an **earned** signal - rank, or repeated demand - and
+residency is a **property** a candidate merely has. The rule: a property may
+inform how an earned signal is weighed (eviction does exactly this, scaling heat
+by cost tier), but it must not gate or bypass the earned signal itself.
+
+That also narrows recommendation 1 below: eviction was not just the only consumer
+of cost_tier by accident, it is the consumer where a property *should* act -
+weighing, not deciding.
+
 ## 4. Calibration reaches nine of the runtime's knobs
 
 Reachable: `GGML_CUDA_MOE_CACHE` / `_MODE` / `_BUDGET_MB`, `SUBSTITUTE_MIN_RANK`,
