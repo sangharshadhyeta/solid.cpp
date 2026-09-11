@@ -498,6 +498,19 @@ struct moe_cache_device {
     std::unordered_set<moe_cache_key, moe_cache_key_hash> substituted_recently;
     double predictor_admit_evidence_for = 1.0;
     double predictor_admit_evidence_against = 1.0;
+    // Router-lookahead payoff, same shape as predictor_admitted above: a key
+    // enters when moe_cache_prefetch queues it into a free slot, leaves with a
+    // hit ("the prediction was used") or with its eviction before any hit
+    // ("the fill was wasted"). Without this the lookahead had no outcome
+    // measurement at all - a hit on a prefetched expert looked like any other.
+    // Approximate at the edges: a pool released on VRAM yield does not clear
+    // its keys, so a later re-admission of the same key can be credited here.
+    std::unordered_set<moe_cache_key, moe_cache_key_hash> lookahead_admitted;
+    long long lookahead_hits = 0;
+    long long lookahead_wasted = 0;
+    // Predicted experts whose mmap pages were read ahead because they were not
+    // cache-resident - the use of the prediction that needs no free slot.
+    long long lookahead_disk_prefetches = 0;
     // Cross-restart persistence staging (see moe_cache_predictor_load_file/
     // _save). Loaded once, lazily, on this device's first training example -
     // name-keyed (host_base is not stable across restarts) flat weight
@@ -1914,6 +1927,22 @@ static double moe_cache_atlas_align_protect_cap_fraction() {
 // invisible at the low end. Adding a bounded amount instead means the boost
 // can tip a close call between similarly-warm candidates but can never
 // manufacture rank-winning "heat" out of nothing.
+// One line per 256 lookahead outcomes: how often a one-layer-ahead prediction
+// that took a free slot was actually used before it was evicted.
+static void moe_cache_lookahead_report(const moe_cache_device & device) {
+    const long long total = device.lookahead_hits + device.lookahead_wasted;
+    if (total > 0 && total % 256 == 0) {
+        // fprintf, not MOE_CACHE_LOG: the server installs a ggml log callback that
+        // drops GGML_LOG_INFO, so the first version of this counter recorded
+        // everything and printed nothing under llama-server - the same trap the
+        // SUMMARY block below documents.
+        fprintf(stderr, "[moe-cache] CUDA%d lookahead: %lld hit, %lld wasted (%.1f%% of prefetched fills used)\n",
+                device.physical, device.lookahead_hits, device.lookahead_wasted,
+                100.0 * (double) device.lookahead_hits / (double) total);
+        fflush(stderr);
+    }
+}
+
 static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_pool & pool,
         const moe_cache_slot & slot, double * out_base = nullptr, double cap_ref = -1.0) {
     const double base = (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
@@ -2158,6 +2187,14 @@ static int moe_cache_pick_coldest_unpinned(moe_cache_device & device, moe_cache_
     // not pay off. The set only ever holds keys still awaiting their first
     // outcome, one way or the other.
     if (best >= 0 && !device.predictor_admitted.empty()) {
+        {
+            const auto lit = device.lookahead_admitted.find(pool.slots[best].key);
+            if (lit != device.lookahead_admitted.end()) {
+                device.lookahead_wasted++;
+                device.lookahead_admitted.erase(lit);
+                moe_cache_lookahead_report(device);
+            }
+        }
         const auto pit = device.predictor_admitted.find(pool.slots[best].key);
         if (pit != device.predictor_admitted.end()) {
             device.predictor_admit_evidence_against += 1.0;
@@ -7805,6 +7842,24 @@ static int moe_cache_atlas_rank(
 // one-shot version a net loss warm. Re-measure if that reasoning stops
 // holding (e.g. after other changes to the admit path).
 #if defined(__linux__)
+// Use a router-lookahead prediction to read a not-yet-resident expert's mmap
+// pages ahead, rather than only to claim a free VRAM slot. See the call site
+// for why this is the use that survives a saturated cache.
+static bool moe_cache_lookahead_disk_prefetch_enabled() {
+    static const bool enabled = [] {
+        // Off: measured on Qwen3.8-Flash-Next (wired into qwen4exp for the test,
+        // since removed) at 11.19 tok/s against 13.19 unwired, with disk traffic
+        // UP from 13.0 to 17.5 GiB per generation. At 512 experts and top-10
+        // routing the prediction is wrong often enough that reading its pages
+        // ahead evicts page cache that was doing real work. Kept because the
+        // mechanism is sound where prediction precision is higher, but it has to
+        // earn its default on measurement, not on the idea being reasonable.
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_LOOKAHEAD_DISK_PREFETCH");
+        return env && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
 static bool moe_cache_live_prefetch_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_LIVE_PREFETCH");
@@ -8416,6 +8471,14 @@ static double moe_cache_predictor_admit_confidence(const moe_cache_device & devi
 static void moe_cache_predictor_note_hit(moe_cache_device & device, const moe_cache_key & key) {
     if (!moe_cache_train_predictor_enabled() || device.predictor_admitted.empty()) {
         return;
+    }
+    {
+        const auto lit = device.lookahead_admitted.find(key);
+        if (lit != device.lookahead_admitted.end()) {
+            device.lookahead_hits++;
+            device.lookahead_admitted.erase(lit);
+            moe_cache_lookahead_report(device);
+        }
     }
     const auto it = device.predictor_admitted.find(key);
     if (it != device.predictor_admitted.end()) {
@@ -11764,15 +11827,51 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     return spec_evict_mode::off;
                 }();
                 const moe_cache_key key{host_base, expert};
+
+                // What the prediction is FOR when the cache is full. A predicted
+                // expert that is not resident gets computed on the CPU from mmap,
+                // and on a model bigger than RAM that read is the dominant cost
+                // (38-221 MiB/token measured on Qwen3.8-Flash-Next). Asking for
+                // its pages one layer early lets the read overlap this layer's
+                // compute instead of stalling the next - and unlike a VRAM fill
+                // it needs no free slot, so it still works at the ~99% occupancy
+                // this cache actually runs at (5541/5603 slots, measured). The
+                // reactive CPU_PREFETCH on the miss path cannot overlap anything:
+                // by the time it fires, the compute is already waiting on it.
+#if defined(__linux__)
+                if (moe_cache_lookahead_disk_prefetch_enabled() && expert_size > 0 &&
+                    pool.map.find(key) == pool.map.end()) {
+                    static const long page_size_l = sysconf(_SC_PAGESIZE);
+                    if (page_size_l > 0) {
+                        const uintptr_t begin = (uintptr_t) host_base + (uintptr_t) expert * expert_size;
+                        const uintptr_t first = begin & ~((uintptr_t) page_size_l - 1);
+                        const uintptr_t last  = (begin + expert_size + page_size_l - 1) &
+                                ~((uintptr_t) page_size_l - 1);
+                        posix_madvise((void *) first, (size_t) (last - first), POSIX_MADV_WILLNEED);
+                        device.lookahead_disk_prefetches++;
+                    }
+                }
+#endif
+
                 int slot_index = -1;
                 if (!pool.free_slots.empty()) {
                     slot_index = pool.free_slots.back();
                     pool.free_slots.pop_back();
                 } else if (mode == spec_evict_mode::off) {
-                    break; // default: no eviction for speculation - measured harmful
-                            // under no real memory pressure (probation churn); gate
-                            // this on to re-test once demand genuinely exceeds
-                            // capacity, where the calculus may differ.
+                    // No eviction for speculation by default - measured harmful
+                    // under no real memory pressure (probation churn). This used
+                    // to `break`, which abandoned every remaining predicted expert
+                    // the moment the pool filled: at steady state the pool is
+                    // always full, so the whole prediction was dropped on its
+                    // first expert while still costing a full gate matmul per
+                    // layer. `continue` keeps the disk-prefetch use above running
+                    // for the rest of the prediction, which is the part that does
+                    // not need a slot. With that use disabled there is nothing
+                    // slot-free left to do, so stop scanning as before.
+                    if (!moe_cache_lookahead_disk_prefetch_enabled()) {
+                        break;
+                    }
+                    continue;
                 } else {
                     // Reset once per real decode step (device.collect_calls) -
                     // shared clock for both the rate limit and the agreement
@@ -11906,6 +12005,7 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                             expert_size});
                     device.queued_bytes += expert_size;
                     device.prefetches++;
+                    device.lookahead_admitted.insert(key);
                     woke = true;
                 } catch (...) {
                     moe_cache_slot_reset(pool, slot_index, true);
