@@ -2455,13 +2455,21 @@ static double common_moe_bench_candidate_server(
     // is the configuration actually served - so the cheap regime only ever ranks,
     // and never has the last word.
     const char * reasoning_args = with_reasoning ? "" : "--reasoning off ";
+    // Keep the candidate's own output. It used to go to /dev/null, which meant a
+    // candidate that failed to come up left no evidence whatsoever - one such
+    // failure (spec-draft-n-max=1 on qwen4exp) skipped four MTP stages and could
+    // not be diagnosed afterwards at all. One file per port, overwritten by the
+    // next candidate on that port, so this costs one small file, not a pile.
+    char log_path[256];
+    snprintf(log_path, sizeof(log_path), "%s/llama-moe-calib-candidate-%d.log",
+             getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp", port);
     snprintf(cmd, sizeof(cmd),
         "%s%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
         "--temp " COMMON_MOE_PROBE_TEMP " --top-p " COMMON_MOE_PROBE_TOP_P
         " --top-k " COMMON_MOE_PROBE_TOP_K " --no-token-freq-log "
-        "--port %d --no-webui > /dev/null 2>&1 & echo $!",
+        "--port %d --no-webui > '%s' 2>&1 & echo $!",
         extra_env.c_str(), subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
-        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port);
+        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port, log_path);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
         return -1.0;
@@ -2486,8 +2494,21 @@ static double common_moe_bench_candidate_server(
     char health_cmd[256];
     snprintf(health_cmd, sizeof(health_cmd),
         "curl -s -o /dev/null -w '%%{http_code}' http://127.0.0.1:%d/health 2>/dev/null", port);
+    // Wait on the child's liveness, not on a fixed number of seconds. The old
+    // form gave every candidate the same 60s (30 polls x 2s) to become healthy,
+    // which silently encoded an assumption about load time: a candidate that also
+    // loads a draft model loads two models and can cross it, and a candidate on a
+    // model far larger than RAM crosses it while doing nothing wrong. Measured on
+    // qwen4exp, that is what failed spec-draft-n-max=1 - and one such failure used
+    // to skip the entire MTP half of calibration.
+    //
+    // A dead child is diagnosed immediately (no reason to keep polling a process
+    // that has exited), and a live one is given room, so the ceiling stops being a
+    // judgement about how long loading ought to take and becomes a backstop
+    // against a genuine hang.
     bool ready = false;
-    for (int i = 0; i < 30; i++) {
+    bool child_exited = false;
+    for (int i = 0; i < 300 && !child_exited; i++) {
         FILE * hp = popen(health_cmd, "r");
         if (hp) {
             char code[8] = {0};
@@ -2498,11 +2519,21 @@ static double common_moe_bench_candidate_server(
                 break;
             }
         }
+        // still loading, or gone? waitpid(WNOHANG) distinguishes the two.
+        int status = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+            child_exited = true;
+            break;
+        }
         struct timespec ts{2, 0};
         nanosleep(&ts, nullptr);
     }
     if (!ready) {
-        cleanup();
+        LOG_WRN("%s: candidate on port %d %s - its log is at %s\n", __func__, port,
+                child_exited ? "exited before serving" : "never became healthy", log_path);
+        if (!child_exited) {
+            cleanup();
+        }
         return -1.0;
     }
 
@@ -3285,6 +3316,7 @@ void common_moe_calibrate(common_params & params) {
             est += 2;                                                 // spec-prob-accept: off, on
         }
         est += 2; // thread-count candidates
+        est += 3; // admission-delay candidates (1, 2, 4)
         // Expert-cache size knee. Counted from the ladder that will actually run
         // (off, then 512 MiB doubling up to measured free VRAM), not the fixed
         // list of 8 this used to assume - four of those rungs were above what a
@@ -3957,15 +3989,34 @@ void common_moe_calibrate(common_params & params) {
             std::map<int, double> nmax_trace;
             double baseline = -1.0;
             int last_good = 1;
+            // The baseline is the first depth that actually benchmarks, not
+            // specifically n=1. Measured on qwen4exp: n=1 failed to come up
+            // twice (a draft depth of 1 is the oddest configuration in the
+            // sweep, and a candidate that fails to load is not evidence about
+            // depth), baseline stayed <= 0, and that single probe silently
+            // skipped the golden-section search, --spec-prob-accept and the
+            // drafter cascade with it - four MTP knobs behind one fragile
+            // candidate. A failure now costs only its own rung.
+            int n_failures = 0;
             for (int n = 1; n <= 32; n *= 2) {
                 const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                 nmax_trace[n] = tps;
                 LOG_INF("%s:   spec-draft-n-max=%d -> %s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
                 common_moe_calibration_status_candidate_done();
-                if (n == 1) {
-                    baseline = tps;
+                if (tps > 0 && baseline <= 0.0) {
+                    baseline = tps; // first depth that stood up anchors the collapse test
                 }
-                if (tps < 0 || (baseline > 0 && tps < baseline * 0.5)) {
+                if (tps < 0) {
+                    // Two consecutive failures means something is wrong with the
+                    // draft itself rather than with this depth - stop paying for it.
+                    if (++n_failures >= 2) {
+                        LOG_WRN("%s: two spec-draft-n-max candidates in a row failed - stopping the envelope search\n", __func__);
+                        break;
+                    }
+                    continue;
+                }
+                n_failures = 0;
+                if (baseline > 0 && tps < baseline * 0.5) {
                     break;
                 }
                 last_good = n;
@@ -4028,8 +4079,20 @@ void common_moe_calibrate(common_params & params) {
     // n_max above, so - unlike before this fix - it's safe to also tune
     // threads under MTP when MTP was calibrated: same real generation
     // conditions, numbers are directly comparable to best_tps above.
-    const std::string mtp_path_for_threads = best_n_max > 0 ? params.speculative.draft.mparams.path : std::string();
-    const int n_max_for_threads = best_n_max > 0 ? best_n_max : 0;
+    // Every later stage - threads, cache size, fit margin, admission, acceptance -
+    // must be measured in the regime the server will actually serve in. If a draft
+    // model is configured, that regime includes the draft, whether or not its depth
+    // search produced a number. The old form dropped the draft entirely when the
+    // depth search failed, so a run launched with -md tuned all four remaining knobs
+    // against a no-draft configuration it would never run: measured on qwen4exp,
+    // where one failed n_max=1 probe silently turned the whole run into a
+    // calibration of the wrong thing. Fall back to the depth the run is configured
+    // with instead; spec_n_max simply stays uncalibrated.
+    const bool  mtp_configured   = params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
+    const std::string mtp_path_for_threads = mtp_configured ? params.speculative.draft.mparams.path : std::string();
+    const int n_max_for_threads = best_n_max > 0
+            ? best_n_max
+            : (mtp_configured ? std::max(1, params.speculative.draft.n_max) : 0);
 
     const int n_threads_physical = common_cpu_get_num_physical_cores();
     const int n_threads_logical  = (int) std::thread::hardware_concurrency();
@@ -4283,7 +4346,7 @@ void common_moe_calibrate(common_params & params) {
     // trusting the monotonicity argument.
     int    best_prob_accept     = -1;
     double best_prob_accept_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
-    if (!mtp_path_for_threads.empty() && best_n_max > 0 && !common_moe_calibrate_budget_spent()) {
+    if (!mtp_path_for_threads.empty() && n_max_for_threads > 0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring probabilistic draft acceptance (--spec-prob-accept) ...\n", __func__);
         common_moe_calibration_status_set("measuring probabilistic draft acceptance");
         for (const int candidate : {0, 1}) {
