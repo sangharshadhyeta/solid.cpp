@@ -1525,6 +1525,16 @@ struct common_moe_calibration_entry {
     // CPU where the expert cache serves them. -1 = not calibrated (backend default
     // 32, an upstream number never measured on a model bigger than RAM).
     int         op_offload_min_batch = -1;
+    // Physical micro-batch (-ub) for prompt processing. -1 = not calibrated (512).
+    // A larger one copies each offloaded expert once for more tokens - published:
+    // -ub 2048 took a dual-3060 prefill on this model from 36 to 303 tok/s.
+    int         n_ubatch = -1;
+    // GGML_SCHED_PREFETCH_EXPERTS (already in the scheduler, off by default):
+    // overlaps offloaded expert uploads with compute. Measured here before on
+    // Gemma-4 at +13.2% pp2048 for 820 MiB of VRAM (see fit.cpp) - VRAM the
+    // expert cache would otherwise use, so measured per model rather than
+    // switched on. -1 = not calibrated, 0 = off won, 1 = on won.
+    int         sched_prefetch_experts = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1824,6 +1834,8 @@ static bool common_moe_calibration_lookup(
         out.spec_p_min          = e.value("spec_p_min", -1.0);
         out.spec_draft_cpu_moe  = e.value("spec_draft_cpu_moe", -1);
         out.op_offload_min_batch = e.value("op_offload_min_batch", -1);
+        out.n_ubatch             = e.value("n_ubatch", -1);
+        out.sched_prefetch_experts = e.value("sched_prefetch_experts", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1883,6 +1895,8 @@ static void common_moe_calibration_save(
         {"spec_p_min", entry.spec_p_min},
         {"spec_draft_cpu_moe", entry.spec_draft_cpu_moe},
         {"op_offload_min_batch", entry.op_offload_min_batch},
+        {"n_ubatch", entry.n_ubatch},
+        {"sched_prefetch_experts", entry.sched_prefetch_experts},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2328,6 +2342,13 @@ static std::atomic<int>       g_moe_calib_offload_min_batch{-1};
 // When set, a candidate reports prompt-processing throughput (prompt tok/s over a
 // short and a long uncached prompt) instead of decode throughput.
 static std::atomic<bool>      g_moe_calib_measure_prefill{false};
+// -ub every candidate launches with from here on (-1 = the default, 512), and
+// whether the prefill probe uses its extra-long prompt (the micro-batch stage:
+// a knob that only matters past one micro-batch cannot show on a short prompt).
+static std::atomic<int>       g_moe_calib_ubatch{-1};
+static std::atomic<bool>      g_moe_calib_prefill_xlong{false};
+// GGML_SCHED_PREFETCH_EXPERTS every candidate launches with from here on.
+static std::atomic<bool>      g_moe_calib_prefetch{false};
 
 // A candidate can end badly in two different ways and they must not be
 // conflated. -1.0 means the run did not happen (server failed to come up, port
@@ -2359,7 +2380,10 @@ static constexpr double COMMON_MOE_TPS_REJECTED = -2.0;
 // temp 0 than at temp 1, so a draft measured greedily overstates itself.
 #define COMMON_MOE_PROBE_TEMP   "1.0"
 #define COMMON_MOE_PROBE_TOP_P  "0.95"
-#define COMMON_MOE_PROBE_TOP_K  "64"
+// top_k 20 per Qwen's own model card (thinking mode: temp 1.0, top_p 0.95,
+// top_k 20, min_p 0). This was 64, Unsloth's figure; the model card is the
+// primary source for the model it describes.
+#define COMMON_MOE_PROBE_TOP_K  "20"
 static std::atomic<long long> g_moe_candidate_ms_sum{0};
 static std::atomic<int>       g_moe_candidate_count{0};
 static std::atomic<bool>      g_moe_budget_is_derived{false};
@@ -2484,6 +2508,9 @@ static double common_moe_bench_candidate_server(
         snprintf(buf, sizeof(buf), "-t %d -tb %d ", n_threads, n_threads);
         threads_args = buf;
     }
+    if (g_moe_calib_ubatch.load() > 0) {
+        threads_args += string_format("-ub %d ", g_moe_calib_ubatch.load());
+    }
     // At concurrency > 1, --parallel must match so the candidate server can
     // actually hold n_concurrency slots, and -c needs enough headroom for
     // all of them at once (n_predict + a real prompt, per slot) - reusing
@@ -2573,6 +2600,9 @@ static double common_moe_bench_candidate_server(
     std::string env_prefix = extra_env;
     if (g_moe_calib_offload_min_batch.load() > 0) {
         env_prefix = string_format("GGML_OP_OFFLOAD_MIN_BATCH=%d ", g_moe_calib_offload_min_batch.load()) + env_prefix;
+    }
+    if (g_moe_calib_prefetch.load()) {
+        env_prefix = std::string("GGML_SCHED_PREFETCH_EXPERTS=1 ") + env_prefix;
     }
     char log_path[256];
     snprintf(log_path, sizeof(log_path), "%s/llama-moe-calib-candidate-%d.log",
@@ -2729,7 +2759,18 @@ static double common_moe_bench_candidate_server(
         // speed-vs-noise trade, made together) on a slow-decoding model
         // where every probe is expensive; this drops the averaging that
         // partially absorbed run-to-run variance within a single candidate.
-        constexpr int n_solo_probes = 1;
+        // With a draft attached, time code and reasoning rather than prose. Draft
+        // acceptance is content-dependent - published for this model: code 90%,
+        // reasoning 73%, prose 38% (little or no speedup) - so a prose-only probe
+        // measures speculative decoding at its worst and ranks depth, placement
+        // and acceptance for a workload nobody runs. Two probes, not one, for the
+        // same reason.
+        static const char * const mtp_probe_prompts[] = {
+            "Write a Python function that implements binary search, then explain its time complexity.",
+            "A train leaves at 3pm at 60 km/h; a second leaves the same station at 4pm at 90 km/h on the "
+            "same track. When does the second catch the first? Work it out step by step.",
+        };
+        const int n_solo_probes = mtp_path.empty() ? 1 : 2;
         double sum_tps = 0.0;
         int n_ok = 0;
         double worst_degeneracy = 0.0;
@@ -2754,7 +2795,23 @@ static double common_moe_bench_candidate_server(
                 }
                 return p;
             }();
-            const char * const prefill_prompts[] = { probe_prompts[0], prefill_long.c_str() };
+            static const std::string prefill_xlong = [] {
+                std::string p = "Read the following notes carefully and list every decision they record.\n";
+                for (int i = 0; i < 24; i++) {
+                    p += "The town council met on Tuesday to review the budget for road repairs, the new "
+                         "library wing, and the summer festival. Members agreed to delay the festival "
+                         "decision until the next session, approved the library plan, and asked the "
+                         "engineers for a revised estimate on the roads before any contract is signed. ";
+                }
+                return p;
+            }();
+            const bool xlong = g_moe_calib_prefill_xlong.load();
+            std::vector<const char *> prefill_prompts;
+            if (xlong) {
+                prefill_prompts = { prefill_xlong.c_str() };
+            } else {
+                prefill_prompts = { probe_prompts[0], prefill_long.c_str() };
+            }
             double tok = 0.0, ms = 0.0;
             for (const char * pp : prefill_prompts) {
                 const auto r = common_moe_bench_one_request_full(port, pp, 4, probe_seed, false, /* cache_prompt */ false);
@@ -2769,7 +2826,8 @@ static double common_moe_bench_candidate_server(
         g_moe_last_draft_n          = -1.0;
         g_moe_last_draft_n_accepted = -1.0;
         for (int i = 0; i < n_solo_probes; i++) {
-            const auto r = common_moe_bench_one_request_full(port, probe_prompts[i], n_predict, probe_seed);
+            const char * timed_prompt = mtp_path.empty() ? probe_prompts[i] : mtp_probe_prompts[i];
+            const auto r = common_moe_bench_one_request_full(port, timed_prompt, n_predict, probe_seed);
             if (r.predicted_n > 0 && r.predicted_ms > 0) {
                 sum_tps += r.predicted_n / (r.predicted_ms / 1000.0);
                 worst_degeneracy = std::max(worst_degeneracy, r.degeneracy);
@@ -3359,6 +3417,9 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_draft_cpu_moe.store(false);
     g_moe_calib_offload_min_batch.store(-1);
     g_moe_calib_measure_prefill.store(false);
+    g_moe_calib_ubatch.store(-1);
+    g_moe_calib_prefill_xlong.store(false);
+    g_moe_calib_prefetch.store(false);
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -3497,6 +3558,7 @@ void common_moe_calibrate(common_params & params) {
                 : 1;
         est += 7; // substitution-floor ladder (6 rungs) + long-probe confirmation
         est += 5; // offload threshold: 32, 64, 128, 256, 400
+        est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -3665,12 +3727,70 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         g_moe_calib_measure_prefill.store(false);
+    g_moe_calib_ubatch.store(-1);
+    g_moe_calib_prefill_xlong.store(false);
+    g_moe_calib_prefetch.store(false);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         if (best_offload_min_batch > 0) {
             LOG_INF("%s: offload threshold: %d at %.1f prompt tok/s\n", __func__, best_offload_min_batch, best_pp);
             common_moe_calibration_status_note("offload threshold", string_format("%d", best_offload_min_batch),
                     string_format("SELECTED - %.1f prompt tok/s", best_pp), true, true);
         }
+    }
+
+    // Micro-batch size, at the chosen offload threshold. Measured on a prompt of
+    // ~1500 tokens - several micro-batches - because below one micro-batch the
+    // knob has nothing to act on.
+    int best_ubatch   = -1;
+    int best_prefetch = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the prompt micro-batch size (-ub) on a long prompt ...\n", __func__);
+        common_moe_calibration_status_set("measuring the prompt micro-batch size");
+        g_moe_calib_measure_prefill.store(true);
+        g_moe_calib_prefill_xlong.store(true);
+        double best_pp = -1.0;
+        for (const int ub : { 512, 2048 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            g_moe_calib_ubatch.store(ub);
+            const double pp = common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    concurrency, -1, -1, active_ngl, active_min_rank);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   -ub %d -> %s\n", __func__, ub,
+                    pp > 0 ? string_format("%.1f prompt tok/s", pp).c_str() : "failed");
+            common_moe_calibration_status_note("prompt micro-batch", string_format("-ub %d", ub),
+                    pp > 0 ? string_format("%.1f prompt tok/s", pp) : std::string("failed"), pp > 0);
+            if (pp > best_pp) {
+                best_pp     = pp;
+                best_ubatch = ub;
+            }
+        }
+        g_moe_calib_ubatch.store(best_ubatch);
+        if (best_ubatch > 0) {
+            LOG_INF("%s: prompt micro-batch: -ub %d at %.1f prompt tok/s\n", __func__, best_ubatch, best_pp);
+            common_moe_calibration_status_note("prompt micro-batch", string_format("-ub %d", best_ubatch),
+                    string_format("SELECTED - %.1f prompt tok/s", best_pp), true, true);
+        }
+        // Expert prefetch at the chosen micro-batch - an existing scheduler
+        // feature, off by default, that only acts on offloaded ops (so after the
+        // threshold, and with a prompt long enough to cross it).
+        if (best_ubatch > 0 && !common_moe_calibrate_budget_spent()) {
+            g_moe_calib_prefetch.store(true);
+            const double pp = common_moe_bench_candidate_server(
+                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
+                    concurrency, -1, -1, active_ngl, active_min_rank);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   expert prefetch on -> %s (off: %.1f prompt tok/s)\n", __func__,
+                    pp > 0 ? string_format("%.1f prompt tok/s", pp).c_str() : "failed", best_pp);
+            best_prefetch = pp > best_pp ? 1 : 0;
+            g_moe_calib_prefetch.store(best_prefetch == 1);
+            common_moe_calibration_status_note("expert prefetch", best_prefetch ? "on" : "off",
+                    string_format("SELECTED - %.1f prompt tok/s", best_prefetch ? pp : best_pp), true, true);
+        }
+        g_moe_calib_measure_prefill.store(false);
+        g_moe_calib_prefill_xlong.store(false);
     }
 
     // The draft first. With a draft model attached, speculative decoding is the
@@ -4937,6 +5057,8 @@ void common_moe_calibrate(common_params & params) {
     entry.spec_p_min      = best_p_min;
     entry.spec_draft_cpu_moe = best_draft_cpu_moe;
     entry.op_offload_min_batch = best_offload_min_batch;
+    entry.n_ubatch             = best_ubatch;
+    entry.sched_prefetch_experts = best_prefetch;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -5446,14 +5568,8 @@ static bool common_maybe_autoplace_moe_cpu(
                         __func__);
                 params.speculative.types = { COMMON_SPECULATIVE_TYPE_NONE };
             }
-            if (cached.op_offload_min_batch > 0 && !getenv("GGML_OP_OFFLOAD_MIN_BATCH")) {
-#if defined(_WIN32)
-                _putenv_s("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(cached.op_offload_min_batch).c_str());
-#else
-                setenv("GGML_OP_OFFLOAD_MIN_BATCH", std::to_string(cached.op_offload_min_batch).c_str(), 1);
-#endif
-                LOG_INF("%s: using calibrated MoE offload threshold of %d tokens\n", __func__, cached.op_offload_min_batch);
-            }
+            // (the offload threshold is applied once, with the other prompt-processing
+            //  settings, in common_moe_apply_prefill_knobs - before the fit pass)
             if (cached.spec_draft_cpu_moe == 1 && params.speculative.has_dft() &&
                 params.speculative.draft.tensor_buft_overrides.empty()) {
                 params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
@@ -5649,6 +5765,34 @@ static bool common_maybe_autoplace_moe_cpu(
 // override is set" rule - that early-out means passing -ncmoe silently disables
 // the very logic meant to make this decision (the same trap as -ngl disabling
 // --fit entirely), which is exactly how the collapse above went unnoticed.
+// Prompt-processing settings from a calibration entry. Applied next to the
+// quality knobs in common_maybe_raise_moe_for_ctx, which runs BEFORE the fit
+// pass - fit sizes compute buffers from n_ubatch and reserves expert-prefetch
+// VRAM only when that env var is set, so applying either later is too late.
+// Every setting is skipped when the user chose it explicitly.
+static void common_moe_apply_prefill_knobs(const common_moe_calibration_entry & cal, common_params & params) {
+    auto set_env = [](const char * name, int value) {
+#if defined(_WIN32)
+        _putenv_s(name, std::to_string(value).c_str());
+#else
+        setenv(name, std::to_string(value).c_str(), 1);
+#endif
+    };
+    if (cal.op_offload_min_batch > 0 && !getenv("GGML_OP_OFFLOAD_MIN_BATCH")) {
+        set_env("GGML_OP_OFFLOAD_MIN_BATCH", cal.op_offload_min_batch);
+        LOG_INF("%s: using calibrated MoE offload threshold of %d tokens\n", __func__, cal.op_offload_min_batch);
+    }
+    if (cal.sched_prefetch_experts == 1 && !getenv("GGML_SCHED_PREFETCH_EXPERTS")) {
+        set_env("GGML_SCHED_PREFETCH_EXPERTS", 1);
+        LOG_INF("%s: using calibrated expert prefetch (on)\n", __func__);
+    }
+    if (cal.n_ubatch > 0 && params.n_ubatch == 512 /* default, see common_params */) {
+        params.n_ubatch = cal.n_ubatch;
+        params.n_batch  = std::max(params.n_batch, params.n_ubatch);
+        LOG_INF("%s: using calibrated prompt micro-batch -ub %d\n", __func__, cal.n_ubatch);
+    }
+}
+
 static bool common_maybe_raise_moe_for_ctx(
         const char * path_model, common_params & params,
         llama_model_params & mparams, const llama_context_params & cparams) {
@@ -5664,6 +5808,7 @@ static bool common_maybe_raise_moe_for_ctx(
         common_moe_calibration_entry cal_q;
         if (common_moe_calibration_lookup(path_model, params, cal_q)) {
             common_moe_apply_quality_knobs(cal_q);
+            common_moe_apply_prefill_knobs(cal_q, params);
         }
     }
 
@@ -5882,6 +6027,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     if (params.fit_params) {
         // must run before common_fit_params() - see the function's own comment
         common_maybe_raise_moe_for_ctx(params.model.path.c_str(), params, mparams, cparams);
+        // cparams was built above, before the calibration entry could set the
+        // prompt micro-batch - carry it over before fit sizes compute buffers from it.
+        cparams.n_ubatch = params.n_ubatch;
+        cparams.n_batch  = params.n_batch;
 
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
