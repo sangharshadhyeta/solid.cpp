@@ -331,7 +331,7 @@ footer a{color:var(--muted);text-decoration:underline;}
 </div>
 <div class="hero-zero-grid">
 <div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">68.75<small> tok/s</small></span><span class="hz-note">ncmoe 20, rank&nbsp;1, &minus;1&sigma; bar</span></div>
-<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">2.81<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;1, 84% stand-in rate</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">12.82<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;2, cache 2048&nbsp;MiB</span></div>
 </div>
 <p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
 &mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
@@ -362,41 +362,87 @@ that badly does not. Nothing here was hand-set; each number is what the search m
 <thead><tr><th>Decided</th><th>Gemma-4 26B-A4B <span class="note">(17GB, fits)</span></th><th>Qwen3.8-Flash-Next <span class="note">(87GB, does not)</span></th></tr></thead>
 <tbody>
 <tr><td>Expert placement</td><td>searched 21/20/19 &rarr; <strong>20 CPU layers</strong></td><td>only [47,48] fit the margin &rarr; <strong>47</strong>, decided by probe, not benchmarked</td></tr>
-<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0 (0.28/0.28/0.30/0.29/<strong>0.40</strong>/0.31), <strong>rank 1</strong>, held over 128 tokens</td></tr>
-<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong> (1.0&sigma; and 0.0&sigma; rejected on fidelity)</td><td>all five measured &mdash; +2&sigma; 0.12, +1&sigma; 0.24, <strong>0&sigma; 0.39</strong>, &minus;1&sigma; 0.31, &minus;2&sigma; 0.34 &mdash; budget spent before one was committed</td></tr>
-<tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td>0.31 tok/s &mdash; measured, and beaten by rank 1</td></tr>
-<tr><td>Rejected outright</td><td><strong>3 candidates</strong> &mdash; one degenerate (0.53), two not reproducible (2 of 5 agreed) at 38.46 and 50.62 tok/s</td><td>every <code>-ngl</code> candidate failed to load &rarr; full residency kept</td></tr>
+<tr><td>Substitution floor</td><td>ladder 10&rarr;0, <strong>rank 1 @ 64.83 tok/s</strong></td><td>ladder 10&rarr;0 (7.51/8.13/7.54/8.60/<strong>8.72</strong>/degenerate), then the top of that shortlist re-measured at full length: rank 1 &rarr; 9.23, <strong>rank 2 &rarr; 11.53</strong></td></tr>
+<tr><td>Stand-in quality bar</td><td>&plusmn;2&sigma; ladder, <strong>&minus;1&sigma; @ 68.75 tok/s</strong></td><td>all five measured (7.90/8.11/8.61/<strong>8.68</strong>/8.39) and none committed &mdash; a <a href="#gates-were-wrong">known defect</a>: these are short-probe numbers compared against a full-length incumbent, so none can win</td></tr>
+<tr><td>Fully aggressive (rank 0)</td><td>32.71 tok/s &mdash; <strong>slower AND worse</strong></td><td><strong>rejected as degenerate</strong> &mdash; the one gate that still vetoes, and it still bites</td></tr>
+<tr><td>Rejected outright</td><td><strong>1 candidate</strong>, degenerate (0.53). Two more were thrown out for &ldquo;not reproducible&rdquo; at 38.46 and 50.62 tok/s &mdash; <a href="#gates-were-wrong">that check has since been removed as wrong</a></td><td><strong>rank 0</strong>, degenerate. Every <code>-ngl</code> candidate now runs and is measured (6.08&ndash;7.99); full residency still wins</td></tr>
 <tr><td>Draft model</td><td>found beside the target by itself &rarr; <strong>spec-draft-n-max 6</strong></td><td>none present</td></tr>
-<tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td>12 candidates in <strong>91 min</strong>, then budget spent</td></tr>
-<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">2.81 tok/s <span class="note">single-stream</span></td></tr>
-<tr><td>With the floor NOT applied</td><td class="note">n/a</td><td class="num delta-neg">0.60 tok/s</td></tr>
+<tr><td>Whole run</td><td>full search, <strong>10m19s</strong></td><td><strong>30 candidates in 20m24s</strong>, every stage reached &mdash; on a budget the run derived for itself (31s/candidate &times; 30)</td></tr>
+<tr><td>Then serving at</td><td class="num">68.75 tok/s</td><td class="num">12.82 tok/s <span class="note">plain launch, no flags</span></td></tr>
+<tr><td>With substitution off</td><td class="note">n/a</td><td class="num delta-neg">8.3 tok/s</td></tr>
+<tr><td>With the expert cache off</td><td class="note">n/a</td><td class="num delta-neg">3.7 tok/s</td></tr>
 </tbody>
 </table>
 </div>
 
-<p class="note">Two things that only exist because a throughput-only search would get them wrong. Substitution
-&mdash; serving a cache miss from a resident stand-in rather than fetching the exact expert &mdash; is the
-largest single lever on a model that does not fit &mdash; and the one most easily lost, since it is applied from a
-cached entry rather than measured live. Measured twice on the same binary and the same model, minutes apart:
-with the floor applied, 30,261 stand-ins served at an 84% accept rate and <strong>2.81 tok/s</strong>; without it,
-<code>substitutions=0, declined=0</code> &mdash; the gate never ran &mdash; and <strong>0.60 tok/s</strong>. A
-4.7&times; difference from one setting reaching the serving session or not &mdash;
-and it is also the one that destroys output when pushed too far: on Qwen3.8-Flash-Next, rank 0 emits
-<em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym is&rdquo;</em> at a very
-respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams, single-word dominance) and
-<strong>rejected outright</strong> rather than ranked &mdash; speed bought with broken generation cannot win.
-And because those probes are short while the failures show up at 150&ndash;250 tokens, the winner is
-re-confirmed over 4&times; the probe length before being committed, stepping back toward the safe end if it does
-not hold. The gates reject on their own evidence: in the gemma-4 run above, three candidates were thrown out
-&mdash; one for degenerate output, and two because the same request at the same seed, sampled greedily, agreed
-only 2 times in 5. Those two measured 38.46 and 50.62 tok/s and would otherwise have been recorded as
-results.</p>
+<p class="note">Substitution &mdash; serving a cache miss from a resident stand-in rather than fetching the
+exact expert &mdash; is the largest single lever on a model that does not fit. Measured on the same binary and
+the same model: rank&nbsp;2 serves <strong>12.82 tok/s</strong>, substitution off <strong>8.3</strong>, and with
+the expert cache off entirely <strong>3.7</strong>. It is also the lever that destroys output when pushed too
+far: rank&nbsp;0 emits <em>&ldquo;a question to how a steps explaining on the how quicksort, e shouldicym
+is&rdquo;</em> at a very respectable 11.95 tok/s. So candidates are scored for degeneracy (repeated 4-grams,
+single-word dominance) and <strong>rejected outright</strong> rather than ranked &mdash; speed bought with
+broken generation cannot win. Rank&nbsp;0 was rejected exactly this way in the run above. And because those
+probes are short while the failures show up at 150&ndash;250 tokens, every candidate within 15% of the best is
+re-measured at 4&times; the probe length, in the configuration actually served, before one is committed.</p>
 
-<p class="note">The honest limit: on Qwen3.8-Flash-Next this hardware is the binding constraint, not the tuning.
-55GB of experts against 30GB of RAM means real swap traffic during generation (634k major faults in one
-200-token run), and no cache policy removes that. Gemma-4 reaches 68.75 tok/s on the same GPU because it fits.
-Calibration's job is to find the best configuration available on the hardware you have &mdash; not to pretend
-the hardware is different.</p>
+<p class="note">What this page used to say here was wrong, and the correction is the more useful
+claim. It read: &ldquo;the honest limit: on Qwen3.8-Flash-Next this hardware is the binding constraint, not the
+tuning &mdash; 55GB of experts against 30GB of RAM means real swap traffic, and no cache policy removes
+that.&rdquo; The swap traffic was real. The conclusion was not. Two of our own bugs were producing it: the
+loader was page-locking mmap-backed experts on a model larger than RAM, which broke copy-on-write and turned
+18.4&nbsp;GiB of weights into unevictable copies; and every page fault pulled the kernel's 4&nbsp;MiB
+sequential read-around for a 0.88&nbsp;MiB expert slice, so a token read 1.2&ndash;1.5&nbsp;GiB of disk. Fixing
+both, plus a calibration that could finally reach its own substitution floor, took the same model on the same
+card from <strong>2.81 to 12.82 tok/s</strong>. What remains true: 87&nbsp;GB does not fit in 12, so it will
+not reach the 68.75 tok/s a model that fits gets. Blaming the hardware was the comfortable answer, and it stood
+here unexamined from 4 September until it was measured.</p>
+
+<div id="gates-were-wrong" style="margin-top:2rem">
+<div class="eyebrow">A correction</div>
+<h2>Three quality gates were rejecting the best configuration</h2>
+<p class="section-lede">Calibration is supposed to refuse a configuration that is <em>wrong</em>. Three of its
+checks were refusing configurations that were merely <em>different</em>, and the difference they measured was
+one the design creates on purpose.</p>
+<div class="tablewrap">
+<table>
+<colgroup><col style="width:22%"><col style="width:44%"><col style="width:34%"></colgroup>
+<thead><tr><th>Check</th><th>What it actually measured</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>Reproducibility<br><span class="note">text identity across 5 greedy repeats</span></td>
+<td>The expert cache admits experts between requests, and an expert computed on GPU and on CPU takes a
+different quantized path &mdash; so identical greedy requests diverge by a word as the cache warms. Cache off:
+5&nbsp;of&nbsp;5 byte-identical. Cache on: 1&nbsp;of&nbsp;5, all five fluent and equivalent.</td>
+<td><strong>Removed.</strong> It fired nine times, every single time at exactly 2-of-5 &mdash; sampling noise at
+n=5 &mdash; and never once at the all-distinct signature corruption leaves.</td></tr>
+<tr><td>Fidelity bar<br><span class="note">similarity to a substitution-free reference</span></td>
+<td>Substitution serves a different expert by construction, so the wording diverges when the mechanism is
+working. It rejected ranks 6, 4 and 2, leaving rank&nbsp;10 at 6.18 tok/s.</td>
+<td><strong>Demoted to a reported number.</strong> Rank&nbsp;2 scores fidelity <strong>0.00</strong> and
+answers <strong>4 of 4</strong> verifiable questions correctly. A metric that rates a correct answer at zero
+cannot gate anything.</td></tr>
+<tr><td>Verifiable answers<br><span class="note">at 24 tokens</span></td>
+<td>Our own first attempt at a replacement, and also wrong: on a reasoning model that budget is spent inside
+the thinking preamble, so the reference itself scored 1&nbsp;of&nbsp;4 and every candidate was rejected against
+that noise.</td>
+<td><strong>Moved</strong> to the confirm step at 320 tokens, where the model can finish thinking before it is
+scored.</td></tr>
+</tbody>
+</table>
+</div>
+<p class="note">The check that survived is the one that was always right. <strong>Degeneracy</strong> &mdash;
+repeated 4-grams, single-word dominance &mdash; still runs on every candidate, and still rejected rank&nbsp;0 in
+the validating run, so removing the other two removed no protection. It is also the only check that ever caught
+a real bug: the one memory corruption this fork has hit produced <em>deterministic</em> garbage, which an
+agreement test cannot see by construction.</p>
+<p class="note">The cost was concrete. Rank&nbsp;2 &mdash; the winner &mdash; was rejected three separate ways,
+and calibration cached something slower in its place. Worse, a rejection was signalled with the same value a
+crashed server returns, and four stages retry on that, so every wrong rejection was paid for twice; that is
+what exhausted the time budget and left thread count, cache size and fit margin skipped in milliseconds while
+being recorded as &ldquo;failed&rdquo;. Two of the gemma-4 rejections still listed above &mdash; 38.46 and
+50.62 tok/s &mdash; were this same check. They were slower than that run's winner, so nothing was lost there;
+that was luck, not the gate working.</p>
+</div>
 
 <p class="note"><strong>What the guard could not see.</strong> That degeneracy score is a lexical health check:
 verbatim 4-gram repeats and single-word dominance. It was also only ever shown one prompt &mdash;
