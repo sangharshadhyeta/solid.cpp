@@ -2238,6 +2238,25 @@ static std::atomic<int>       g_moe_verifiable_ref{-1};
 // which is what exhausted the time budget and left the later stages - thread
 // count, cache size, fit margin - skipped in milliseconds.
 static constexpr double COMMON_MOE_TPS_REJECTED = -2.0;
+
+// Sampling the calibration probes run under, and the values to quote when
+// anyone asks "how should this model be run".
+//
+// These are Unsloth's recommended settings for the quantized Qwen3.8-Flash-Next
+// and Gemma-4 GGUFs this fork targets, not a generic default and not greedy.
+// They live here as named constants because they were re-derived from memory
+// three separate times in one day, each time slightly differently, and every
+// throughput number is only comparable against others measured the same way.
+//
+// Greedy (temp 0, top-k 1) is deliberately NOT this: it is the right choice for
+// a reproducible A/B, where removing sampling variance is the point, but it is
+// not the configuration anything is actually served under, and a quality
+// judgement made under it can be wrong in both directions - short factual
+// prompts behave differently, and speculative acceptance is far higher at
+// temp 0 than at temp 1, so a draft measured greedily overstates itself.
+#define COMMON_MOE_PROBE_TEMP   "1.0"
+#define COMMON_MOE_PROBE_TOP_P  "0.95"
+#define COMMON_MOE_PROBE_TOP_K  "64"
 static std::atomic<long long> g_moe_candidate_ms_sum{0};
 static std::atomic<int>       g_moe_candidate_count{0};
 static std::atomic<bool>      g_moe_budget_is_derived{false};
@@ -2427,7 +2446,8 @@ static double common_moe_bench_candidate_server(
     const char * reasoning_args = with_reasoning ? "" : "--reasoning off ";
     snprintf(cmd, sizeof(cmd),
         "%s%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
-        "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
+        "--temp " COMMON_MOE_PROBE_TEMP " --top-p " COMMON_MOE_PROBE_TOP_P
+        " --top-k " COMMON_MOE_PROBE_TOP_K " --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
         extra_env.c_str(), subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port);
