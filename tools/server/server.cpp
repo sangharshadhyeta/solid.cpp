@@ -529,7 +529,11 @@ int llama_server(common_params & params, int argc, char ** argv) {
 
     // for consistency between server router mode and single-model mode, we set the same model name as alias
     auto model_name = params.model.get_name();
-    if (params.model_alias.empty() && !model_name.empty()) {
+    // For a local file get_name() is the path. Inserting that as an alias made it
+    // an "explicit" alias, so the server never looked at the model's own
+    // general.name - a split model was named after its first shard. Leave the
+    // alias empty then and let server_context name the model after loading it.
+    if (params.model_alias.empty() && !model_name.empty() && model_name != params.model.path) {
         params.model_alias.insert(model_name);
     }
 
