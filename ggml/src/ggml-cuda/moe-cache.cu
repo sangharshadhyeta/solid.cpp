@@ -1233,9 +1233,22 @@ static void moe_cache_set_max_batch_hint(int n_seq_max) {
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+    // Serve every expert exact in this scope: no stand-ins. Set for a
+    // speculative draft's compute. A draft shares the target's session (one
+    // pool, one budget, one ranking), but substitution there is a loss, not a
+    // trade: the draft exists to predict what the target will emit, a
+    // stand-in makes that prediction worse, and a worse prediction is a
+    // rejected token and a wasted verify pass. The draft's experts are small
+    // enough to stay resident under the shared pool, so exact costs little.
+    bool exact = false;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
+
+// True while the innermost scope on this thread asked for exact experts only.
+static bool moe_cache_scope_exact() {
+    return !g_session_stack.empty() && g_session_stack.back().exact;
+}
 
 static size_t moe_cache_trim_session(
         moe_cache_session & session, int physical_device);
@@ -6279,6 +6292,18 @@ static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device);
 // pointer, so the caller can treat it exactly like a session_create() result -
 // including passing it to session_destroy(), which now only tears down on the
 // last release.
+// session_enter, then mark the frame it pushed as exact-only. A scope that
+// pushed nothing (no session, or a suppressed one) has no frame to mark and
+// runs the stock path anyway, where nothing is substituted.
+static void moe_cache_session_enter(void * opaque);
+static void moe_cache_session_enter_exact(void * opaque) {
+    const size_t depth = g_session_stack.size();
+    moe_cache_session_enter(opaque);
+    if (g_session_stack.size() > depth) {
+        g_session_stack.back().exact = true;
+    }
+}
+
 static void * moe_cache_session_share(void * opaque) {
     moe_cache_session * session = (moe_cache_session *) opaque;
     if (!session) {
@@ -9954,7 +9979,7 @@ static int moe_cache_plan(
         // available via GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK for anyone
         // who wants the router's most-confident picks to always pay exact
         // compute regardless of residency.
-        if (moe_cache_substitute_enabled() && slot_indices[index] < 0 &&
+        if (moe_cache_substitute_enabled() && !moe_cache_scope_exact() && slot_indices[index] < 0 &&
             rank_bucket >= moe_cache_substitute_min_rank(device) &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
             // Hot-loaded-first by default (2026-09-04): picks the hottest
@@ -12539,6 +12564,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.owner = owner;
     ggml_moe_cache.session_create = moe_cache_session_create;
     ggml_moe_cache.session_share = moe_cache_session_share;
+    ggml_moe_cache.session_enter_exact = moe_cache_session_enter_exact;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;

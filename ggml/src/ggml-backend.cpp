@@ -884,6 +884,7 @@ struct ggml_backend_sched {
 
     struct ggml_context * ctx;
     void * moe_cache_session;
+    bool   moe_cache_exact; // serve exact experts only (a speculative draft) - see ggml_backend_sched_set_moe_cache_exact
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
@@ -1791,9 +1792,11 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         void * session;
         void (*leave)(void *);
 
-        explicit moe_cache_scope(void * session)
+        explicit moe_cache_scope(void * session, bool exact)
             : session(session), leave(ggml_moe_cache.session_leave) {
-            auto enter = ggml_moe_cache.session_enter;
+            auto enter = exact && ggml_moe_cache.session_enter_exact
+                    ? ggml_moe_cache.session_enter_exact
+                    : ggml_moe_cache.session_enter;
             if (enter && leave) {
                 enter(session);
             } else {
@@ -1806,7 +1809,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 leave(session);
             }
         }
-    } cache_scope(sched->moe_cache_session);
+    } cache_scope(sched->moe_cache_session, sched->moe_cache_exact);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -2359,6 +2362,12 @@ void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched) {
     void * session = sched->moe_cache_session;
     sched->moe_cache_session = NULL;
     return session;
+}
+
+void ggml_backend_sched_set_moe_cache_exact(ggml_backend_sched_t sched, bool exact) {
+    if (sched) {
+        sched->moe_cache_exact = exact;
+    }
 }
 
 void * ggml_backend_sched_share_moe_cache_session(ggml_backend_sched_t sched) {

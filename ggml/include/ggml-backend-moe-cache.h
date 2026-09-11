@@ -103,6 +103,11 @@ struct ggml_moe_cache_api {
     // NULL and dormant sessions still create a suppressing thread-local scope.
     void   (*session_enter)(void * session);
     void   (*session_leave)(void * session);
+    // As session_enter, but every expert in this scope is served exact - no
+    // stand-ins. For a speculative draft sharing its target's session: the
+    // draft predicts the target, so a stand-in only lowers acceptance. Leave
+    // with session_leave as usual.
+    void   (*session_enter_exact)(void * session);
 
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the
     // stock CPU path should handle the complete node.
