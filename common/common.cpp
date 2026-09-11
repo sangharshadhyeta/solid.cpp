@@ -1556,6 +1556,14 @@ struct common_moe_calibration_entry {
     // -1 = not calibrated (the weight-based split, which gives the draft ~2%
     // purely because it has 3 tensors against the target's 144).
     int         draft_share_pct = -1;
+    // How stand-ins are chosen. 0 = by heat (the long-standing default), 1 = by
+    // atlas similarity to the missed expert with a fallback to heat, 2 = atlas
+    // only, declining the substitution when nothing resident is near enough.
+    // -1 = not calibrated.
+    int         substitute_atlas = -1;
+    // Atlas prewarm on a restored prompt-cache prefix (top_k per tensor).
+    // -1 = not calibrated, 0 = measured and not worth it.
+    int         atlas_prewarm_k  = -1;
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1792,6 +1800,10 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             LOG_WRN("%s: using calibrated %s\n", __func__, kv.c_str());
         }
     }
+    if (cal.substitute_atlas > 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", cal.substitute_atlas);
+        LOG_WRN("%s: choosing stand-ins by atlas similarity (mode %d)\n", __func__, cal.substitute_atlas);
+    }
     if (cal.draft_share_pct > 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", cal.draft_share_pct);
         LOG_WRN("%s: using calibrated draft cache share of %d%%\n", __func__, cal.draft_share_pct);
@@ -1917,6 +1929,8 @@ static bool common_moe_calibration_lookup(
         out.draft_exact            = e.value("draft_exact", -1);
         out.tuned_constants        = e.value("tuned_constants", std::string());
         out.draft_share_pct        = e.value("draft_share_pct", -1);
+        out.substitute_atlas       = e.value("substitute_atlas", -1);
+        out.atlas_prewarm_k        = e.value("atlas_prewarm_k", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -1986,6 +2000,8 @@ static void common_moe_calibration_save(
         {"draft_exact", entry.draft_exact},
         {"tuned_constants", entry.tuned_constants},
         {"draft_share_pct", entry.draft_share_pct},
+        {"substitute_atlas", entry.substitute_atlas},
+        {"atlas_prewarm_k", entry.atlas_prewarm_k},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -3638,6 +3654,12 @@ void common_moe_calibrate(common_params & params) {
     // half-configured.
     common_moe_calibration_entry entry;
     entry.concurrency = concurrency;
+    // Seed the fields a partial entry would otherwise report as a measurement.
+    // n_cpu_moe defaults to 0, which reads as "no layers on the CPU" rather than
+    // "not calibrated", so a server loading a checkpoint mid-run applied a
+    // placement nothing had chosen. -1 is the value the apply side skips.
+    entry.n_cpu_moe     = -1;
+    entry.gates_version = COMMON_MOE_CALIBRATION_GATES_VERSION;
     auto checkpoint = [&](const char * stage) {
         time_t ck_now = time(nullptr);
         char ck_buf[32];
@@ -3830,6 +3852,7 @@ void common_moe_calibrate(common_params & params) {
         est += 5; // offload threshold: 32, 64, 128, 256, 400 - one load, live thereafter
         est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
         est += 4; // prediction ring: 0, 5, 10 percent (one load) + the winner answer-checked
+        est += 4; // stand-in selection: heat / atlas+fallback / atlas-only + answer check
         est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
         est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
         // The constant sweep shares ONE server: 1 launch + 15 live measurements +
@@ -5334,6 +5357,70 @@ void common_moe_calibrate(common_params & params) {
                 -1, std::string(), /* keep_alive */ true);
     };
 
+    // How stand-ins are CHOSEN, once the floor has decided how often. Every
+    // existing picker ranks candidates by how wanted they are in general - heat,
+    // or co-activation - which is not the question substitution poses. Atlas
+    // similarity ranks by resemblance to the missing expert instead, and its
+    // strict form declines when nothing resident is near enough, paying exact
+    // compute rather than serving something unrelated.
+    //
+    // Measured only when substitution is actually in use: with the floor at "never
+    // substitute" there is nothing to choose. Judged on throughput AND the answer
+    // bar, because the whole claim is that a better-chosen stand-in costs less
+    // correctness - a claim that has to be shown, not asserted.
+    int best_sub_atlas = -1;
+    if (best_min_rank >= 0 && best_min_rank < 10 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring how stand-ins are chosen (heat vs atlas similarity) ...\n", __func__);
+        common_moe_calibration_status_set("measuring stand-in selection");
+        common_moe_stage_begin("stand-in selection", 3);
+        double best_sub_tps = -1.0;
+        for (const int mode : { 0, 1, 2 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const char * label = mode == 0 ? "by heat" : (mode == 1 ? "atlas, heat fallback" : "atlas only");
+            const std::string body = string_format("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS\": \"%d\"}", mode);
+            double tps = (mode == 0) ? open_live(n_predict) : measure_live(body, n_predict);
+            if (mode == 0 && g_moe_live_port > 0) {
+                // the launch itself ran at the default; re-measure through the knob
+                tps = measure_live(body, n_predict);
+            }
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   stand-ins %s -> %s\n", __func__, label,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("stand-in selection", label,
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_sub_tps) {
+                best_sub_tps   = tps;
+                best_sub_atlas = mode;
+            }
+        }
+        common_moe_live_stop();
+        common_moe_stage_end();
+        if (best_sub_atlas > 0 && !common_moe_calibrate_budget_spent()) {
+            common_moe_calib_set_env(string_format("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS=%d", best_sub_atlas));
+            const double checked = common_moe_bench_candidate_server(
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                    next_port(), ctx, n_predict * 4, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                    /* verify_answers */ true, /* with_reasoning */ true);
+            common_moe_calibration_status_candidate_done();
+            if (checked <= 0) {
+                LOG_WRN("%s:   atlas stand-ins did not pass the answer check - keeping heat selection\n", __func__);
+                common_moe_calibration_status_note("stand-in selection", "atlas",
+                        "rejected by the answer check", false);
+                best_sub_atlas = 0;
+            }
+            common_moe_calib_set_env(std::string());
+        }
+        entry.substitute_atlas = best_sub_atlas;
+        checkpoint("stand-in selection");
+        if (best_sub_atlas >= 0) {
+            LOG_INF("%s: stand-in selection: %s\n", __func__,
+                    best_sub_atlas == 0 ? "by heat" : (best_sub_atlas == 1 ? "atlas with heat fallback" : "atlas only"));
+        }
+    }
+
     // Prediction ring: how much of each pool the router lookahead may use. At full
     // occupancy a prediction otherwise has nowhere to go; too large a ring takes
     // slots from experts that were really demanded. Measured on decode, as served
@@ -5814,6 +5901,7 @@ void common_moe_calibrate(common_params & params) {
     entry.draft_exact            = best_draft_exact;
     entry.tuned_constants        = tuned_constants;
     entry.draft_share_pct        = best_share_pct;
+    entry.substitute_atlas       = best_sub_atlas;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -6316,7 +6404,10 @@ static bool common_maybe_autoplace_moe_cpu(
         // threshold on expert weights. Those stay valid, so a relaxed match
         // applies them rather than dropping the whole entry on the floor and
         // silently reverting every knob to its default.
-        const bool use_placement = cached.ngl_exact &&
+        // n_cpu_moe < 0 means the entry was written before placement was decided -
+        // a checkpoint from a run still in progress. Casting that to uint32_t would
+        // ask whether 4294967295 CPU layers fit, so it is rejected explicitly.
+        const bool use_placement = cached.ngl_exact && cached.n_cpu_moe >= 0 &&
             common_moe_fits_with_n(path_model, mparams, cparams, (uint32_t) cached.n_cpu_moe,
                                     devs, hp_ngl, hp_n_ctx_train, hp_n_expert);
         if (use_placement || !cached.ngl_exact) {

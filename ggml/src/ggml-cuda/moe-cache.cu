@@ -1042,6 +1042,10 @@ struct moe_cache_device {
     // Prediction ring accounting: predictions later hit by the router, oldest
     // predictions rotated out for newer ones, and probation slots given up to
     // grow the ring (at most one per decode step).
+    // Atlas-similarity substitution: stand-ins chosen by resemblance to the missed
+    // expert, and misses where nothing resident was near enough (strict mode only).
+    long long substitute_atlas_hits = 0;
+    long long substitute_atlas_declined = 0;
     long long ring_hits = 0;
     long long ring_rotations = 0;
     long long ring_seeds = 0;
@@ -6782,6 +6786,11 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            if (d.substitute_atlas_hits || d.substitute_atlas_declined) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d atlas stand-ins: %lld chosen by similarity, "
+                        "%lld declined for want of a near neighbour\n",
+                        d.physical, d.substitute_atlas_hits, d.substitute_atlas_declined);
+            }
             if (d.ring_hits || d.ring_rotations || d.ring_seeds) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d prediction ring: hits=%lld rotations=%lld seeds=%lld "
                         "(lookahead hits=%lld wasted=%lld)\n", d.physical, d.ring_hits, d.ring_rotations,
@@ -9471,6 +9480,118 @@ static int moe_cache_substitute_pick(
 //     resident within the scan at all, not merely when nothing resident
 //     happens to be a co-activation match yet.
 // Caller must hold the session lock, as everything reading pool state does.
+// Pick the stand-in that is NEAREST THE MISSING EXPERT, not the most popular one.
+//
+// Every existing picker ranks by how much a candidate is wanted in general: heat
+// (how often it fires) with co-activation as a tiebreak, or co-activation first.
+// Neither asks the question substitution actually poses - "will this expert
+// compute something close to the one we do not have?" - so a busy but unrelated
+// expert wins whenever it is resident, and the answer degrades for a reason the
+// router never sanctioned. That is the mechanism behind the fluent-but-wrong
+// output the fidelity check kept catching on this model.
+//
+// The atlas already holds the signal: a per-expert topic-affinity embedding
+// (`dims`, 46-dimensional here; the 2D projection is only for drawing). Cosine
+// distance between two experts' embeddings is a direct measure of whether they
+// serve the same topics, which is as close to "computes something similar" as
+// anything available at dispatch time without running the expert.
+//
+// Declines rather than guessing: a candidate must clear a similarity floor, so a
+// miss with no near neighbour resident pays exact compute instead of being served
+// something unrelated. That is the opposite trade from the other pickers, which
+// always return their best candidate however poor it is.
+static int moe_cache_substitute_pick_atlas(
+        moe_cache_device & device, moe_cache_pool & pool,
+        const void * host_base, int32_t missed, int64_t n_expert) {
+    const auto arow = device.atlas_by_tensor.find(host_base);
+    if (arow == device.atlas_by_tensor.end() || !arow->second) {
+        return -1;   // no atlas for this tensor - caller falls back
+    }
+    const moe_cache_atlas_row & row = *arow->second;
+    const moe_cache_atlas_cell * want = nullptr;
+    for (const auto & [expert, cell] : row) {
+        if (expert == missed) {
+            want = &cell;
+            break;
+        }
+    }
+    if (!want || want->dims.empty()) {
+        return -1;
+    }
+    // index the row once per call: expert -> cell, so the resident scan is O(1) per candidate
+    auto cell_of = [&row](int32_t e) -> const moe_cache_atlas_cell * {
+        for (const auto & [expert, cell] : row) {
+            if (expert == e) {
+                return &cell;
+            }
+        }
+        return nullptr;
+    };
+    double want_norm = 0.0;
+    for (float v : want->dims) {
+        want_norm += (double) v * (double) v;
+    }
+    want_norm = std::sqrt(want_norm);
+    if (want_norm < 1e-6) {
+        return -1;
+    }
+    static const double min_similarity = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_SIM");
+        const double v = env ? atof(env) : 0.5;
+        return v < -1.0 ? -1.0 : (v > 1.0 ? 1.0 : v);
+    }();
+
+    const std::vector<uint64_t> * words = moe_cache_mask_words(pool, host_base);
+    if (!words) {
+        return -1;
+    }
+    const int scan_cap = moe_cache_substitute_scan();
+    int    best_slot = -1;
+    double best_sim  = min_similarity;
+    uint16_t best_heat = 0;
+    int examined = 0;
+    for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
+        uint64_t bits = (*words)[w];
+        while (bits && examined < scan_cap) {
+            const int cand = (int) (w << 6) + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (cand == missed || cand >= (int) n_expert) {
+                continue;
+            }
+            examined++;
+            const auto found = pool.map.find(moe_cache_key{host_base, cand});
+            if (found == pool.map.end()) {
+                continue;
+            }
+            const moe_cache_slot & slot = pool.slots[found->second];
+            if (slot.state != moe_cache_slot_state::valid) {
+                continue;
+            }
+            const moe_cache_atlas_cell * have = cell_of(cand);
+            if (!have || have->dims.size() != want->dims.size()) {
+                continue;
+            }
+            double dot = 0.0, norm = 0.0;
+            for (size_t i = 0; i < have->dims.size(); i++) {
+                dot  += (double) want->dims[i] * (double) have->dims[i];
+                norm += (double) have->dims[i] * (double) have->dims[i];
+            }
+            norm = std::sqrt(norm);
+            if (norm < 1e-6) {
+                continue;
+            }
+            const double sim = dot / (want_norm * norm);
+            // strictly nearer wins; equal similarity falls back to the warmer slot
+            if (sim > best_sim || (sim == best_sim && slot.heat > best_heat)) {
+                best_sim  = sim;
+                best_heat = slot.heat;
+                best_slot = found->second;
+            }
+        }
+    }
+    return best_slot;
+}
+
 static int moe_cache_substitute_pick_hot(
         moe_cache_device & device, moe_cache_pool & pool,
         const void * host_base, int32_t missed, int64_t n_expert) {
@@ -10213,12 +10334,29 @@ static int moe_cache_plan(
                 const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT");
                 return env && atoi(env) != 0;
             }();
-            const int sub = use_strict_rank
-                ? moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
-                                                 rank_top_k, node->n_expert)
-                : use_coact
-                ? moe_cache_substitute_pick(device, pool, node->host_base, expert, node->n_expert)
-                : moe_cache_substitute_pick_hot(device, pool, node->host_base, expert, node->n_expert);
+            // Atlas-similarity first when asked for: it is the only picker that
+            // ranks by resemblance to the MISSING expert rather than by how wanted
+            // a candidate is in general. It declines when nothing resident is near
+            // enough, so the fallback below is a real fallback, not a formality.
+            // Live-tunable and calibrated - see the substitution-mode stage.
+            const int mode = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 0);
+            int sub = -1;
+            if (mode != 0) {
+                sub = moe_cache_substitute_pick_atlas(device, pool, node->host_base, expert, node->n_expert);
+                if (sub >= 0) {
+                    device.substitute_atlas_hits++;
+                } else if (mode == 2) {
+                    device.substitute_atlas_declined++;   // strict: no near neighbour, pay exact compute
+                }
+            }
+            if (sub < 0 && mode != 2) {
+                sub = use_strict_rank
+                    ? moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
+                                                     rank_top_k, node->n_expert)
+                    : use_coact
+                    ? moe_cache_substitute_pick(device, pool, node->host_base, expert, node->n_expert)
+                    : moe_cache_substitute_pick_hot(device, pool, node->host_base, expert, node->n_expert);
+            }
             if (sub >= 0) {
                 moe_cache_slot & ssl = pool.slots[sub];
                 ssl.readers++;
