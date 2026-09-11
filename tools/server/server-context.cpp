@@ -5484,9 +5484,12 @@ void server_routes::init_routes() {
     // it lets a caller reshape cache policy mid-flight.
     this->post_moe_tuning = [this](const server_http_req & req) {
         auto res = create_response();
-        if (!params.moe_calibrate) {
+        // --moe-calibrate enables this for the calibrating process itself. The
+        // candidates it spawns are deliberately NOT calibrating - and they are the
+        // ones a live sweep actually POSTs to - so they enable it by environment.
+        if (!params.moe_calibrate && !getenv("LLAMA_MOE_TUNING_ENDPOINT")) {
             res->error(format_error_response(
-                    "runtime MoE tuning is only available when the server was started with --moe-calibrate",
+                    "runtime MoE tuning requires --moe-calibrate or LLAMA_MOE_TUNING_ENDPOINT=1",
                     ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
