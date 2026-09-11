@@ -1535,6 +1535,10 @@ struct common_moe_calibration_entry {
     // expert cache would otherwise use, so measured per model rather than
     // switched on. -1 = not calibrated, 0 = off won, 1 = on won.
     int         sched_prefetch_experts = -1;
+    // Share of each expert-cache pool reserved for lookahead predictions (the
+    // prediction ring, GGML_CUDA_MOE_CACHE_RING_PCT). -1 = not calibrated, 0 =
+    // measured and off. Chosen on decode throughput and then answer-checked.
+    int         moe_cache_ring_pct = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1836,6 +1840,7 @@ static bool common_moe_calibration_lookup(
         out.op_offload_min_batch = e.value("op_offload_min_batch", -1);
         out.n_ubatch             = e.value("n_ubatch", -1);
         out.sched_prefetch_experts = e.value("sched_prefetch_experts", -1);
+        out.moe_cache_ring_pct     = e.value("moe_cache_ring_pct", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1897,6 +1902,7 @@ static void common_moe_calibration_save(
         {"op_offload_min_batch", entry.op_offload_min_batch},
         {"n_ubatch", entry.n_ubatch},
         {"sched_prefetch_experts", entry.sched_prefetch_experts},
+        {"moe_cache_ring_pct", entry.moe_cache_ring_pct},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2353,6 +2359,8 @@ static std::atomic<int>       g_moe_calib_ubatch{-1};
 static std::atomic<bool>      g_moe_calib_prefill_xlong{false};
 // GGML_SCHED_PREFETCH_EXPERTS every candidate launches with from here on.
 static std::atomic<bool>      g_moe_calib_prefetch{false};
+// GGML_CUDA_MOE_CACHE_RING_PCT every candidate launches with from here on (-1 = unset).
+static std::atomic<int>       g_moe_calib_ring_pct{-1};
 
 // A candidate can end badly in two different ways and they must not be
 // conflated. -1.0 means the run did not happen (server failed to come up, port
@@ -2612,6 +2620,9 @@ static double common_moe_bench_candidate_server(
     }
     if (g_moe_calib_prefetch.load()) {
         env_prefix = std::string("GGML_SCHED_PREFETCH_EXPERTS=1 ") + env_prefix;
+    }
+    if (g_moe_calib_ring_pct.load() > 0) {
+        env_prefix = string_format("GGML_CUDA_MOE_CACHE_RING_PCT=%d ", g_moe_calib_ring_pct.load()) + env_prefix;
     }
     char log_path[256];
     snprintf(log_path, sizeof(log_path), "%s/llama-moe-calib-candidate-%d.log",
@@ -3429,6 +3440,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_ubatch.store(-1);
     g_moe_calib_prefill_xlong.store(false);
     g_moe_calib_prefetch.store(false);
+    g_moe_calib_ring_pct.store(-1);
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -3568,6 +3580,7 @@ void common_moe_calibrate(common_params & params) {
         est += 7; // substitution-floor ladder (6 rungs) + long-probe confirmation
         est += 5; // offload threshold: 32, 64, 128, 256, 400
         est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
+        est += 4; // prediction ring: 0, 5, 10 percent, then the winner answer-checked
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -3739,6 +3752,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_ubatch.store(-1);
     g_moe_calib_prefill_xlong.store(false);
     g_moe_calib_prefetch.store(false);
+    g_moe_calib_ring_pct.store(-1);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         if (best_offload_min_batch > 0) {
             LOG_INF("%s: offload threshold: %d at %.1f prompt tok/s\n", __func__, best_offload_min_batch, best_pp);
@@ -4885,6 +4899,61 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Prediction ring: how much of each pool the router lookahead may use. At full
+    // occupancy a prediction otherwise has nowhere to go; too large a ring takes
+    // slots from experts that were really demanded. Measured on decode, as served
+    // (draft, depth, floor and cache size already chosen). A ring slot holds the
+    // exact expert, so it changes no arithmetic - but the winner is still re-run
+    // through the answer check against the substitution-off bar before it is kept.
+    int best_ring_pct = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the prediction ring (GGML_CUDA_MOE_CACHE_RING_PCT) ...\n", __func__);
+        common_moe_calibration_status_set("measuring the prediction ring");
+        double best_ring_tps = -1.0;
+        for (const int pct : { 0, 5, 10 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            g_moe_calib_ring_pct.store(pct);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   ring %d%% -> %s%s\n", __func__, pct,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                    tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+            common_moe_calibration_status_note("prediction ring", string_format("%d%%", pct),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_ring_tps) {
+                best_ring_tps = tps;
+                best_ring_pct = pct;
+            }
+        }
+        if (best_ring_pct > 0 && !common_moe_calibrate_budget_spent()) {
+            g_moe_calib_ring_pct.store(best_ring_pct);
+            const double checked = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict * 4, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                    /* verify_answers */ true, /* with_reasoning */ true);
+            common_moe_calibration_status_candidate_done();
+            if (checked <= 0) {
+                LOG_WRN("%s:   ring %d%% did not pass the answer check - keeping the ring off\n",
+                        __func__, best_ring_pct);
+                common_moe_calibration_status_note("prediction ring", string_format("%d%%", best_ring_pct),
+                        "rejected by the answer check", false);
+                best_ring_pct = 0;
+            }
+        }
+        g_moe_calib_ring_pct.store(best_ring_pct > 0 ? best_ring_pct : -1);
+        if (best_ring_pct >= 0) {
+            LOG_INF("%s: prediction ring: %d%%\n", __func__, best_ring_pct);
+            common_moe_calibration_status_note("prediction ring", string_format("%d%%", best_ring_pct),
+                    string_format("SELECTED - %.2f tok/s", best_ring_tps), true, true);
+        }
+    }
+
     // Probabilistic draft acceptance. Only meaningful with a draft model, and
     // only worth measuring at the sampling actually served: at greedy the target
     // almost always reproduces the drafted token anyway, so exact-match already
@@ -5068,6 +5137,7 @@ void common_moe_calibrate(common_params & params) {
     entry.op_offload_min_batch = best_offload_min_batch;
     entry.n_ubatch             = best_ubatch;
     entry.sched_prefetch_experts = best_prefetch;
+    entry.moe_cache_ring_pct     = best_ring_pct;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -5790,6 +5860,12 @@ static void common_moe_apply_prefill_knobs(const common_moe_calibration_entry & 
     if (cal.op_offload_min_batch > 0 && !getenv("GGML_OP_OFFLOAD_MIN_BATCH")) {
         set_env("GGML_OP_OFFLOAD_MIN_BATCH", cal.op_offload_min_batch);
         LOG_INF("%s: using calibrated MoE offload threshold of %d tokens\n", __func__, cal.op_offload_min_batch);
+    }
+    // The prediction ring is read when the moe-cache session is created, which is
+    // after this - so setting it here reaches it.
+    if (cal.moe_cache_ring_pct > 0 && !getenv("GGML_CUDA_MOE_CACHE_RING_PCT")) {
+        set_env("GGML_CUDA_MOE_CACHE_RING_PCT", cal.moe_cache_ring_pct);
+        LOG_INF("%s: using calibrated prediction ring of %d%% per pool\n", __func__, cal.moe_cache_ring_pct);
     }
     if (cal.sched_prefetch_experts == 1 && !getenv("GGML_SCHED_PREFETCH_EXPERTS")) {
         set_env("GGML_SCHED_PREFETCH_EXPERTS", 1);

@@ -460,6 +460,24 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
                 model.layers[il].hc_ffn_inject,
                 &inject, il);
 
+        // Router lookahead for the prediction ring: this layer's router input
+        // through the NEXT layer's gate, delivered to moe-cache while this layer's
+        // experts are still computing. The ranking matches the real router's -
+        // softmax and sigmoid order logits identically, and qwen4exp routes with no
+        // load-balancing bias. All three expert tensors of the next layer are
+        // passed: they are separate here. A no-op unless moe-cache is registered,
+        // and with GGML_CUDA_MOE_CACHE_RING_PCT at its default of 0 a full pool
+        // leaves the prediction nowhere to go - the ring is what gives it a place.
+        if (il + 1 < n_layer && model.layers[il + 1].ffn_gate_inp) {
+            build_moe_lookahead(cur,
+                    model.layers[il + 1].ffn_gate_inp,
+                    model.layers[il + 1].ffn_down_exps,
+                    nullptr,
+                    n_expert_used, il, 1,
+                    model.layers[il + 1].ffn_gate_exps,
+                    model.layers[il + 1].ffn_up_exps);
+        }
+
         cur = build_layer_ffn(cur, il);
         cb(cur, "ffn_out", il);
 

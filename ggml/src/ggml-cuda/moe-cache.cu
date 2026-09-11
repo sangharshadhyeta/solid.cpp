@@ -157,6 +157,10 @@ struct moe_cache_slot {
     uint32_t heat = 0;
     moe_cache_slot_state state = moe_cache_slot_state::free;
     moe_cache_segment segment = moe_cache_segment::probation;
+    // Holds a lookahead PREDICTION the router has not asked for yet - a ring
+    // slot (see moe_cache_ring_take). Cleared by the first real hit, which turns
+    // it into an ordinary resident, or by the slot being reset.
+    bool spec = false;
 };
 
 struct moe_cache_pool {
@@ -201,6 +205,11 @@ struct moe_cache_pool {
     int protected_head = -1; // protected segment (proven hot: re-requested at least once while resident)
     int protected_tail = -1;
     int protected_count = 0; // capped at n_slots * MOE_CACHE_PROTECTED_CAP_PCT / 100 - see moe_cache_promote_to_protected
+    // Prediction ring (GGML_CUDA_MOE_CACHE_RING_PCT): how many slots hold
+    // unconfirmed lookahead predictions, and their fill order for rotation.
+    int ring_count = 0;
+    int ring_seeded = 0;     // lifetime probation slots given up to the ring, capped at its target
+    std::deque<int> ring_fifo;
     long long fills_since_decay = 0;
     // Slow-moving reference scale for this pool's own heat magnitudes -
     // updated on every heat step and halved alongside moe_cache_pool_decay,
@@ -1018,6 +1027,12 @@ struct moe_cache_device {
     long long collect_calls = 0;
     long long spec_evictions_this_cycle = 0;   // rate limit for speculative eviction
     long long spec_evict_reset_at_calls = 0;   // collect_calls value at last reset
+    // Prediction ring accounting: predictions later hit by the router, oldest
+    // predictions rotated out for newer ones, and probation slots given up to
+    // grow the ring (at most one per decode step).
+    long long ring_hits = 0;
+    long long ring_rotations = 0;
+    long long ring_seeds = 0;
     // Cross-depth agreement gate for GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=agree
     // (see moe_cache_prefetch): a candidate a farther, less-accurate depth
     // wanted but could not get a free slot for is remembered here, along
@@ -2456,6 +2471,12 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.heat = 0; // heat belongs to the content that was resident, not the physical slot
     slot.state = moe_cache_slot_state::free;
     slot.segment = moe_cache_segment::probation;
+    if (slot.spec) {
+        slot.spec = false;
+        if (pool.ring_count > 0) {
+            pool.ring_count--;
+        }
+    }
     slot.prev = -1;
     slot.next = -1;
     if (add_to_free) {
@@ -6587,6 +6608,11 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            if (d.ring_hits || d.ring_rotations || d.ring_seeds) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d prediction ring: hits=%lld rotations=%lld seeds=%lld "
+                        "(lookahead hits=%lld wasted=%lld)\n", d.physical, d.ring_hits, d.ring_rotations,
+                        d.ring_seeds, d.lookahead_hits, d.lookahead_wasted);
+            }
             // Per-pool breakdown, in creation order (index 0 is always the
             // first shape the model actually presented - a real pool, not
             // necessarily "the" primary one on a model with several
@@ -9913,6 +9939,16 @@ static int moe_cache_plan(
                     const char * e = getenv("GGML_CUDA_MOE_CACHE_NO_PROMOTE");
                     return e && atoi(e) != 0;
                 }();
+                if (slot.spec) {
+                    // A prediction the router then asked for. It leaves the ring
+                    // here; the real hit is what promotes it, below, the same as
+                    // any resident - the prediction itself earned nothing.
+                    slot.spec = false;
+                    if (pool.ring_count > 0) {
+                        pool.ring_count--;
+                    }
+                    device.ring_hits++;
+                }
                 if (!no_promote) {
                     moe_cache_promote_to_protected(device, pool, found->second);
                 }
@@ -12079,6 +12115,76 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
 //    than a right one saves.
 //  - it respects the same queue bounds as demand fills, so a bad prediction
 //    cannot starve real work.
+// Prediction ring - where a lookahead prediction goes when the pool is full.
+//
+// The pool runs at ~100% occupancy, so the free-slot-only prefetch had nowhere to
+// put a prediction and the lookahead's cost bought nothing; letting a guess evict
+// any resident (spec-evict "any") lost 15-35% to churn. The ring sits between the
+// two: a small share of the pool, capped by GGML_CUDA_MOE_CACHE_RING_PCT (default 0
+// = off, exactly the old behaviour), in which predictions displace only older
+// predictions. It grows by at most one probation eviction per decode step and never
+// touches protected. A prediction the router then asks for becomes an ordinary
+// resident at its first hit, and from there the normal rules decide everything -
+// a prediction can get an expert into VRAM early, never earn it protection.
+// Demand misses reach ring slots first on their own: they have never been hit, so
+// their heat is zero and moe_cache_pick_coldest_unpinned ranks them coldest.
+// Adapted from the ring in thecodacus's fork, into this pool rather than beside it.
+static int moe_cache_ring_target(const moe_cache_pool & pool) {
+    static const int pct = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_RING_PCT");
+        const int v = env ? atoi(env) : 0;
+        return v < 0 ? 0 : (v > 50 ? 50 : v);
+    }();
+    return pct > 0 ? std::max(1, pool.n_slots * pct / 100) : 0;
+}
+
+static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target) {
+    // Carve the ring out of probation ONCE: at most ring_target evictions over the
+    // whole run, not per step. A per-step budget looked bounded and was not - the
+    // clock available here (collect_calls) ticks per MoE op, ~48x per token on this
+    // model - and it fed a churn loop, because a demand miss evicts ring slots first
+    // (heat 0), which drops ring_count below target, which seeds again. Measured on
+    // Qwen3.8-Flash-Next at 5%: 14986 seeds against a 140-slot ring, 330k evictions
+    // against ~215k, and the hit rate fell from 28.8% to 6.4%. With a lifetime cap
+    // the ring can only ever cost its own size, and if demand reclaims those slots
+    // it simply shrinks - predictions then use free slots when there are any.
+    if (pool.ring_count < ring_target && pool.ring_seeded < ring_target) {
+        const int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
+        if (candidate >= 0) {
+            pool.ring_seeded++;
+            moe_cache_slot_reset(pool, candidate, false);
+            device.evictions++;
+            device.ring_seeds++;
+            return candidate;
+        }
+    }
+    // Otherwise rotate: the oldest prediction still unused gives up its slot.
+    // Entries that were hit or reset since are dropped; ones still copying or
+    // pinned are kept for a later pass.
+    for (size_t n = pool.ring_fifo.size(); n > 0; n--) {
+        const int index = pool.ring_fifo.front();
+        pool.ring_fifo.pop_front();
+        moe_cache_slot & slot = pool.slots[index];
+        if (!slot.spec) {
+            continue;
+        }
+        if (slot.readers > 0 || slot.state != moe_cache_slot_state::valid) {
+            pool.ring_fifo.push_back(index);
+            continue;
+        }
+        const auto lit = device.lookahead_admitted.find(slot.key);
+        if (lit != device.lookahead_admitted.end()) {
+            device.lookahead_wasted++;
+            device.lookahead_admitted.erase(lit);
+        }
+        moe_cache_slot_reset(pool, index, false);
+        device.evictions++;
+        device.ring_rotations++;
+        return index;
+    }
+    return -1;
+}
+
 static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int n_ids, int depth) {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_PREFETCH");
@@ -12187,9 +12293,18 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
 #endif
 
                 int slot_index = -1;
+                const int ring_target = moe_cache_ring_target(pool);
                 if (!pool.free_slots.empty()) {
                     slot_index = pool.free_slots.back();
                     pool.free_slots.pop_back();
+                } else if (ring_target > 0) {
+                    slot_index = moe_cache_ring_take(device, pool, ring_target);
+                    if (slot_index < 0) {
+                        if (!moe_cache_lookahead_disk_prefetch_enabled()) {
+                            break;
+                        }
+                        continue;
+                    }
                 } else if (mode == spec_evict_mode::off) {
                     // No eviction for speculation by default - measured harmful
                     // under no real memory pressure (probation churn). This used
@@ -12339,6 +12454,14 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     device.queued_bytes += expert_size;
                     device.prefetches++;
                     device.lookahead_admitted.insert(key);
+                    if (ring_target > 0) {
+                        slot.spec = true;
+                        pool.ring_count++;
+                        pool.ring_fifo.push_back(slot_index);
+                        while (pool.ring_fifo.size() > (size_t) pool.n_slots) {
+                            pool.ring_fifo.pop_front(); // stale entries only - live ones are re-queued on rotation
+                        }
+                    }
                     woke = true;
                 } catch (...) {
                     moe_cache_slot_reset(pool, slot_index, true);
