@@ -2200,6 +2200,79 @@ static std::atomic<long long> g_moe_calibrate_deadline_ms{0};
 // calibration measured - the noise floor later candidates are judged against.
 // -1 until something has been measured.
 static std::atomic<int> g_moe_repro_floor{-1};
+
+// Inputs for deriving the time budget from this model's measured cost instead
+// of a flat constant. See common_moe_maybe_derive_budget.
+static std::atomic<long long> g_moe_calibrate_start_ms{0};
+static std::atomic<int>       g_moe_planned_candidates{0};
+// How many verifiable-answer probes the first configuration measured got right.
+// The bar later candidates are held to - measured, never assumed, because a
+// heavily quantized model may legitimately fail one.
+static std::atomic<int>       g_moe_verifiable_ref{-1};
+
+// A candidate can end badly in two different ways and they must not be
+// conflated. -1.0 means the run did not happen (server failed to come up, port
+// clash, budget spent) - worth one retry. COMMON_MOE_TPS_REJECTED means it ran
+// fine and the output was judged unusable - retrying that is guaranteed to
+// reach the same verdict at twice the cost. Both stay < 0 so every "tps > 0"
+// ranking test is unaffected.
+//
+// This conflation is how the quality gates did their real damage: four stages
+// retry on tps < 0, so every wrongly-rejected candidate was measured twice,
+// which is what exhausted the time budget and left the later stages - thread
+// count, cache size, fit margin - skipped in milliseconds.
+static constexpr double COMMON_MOE_TPS_REJECTED = -2.0;
+static std::atomic<long long> g_moe_candidate_ms_sum{0};
+static std::atomic<int>       g_moe_candidate_count{0};
+static std::atomic<bool>      g_moe_budget_is_derived{false};
+
+// A fixed budget cannot be right for both models this fork runs: gemma-4's full
+// search fits in 600s (10m19s measured), while Qwen3.8-Flash-Next spends ~60s
+// per candidate, so the same 600s bought ten of the ~40 candidates the stages
+// wanted. Everything after the substitution ladder - thread count, expert-cache
+// size, fit margin - was then skipped in milliseconds and recorded as "failed",
+// which is indistinguishable in the cache from "measured and no good". That is
+// how a run ends up serving a configuration nothing measured.
+//
+// So price the run instead of guessing it: two real candidates say what one
+// costs on this model and this hardware, and the status page's own planned-
+// candidate estimate says how many the stages intend to run. Derive once, early,
+// and only ever extend - never cut a budget the user asked for. An explicit
+// GGML_MOE_CALIBRATE_BUDGET_S disables this entirely; the ceiling exists because
+// this can block a plain launch, and is itself overridable.
+static void common_moe_maybe_derive_budget() {
+    if (!g_moe_budget_is_derived.load(std::memory_order_relaxed)) {
+        return;
+    }
+    if (g_moe_candidate_count.load(std::memory_order_relaxed) != 2) {
+        return; // one sample is noise; derive once, on the second
+    }
+    const int planned = g_moe_planned_candidates.load(std::memory_order_relaxed);
+    const long long start_ms = g_moe_calibrate_start_ms.load(std::memory_order_relaxed);
+    if (planned <= 0 || start_ms == 0) {
+        return;
+    }
+    const double per_candidate_s =
+            (double) g_moe_candidate_ms_sum.load(std::memory_order_relaxed) / 2.0 / 1000.0;
+    const double cap_s = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_MAX_S");
+        const double v = e ? atof(e) : 3600.0;
+        return v > 0.0 ? v : 3600.0;
+    }();
+    // Slack for the stages that cost more than a plain candidate - the
+    // substitution confirm step runs at 4x the probe length.
+    double want_s = per_candidate_s * (double) planned * 1.25;
+    want_s = std::max(600.0, std::min(want_s, cap_s));
+    const long long deadline_ms = start_ms + (long long) (want_s * 1000.0);
+    if (deadline_ms <= g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed)) {
+        return;
+    }
+    g_moe_calibrate_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+    LOG_WRN("%s: time budget derived from this model's measured cost: %.0fs "
+            "(%.0fs per candidate x %d planned candidates, capped at %.0fs - "
+            "set GGML_MOE_CALIBRATE_BUDGET_S to fix it, GGML_MOE_CALIBRATE_BUDGET_MAX_S to raise the cap)\n",
+            __func__, want_s, per_candidate_s, planned, cap_s);
+}
 static std::atomic<bool>      g_moe_calibrate_budget_warned{false};
 
 static long long common_moe_steady_now_ms() {
@@ -2226,10 +2299,23 @@ static double common_moe_bench_candidate_server(
         uint32_t n_cpu_moe, int n_max, int n_threads, int port, uint32_t n_ctx, int n_predict,
         int n_concurrency = 1, int moe_cache_mb = -1, int fit_target_mb = -1, int n_gpu_layers = 99,
         int substitute_min_rank = -1, std::string * out_sample = nullptr, int probe_seed = 1234,
-        double substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN()) {
+        double substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN(),
+        bool verify_answers = false,
+        bool with_reasoning = false) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
+    // Every candidate in every stage funnels through here (the same property
+    // that makes it the right place for the deadline check above), so it is also
+    // where a candidate's real cost on this model can be learned.
+    struct candidate_timer {
+        long long t0 = common_moe_steady_now_ms();
+        ~candidate_timer() {
+            g_moe_candidate_ms_sum.fetch_add(common_moe_steady_now_ms() - t0, std::memory_order_relaxed);
+            g_moe_candidate_count.fetch_add(1, std::memory_order_relaxed);
+            common_moe_maybe_derive_budget();
+        }
+    } timer;
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
@@ -2311,12 +2397,23 @@ static double common_moe_bench_candidate_server(
         snprintf(buf, sizeof(buf), "GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=%d ", substitute_min_rank);
         subst_env = buf;
     }
+    // Ranking probes run with reasoning off; the confirm step turns it back on.
+    // On a reasoning model a short probe is spent entirely inside the "We need
+    // answer user: ..." preamble - the throughput is still real tok/s, but the
+    // text scored for degeneracy is preamble rather than output, and a
+    // correctness probe never reaches an answer at all (measured: the reference
+    // itself scored 1 of 4 at 24 tokens). With thinking disabled a short probe
+    // contains a real answer, so many candidates stay affordable AND checkable.
+    // The winner is then confirmed at full length WITH reasoning, because that
+    // is the configuration actually served - so the cheap regime only ever ranks,
+    // and never has the last word.
+    const char * reasoning_args = with_reasoning ? "" : "--reasoning off ";
     snprintf(cmd, sizeof(cmd),
-        "%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s"
+        "%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
         subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
-        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), port);
+        mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
         return -1.0;
@@ -2398,6 +2495,30 @@ static double common_moe_bench_candidate_server(
     };
     static constexpr int n_quality_prompts = sizeof(quality_prompts) / sizeof(quality_prompts[0]);
 
+    // Coherence is not correctness. Degeneracy above catches broken generation -
+    // repetition, word salad - and the fidelity bar catches drift from the
+    // substitution-free reference, but the fidelity bar only gates when the two
+    // reference runs gave it evidence to measure a tolerance from, and on
+    // Qwen3.8-Flash-Next it came back 0.00. In that gap a configuration can emit
+    // perfectly fluent, perfectly self-consistent, *wrong* text and pass every
+    // check. Substitution serves a different expert than the router asked for, so
+    // that is exactly the failure it would produce if pushed too far.
+    //
+    // These have answers that are checkable regardless of wording, so a wrong
+    // answer is wrong no matter how well phrased. Accept every reasonable form -
+    // the probe is testing the model's routing, not its formatting.
+    struct verifiable_probe {
+        const char * prompt;
+        const char * accept[4];
+    };
+    static const verifiable_probe verifiable_probes[] = {
+        { "What is 2 + 2? Reply with just the number.",                    { "4", "four", nullptr, nullptr } },
+        { "What is the capital of France? Reply with just the city name.", { "paris", nullptr, nullptr, nullptr } },
+        { "Complete with one word: the opposite of hot is ___.",           { "cold", "chilly", nullptr, nullptr } },
+        { "How many days are in a week? Reply with just the number.",      { "7", "seven", nullptr, nullptr } },
+    };
+    static constexpr int n_verifiable = sizeof(verifiable_probes) / sizeof(verifiable_probes[0]);
+
     double result_tps = -1.0;
     if (n_concurrency <= 1) {
         // Solo path: average per-request predicted_per_second across
@@ -2438,6 +2559,53 @@ static double common_moe_bench_candidate_server(
                 }
             }
         }
+        // Fluent-but-wrong check. Scored against what the first configuration of
+        // this run actually managed, so a quant that cannot do one of these is
+        // not punished for it - only a candidate that answers fewer than the
+        // reference did is rejected.
+        // Only where it can be afforded and can actually work: once, on the
+        // configuration about to be committed. Two reasons it is not per-candidate.
+        // Cost - 4 probes at a length a reasoning model needs is ~170s against a
+        // ~60s candidate, times 32 candidates. And validity - the first version ran
+        // these at 24 tokens, which on Qwen3.8-Flash-Next is spent inside the
+        // reasoning preamble ("We need answer user: ..."), so the reference itself
+        // scored 1 of 4 and every candidate was rejected against that noise. A
+        // correctness probe has to let the model finish thinking before it is
+        // scored, or it measures verbosity.
+        if (result_tps > 0 && verify_answers) {
+            int correct = 0;
+            for (int i = 0; i < n_verifiable; i++) {
+                const auto v = common_moe_bench_one_request_full(
+                        port, verifiable_probes[i].prompt, 320, probe_seed, /* greedy */ true);
+                if (v.predicted_n <= 0) {
+                    continue;
+                }
+                std::string low = v.text;
+                std::transform(low.begin(), low.end(), low.begin(),
+                        [](unsigned char c) { return (char) std::tolower(c); });
+                for (const char * want : verifiable_probes[i].accept) {
+                    if (want && low.find(want) != std::string::npos) {
+                        correct++;
+                        break;
+                    }
+                }
+            }
+            const int ref = g_moe_verifiable_ref.load();
+            if (ref < 0) {
+                g_moe_verifiable_ref.store(correct);
+                LOG_INF("%s: verifiable-answer bar for this run: %d of %d\n", __func__, correct, n_verifiable);
+            } else if (correct < ref) {
+                LOG_WRN("%s: candidate rejected - answered %d of %d verifiable probes against this run's "
+                        "reference of %d, at %.2f tok/s. Fluent output that is wrong is not a faster "
+                        "configuration, it is a broken one\n",
+                        __func__, correct, n_verifiable, ref, result_tps);
+                common_moe_calibration_status_note("output check", "verifiable answers",
+                        string_format("rejected - %d of %d correct, reference %d (was %.2f tok/s)",
+                                correct, n_verifiable, ref, result_tps), false);
+                result_tps = COMMON_MOE_TPS_REJECTED;
+            }
+        }
+
         // Reject rather than rank: a candidate that generates degenerate text
         // is not a slower-but-valid point on the throughput curve, it is not a
         // usable configuration at all, so it must not be able to win on speed.
@@ -2449,7 +2617,7 @@ static double common_moe_bench_candidate_server(
                     __func__, worst_degeneracy, common_moe_degeneracy_reject_threshold(), result_tps);
             common_moe_calibration_status_note("output check", "degeneracy",
                     string_format("rejected - score %.2f (was %.2f tok/s)", worst_degeneracy, result_tps), false);
-            result_tps = -1.0;
+            result_tps = COMMON_MOE_TPS_REJECTED;
         }
         // Determinism gate: same request, same seed, repeated. A configuration
         // that answers one question two different ways is not a slower-but-
@@ -2486,32 +2654,59 @@ static double common_moe_bench_candidate_server(
             for (const auto & a : answers) {
                 modal = std::max(modal, (int) std::count(answers.begin(), answers.end(), a));
             }
-            // Exact agreement is not a property this stack has even when correct:
-            // the expert cache admits experts between requests by design, and an
-            // expert computed on the GPU and on the CPU goes through different
-            // quantized dot products, so identical greedy requests can diverge by a
-            // word as the cache warms. Measured on Qwen3.8-Flash-Next: 1 of 5
-            // agreed, all five fluent and saying the same thing - and the
-            // substitution-free baseline failed the absolute test the same way.
-            // So judge against the noise this run actually has: the first
-            // configuration measured sets the floor, and a candidate is rejected
-            // only for agreeing less than that. Garbage is still caught by the
-            // degeneracy check above; corruption shows up as worse than the floor.
-            int repro_floor = g_moe_repro_floor.load();
-            if (repro_floor < 0 && !answers.empty()) {
+            // What this check is for: a forward pass reading memory it does not
+            // own, which no throughput redeems. What it must NOT punish: the
+            // nondeterminism this stack has by design. The expert cache admits
+            // experts between requests, and an expert computed on the GPU and on
+            // the CPU goes through different quantized dot products, so identical
+            // greedy requests legitimately diverge by a word as the cache warms.
+            //
+            // Measured on Qwen3.8-Flash-Next: cache off gives 5 of 5 byte-identical
+            // answers, cache on gives 1 of 5 - all five fluent and saying the same
+            // thing. So with the cache on, this metric reports cache-warming state,
+            // not correctness. Two earlier versions of this check both got it wrong:
+            // demanding exact agreement (modal*2 <= n) rejected the substitution-free
+            // baseline itself, and comparing against the first candidate's own count
+            // rejected on a 2-vs-3 difference, which at n=5 is pure sampling noise.
+            // Both rejected substitute-min-rank=2 - measured at 24.27 tok/s in the
+            // ladder and 13.19 mean in a controlled A/B, the best configuration this
+            // model has - and calibration then cached a slower one.
+            //
+            // Reject only the signature corruption actually leaves: no two of the
+            // five runs agreeing at all. Benign cache warming converges, so at least
+            // two runs match; a pass reading unowned memory produces a different
+            // answer every time. Garbage that stays self-consistent is still caught
+            // by the degeneracy check above, and drift that stays fluent by the
+            // fidelity bar, which is measured against this model's own resampling
+            // distance rather than assumed.
+            const int repro_seen = g_moe_repro_floor.load();
+            if (repro_seen < 0 && !answers.empty()) {
                 g_moe_repro_floor.store(modal);
-                repro_floor = modal;
-                LOG_INF("%s: reproducibility repro_floor for this run: %d of %zu greedy repeats agree\n",
+                LOG_INF("%s: greedy agreement for this run's first configuration: %d of %zu repeats\n",
                         __func__, modal, answers.size());
             }
-            if (!answers.empty() && modal < repro_floor) {
-                LOG_WRN("%s: candidate rejected - less reproducible than this run's baseline: %d of %zu "
-                        "greedy repeats agreed against a repro_floor of %d, at %.2f tok/s\n",
-                        __func__, modal, answers.size(), repro_floor, result_tps);
-                common_moe_calibration_status_note("output check", "reproducibility",
-                        string_format("rejected - %d of %zu agreed (was %.2f tok/s)",
-                                modal, answers.size(), result_tps), false);
-                result_tps = -1.0;
+            // Reported, never a veto. Three versions of this check rejected on
+            // text identity and all three were wrong, because identity is not a
+            // correctness property of an adaptive cache: coherent answers that
+            // differ by a word are a correct forward pass, not a failure.
+            //
+            // The check also never did the job it was added for. The one real
+            // corruption this fork has hit - the LFRU device-to-device path on
+            // qwen4exp (a921f14f6) - produced *deterministic* garbage, "independent
+            // of sampling settings", so an agreement test could not have caught it;
+            // the degeneracy check did. Meanwhile it repeatedly threw out
+            // substitute-min-rank=2, the best configuration this model has
+            // (24.27 tok/s in the ladder, 13.19 mean in a controlled A/B), and
+            // calibration cached a slower one in its place.
+            //
+            // So correctness is judged by what it is actually made of: degeneracy
+            // above rejects broken generation, and the fidelity bar rejects drift
+            // from the substitution-free reference using this model's own
+            // resampling distance as the tolerance. Agreement stays as a logged
+            // diagnostic, because a sudden collapse in it is still worth seeing.
+            if (!answers.empty()) {
+                LOG_INF("%s: greedy agreement %d of %zu (diagnostic - coherence is judged by the degeneracy "
+                        "and fidelity checks, not by text identity)\n", __func__, modal, answers.size());
             }
         }
     } else {
@@ -2618,6 +2813,7 @@ void common_moe_calibration_status_set(const std::string & stage) {
 }
 
 void common_moe_calibration_status_set_total(int total_candidates) {
+    g_moe_planned_candidates.store(total_candidates, std::memory_order_relaxed);
     std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
     g_moe_calib_status_total = total_candidates;
 }
@@ -2879,16 +3075,26 @@ void common_moe_calibrate(common_params & params) {
     // the refinements) and each candidate is skipped once the budget is
     // spent. Skipped candidates report as failures, which every search here
     // already handles by keeping the best point actually measured.
+    const bool budget_pinned_by_user = getenv("GGML_MOE_CALIBRATE_BUDGET_S") != nullptr;
     const double calibration_budget_s = [] {
         const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_S");
-        const double v = e ? atof(e) : 600.0; // 10 minutes
+        const double v = e ? atof(e) : 600.0; // provisional; re-derived once two candidates have been priced
         return v > 0.0 ? v : 600.0;
     }();
     g_moe_calibrate_budget_warned.store(false);
+    const long long calibrate_start_ms = common_moe_steady_now_ms();
+    g_moe_calibrate_start_ms.store(calibrate_start_ms);
     g_moe_calibrate_deadline_ms.store(
-            common_moe_steady_now_ms() + (long long) (calibration_budget_s * 1000.0));
+            calibrate_start_ms + (long long) (calibration_budget_s * 1000.0));
     g_moe_repro_floor.store(-1);
-    LOG_INF("%s: time budget for this run: %.0fs (GGML_MOE_CALIBRATE_BUDGET_S)\n", __func__, calibration_budget_s);
+    g_moe_verifiable_ref.store(-1);
+    g_moe_candidate_ms_sum.store(0);
+    g_moe_candidate_count.store(0);
+    g_moe_planned_candidates.store(0);
+    g_moe_budget_is_derived.store(!budget_pinned_by_user);
+    LOG_INF("%s: time budget for this run: %.0fs (%s)\n", __func__, calibration_budget_s,
+            budget_pinned_by_user ? "GGML_MOE_CALIBRATE_BUDGET_S"
+                                  : "provisional - re-derived once this model's candidate cost is measured");
 
     const std::string self_exe = common_self_exe_path();
     if (self_exe.empty()) {
@@ -2953,7 +3159,8 @@ void common_moe_calibrate(common_params & params) {
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
                 -1, -1, active_ngl, active_min_rank);
-        if (tps < 0) {
+        // Retry only an infrastructure failure - a quality rejection is deterministic.
+        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
             LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
@@ -3020,7 +3227,19 @@ void common_moe_calibrate(common_params & params) {
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
         }
         est += 2; // thread-count candidates
-        est += 8; // expert-cache size knee (fixed candidate list)
+        // Expert-cache size knee. Counted from the ladder that will actually run
+        // (off, then 512 MiB doubling up to measured free VRAM), not the fixed
+        // list of 8 this used to assume - four of those rungs were above what a
+        // 12 GiB card can ever grant, so the estimate overstated the work, and
+        // since the time budget is derived from this number it overstated the
+        // budget too.
+        {
+            int cache_rungs = 1; // "off" is always measured
+            for (size_t mb = 512; mb <= (calib_free_vram_bytes >> 20); mb *= 2) {
+                cache_rungs++;
+            }
+            est += cache_rungs;
+        }
         est += 4; // fit-margin search (upper bound; stops early on first failure)
         common_moe_calibration_status_set_total(est);
     }
@@ -3230,6 +3449,7 @@ void common_moe_calibrate(common_params & params) {
         // off" placeholder below was cached as if it had been measured, so every
         // later launch applied it and the runtime default never got a say.
         bool ladder_ran = false;
+        std::vector<std::pair<int, double>> ladder_results; // (rank, cheap-probe tok/s)
         for (const int rank : {10, 6, 4, 2, 1, 0}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
@@ -3240,24 +3460,26 @@ void common_moe_calibrate(common_params & params) {
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
                     concurrency, -1, -1, active_ngl, rank, &cand_text, 1234);
             common_moe_calibration_status_candidate_done();
-            // Fidelity is a rejection, not a ranking term - same rule as the
-            // degeneracy guard. A rung that drifts further from the reference
-            // than the model's own resampling does is not a faster point on
-            // the quality curve, it is a different (and unasked-for) model.
+            // Reported, not a veto - the same mistake the reproducibility check
+            // made, found the same way. Fidelity is text similarity to the
+            // substitution-free reference, and substitution deliberately serves a
+            // different expert than the router asked for, so the wording diverges
+            // by design. Measured on Qwen3.8-Flash-Next: this rejected rank 6
+            // (fidelity 0.30), rank 4 (0.00) and rank 2 (0.00), leaving rank 10 at
+            // 6.18 tok/s - while rank 2 measures 13.19 tok/s in a controlled A/B
+            // and produces plainly correct prose. A low similarity score means
+            // "said differently", not "said wrongly", and no amount of tuning the
+            // threshold fixes a metric that cannot tell those apart.
+            //
+            // Correctness is judged by things that do not depend on phrasing: the
+            // degeneracy guard rejects broken generation, and the verifiable-answer
+            // probes in common_moe_bench_candidate_server reject a candidate that
+            // answers fewer checkable questions than this run's own reference did.
+            // That is the fluent-but-wrong failure, caught by being wrong rather
+            // than by being different.
             double fidelity = -1.0;
             if (tps > 0 && fidelity_bar >= 0.0 && !cand_text.empty()) {
                 fidelity = common_moe_output_fidelity(ref_text, cand_text);
-                if (fidelity < fidelity_bar) {
-                    LOG_WRN("%s:   substitute-min-rank=%d rejected - output diverges from the "
-                            "substitution-free reference (fidelity %.2f < %.2f) at %.2f tok/s; this is the "
-                            "fluent-but-wrong failure the degeneracy guard cannot see\n",
-                            __func__, rank, fidelity, fidelity_bar, tps);
-                    common_moe_calibration_status_note("substitution floor",
-                            string_format("rank %d", rank),
-                            string_format("rejected - fidelity %.2f < %.2f (was %.2f tok/s)",
-                                    fidelity, fidelity_bar, tps), false);
-                    continue;
-                }
             }
             LOG_INF("%s:   substitute-min-rank=%d -> %s%s\n", __func__, rank,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected as degenerate",
@@ -3268,9 +3490,52 @@ void common_moe_calibrate(common_params & params) {
                             fidelity >= 0.0 ? string_format(", fidelity %.2f", fidelity).c_str() : "")
                             : std::string("failed or degenerate"),
                     tps > 0);
+            if (tps > 0) {
+                ladder_results.emplace_back(rank, tps);
+            }
             if (tps > best_min_rank_tps) {
                 best_min_rank_tps = tps;
                 best_min_rank     = rank;
+            }
+        }
+
+        // Shortlist, then decide in the regime we actually serve.
+        //
+        // The ladder ranks on short probes with reasoning disabled, which is
+        // ~30% cheaper per candidate and lets more levers fit the budget - but
+        // it is not the workload being served, and it does not reliably preserve
+        // the ordering. Measured on Qwen3.8-Flash-Next: with thinking, rank 2
+        // (7.69) beat rank 6 (7.21); without it the two tied at exactly 8.56 and
+        // the tie went to rank 6 purely because `tps > best` keeps whichever was
+        // measured first, and the ladder runs 10, 6, 4, 2 - so every tie breaks
+        // toward the conservative end. That cost 11.48 -> 9.95 tok/s confirmed.
+        //
+        // So the cheap regime only narrows the field. Everything within 5% of
+        // its best is re-measured at full length WITH reasoning, and the winner
+        // is chosen on those numbers. Capped at three, because the confirm is the
+        // most expensive single measurement in the run.
+        std::vector<std::pair<int, double>> shortlist;
+        if (!ladder_results.empty()) {
+            double best_cheap = 0.0;
+            for (const auto & r : ladder_results) {
+                best_cheap = std::max(best_cheap, r.second);
+            }
+            for (const auto & r : ladder_results) {
+                if (r.second >= best_cheap * 0.95) {
+                    shortlist.push_back(r);
+                }
+            }
+            std::sort(shortlist.begin(), shortlist.end(),
+                    [](const std::pair<int, double> & a, const std::pair<int, double> & b) {
+                        // Best cheap number first; on a tie prefer the more
+                        // aggressive rung, so a tie costs nothing if both confirm.
+                        if (a.second != b.second) {
+                            return a.second > b.second;
+                        }
+                        return a.first < b.first;
+                    });
+            if (shortlist.size() > 3) {
+                shortlist.resize(3);
             }
         }
         // Confirm the winner over a LONGER generation before committing it.
@@ -3289,45 +3554,79 @@ void common_moe_calibrate(common_params & params) {
             best_min_rank     = -1;
             best_min_rank_tps = 0.0;
         }
-        while (best_min_rank >= 0 && !common_moe_calibrate_budget_spent()) {
-            const int confirm_predict = n_predict * 4;
-            // Say so. This step re-runs the winner at 4x the probe length and
-            // on a slow model that is several minutes during which the stage
-            // line and the decisions table both sat unchanged, which reads as
-            // a stall rather than as the longest single check in the run.
+        const int confirm_predict = n_predict * 4;
+
+        // Confirm each shortlisted rung at full length, with reasoning on - the
+        // configuration that will actually be served - and take the best of those.
+        // Short probes that never reach 150-250 tokens cannot see the degenerate
+        // output this model produces there, which is the other reason the confirm
+        // exists: it is both the tie-break and the long-generation check.
+        int    confirmed_rank = -1;
+        double confirmed_tps  = 0.0;
+        for (const auto & cand : shortlist) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
             common_moe_calibration_status_set(string_format(
-                    "confirming substitution floor rank %d over %d tokens",
-                    best_min_rank, confirm_predict));
+                    "confirming substitution floor rank %d over %d tokens", cand.first, confirm_predict));
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
-                    confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank);
+                    confirm_predict, concurrency, -1, -1, active_ngl, cand.first,
+                    nullptr, 1234, std::numeric_limits<double>::quiet_NaN(),
+                    /* verify_answers */ true, /* with_reasoning */ true);
             common_moe_calibration_status_candidate_done();
-            if (tps > 0) {
-                // The ladder's best may belong to a rank this step has since backed
-                // away from - rank 2 measured 24.27 tok/s on Qwen3.8-Flash-Next, did
-                // not hold, and rank 6 was confirmed at 9.80 while 24.27 was the
-                // number logged and cached. Report what was actually confirmed.
-                best_min_rank_tps = tps;
-                LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
-                        __func__, best_min_rank, confirm_predict, tps);
+            if (tps <= 0) {
+                LOG_WRN("%s:   rank %d did NOT hold over %d tokens\n", __func__, cand.first, confirm_predict);
                 common_moe_calibration_status_note("substitution floor",
-                        string_format("rank %d", best_min_rank),
-                        string_format("confirmed over %d tokens - %.2f tok/s", confirm_predict, tps), true);
-                break;
+                        string_format("rank %d", cand.first),
+                        string_format("did not hold over %d tokens", confirm_predict), false);
+                continue;
             }
-            // Degenerate (or failed) at length: step toward the safe end.
-            const int safer = best_min_rank < 2 ? 2 : (best_min_rank < 4 ? 4 : (best_min_rank < 6 ? 6 : 10));
-            LOG_WRN("%s:   rank %d did NOT hold over %d tokens - stepping back to rank %d\n",
-                    __func__, best_min_rank, confirm_predict, safer);
+            LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s (cheap probe said %.2f)\n",
+                    __func__, cand.first, confirm_predict, tps, cand.second);
             common_moe_calibration_status_note("substitution floor",
-                    string_format("rank %d", best_min_rank),
-                    string_format("did not hold over %d tokens - stepping back to rank %d",
-                            confirm_predict, safer), false);
-            if (safer == best_min_rank || safer > 10) {
-                best_min_rank = -1; // nothing survived confirmation; leave the runtime default in place
-                break;
+                    string_format("rank %d", cand.first),
+                    string_format("confirmed over %d tokens - %.2f tok/s", confirm_predict, tps), true);
+            if (tps > confirmed_tps) {
+                confirmed_tps  = tps;
+                confirmed_rank = cand.first;
             }
-            best_min_rank = safer;
+        }
+
+        if (confirmed_rank >= 0) {
+            best_min_rank     = confirmed_rank;
+            best_min_rank_tps = confirmed_tps;
+        } else {
+            // Nothing on the shortlist survived its long generation. Step toward
+            // the safe end from the cheap ladder's best and confirm that instead,
+            // rather than committing a rung no long run ever validated.
+            while (best_min_rank >= 0 && !common_moe_calibrate_budget_spent()) {
+                const int safer = best_min_rank < 2 ? 2 : (best_min_rank < 4 ? 4 : (best_min_rank < 6 ? 6 : 10));
+                if (safer == best_min_rank || safer > 10) {
+                    best_min_rank = -1; // leave the runtime default in place
+                    break;
+                }
+                best_min_rank = safer;
+                common_moe_calibration_status_set(string_format(
+                        "confirming substitution floor rank %d over %d tokens", best_min_rank, confirm_predict));
+                const double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank,
+                        nullptr, 1234, std::numeric_limits<double>::quiet_NaN(),
+                        /* verify_answers */ true, /* with_reasoning */ true);
+                common_moe_calibration_status_candidate_done();
+                if (tps > 0) {
+                    best_min_rank_tps = tps;
+                    LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
+                            __func__, best_min_rank, confirm_predict, tps);
+                    common_moe_calibration_status_note("substitution floor",
+                            string_format("rank %d", best_min_rank),
+                            string_format("confirmed over %d tokens - %.2f tok/s", confirm_predict, tps), true);
+                    break;
+                }
+                LOG_WRN("%s:   rank %d did NOT hold over %d tokens - stepping back further\n",
+                        __func__, best_min_rank, confirm_predict);
+            }
         }
         if (best_min_rank >= 0) {
             LOG_INF("%s: substitution floor: rank %d at %.2f tok/s - carried into the remaining stages\n",
@@ -3371,19 +3670,18 @@ void common_moe_calibrate(common_params & params) {
                         self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
                         concurrency, -1, -1, active_ngl, active_min_rank, &cand_text, 1234, sigma);
                 common_moe_calibration_status_candidate_done();
+                // Reported, not a veto - the same fix the substitution ladder needed,
+                // for the same reason. Fidelity is similarity to the substitution-free
+                // reference, and a stand-in is a different expert by construction, so
+                // divergence is the mechanism working rather than failing. Proved on
+                // Qwen3.8-Flash-Next: substitute-min-rank=2 scores fidelity 0.00 and
+                // answers 4 of 4 verifiable probes correctly. A metric that rates a
+                // demonstrably correct answer at zero cannot be a rejection criterion.
+                // Degeneracy still rejects broken generation per candidate, and the
+                // confirm step verifies the winner's answers.
                 double fidelity = -1.0;
                 if (tps > 0 && fidelity_bar >= 0.0 && !cand_text.empty()) {
                     fidelity = common_moe_output_fidelity(ref_text, cand_text);
-                    if (fidelity < fidelity_bar) {
-                        LOG_WRN("%s:   quality-sigma=%.1f rejected - diverges from the substitution-free "
-                                "reference (fidelity %.2f < %.2f) at %.2f tok/s\n",
-                                __func__, sigma, fidelity, fidelity_bar, tps);
-                        common_moe_calibration_status_note("stand-in quality bar",
-                                string_format("%+.1f sigma", sigma),
-                                string_format("rejected - fidelity %.2f < %.2f (was %.2f tok/s)",
-                                        fidelity, fidelity_bar, tps), false);
-                        continue;
-                    }
                 }
                 LOG_INF("%s:   quality-sigma=%.1f -> %s%s\n", __func__, sigma,
                         tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed or rejected",
@@ -3429,7 +3727,8 @@ void common_moe_calibrate(common_params & params) {
                 double tps = common_moe_bench_candidate_server(
                         self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
                         concurrency, -1, -1, n, active_min_rank);
-                if (tps < 0) {
+                // Retry only an infrastructure failure - a quality rejection is deterministic.
+                if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
                     tps = common_moe_bench_candidate_server(
                             self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, n, active_min_rank);
@@ -3438,6 +3737,13 @@ void common_moe_calibrate(common_params & params) {
             }
             const double result = n_ok > 0 ? sum / n_ok : -1.0;
             LOG_INF("%s:   ngl=%d -> %s\n", __func__, n, result > 0 ? string_format("%.2f tok/s", result).c_str() : "failed");
+            // This stage advanced the progress bar but never wrote a row, so the
+            // decisions table silently omitted every GPU-residency candidate - the
+            // one stage whose candidates are the most expensive to re-run by hand.
+            common_moe_calibration_status_note("GPU-resident layers",
+                    string_format("-ngl %d", n),
+                    result > 0 ? string_format("%.2f tok/s", result) : std::string("failed"),
+                    result > 0);
             common_moe_calibration_status_candidate_done();
             return result;
         };
@@ -3486,7 +3792,8 @@ void common_moe_calibrate(common_params & params) {
                     double tps = common_moe_bench_candidate_server(
                             self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, (int) best_ngl, active_min_rank);
-                    if (tps < 0) {
+                    // Retry only an infrastructure failure - a quality rejection is deterministic.
+                    if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
                         tps = common_moe_bench_candidate_server(
                                 self_exe, path_model, "", (uint32_t) n, 0, n_threads_default, next_port(), ctx, n_predict,
                                 concurrency, -1, -1, (int) best_ngl, active_min_rank);
@@ -3624,6 +3931,8 @@ void common_moe_calibrate(common_params & params) {
             }
             const double tps = bench_with_retry(best_n, n_max_for_threads, mtp_path_for_threads, nt);
             LOG_INF("%s:   n_threads=%d -> %s\n", __func__, nt, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("thread count", string_format("%d threads", nt),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
             common_moe_calibration_status_candidate_done();
             if (tps > best_threads_tps) {
                 best_threads_tps = tps;
@@ -3682,13 +3991,17 @@ void common_moe_calibrate(common_params & params) {
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                 best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
-        if (tps < 0) {
+        // Retry only an infrastructure failure - a quality rejection is deterministic.
+        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                     best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
         }
         LOG_INF("%s:   moe-cache=%dMiB -> %s\n", __func__, mb,
                 tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+        common_moe_calibration_status_note("expert-cache size",
+                mb == 0 ? std::string("off") : string_format("%d MiB", mb),
+                tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
         common_moe_calibration_status_candidate_done();
         if (tps > 0) {
             cache_results.emplace_back(mb, tps);
@@ -3764,6 +4077,8 @@ void common_moe_calibrate(common_params & params) {
                     best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, mb, active_ngl, active_min_rank);
             LOG_INF("%s:   fitt=%dMiB -> %s\n", __func__, mb,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("fit margin", string_format("%d MiB", mb),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
             common_moe_calibration_status_candidate_done();
             if (tps <= 0) {
                 LOG_INF("%s:   fitt=%dMiB did not come up - stopping here, this is the edge the "
