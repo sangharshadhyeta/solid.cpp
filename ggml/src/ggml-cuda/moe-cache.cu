@@ -821,6 +821,13 @@ struct moe_cache_device {
         std::vector<bool> is_cold;       // already advised, don't re-advise every sweep
         std::vector<uint32_t> selections; // saturating per-expert selection count
         std::vector<bool> is_pinned;      // held resident with mlock
+        // Page-cache residency, sampled once per tensor per cold sweep. Without
+        // this, cost_tier could only answer for experts the sweep had already
+        // advised cold - every other expert was assumed RAM-cheap, including the
+        // majority that were never touched this session and are therefore exactly
+        // the ones a miss would fetch from NVMe. On a model whose 53 GiB of
+        // experts compete for ~28 GiB of page cache, that is most of them.
+        std::vector<bool> is_resident;
         // Routing-relative recency: the value of device.plan_epoch when this
         // expert was last selected. Wall-clock idleness turned out to be the
         // wrong unit - at 120s idle swept every 30s, a 40-second benchmark run
@@ -1620,6 +1627,53 @@ static bool moe_cache_cost_weight_enabled() {
 // resident right now, no assumption needed. Only called for is_cold-flagged
 // experts (the minority actually advised), so the common case - most
 // experts are never cold-swept at all - never pays this syscall.
+// Whole-tensor residency sample: one mincore per tensor, not one per expert.
+// Called from the cold sweep, so it is off the decode path entirely. Reads the
+// first page of each expert rather than all of them - an expert's pages are
+// faulted in together by the read that fetches it, so the first page is a good
+// proxy, and checking every page would mean ~13M page queries per sweep on
+// Qwen3.8-Flash-Next instead of ~141 syscalls.
+static void moe_cache_sample_residency(moe_cache_device & device) {
+#if defined(__linux__)
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_RESIDENCY_SAMPLE");
+        return !env || atoi(env) != 0;
+    }();
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (!enabled || page_size <= 0) {
+        return;
+    }
+    std::vector<unsigned char> vec;
+    for (auto & [host_base, res] : device.residency) {
+        const size_t n_expert = res.last_seen.size();
+        if (n_expert == 0 || res.expert_size == 0 || !host_base) {
+            continue;
+        }
+        if (res.is_resident.size() != n_expert) {
+            res.is_resident.assign(n_expert, true);
+        }
+        const uintptr_t start = (uintptr_t) host_base & ~((uintptr_t) page_size - 1);
+        const uintptr_t end   = ((uintptr_t) host_base + (uintptr_t) (n_expert * res.expert_size)
+                                 + (uintptr_t) page_size - 1) & ~((uintptr_t) page_size - 1);
+        const size_t n_pages = (size_t) ((end - start) / (uintptr_t) page_size);
+        if (n_pages == 0) {
+            continue;
+        }
+        vec.assign(n_pages, 0);
+        if (mincore((void *) start, (size_t) (end - start), vec.data()) != 0) {
+            continue; // unmapped hole or similar - leave the previous answer alone
+        }
+        for (size_t e = 0; e < n_expert; e++) {
+            const uintptr_t b  = (uintptr_t) host_base + (uintptr_t) (e * res.expert_size);
+            const size_t    pi = (size_t) ((b - start) / (uintptr_t) page_size);
+            res.is_resident[e] = pi >= n_pages || (vec[pi] & 1);
+        }
+    }
+#else
+    (void) device;
+#endif
+}
+
 static bool moe_cache_pages_actually_resident(const void * host_base, size_t expert_size, size_t expert) {
     static const long page_size = sysconf(_SC_PAGESIZE);
     if (page_size <= 0 || expert_size == 0) {
@@ -1665,6 +1719,12 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
     const size_t e = (size_t) key.expert;
     if (e < res.is_pinned.size() && res.is_pinned[e]) {
         return MOE_CACHE_COST_TIER_RAM; // mlock'd: always page-cache-resident, never pays the NVMe tier
+    }
+    // The sampled answer covers every expert, not just the ones the sweep
+    // advised. An expert that is simply not in the page cache costs an NVMe read
+    // on a miss whether or not this process ever advised it away.
+    if (e < res.is_resident.size() && !res.is_resident[e]) {
+        return MOE_CACHE_COST_TIER_NVME;
     }
     if (e < res.is_cold.size() && res.is_cold[e]) {
         // Ground-truth check before trusting our own advisory flag - see the
@@ -7081,6 +7141,11 @@ static void moe_cache_cold_sweep(moe_cache_device & device, std::chrono::steady_
         }
     }
 
+    // Refresh the residency sample every sweep, independent of the dormancy
+    // gate above: the cost signal has to be current even when nothing is being
+    // advised cold this tick.
+    moe_cache_sample_residency(device);
+
     size_t advised_experts = 0;
     size_t advised_bytes = 0;
     for (auto & [host_base, res] : device.residency) {
@@ -7571,6 +7636,50 @@ static double moe_cache_substitute_quality_sigma() {
         return e ? atof(e) : 1.0;
     }();
     return k;
+}
+
+// NOT WIRED IN, and the measurement is why - kept because the reasoning that
+// produced it is the kind worth being able to re-read.
+//
+// The idea: substitution trades quality for latency, so gate it on whether the
+// latency is real - substitute when the missed expert would cost an NVMe read,
+// serve the exact expert when its pages are already in the page cache.
+//
+// Measured on Qwen3.8-Flash-Next, interleaved rounds against a ~5% noise floor:
+// gate on 8.02-9.14 tok/s, gate off 11.45-12.97. A ~30% regression.
+//
+// The cost model was wrong. Page-cache residency removes the *fetch* cost but
+// not the *compute* cost: the exact expert still has to be multiplied on the
+// CPU, which on this hardware is far slower than serving a resident stand-in
+// from VRAM. The real comparison is CPU compute vs GPU compute with a
+// substitute, and the CPU term dominates whether the bytes came from RAM or
+// NVMe. Suppressing substitution for resident experts throws away the lever
+// that takes this model from 8.3 to 13.1 tok/s.
+//
+// The boundary this draws is the useful part: cost_tier answers "what does it
+// cost to FETCH this expert into VRAM". That is valid for fetch decisions -
+// eviction (which already uses it), admission, prefetch. It is not valid for a
+// decision whose alternative is computing the expert instead of fetching it.
+static bool moe_cache_substitute_cost_gate(const moe_cache_device & device,
+        const void * host_base, int expert) {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_COST_GATE");
+        return !env || atoi(env) != 0;
+    }();
+    if (!enabled || expert < 0) {
+        return true; // gate off: every miss is substitutable, as before
+    }
+    const auto it = device.residency.find(host_base);
+    if (it == device.residency.end()) {
+        return true; // untracked tensor - no opinion, keep today's behaviour
+    }
+    const auto & res = it->second;
+    const size_t e = (size_t) expert;
+    if (e >= res.is_resident.size()) {
+        return true;
+    }
+    // Resident: the exact expert is cheap, so prefer it and keep the quality.
+    return !res.is_resident[e];
 }
 
 static int moe_cache_substitute_scan() {
@@ -9271,6 +9380,7 @@ static int moe_cache_plan(
                 entry.is_cold.assign((size_t) node->n_expert, false);
                 entry.selections.assign((size_t) node->n_expert, 0);
                 entry.is_pinned.assign((size_t) node->n_expert, false);
+                entry.is_resident.assign((size_t) node->n_expert, true);
                 entry.last_epoch.assign((size_t) node->n_expert, 0);
                 entry.host_slot = std::vector<std::atomic<void *>>((size_t) node->n_expert);
                 for (auto & hs : entry.host_slot) {
@@ -9425,6 +9535,11 @@ static int moe_cache_plan(
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
             residency->is_cold[expert] = false;
+            // Just read by the CPU, so its pages are in the page cache now -
+            // record that without waiting for the next sweep to notice.
+            if ((size_t) expert < residency->is_resident.size()) {
+                residency->is_resident[expert] = true;
+            }
         }
 
         const moe_cache_key key{node->host_base, expert};

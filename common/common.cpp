@@ -3953,6 +3953,15 @@ void common_moe_calibrate(common_params & params) {
                     }
                 }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
+                // The whole speculative-decoding stage wrote no row, so a model
+                // with a draft head showed nothing for it in the decisions table
+                // even though it is one of the largest levers such a model has.
+                for (const auto & kv : nmax_trace) {
+                    common_moe_calibration_status_note("speculative depth",
+                            string_format("n-max %d", kv.first),
+                            kv.second > 0 ? string_format("%.2f tok/s", kv.second) : std::string("failed"),
+                            kv.second > 0, /* chosen */ kv.first == best_n_max);
+                }
                 // The n_max search's own winning number (MTP active) is the
                 // real answer for this deployment, not the earlier ncmoe-only
                 // number (MTP off) - carry it forward so the final report and
@@ -3989,9 +3998,17 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_set(string_format("benchmarking %zu thread-count candidate(s)", thread_candidates.size()));
         LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u%s ...\n", __func__, thread_candidates.size(), best_n,
                 best_n_max > 0 ? string_format(", spec-draft-n-max=%d", best_n_max).c_str() : "");
+        // Record the incumbent explicitly. It is measured - the ladder above ran
+        // at it - but skipping it silently left the table showing only the
+        // candidate that lost, reading as though the winning thread count had
+        // never been tried at all.
+        common_moe_calibration_status_note("thread count",
+                string_format("%d threads", n_threads_default),
+                string_format("%.2f tok/s (incumbent - every stage above ran at this)", best_threads_tps),
+                true);
         for (int nt : thread_candidates) {
             if (nt == n_threads_default) {
-                continue; // already measured above as best_tps
+                continue; // already measured above, as the incumbent just recorded
             }
             const double tps = bench_with_retry(best_n, n_max_for_threads, mtp_path_for_threads, nt);
             LOG_INF("%s:   n_threads=%d -> %s\n", __func__, nt, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");

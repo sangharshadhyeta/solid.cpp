@@ -109,10 +109,28 @@ week's fixes. They cannot be re-measured today without editing source.
 
 ## 5. What is worth doing, in order
 
-1. **Populate and use the disk-cost signal.** It is the dominant cost on a
-   bigger-than-RAM model and only eviction reads it. Admission and substitution
-   should prefer keeping an expert whose miss would hit NVMe over one still
-   resident in the page cache.
+1. **Populate the disk-cost signal — and know where it is valid.** The
+   population half is done: residency is now sampled for every expert (one
+   `mincore` per tensor per cold sweep) instead of being inferred only for the
+   minority the sweep had flagged. Measured effect on throughput: *cannot
+   resolve* — medians 12.83 vs 13.18, IQRs overlapping, rounds split 2/4.
+   Populating a signal that only one decision reads does not move anything.
+
+   The consumption half was then tried at substitution and **is wrong**. Gating
+   substitution on "is this expert resident?" measured 8.02–9.14 tok/s against
+   11.45–12.97 with the gate off — a ~30% regression against a ~5% noise floor.
+
+   The cost model was the error, and the correction is the useful output of this
+   item: `cost_tier` answers *"what does it cost to **fetch** this expert into
+   VRAM"*. Page-cache residency removes the fetch cost but not the **compute**
+   cost — the exact expert still has to be multiplied on the CPU, which is far
+   slower than serving a resident stand-in from VRAM. So the signal is valid for
+   **fetch** decisions (eviction, which already uses it; admission; prefetch) and
+   invalid for any decision whose alternative is *computing* the expert rather
+   than fetching it. Substitution ignores this signal **correctly**.
+
+   Remaining and untested: admission, which is a genuine fetch decision and the
+   one place the original recommendation may still hold.
 2. **Let the loader tell the cache what it already knows.** One
    "bigger-than-RAM" decision, made once, consumed by both — instead of two
    independent estimates that can disagree.
