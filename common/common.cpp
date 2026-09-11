@@ -2934,10 +2934,17 @@ static double common_moe_bench_candidate_server(
                 LOG_INF("%s: verifiable answers with substitution off (reference): %d of %d\n",
                         __func__, correct, n_verifiable);
             } else if (ref < 0) {
-                g_moe_verifiable_ref.store(correct);
-                LOG_WRN("%s: no substitution-off reference was measured for the answer check, so this first "
-                        "candidate sets the bar (%d of %d) - a broken candidate would grade itself\n",
+                // No substitution-off reference was measured (the budget ran out before
+                // it), so there is nothing to judge this candidate against. Letting it
+                // set its own bar means it then passes by definition - a broken
+                // candidate grading itself. Reject instead: the stage records nothing,
+                // the setting stays uncalibrated, and the runtime default applies.
+                LOG_WRN("%s: no substitution-off reference for the answer check - rejecting this candidate "
+                        "rather than letting it set its own bar (%d of %d correct)\n",
                         __func__, correct, n_verifiable);
+                common_moe_calibration_status_note("output check", "verifiable answers",
+                        "rejected - no reference measured to judge against", false);
+                result_tps = COMMON_MOE_TPS_REJECTED;
             } else if (correct < bar - tol) {
                 LOG_WRN("%s: candidate rejected - answered %d of %d verifiable probes against the "
                         "substitution-off reference's %d (tolerance %d, its own run-to-run spread), at %.2f "
@@ -3749,10 +3756,6 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         g_moe_calib_measure_prefill.store(false);
-    g_moe_calib_ubatch.store(-1);
-    g_moe_calib_prefill_xlong.store(false);
-    g_moe_calib_prefetch.store(false);
-    g_moe_calib_ring_pct.store(-1);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         if (best_offload_min_batch > 0) {
             LOG_INF("%s: offload threshold: %d at %.1f prompt tok/s\n", __func__, best_offload_min_batch, best_pp);
