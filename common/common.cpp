@@ -1492,6 +1492,16 @@ struct common_moe_calibration_entry {
     int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
     int         admit_after         = -1; // -1 = not calibrated, use the runtime default (2)
     int         spec_prob_accept    = -1; // -1 = not calibrated; 0 = exact-match only, 1 = probabilistic
+    // The drafter cascade, as a --spec-type list. Empty = not calibrated, leave
+    // the user's own --spec-type alone. The speculative framework already runs
+    // several drafters in priority order and falls through to the next only when
+    // the previous one proposes nothing (see common_speculative_init), so an
+    // n-gram drafter in front of MTP is free on the steps it hits - it proposes
+    // from the suffix tree with no forward pass at all - and costs nothing but a
+    // lookup on the steps it misses, where MTP still runs. Whether that trade
+    // actually pays depends on how repetitive the traffic is, which is exactly
+    // the kind of thing this fork measures rather than assumes.
+    std::string spec_types;                   // "" = not calibrated
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1787,6 +1797,7 @@ static bool common_moe_calibration_lookup(
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
         out.admit_after         = e.value("admit_after", -1);
         out.spec_prob_accept    = e.value("spec_prob_accept", -1);
+        out.spec_types          = e.value("spec_types", std::string());
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1842,6 +1853,7 @@ static void common_moe_calibration_save(
         {"substitute_min_rank", entry.substitute_min_rank},
         {"admit_after", entry.admit_after},
         {"spec_prob_accept", entry.spec_prob_accept},
+        {"spec_types", entry.spec_types},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2341,7 +2353,8 @@ static double common_moe_bench_candidate_server(
         bool verify_answers = false,
         bool with_reasoning = false,
         const std::string & extra_env = std::string(),
-        int spec_prob_accept = -1) {
+        int spec_prob_accept = -1,
+        const std::string & spec_types = std::string()) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2359,8 +2372,8 @@ static double common_moe_bench_candidate_server(
     std::string mtp_args;
     if (!mtp_path.empty()) {
         char buf[2048];
-        snprintf(buf, sizeof(buf), "--model-draft '%s' --spec-type draft-mtp --spec-draft-n-max %d ",
-                mtp_path.c_str(), n_max);
+        snprintf(buf, sizeof(buf), "--model-draft '%s' --spec-type %s --spec-draft-n-max %d ",
+                mtp_path.c_str(), spec_types.empty() ? "draft-mtp" : spec_types.c_str(), n_max);
         mtp_args = buf;
         // Only ever appended for a candidate that is explicitly measuring this
         // lever; -1 leaves the server on its own default (off, exact-match).
@@ -3314,6 +3327,7 @@ void common_moe_calibrate(common_params & params) {
             est += 6;                                                // spec-draft-n-max envelope doubling
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
             est += 2;                                                 // spec-prob-accept: off, on
+            est += 2;                                                 // drafter cascade: mtp alone, ngram-suffix in front
         }
         est += 2; // thread-count candidates
         est += 3; // admission-delay candidates (1, 2, 4)
@@ -4378,6 +4392,48 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // The drafter cascade. MTP alone pays one draft forward pass every decode
+    // step; an n-gram drafter in front of it proposes from the live suffix tree
+    // with no forward pass at all, and MTP only runs on the steps the n-gram
+    // drafter declines (common_speculative_init orders the impls and stops at
+    // the first one that produces a draft). On this hardware the scarce resource
+    // is expert bandwidth, not compute, so a step that skips the draft model
+    // entirely is worth more than the accept-rate arithmetic alone suggests -
+    // but only on traffic repetitive enough for the suffix tree to hit, so
+    // measure it rather than defaulting it on.
+    std::string best_spec_types;
+    double best_spec_types_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
+    if (!mtp_path_for_threads.empty() && n_max_for_threads > 0 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the drafter cascade (--spec-type) ...\n", __func__);
+        common_moe_calibration_status_set("measuring the drafter cascade");
+        for (const char * candidate : {"draft-mtp", "ngram-suffix,draft-mtp"}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234,
+                    std::numeric_limits<double>::quiet_NaN(), false, false, std::string(),
+                    best_prob_accept, candidate);
+            LOG_INF("%s:   spec-type=%s -> %s\n", __func__, candidate,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("drafter cascade", std::string(candidate),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_spec_types_tps) {
+                best_spec_types_tps = tps;
+                best_spec_types     = candidate;
+            }
+        }
+        if (!best_spec_types.empty()) {
+            LOG_INF("%s: drafter cascade: %s at %.2f tok/s\n", __func__,
+                    best_spec_types.c_str(), best_spec_types_tps);
+            common_moe_calibration_status_note("drafter cascade", best_spec_types,
+                    string_format("SELECTED - %.2f tok/s", best_spec_types_tps), true, true);
+        }
+    }
+
     common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
@@ -4410,6 +4466,7 @@ void common_moe_calibrate(common_params & params) {
     entry.fit_target_mb   = best_fit_mb;
     entry.admit_after     = best_admit_after;
     entry.spec_prob_accept = best_prob_accept;
+    entry.spec_types      = best_spec_types;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -4907,6 +4964,16 @@ static bool common_maybe_autoplace_moe_cpu(
             if (cached.spec_prob_accept >= 0 && params.speculative.has_dft() &&
                 !params.speculative.draft.prob_accept) {
                 params.speculative.draft.prob_accept = cached.spec_prob_accept != 0;
+            }
+            // Same rule once more: only for a run that already has a draft model,
+            // and only when the user left --spec-type at its default, which parses
+            // as the single NONE entry that the launcher then replaces with
+            // draft-mtp. An explicit --spec-type is the user's decision.
+            if (!cached.spec_types.empty() && params.speculative.has_dft() &&
+                params.speculative.types.size() == 1 &&
+                params.speculative.types[0] == COMMON_SPECULATIVE_TYPE_NONE) {
+                params.speculative.types =
+                        common_speculative_types_from_names(string_split<std::string>(cached.spec_types, ','));
             }
             // Same rule as spec_n_max above: only refine --moe-cache's own
             // "auto" intent, never override a size the user explicitly
