@@ -1614,7 +1614,10 @@ private:
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
-        } else if (!params_base.model.get_name().empty()) {
+        } else if (!params_base.model.get_name().empty() &&
+                   params_base.model.get_name() != params_base.model.path) {
+            // a download name (e.g. the Hugging Face repo) - for a local file
+            // get_name() is only the path, which says nothing a user wants to read
             model_name = params_base.model.get_name();
         } else if (char gname[256]; model_tgt &&
                    llama_model_meta_val_str(model_tgt, "general.name", gname, sizeof(gname)) > 0 && gname[0]) {
