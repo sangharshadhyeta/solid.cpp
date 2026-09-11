@@ -3602,7 +3602,24 @@ static void moe_cache_coact_save(moe_cache_session & session, const moe_cache_de
 // unreclaimable, so over-pinning under a cgroup cap converts a slow machine
 // into an OOM kill. Deliberately far more conservative than the VRAM side.
 // GGML_CUDA_MOE_CACHE_PIN_MB overrides (0 disables).
+// Set by the loader (see set_host_oversubscribed). -1 = never told.
+static std::atomic<int> g_moe_host_oversubscribed{-1};
+
+static void moe_cache_set_host_oversubscribed(int oversubscribed) {
+    g_moe_host_oversubscribed.store(oversubscribed, std::memory_order_relaxed);
+}
+
 static size_t moe_cache_pin_budget_bytes() {
+    // Pinning is mlock: those pages become unevictable, so on a model that does
+    // not fit in RAM they are taken directly from the page cache the model needs
+    // to stream its experts through. That is the same trade the loader's own
+    // pinning pass got wrong (see llama-model.cpp, "not pinning mmap-backed CPU
+    // weights"), and it is settled by the same fact - which the loader has
+    // already established rather than this having to guess at it again.
+    if (g_moe_host_oversubscribed.load(std::memory_order_relaxed) == 1 &&
+        !getenv("GGML_CUDA_MOE_CACHE_PIN_MB")) {
+        return 0;
+    }
     static const size_t value = [] () -> size_t {
         if (const char * env = getenv("GGML_CUDA_MOE_CACHE_PIN_MB")) {
             if (strcmp(env, "auto") == 0) {
@@ -12414,6 +12431,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
     ggml_moe_cache.set_max_batch_hint = moe_cache_set_max_batch_hint;
+    ggml_moe_cache.set_host_oversubscribed = moe_cache_set_host_oversubscribed;
     ggml_moe_cache.get_stats = moe_cache_get_stats;
     ggml_moe_cache.get_expert_map = moe_cache_get_expert_map;
     ggml_moe_cache.get_substitute_map = moe_cache_get_substitute_map;
