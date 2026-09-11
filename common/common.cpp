@@ -3571,6 +3571,27 @@ void common_moe_calibrate(common_params & params) {
     }
 
     const int n_threads_default = params.cpuparams.n_threads > 0 ? params.cpuparams.n_threads : common_cpu_get_num_math();
+
+    // The entry is built as the run goes, not assembled at the end, and saved
+    // after every stage that decides something. A run that is interrupted - by a
+    // crash, a stopped process, or a spent budget - then keeps everything it had
+    // already measured instead of losing all of it. Measured cost of this: one
+    // small JSON write per stage against candidates that take tens of seconds.
+    //
+    // Safe to save half-finished by construction: every field defaults to -1,
+    // "not calibrated", and the apply side skips those, so a partial entry means
+    // "use what was measured, runtime defaults for the rest" rather than anything
+    // half-configured.
+    common_moe_calibration_entry entry;
+    entry.concurrency = concurrency;
+    auto checkpoint = [&](const char * stage) {
+        time_t ck_now = time(nullptr);
+        char ck_buf[32];
+        strftime(ck_buf, sizeof(ck_buf), "%Y-%m-%d %H:%M:%S", localtime(&ck_now));
+        entry.calibrated_at = ck_buf;
+        common_moe_calibration_save(path_model, params, entry);
+        LOG_DBG("%s: checkpointed after %s\n", __func__, stage);
+    };
     // 32, not 64: per-candidate cost is dominated by this probe on a
     // CPU-offloaded model (64 tokens at ~0.6 tok/s is ~107s, against ~25s to
     // spawn and load), and halving it roughly doubles how many levers fit in
@@ -3950,6 +3971,8 @@ void common_moe_calibrate(common_params & params) {
         common_moe_live_stop();
         g_moe_calib_measure_prefill.store(false);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
+        entry.op_offload_min_batch = best_offload_min_batch;
+        checkpoint("offload threshold");
         if (best_offload_min_batch > 0) {
             LOG_INF("%s: offload threshold: %d at %.1f prompt tok/s\n", __func__, best_offload_min_batch, best_pp);
             common_moe_calibration_status_note("offload threshold", string_format("%d", best_offload_min_batch),
@@ -3987,6 +4010,8 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         g_moe_calib_ubatch.store(best_ubatch);
+        entry.n_ubatch = best_ubatch;
+        checkpoint("prompt micro-batch");
         if (best_ubatch > 0) {
             LOG_INF("%s: prompt micro-batch: -ub %d at %.1f prompt tok/s\n", __func__, best_ubatch, best_pp);
             common_moe_calibration_status_note("prompt micro-batch", string_format("-ub %d", best_ubatch),
@@ -4004,6 +4029,8 @@ void common_moe_calibrate(common_params & params) {
             LOG_INF("%s:   expert prefetch on -> %s (off: %.1f prompt tok/s)\n", __func__,
                     pp > 0 ? string_format("%.1f prompt tok/s", pp).c_str() : "failed", best_pp);
             best_prefetch = pp > best_pp ? 1 : 0;
+            entry.sched_prefetch_experts = best_prefetch;
+            checkpoint("expert prefetch");
             g_moe_calib_prefetch.store(best_prefetch == 1);
             common_moe_calibration_status_note("expert prefetch", best_prefetch ? "on" : "off",
                     string_format("SELECTED - %.1f prompt tok/s", best_prefetch ? pp : best_pp), true, true);
@@ -4160,6 +4187,8 @@ void common_moe_calibrate(common_params & params) {
                     depth_runner_up = best_n_max == first_winner ? runner_up : first_winner;
                 }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
+                entry.spec_n_max = best_n_max;
+                checkpoint("draft depth");
                 // The whole speculative-decoding stage wrote no row, so a model
                 // with a draft head showed nothing for it in the decisions table
                 // even though it is one of the largest levers such a model has.
@@ -4210,6 +4239,8 @@ void common_moe_calibrate(common_params & params) {
                 cpu_tps > 0 ? string_format("%.2f tok/s", cpu_tps).c_str() : "failed",
                 cpu_tps > 0 ? common_moe_last_acceptance_str().c_str() : "", best_n_max_tps);
         best_draft_cpu_moe = cpu_tps > best_n_max_tps ? 1 : 0;
+        entry.spec_draft_cpu_moe = best_draft_cpu_moe;
+        checkpoint("draft placement");
         g_moe_calib_draft_cpu_moe.store(best_draft_cpu_moe == 1);
         common_moe_calibration_status_note("draft placement", best_draft_cpu_moe ? "experts on CPU" : "on GPU",
                 string_format("SELECTED - %.2f tok/s", best_draft_cpu_moe ? cpu_tps : best_n_max_tps), true, true);
@@ -4254,6 +4285,9 @@ void common_moe_calibrate(common_params & params) {
                 }
             }
             common_moe_calib_set_env(exact_env.empty() ? std::string() : exact_env.substr(1));
+            entry.draft_exact     = best_draft_exact;
+            entry.draft_share_pct = best_share_pct;
+            checkpoint("draft cache share");
             if (best_share_pct > 0) {
                 LOG_INF("%s: draft cache share: %d%% at %.2f tok/s\n", __func__, best_share_pct, best_share_tps);
                 common_moe_calibration_status_note("draft cache share", string_format("%d%%", best_share_pct),
@@ -5087,6 +5121,7 @@ void common_moe_calibrate(common_params & params) {
     // whenever tightening does not actually help, which for this model it
     // does not.
     double best_fit_tps = best_cache_tps > 0 ? best_cache_tps : best_threads_tps;
+    std::map<int, double> fit_trace;   // margin -> tok/s, for the re-measure of the top two
     {
         const int default_fit_mb = (int) (params.fit_params_target[0] / (1024 * 1024));
         static const int fit_candidates_mb[] = {640, 448, 320, 256};
@@ -5111,10 +5146,57 @@ void common_moe_calibrate(common_params & params) {
                         "margin exists to stay clear of\n", __func__, mb);
                 break;
             }
+            if (tps > 0) {
+                fit_trace[mb] = tps;
+            }
             if (tps > best_fit_tps) {
                 best_fit_tps = tps;
                 best_fit_mb  = mb;
             }
+        }
+        // The winner was tracked and saved but never announced, so the log showed
+        // four numbers and left the choice to be inferred - and the decisions table
+        // had no chosen row for this stage at all.
+        // Each margin above is one short probe, and the readings are not monotonic -
+        // measured on gemma-4: 640 MiB 76.55, 448 MiB 69.33, 320 MiB 80.86, 256 MiB
+        // 80.70. A 0.2% gap between the top two cannot be called on one sample
+        // each, and the 448 dip says the noise is larger than that. Measure the top
+        // two again and decide on the mean of both samples, as the depth search does.
+        if (best_fit_mb > 0 && !fit_trace.empty()) {
+            int runner_up = -1;
+            for (const auto & kv : fit_trace) {
+                if (kv.first != best_fit_mb && kv.second > 0 &&
+                    (runner_up < 0 || kv.second > fit_trace.at(runner_up))) {
+                    runner_up = kv.first;
+                }
+            }
+            for (const int mb : { best_fit_mb, runner_up }) {
+                if (mb <= 0 || common_moe_calibrate_budget_spent()) {
+                    continue;
+                }
+                const double again = common_moe_bench_candidate_server(
+                        self_exe, path_model, sub_mtp_path, safe_n, sub_n_max, n_threads_default,
+                        next_port(), ctx, n_predict, concurrency, best_cache_mb, mb,
+                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+                common_moe_calibration_status_candidate_done();
+                if (again > 0) {
+                    LOG_INF("%s:   fitt=%dMiB measured again -> %.2f tok/s (first %.2f, mean %.2f)\n",
+                            __func__, mb, again, fit_trace.at(mb), (again + fit_trace.at(mb)) / 2.0);
+                    fit_trace[mb] = (again + fit_trace.at(mb)) / 2.0;
+                }
+            }
+            if (runner_up > 0 && fit_trace.at(runner_up) > fit_trace.at(best_fit_mb)) {
+                best_fit_mb = runner_up;
+            }
+            best_fit_tps = fit_trace.at(best_fit_mb);
+        }
+        entry.fit_target_mb = best_fit_mb;
+        checkpoint("fit margin");
+        if (best_fit_mb > 0) {
+            LOG_INF("%s: fit margin: %d MiB at %.2f tok/s\n", __func__, best_fit_mb, best_fit_tps);
+            common_moe_calibration_status_note("fit margin", string_format("%d MiB", best_fit_mb),
+                    string_format("SELECTED - %.2f tok/s (mean of two samples where confirmed)", best_fit_tps),
+                    true, /* chosen */ true);
         }
     }
 
@@ -5233,6 +5315,12 @@ void common_moe_calibrate(common_params & params) {
                 best_ring_pct = pct;
             }
         }
+        // Release the live candidate BEFORE the confirm below launches its own: it
+        // runs at a different length with reasoning on, so it cannot reuse this
+        // one, and a 12 GiB card has no room for both - the new candidate failed
+        // with "unable to allocate CUDA0 buffer" and calibration sat in the health
+        // wait. The ladder already did this; this stage did not.
+        common_moe_live_stop();
         if (best_ring_pct > 0 && !common_moe_calibrate_budget_spent()) {
             g_moe_calib_ring_pct.store(best_ring_pct);
             const double checked = common_moe_bench_candidate_server(
@@ -5250,6 +5338,8 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         common_moe_live_stop();
+        entry.moe_cache_ring_pct = best_ring_pct;
+        checkpoint("prediction ring");
         g_moe_calib_ring_pct.store(best_ring_pct > 0 ? best_ring_pct : -1);
         if (best_ring_pct >= 0) {
             LOG_INF("%s: prediction ring: %d%%\n", __func__, best_ring_pct);
@@ -5597,8 +5687,8 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calib_set_env(carried);
     }
 
-    common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
+    entry.gates_version   = COMMON_MOE_CALIBRATION_GATES_VERSION;
     entry.n_threads       = best_threads;
     entry.n_threads_batch = best_threads;
     entry.spec_n_max      = best_n_max;
