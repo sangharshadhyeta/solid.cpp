@@ -3145,6 +3145,15 @@ void common_moe_calibrate(common_params & params) {
     // dropped the setting the ladder had just established, and then tuned
     // cache size against a configuration that is not the one being served.
     int active_min_rank = -1;
+    // The best configuration so far, measured with the SAME short probe the
+    // later stages use for their candidates. Distinct from best_tps, which after
+    // the substitution ladder holds a full-length confirmed number (128 tokens,
+    // reasoning on). Comparing a 32-token no-reasoning candidate against that is
+    // apples to oranges and the incumbent always wins: measured on
+    // Qwen3.8-Flash-Next, all five stand-in sigma rungs (7.90-8.68) and every
+    // -ngl rung (6.08-7.99) lost to a confirmed 11.53 and none could ever have
+    // won, whatever their merit.
+    double cheap_incumbent_tps = 0.0;
     // Carried into the later stages the same way active_min_rank is, so
     // everything measured after this point is measured at the balance that
     // will actually be served.
@@ -3510,10 +3519,15 @@ void common_moe_calibrate(common_params & params) {
         // measured first, and the ladder runs 10, 6, 4, 2 - so every tie breaks
         // toward the conservative end. That cost 11.48 -> 9.95 tok/s confirmed.
         //
-        // So the cheap regime only narrows the field. Everything within 5% of
+        // So the cheap regime only narrows the field. Everything within 15% of
         // its best is re-measured at full length WITH reasoning, and the winner
         // is chosen on those numbers. Capped at three, because the confirm is the
         // most expensive single measurement in the run.
+        //
+        // 15%, not the 5% this first shipped with: the cheap probe's error against
+        // the confirmed number is far larger than 5% - measured at +34% for rank 2
+        // (8.60 -> 11.53) against +6% for rank 1 (8.72 -> 9.23) in the same run - so
+        // a 5% window discards rungs the cheap number has no power to rule out.
         std::vector<std::pair<int, double>> shortlist;
         if (!ladder_results.empty()) {
             double best_cheap = 0.0;
@@ -3521,7 +3535,7 @@ void common_moe_calibrate(common_params & params) {
                 best_cheap = std::max(best_cheap, r.second);
             }
             for (const auto & r : ladder_results) {
-                if (r.second >= best_cheap * 0.95) {
+                if (r.second >= best_cheap * 0.85) {
                     shortlist.push_back(r);
                 }
             }
@@ -3596,6 +3610,16 @@ void common_moe_calibrate(common_params & params) {
         if (confirmed_rank >= 0) {
             best_min_rank     = confirmed_rank;
             best_min_rank_tps = confirmed_tps;
+            // Keep the winner's CHEAP-regime number too. Every later stage
+            // measures its candidates with the short no-reasoning probe, so it
+            // needs an incumbent measured the same way to compare against - see
+            // cheap_incumbent_tps below.
+            for (const auto & r : ladder_results) {
+                if (r.first == confirmed_rank) {
+                    cheap_incumbent_tps = r.second;
+                    break;
+                }
+            }
         } else {
             // Nothing on the shortlist survived its long generation. Step toward
             // the safe end from the cheap ladder's best and confirm that instead,
@@ -3656,7 +3680,7 @@ void common_moe_calibrate(common_params & params) {
         // permissive end is rejected on evidence rather than avoided by a
         // number written here.
         double best_sigma = std::numeric_limits<double>::quiet_NaN();
-        double best_sigma_tps = best_min_rank_tps;
+        double best_sigma_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_min_rank_tps;
         if (!common_moe_calibrate_budget_spent()) {
             LOG_INF("%s: measuring stand-in quality bar at rank %d (this is the wait-or-substitute "
                     "balance) ...\n", __func__, active_min_rank);
@@ -3697,6 +3721,38 @@ void common_moe_calibrate(common_params & params) {
                     best_sigma     = sigma;
                 }
             }
+            // Confirm it in the regime it will be served in, exactly as the
+            // substitution floor is. The ladder above measures with the short
+            // no-reasoning probe, and a stand-in bar can break a failure mode that
+            // regime cannot see: measured on Qwen3.8-Flash-Next, -2 sigma passed
+            // every cheap probe and every degeneracy check, then served an empty
+            // content field with 200 tokens of unterminated reasoning, and a bare
+            // "</think>" for the next prompt. Speed was fine. Output was destroyed.
+            // Nothing downstream can catch this, because the calibration that
+            // chose it never ran with reasoning on.
+            if (!std::isnan(best_sigma) && !common_moe_calibrate_budget_spent()) {
+                const int sigma_confirm_predict = n_predict * 4;
+                common_moe_calibration_status_set(string_format(
+                        "confirming stand-in quality bar %+.1f sigma over %d tokens",
+                        best_sigma, sigma_confirm_predict));
+                const double ctps = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        sigma_confirm_predict, concurrency, -1, -1, active_ngl, active_min_rank,
+                        nullptr, 1234, best_sigma, /* verify_answers */ true, /* with_reasoning */ true);
+                common_moe_calibration_status_candidate_done();
+                if (ctps > 0) {
+                    best_sigma_tps = ctps;
+                    LOG_INF("%s:   %+.1f sigma confirmed over %d tokens -> %.2f tok/s\n",
+                            __func__, best_sigma, sigma_confirm_predict, ctps);
+                } else {
+                    LOG_WRN("%s:   %+.1f sigma did NOT hold with reasoning on - leaving the stand-in bar "
+                            "uncalibrated rather than shipping it\n", __func__, best_sigma);
+                    common_moe_calibration_status_note("stand-in quality bar",
+                            string_format("%+.1f sigma", best_sigma),
+                            std::string("did not hold with reasoning on - not committed"), false);
+                    best_sigma = std::numeric_limits<double>::quiet_NaN();
+                }
+            }
             if (!std::isnan(best_sigma)) {
                 LOG_INF("%s: stand-in quality bar: %.1f sigma at %.2f tok/s\n",
                         __func__, best_sigma, best_sigma_tps);
@@ -3718,7 +3774,13 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_set(string_format("searching GPU-resident layer count (-ngl) in [%u, %u]", ngl_lo, ngl_hi));
 
         std::map<int, double> ngl_trace;
-        ngl_trace[(int) ngl_hi] = best_tps; // already measured above - full residency is the ncmoe search's own baseline
+        // Seeded in the SAME regime the candidates below are measured in. This
+        // used to take best_tps, which after the substitution ladder holds a
+        // full-length confirmed number: the search then compared 32-token
+        // no-reasoning candidates (5.55-8.09 measured) against a confirmed 12.02
+        // seed, so best_ngl always landed on ngl_hi and "full GPU residency still
+        // wins" was true by construction rather than by measurement.
+        ngl_trace[(int) ngl_hi] = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
         // bench_with_retry doesn't take an ngl override, so this wraps
         // common_moe_bench_candidate_server directly instead.
         auto measure_ngl = [&](int n) -> double {
@@ -3768,7 +3830,8 @@ void common_moe_calibrate(common_params & params) {
             }
         }
 
-        if (best_ngl_tps > best_tps && best_ngl < ngl_hi) {
+        const double ngl_incumbent = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
+        if (best_ngl_tps > ngl_incumbent && best_ngl < ngl_hi) {
             LOG_INF("%s: -ngl=%u wins over full GPU residency (%.2f vs %.2f tok/s) - re-searching ncmoe at "
                     "this layer residency, since the safe floor and available VRAM both just changed\n",
                     __func__, best_ngl, best_ngl_tps, best_tps);
@@ -3820,7 +3883,8 @@ void common_moe_calibrate(common_params & params) {
                 }
             }
         } else {
-            LOG_INF("%s: full GPU residency still wins (%.2f tok/s) - -ngl left at default\n", __func__, best_tps);
+            LOG_INF("%s: full GPU residency still wins (%.2f vs %.2f tok/s on the same probe) - "
+                    "-ngl left at default\n", __func__, ngl_incumbent, best_ngl_tps);
             best_ngl = ngl_hi;
         }
         // Carry it forward, so the thread / cache-size / fit-margin stages
@@ -3920,7 +3984,7 @@ void common_moe_calibrate(common_params & params) {
     }
 
     int    best_threads = n_threads_default;
-    double best_threads_tps = best_tps;
+    double best_threads_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
     if (thread_candidates.size() > 1) {
         common_moe_calibration_status_set(string_format("benchmarking %zu thread-count candidate(s)", thread_candidates.size()));
         LOG_INF("%s: benchmarking %zu thread-count candidate(s) at ncmoe=%u%s ...\n", __func__, thread_candidates.size(), best_n,
@@ -4114,7 +4178,14 @@ void common_moe_calibrate(common_params & params) {
     // qwen4exp: the ladder found 1.64 tok/s at rank 2 while the entry
     // reported 0.65, the placement/-ngl number - the same understatement the
     // cache-sweep comment above already describes for a different stage.
-    entry.tok_per_sec     = std::max({best_threads_tps, best_fit_tps, best_min_rank_tps});
+    // The confirmed full-length number when there is one, not a max across
+    // regimes. best_threads_tps and best_fit_tps are short no-reasoning probes;
+    // best_min_rank_tps is a 128-token confirm with reasoning on. Taking the max
+    // of the three let a 32-token fit-margin probe of 15.10 become the cached
+    // headline while the configuration actually served ~13.
+    entry.tok_per_sec     = best_min_rank_tps > 0.0
+            ? best_min_rank_tps
+            : std::max({best_threads_tps, best_fit_tps});
     entry.moe_cache_mb    = best_cache_mb;
     entry.substitute_min_rank = best_min_rank;
     entry.substitute_quality_sigma = active_quality_sigma;
