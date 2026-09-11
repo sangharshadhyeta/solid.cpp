@@ -5734,7 +5734,16 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+    // Read GGML_OP_OFFLOAD_MIN_BATCH here, at decision time, as well as at device
+    // registration. Registration happens when the backend is first enumerated -
+    // before a process has loaded its calibration - so a calibrated threshold
+    // applied afterwards was silently ignored and the device kept the default.
+    // The variable is read on every call rather than cached so a value set after
+    // the first graph is honoured too; it is a getenv on the scheduler's
+    // op-assignment path, negligible beside the op itself.
+    const char * env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
+    const int min_batch = env && atoi(env) > 0 ? atoi(env) : dev_ctx->op_offload_min_batch_size;
+    return get_op_batch_size(op) >= min_batch;
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
