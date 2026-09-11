@@ -1490,6 +1490,7 @@ struct common_moe_calibration_entry {
     double      tok_per_sec     = 0.0;
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
     int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
+    int         admit_after         = -1; // -1 = not calibrated, use the runtime default (2)
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
     // the wait-or-substitute balance: high = wait for the real expert, low =
@@ -1644,6 +1645,19 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
 #endif
         LOG_WRN("%s: using calibrated substitution floor of rank %d\n", __func__, cal.substitute_min_rank);
     }
+    // admit_after: how many times an expert must be demanded before it earns a
+    // slot. Not a property gate (see the rejected cost-gate/cost-bias attempts
+    // elsewhere in this file) - demand->count is still what is compared against
+    // this number, calibration only measures what the number should be instead
+    // of it being a guess from 2026-08-13 that nothing ever revisited.
+    if (cal.admit_after >= 0 && !getenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER")) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cal.admit_after).c_str());
+#else
+        setenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cal.admit_after).c_str(), 1);
+#endif
+        LOG_WRN("%s: using calibrated admission threshold of %d\n", __func__, cal.admit_after);
+    }
     if (!std::isnan(cal.substitute_quality_sigma) &&
         !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA")) {
 #if defined(_WIN32)
@@ -1770,6 +1784,7 @@ static bool common_moe_calibration_lookup(
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
+        out.admit_after         = e.value("admit_after", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
         // on a present null it throws, the catch below turns that into a miss, and
@@ -1823,6 +1838,7 @@ static void common_moe_calibration_save(
         {"tok_per_sec",     entry.tok_per_sec},
         {"moe_cache_mb",    entry.moe_cache_mb},
         {"substitute_min_rank", entry.substitute_min_rank},
+        {"admit_after", entry.admit_after},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
@@ -2301,7 +2317,8 @@ static double common_moe_bench_candidate_server(
         int substitute_min_rank = -1, std::string * out_sample = nullptr, int probe_seed = 1234,
         double substitute_quality_sigma = std::numeric_limits<double>::quiet_NaN(),
         bool verify_answers = false,
-        bool with_reasoning = false) {
+        bool with_reasoning = false,
+        const std::string & extra_env = std::string()) {
     if (common_moe_calibrate_budget_spent()) {
         return -1.0; // reported as a failed candidate; every search here keeps its best measured point
     }
@@ -2409,10 +2426,10 @@ static double common_moe_bench_candidate_server(
     // and never has the last word.
     const char * reasoning_args = with_reasoning ? "" : "--reasoning off ";
     snprintf(cmd, sizeof(cmd),
-        "%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
+        "%s%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
         "--temp 1.0 --top-p 0.95 --top-k 64 --no-token-freq-log "
         "--port %d --no-webui > /dev/null 2>&1 & echo $!",
-        subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
+        extra_env.c_str(), subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port);
     FILE * pf = popen(cmd, "r");
     if (!pf) {
@@ -4177,6 +4194,50 @@ void common_moe_calibrate(common_params & params) {
     char timebuf[32];
     strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
 
+    // Admission threshold: how many times an expert must be demanded before it
+    // earns a slot. admit_after=2 / readmit_after=8 (the fallback when the pool
+    // is full) have been constants since 2026-08-13 and were never revisited.
+    // Ladder is small on purpose - each rung is a full candidate spawn, and this
+    // stage runs after everything else has already spent most of the budget.
+    // Compared against the same-regime incumbent (cheap_incumbent_tps), not
+    // best_tps, for the reason documented on that variable's declaration: a
+    // 32-token candidate can never beat a 128-token confirmed number.
+    int    best_admit_after     = -1;
+    double best_admit_after_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: searching admission threshold (admit_after) ...\n", __func__);
+        common_moe_calibration_status_set("searching admission threshold");
+        for (const int candidate : {1, 2, 4}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            char env_buf[64];
+            snprintf(env_buf, sizeof(env_buf), "GGML_CUDA_MOE_CACHE_ADMIT_AFTER=%d ", candidate);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234,
+                    std::numeric_limits<double>::quiet_NaN(), false, false, env_buf);
+            LOG_INF("%s:   admit_after=%d -> %s\n", __func__, candidate,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("admission threshold",
+                    string_format("admit_after=%d", candidate),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_admit_after_tps) {
+                best_admit_after_tps = tps;
+                best_admit_after     = candidate;
+            }
+        }
+        if (best_admit_after >= 0) {
+            LOG_INF("%s: admission threshold: admit_after=%d at %.2f tok/s\n",
+                    __func__, best_admit_after, best_admit_after_tps);
+            common_moe_calibration_status_note("admission threshold",
+                    string_format("admit_after=%d", best_admit_after),
+                    string_format("SELECTED - %.2f tok/s", best_admit_after_tps), true, true);
+        }
+    }
+
     common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
@@ -4207,6 +4268,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_min_rank = best_min_rank;
     entry.substitute_quality_sigma = active_quality_sigma;
     entry.fit_target_mb   = best_fit_mb;
+    entry.admit_after     = best_admit_after;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
@@ -4754,6 +4816,13 @@ static bool common_maybe_autoplace_moe_cpu(
 #else
                 setenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK",
                         std::to_string(cached.substitute_min_rank).c_str(), 1);
+#endif
+            }
+            if (cached.admit_after >= 0 && !getenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER")) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cached.admit_after).c_str());
+#else
+                setenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cached.admit_after).c_str(), 1);
 #endif
             }
             const bool neuron_reduce_is_default = !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
