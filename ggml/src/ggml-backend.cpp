@@ -2364,6 +2364,14 @@ void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched) {
     return session;
 }
 
+bool ggml_moe_cache_set_tunable(const char * name, const char * value) {
+    if (!ggml_moe_cache.set_tunable || !name) {
+        return false;
+    }
+    ggml_moe_cache.set_tunable(name, value);
+    return true;
+}
+
 void ggml_backend_sched_set_moe_cache_exact(ggml_backend_sched_t sched, bool exact) {
     if (sched) {
         sched->moe_cache_exact = exact;

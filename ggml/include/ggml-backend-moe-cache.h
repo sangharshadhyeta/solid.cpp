@@ -109,6 +109,13 @@ struct ggml_moe_cache_api {
     // with session_leave as usual.
     void   (*session_enter_exact)(void * session);
 
+    // Set a policy knob at runtime, overriding the environment; an empty or NULL
+    // value clears the override. Only knobs that do not decide an allocation can
+    // change this way - expert-cache size, placement and ubatch are fixed once the
+    // pools exist. Lets a calibration sweep measure many values in one process
+    // instead of reloading the model for each (~80% of a candidate's cost).
+    void   (*set_tunable)(const char * name, const char * value);
+
     // Begin one CPU MUL_MAT_ID node. Returns an opaque plan, or NULL when the
     // stock CPU path should handle the complete node.
     void * (*begin)(const char * tensor_name, const void * host_base, size_t expert_size,

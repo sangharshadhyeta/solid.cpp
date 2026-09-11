@@ -5473,6 +5473,50 @@ void server_routes::init_routes() {
         return res;
     };
 
+    // Set moe-cache policy knobs at runtime: {"GGML_CUDA_MOE_CACHE_RING_PCT": "5", ...}.
+    // An empty value clears an override. Only knobs that decide policy can change
+    // this way - expert-cache size, placement and ubatch are fixed once the pools
+    // exist, and are silently accepted only to be rejected by the cache itself.
+    //
+    // This exists so a calibration sweep can measure many values of a knob in one
+    // process: ~80% of a candidate's cost is loading the model, and it was being
+    // paid once per VALUE. Gated on --moe-calibrate rather than always on, because
+    // it lets a caller reshape cache policy mid-flight.
+    this->post_moe_tuning = [this](const server_http_req & req) {
+        auto res = create_response();
+        if (!params.moe_calibrate) {
+            res->error(format_error_response(
+                    "runtime MoE tuning is only available when the server was started with --moe-calibrate",
+                    ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const std::exception & e) {
+            res->error(format_error_response(std::string("invalid JSON: ") + e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        if (!body.is_object()) {
+            res->error(format_error_response("expected a JSON object of knob -> value", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        json applied = json::object();
+        for (const auto & item : body.items()) {
+            const std::string value = item.value().is_string()
+                    ? item.value().get<std::string>()
+                    : (item.value().is_null() ? std::string() : item.value().dump());
+            if (!ggml_moe_cache_set_tunable(item.key().c_str(), value.c_str())) {
+                res->error(format_error_response("no MoE cache provider is registered", ERROR_TYPE_NOT_SUPPORTED));
+                return res;
+            }
+            applied[item.key()] = value;
+        }
+        SRV_INF("runtime MoE tuning applied: %s\n", applied.dump().c_str());
+        res->ok({{ "success", true }, { "applied", applied }});
+        return res;
+    };
+
     this->post_infill = [this](const server_http_req & req) {
         auto res = create_response();
         // check model compatibility

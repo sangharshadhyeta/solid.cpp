@@ -333,6 +333,10 @@ extern "C" {
     // speculative draft, whose job is to predict the target; the target keeps them.
     GGML_API void   ggml_backend_sched_set_moe_cache_exact(ggml_backend_sched_t sched, bool exact);
 
+    // Set a moe-cache policy knob at runtime (see set_tunable in
+    // ggml-backend-moe-cache.h). Returns false when no cache provider is registered.
+    GGML_API bool   ggml_moe_cache_set_tunable(const char * name, const char * value);
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
