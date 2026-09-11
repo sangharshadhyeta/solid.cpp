@@ -1921,6 +1921,18 @@ void llm_graph_context::build_moe_lookahead(
     if (!ggml_moe_cache.prefetch || !cur || !next_gate_inp || !next_exps || !next_exps->data) {
         return;
     }
+    // Decode-size batches only. Prediction is worth something when a token routes
+    // to a handful of experts; a prefill batch routes to nearly all of them, so
+    // there is nothing left to predict and the extra [n_embd, n_expert] gate matmul
+    // per layer - plus a madvise per predicted expert - is pure cost. Measured on
+    // Qwen3.8-Flash-Next after wiring this into qwen4exp: prompt processing fell
+    // from 20.1 to 4.6 tok/s, and calibration candidates went 44s to 78s, with the
+    // ring at its default 0 so not one prediction could even be stored. 8 is the
+    // decode/MTP-verify width (n_parallel x draft depth) this fork already uses as
+    // the boundary for decode-only work elsewhere.
+    if (n_tokens > 8) {
+        return;
+    }
 
     ggml_tensor * next_logits = build_lora_mm(next_gate_inp, cur);
     // Rank by what the target layer's router actually ranks by, not raw
