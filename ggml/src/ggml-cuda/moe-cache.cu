@@ -12459,7 +12459,19 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                         pool.ring_count++;
                         pool.ring_fifo.push_back(slot_index);
                         while (pool.ring_fifo.size() > (size_t) pool.n_slots) {
-                            pool.ring_fifo.pop_front(); // stale entries only - live ones are re-queued on rotation
+                            // Not necessarily stale: while the pool still has free slots
+                            // every admission pushes without a matching pop, so this can
+                            // drop a LIVE entry. Release it properly - it stays resident
+                            // as an ordinary probation slot, but stops counting against
+                            // the ring, which rotation could otherwise never reclaim.
+                            const int dropped = pool.ring_fifo.front();
+                            pool.ring_fifo.pop_front();
+                            if (dropped >= 0 && dropped < pool.n_slots && pool.slots[dropped].spec) {
+                                pool.slots[dropped].spec = false;
+                                if (pool.ring_count > 0) {
+                                    pool.ring_count--;
+                                }
+                            }
                         }
                     }
                     woke = true;
