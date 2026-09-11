@@ -1479,7 +1479,13 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
 // 1 = measured with the degeneracy guard, the short-prompt quality pass, the
 // output-fidelity check against a substitution-free reference, and the
 // repeat-identical-request reproducibility check.
-static constexpr int COMMON_MOE_CALIBRATION_GATES_VERSION = 1;
+// 2 = the answer check reads the answer channel only (empty after </think> is
+// wrong), samples as served rather than greedily, asks 8 questions, and takes
+// its bar and tolerance from the substitution-off reference measured twice -
+// never from the first candidate. Version 1 approved rank 1 / -1.0 sigma on
+// Qwen3.8-Flash-Next, which served 1-2 correct answers in 10; every version-1
+// substitution setting is suspect for the same reason, so none is applied.
+static constexpr int COMMON_MOE_CALIBRATION_GATES_VERSION = 2;
 
 struct common_moe_calibration_entry {
     int         n_cpu_moe       = 0;
@@ -2134,6 +2140,12 @@ struct common_moe_bench_result {
     // What the model actually emitted, for the fidelity comparison in the
     // substitution ladder. See common_moe_output_fidelity().
     std::string text;
+    // The answer channel alone: `content`, i.e. what follows </think>. `text`
+    // joins content and reasoning for the degeneracy and fidelity checks, which
+    // is right for them - but a correctness check that reads it counts an answer
+    // that only ever appeared inside the reasoning, with nothing after </think>,
+    // as correct. That is exactly the failure it exists to catch.
+    std::string answer;
 };
 
 static common_moe_bench_result common_moe_bench_one_request_full(int port, const char * prompt, int n_predict, int seed = 1234, bool greedy = false);
@@ -2207,6 +2219,9 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
                             }
                             r.text += s;
                         }
+                        if (strcmp(field, "content") == 0) {
+                            r.answer = s;
+                        }
                     }
                 }
                 r.degeneracy = worst;
@@ -2240,6 +2255,8 @@ static std::atomic<int>       g_moe_planned_candidates{0};
 // The bar later candidates are held to - measured, never assumed, because a
 // heavily quantized model may legitimately fail one.
 static std::atomic<int>       g_moe_verifiable_ref{-1};
+static std::atomic<int>       g_moe_verifiable_ref2{-1};         // second reference run, for the tolerance
+static std::atomic<bool>      g_moe_verifying_reference{false};  // the next verifications set the bar
 
 // A candidate can end badly in two different ways and they must not be
 // conflated. -1.0 means the run did not happen (server failed to come up, port
@@ -2608,6 +2625,15 @@ static double common_moe_bench_candidate_server(
         { "What is the capital of France? Reply with just the city name.", { "paris", nullptr, nullptr, nullptr } },
         { "Complete with one word: the opposite of hot is ___.",           { "cold", "chilly", nullptr, nullptr } },
         { "How many days are in a week? Reply with just the number.",      { "7", "seven", nullptr, nullptr } },
+        // Plain questions with no "reply with just" instruction, as a user would
+        // ask them. These are the ones that exposed rank 1 / -1.0 sigma on
+        // Qwen3.8-Flash-Next: served, it answered 2 of 10 (empty after </think>,
+        // or fragments like "boiling point"), while four instructed one-word
+        // probes scored greedily had passed it 4 of 4.
+        { "What is 17 times 23?",                                          { "391", nullptr, nullptr, nullptr } },
+        { "Name the largest planet.",                                      { "jupiter", nullptr, nullptr, nullptr } },
+        { "What is the boiling point of water in Celsius?",                { "100", nullptr, nullptr, nullptr } },
+        { "Who wrote Hamlet?",                                             { "shakespeare", nullptr, nullptr, nullptr } },
     };
     static constexpr int n_verifiable = sizeof(verifiable_probes) / sizeof(verifiable_probes[0]);
 
@@ -2667,12 +2693,16 @@ static double common_moe_bench_candidate_server(
         if (result_tps > 0 && verify_answers) {
             int correct = 0;
             for (int i = 0; i < n_verifiable; i++) {
+                // Served sampling, not greedy: the gate has to see the regime the
+                // answers will actually be produced under. Greedy is where this
+                // passed rank 1 while temp 1.0 served broken answers - the argmax
+                // path can survive a stand-in that sampling does not.
                 const auto v = common_moe_bench_one_request_full(
-                        port, verifiable_probes[i].prompt, 320, probe_seed, /* greedy */ true);
-                if (v.predicted_n <= 0) {
-                    continue;
+                        port, verifiable_probes[i].prompt, 320, probe_seed, /* greedy */ false);
+                if (v.predicted_n <= 0 || v.answer.empty()) {
+                    continue; // no answer after </think> is a wrong answer, not a skipped probe
                 }
-                std::string low = v.text;
+                std::string low = v.answer;
                 std::transform(low.begin(), low.end(), low.begin(),
                         [](unsigned char c) { return (char) std::tolower(c); });
                 for (const char * want : verifiable_probes[i].accept) {
@@ -2683,17 +2713,38 @@ static double common_moe_bench_candidate_server(
                 }
             }
             const int ref = g_moe_verifiable_ref.load();
-            if (ref < 0) {
+            // The bar comes from the substitution-off reference, measured twice,
+            // never from a candidate. It used to be set by whichever candidate was
+            // verified first - on Qwen3.8-Flash-Next that was rank 1, which then
+            // passed against its own score.
+            const int ref2 = g_moe_verifiable_ref2.load();
+            const int bar  = ref2 >= 0 ? std::min(ref, ref2) : ref;
+            // The reference's own run-to-run difference is the tolerance: the
+            // model's natural variation at the served sampling, measured rather
+            // than chosen. Two identical references give 0 - the strictest bar,
+            // because that is the model saying it answers these reliably.
+            const int tol  = ref2 >= 0 ? std::abs(ref - ref2) : 0;
+            if (g_moe_verifying_reference.load()) {
+                if (ref < 0) {
+                    g_moe_verifiable_ref.store(correct);
+                } else {
+                    g_moe_verifiable_ref2.store(correct);
+                }
+                LOG_INF("%s: verifiable answers with substitution off (reference): %d of %d\n",
+                        __func__, correct, n_verifiable);
+            } else if (ref < 0) {
                 g_moe_verifiable_ref.store(correct);
-                LOG_INF("%s: verifiable-answer bar for this run: %d of %d\n", __func__, correct, n_verifiable);
-            } else if (correct < ref) {
-                LOG_WRN("%s: candidate rejected - answered %d of %d verifiable probes against this run's "
-                        "reference of %d, at %.2f tok/s. Fluent output that is wrong is not a faster "
-                        "configuration, it is a broken one\n",
-                        __func__, correct, n_verifiable, ref, result_tps);
+                LOG_WRN("%s: no substitution-off reference was measured for the answer check, so this first "
+                        "candidate sets the bar (%d of %d) - a broken candidate would grade itself\n",
+                        __func__, correct, n_verifiable);
+            } else if (correct < bar - tol) {
+                LOG_WRN("%s: candidate rejected - answered %d of %d verifiable probes against the "
+                        "substitution-off reference's %d (tolerance %d, its own run-to-run spread), at %.2f "
+                        "tok/s. Fluent output that is wrong is not a faster configuration, it is a broken one\n",
+                        __func__, correct, n_verifiable, bar, tol, result_tps);
                 common_moe_calibration_status_note("output check", "verifiable answers",
-                        string_format("rejected - %d of %d correct, reference %d (was %.2f tok/s)",
-                                correct, n_verifiable, ref, result_tps), false);
+                        string_format("rejected - %d of %d correct, reference %d +/- %d (was %.2f tok/s)",
+                                correct, n_verifiable, bar, tol, result_tps), false);
                 result_tps = COMMON_MOE_TPS_REJECTED;
             }
         }
@@ -3180,6 +3231,8 @@ void common_moe_calibrate(common_params & params) {
             calibrate_start_ms + (long long) (calibration_budget_s * 1000.0));
     g_moe_repro_floor.store(-1);
     g_moe_verifiable_ref.store(-1);
+    g_moe_verifiable_ref2.store(-1);
+    g_moe_verifying_reference.store(false);
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -3317,6 +3370,7 @@ void common_moe_calibrate(common_params & params) {
                 ? common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi)
                 : 1;
         est += 7; // substitution-floor ladder (6 rungs) + long-probe confirmation
+        est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
         est += common_golden_section_eval_estimate((int) ngl_lo_est, (int) ngl_hi_est); // -ngl search
@@ -3670,6 +3724,35 @@ void common_moe_calibrate(common_params & params) {
         // Short probes that never reach 150-250 tokens cannot see the degenerate
         // output this model produces there, which is the other reason the confirm
         // exists: it is both the tie-break and the long-generation check.
+        // The answer bar, measured before any candidate is judged against it:
+        // substitution off, the confirm's own length, reasoning on, served
+        // sampling - the same conditions every confirm runs under. Twice, with
+        // different seeds, so the tolerance is the model's own variation.
+        if (!shortlist.empty() && !common_moe_calibrate_budget_spent()) {
+            g_moe_verifying_reference.store(true);
+            for (const int seed : {1234, 5678}) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                common_moe_calibration_status_set("measuring the answer bar with substitution off");
+                common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        confirm_predict, concurrency, -1, -1, active_ngl, subst_off_rank,
+                        nullptr, seed, std::numeric_limits<double>::quiet_NaN(),
+                        /* verify_answers */ true, /* with_reasoning */ true);
+                common_moe_calibration_status_candidate_done();
+            }
+            g_moe_verifying_reference.store(false);
+            const int r1 = g_moe_verifiable_ref.load();
+            const int r2 = g_moe_verifiable_ref2.load();
+            if (r1 >= 0) {
+                LOG_INF("%s:   answer bar from substitution off: %d%s\n", __func__,
+                        r2 >= 0 ? std::min(r1, r2) : r1,
+                        r2 >= 0 ? string_format(" (runs %d and %d, tolerance %d)", r1, r2, std::abs(r1 - r2)).c_str()
+                                : " (one run, no tolerance)");
+            }
+        }
+
         int    confirmed_rank = -1;
         double confirmed_tps  = 0.0;
         for (const auto & cand : shortlist) {
