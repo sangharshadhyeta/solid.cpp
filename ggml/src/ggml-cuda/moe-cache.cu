@@ -3610,16 +3610,6 @@ static void moe_cache_set_host_oversubscribed(int oversubscribed) {
 }
 
 static size_t moe_cache_pin_budget_bytes() {
-    // Pinning is mlock: those pages become unevictable, so on a model that does
-    // not fit in RAM they are taken directly from the page cache the model needs
-    // to stream its experts through. That is the same trade the loader's own
-    // pinning pass got wrong (see llama-model.cpp, "not pinning mmap-backed CPU
-    // weights"), and it is settled by the same fact - which the loader has
-    // already established rather than this having to guess at it again.
-    if (g_moe_host_oversubscribed.load(std::memory_order_relaxed) == 1 &&
-        !getenv("GGML_CUDA_MOE_CACHE_PIN_MB")) {
-        return 0;
-    }
     static const size_t value = [] () -> size_t {
         if (const char * env = getenv("GGML_CUDA_MOE_CACHE_PIN_MB")) {
             if (strcmp(env, "auto") == 0) {
@@ -3657,6 +3647,21 @@ static size_t moe_cache_pin_budget_bytes() {
         }
         if (avail == 0) {
             return 0;
+        }
+        // The operator opted into pinning, so the question is how much, not
+        // whether. The loader has already established whether this model fits in
+        // host RAM (it disables eager mmap prefetch on that basis) - consume that
+        // rather than re-deriving the same fact here from the same /proc/meminfo
+        // read, which is how two estimates of one thing drift apart.
+        //
+        // When it does not fit, halve the derived budget. This is the case the
+        // comment above measured as a loss: pinning a small slice cannot fix a
+        // large shortfall, and every pinned page is one the streaming working set
+        // cannot reclaim. Halving rather than zeroing keeps the operator's opt-in
+        // meaningful - they asked for pinning and a genuinely hot slice can still
+        // be held - while spending less of the page cache the model is relying on.
+        if (g_moe_host_oversubscribed.load(std::memory_order_relaxed) == 1) {
+            avail /= 2;
         }
 
         // A cgroup cap is the real ceiling when there is one, and it is not
