@@ -164,6 +164,12 @@ struct moe_cache_slot {
 };
 
 struct moe_cache_pool {
+    // Which role's experts this pool holds. The draft's experts are the same
+    // shape as the target's, so without this they would land in the same pool and
+    // compete under one LRU - the "united" arrangement. Keyed separately, each
+    // role keeps its own slots, heat, probation/protected chains and ring, and
+    // every rule runs unchanged within it.
+    bool   draft = false;
     size_t expert_size = 0;
     // Physical distance between consecutive slots in `slab`, always
     // >= expert_size. The gap (slot_stride - expert_size) is a per-slot
@@ -222,6 +228,9 @@ struct moe_cache_pool {
 };
 
 struct moe_cache_shape {
+    // Draft and target experts are the same shape, so a shape must carry the role
+    // too or the two would share one pending pool and, in the end, one pool.
+    bool   draft = false;
     size_t expert_size = 0;
     int wtype = -1;
     int64_t n_expert = 0;
@@ -234,6 +243,9 @@ struct moe_cache_seen_tensor {
     size_t bytes = 0;
     size_t expert_size = 0;
     int wtype = -1;
+    // Recorded the first time this tensor is seen, from the scope that was
+    // computing. A tensor belongs to exactly one model, so this never changes.
+    bool   draft = false;
 };
 
 enum class moe_cache_job_kind : uint8_t {
@@ -1339,6 +1351,10 @@ struct moe_cache_scope_frame {
     // rejected token and a wasted verify pass. The draft's experts are small
     // enough to stay resident under the shared pool, so exact costs little.
     bool exact = false;
+    // This scope belongs to a speculative draft. Independent of `exact`: the draft
+    // keeps its own pools, its own heat and its own knob values whether or not it
+    // is allowed stand-ins. Same rules as the target, applied within itself.
+    bool draft = false;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
@@ -1346,6 +1362,38 @@ static thread_local int g_session_suppressed = 0;
 // True while the innermost scope on this thread asked for exact experts only.
 static bool moe_cache_scope_exact() {
     return !g_session_stack.empty() && g_session_stack.back().exact;
+}
+
+static bool moe_cache_scope_draft() {
+    return !g_session_stack.empty() && g_session_stack.back().draft;
+}
+
+// A knob's value for whichever role is computing. The draft looks for
+// "<NAME>_DRAFT" first and falls back to the target's value when it is unset, so
+// every policy knob can be given its own draft value without duplicating any of
+// the machinery that reads it.
+static int moe_cache_tunable_int_scoped(const char * name, int def) {
+    if (moe_cache_scope_draft()) {
+        const std::string draft_name = std::string(name) + "_DRAFT";
+        const std::string raw = moe_cache_tunable_raw(draft_name.c_str());
+        if (!raw.empty()) {
+            return atoi(raw.c_str());
+        }
+    }
+    const std::string raw = moe_cache_tunable_raw(name);
+    return raw.empty() ? def : atoi(raw.c_str());
+}
+
+static double moe_cache_tunable_double_scoped(const char * name, double def) {
+    if (moe_cache_scope_draft()) {
+        const std::string draft_name = std::string(name) + "_DRAFT";
+        const std::string raw = moe_cache_tunable_raw(draft_name.c_str());
+        if (!raw.empty()) {
+            return atof(raw.c_str());
+        }
+    }
+    const std::string raw = moe_cache_tunable_raw(name);
+    return raw.empty() ? def : atof(raw.c_str());
 }
 
 static size_t moe_cache_trim_session(
@@ -4923,10 +4971,10 @@ static bool moe_cache_start_worker(
 }
 
 static int moe_cache_find_pool(
-        const moe_cache_device & device, size_t expert_size, int wtype) {
+        const moe_cache_device & device, size_t expert_size, int wtype, bool draft) {
     for (int index = 0; index < (int)device.pools.size(); index++) {
         const moe_cache_pool & pool = *device.pools[index];
-        if (pool.expert_size == expert_size && pool.wtype == wtype) {
+        if (pool.expert_size == expert_size && pool.wtype == wtype && pool.draft == draft) {
             return index;
         }
     }
@@ -5536,6 +5584,7 @@ static bool moe_cache_allocate_pool(
         return false;
     }
     try {
+        pool->draft = shape.draft;
         pool->expert_size = shape.expert_size;
         pool->slot_stride = slot_stride;
         pool->wtype = shape.wtype;
@@ -5716,7 +5765,7 @@ static void moe_cache_try_reduce_convert(
     }
     const size_t reduced_expert_size = (size_t) indices.size() * row_bytes;
 
-    int pool_index = moe_cache_find_pool(device, reduced_expert_size, wtype);
+    int pool_index = moe_cache_find_pool(device, reduced_expert_size, wtype, moe_cache_scope_draft());
     if (pool_index < 0) {
         const size_t headroom = device.budget_limit > device.allocated_bytes
             ? device.budget_limit - device.allocated_bytes : 0;
@@ -5862,7 +5911,7 @@ static void moe_cache_prewarm_from_history(
         const size_t expert_size = it_seen->second.expert_size;
         const int    wtype       = it_seen->second.wtype;
 
-        const int pool_index = moe_cache_find_pool(device, expert_size, wtype);
+        const int pool_index = moe_cache_find_pool(device, expert_size, wtype, moe_cache_scope_draft());
         if (pool_index < 0) {
             continue;
         }
@@ -6089,6 +6138,7 @@ static void moe_cache_build_pending(
                 (double)shape.expert_size * (double)shape.n_tensors;
         }
     }
+    double draft_scale = 1.0;
     std::sort(pending.begin(), pending.end(), [](const auto * lhs, const auto * rhs) {
         const double lhs_weight =
             (double)lhs->expert_size * (double)lhs->n_tensors;
@@ -6097,9 +6147,40 @@ static void moe_cache_build_pending(
         return lhs_weight > rhs_weight;
     });
 
+    // How much of the budget the draft's pools may take.
+    //
+    // The weights above are total bytes per shape, so the draft - one MTP layer,
+    // 3 tensors against the target's 144 - would get ~2% purely because it has
+    // fewer tensors. That is an artifact of tensor count, not a decision about how
+    // much speculative decoding is worth, and the draft runs on EVERY decode step.
+    //
+    // GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT names the split directly: the draft's
+    // shapes are rescaled so they collectively take that fraction, and the target's
+    // split the rest by weight as before. -1 (default) keeps the weight-based
+    // behaviour, so this changes nothing until a value is measured.
+    {
+        const int pct = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", -1);
+        if (pct >= 0 && pct <= 100) {
+            double draft_weight = 0.0;
+            for (const moe_cache_shape * shape : pending) {
+                if (shape->draft) {
+                    draft_weight += (double) shape->expert_size * (double) shape->n_tensors;
+                }
+            }
+            const double target_weight = total_weight - draft_weight;
+            const double p = (double) pct / 100.0;
+            if (draft_weight > 0.0 && target_weight > 0.0 && p > 0.0 && p < 1.0) {
+                // scale so draft/(draft+target) == p, leaving the machinery below untouched
+                draft_scale  = (p * target_weight) / ((1.0 - p) * draft_weight);
+                total_weight = target_weight + draft_weight * draft_scale;
+            }
+        }
+    }
+
     for (moe_cache_shape * shape : pending) {
         const double weight =
-            (double)shape->expert_size * (double)shape->n_tensors;
+            (double)shape->expert_size * (double)shape->n_tensors *
+            (shape->draft ? draft_scale : 1.0);
         const size_t share = total_weight > 0.0
             ? (size_t)((double)remaining * weight / total_weight) : 0;
         const size_t before = device.allocated_bytes;
@@ -6116,27 +6197,28 @@ static int moe_cache_discover_pool(
         moe_cache_session & session, moe_cache_device & device,
         const void * host_base, size_t tensor_size, size_t expert_size,
         int wtype, int64_t n_expert) {
-    int pool = moe_cache_find_pool(device, expert_size, wtype);
+    int pool = moe_cache_find_pool(device, expert_size, wtype, moe_cache_scope_draft());
     if (pool >= 0) {
         return pool;
     }
 
+    const bool draft = moe_cache_scope_draft();
     moe_cache_shape * shape = nullptr;
     for (moe_cache_shape & candidate : device.shapes) {
-        if (candidate.expert_size == expert_size && candidate.wtype == wtype) {
+        if (candidate.expert_size == expert_size && candidate.wtype == wtype && candidate.draft == draft) {
             shape = &candidate;
             break;
         }
     }
     if (!shape) {
-        device.shapes.push_back({expert_size, wtype, n_expert, 0, -1, false});
+        device.shapes.push_back({draft, expert_size, wtype, n_expert, 0, -1, false});
         shape = &device.shapes.back();
     } else {
         shape->n_expert = std::max(shape->n_expert, n_expert);
     }
 
     const bool first_visit = device.seen_tensors.emplace(
-            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype}).second;
+            host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype, moe_cache_scope_draft()}).second;
     if (first_visit) {
         if (shape->n_tensors == 0 && shape->pool < 0) {
             shape->finished = false;
@@ -6153,7 +6235,7 @@ static int moe_cache_discover_pool(
     }
 
     moe_cache_build_pending(session, device);
-    return moe_cache_find_pool(device, expert_size, wtype);
+    return moe_cache_find_pool(device, expert_size, wtype, moe_cache_scope_draft());
 }
 
 static bool moe_cache_neuron_heat_enabled();
@@ -6412,11 +6494,12 @@ static void moe_cache_maybe_profile_bandwidth(moe_cache_device & device);
 // pushed nothing (no session, or a suppressed one) has no frame to mark and
 // runs the stock path anyway, where nothing is substituted.
 static void moe_cache_session_enter(void * opaque);
-static void moe_cache_session_enter_exact(void * opaque) {
+static void moe_cache_session_enter_scope(void * opaque, int flags) {
     const size_t depth = g_session_stack.size();
     moe_cache_session_enter(opaque);
     if (g_session_stack.size() > depth) {
-        g_session_stack.back().exact = true;
+        g_session_stack.back().exact = (flags & 1) != 0;
+        g_session_stack.back().draft = (flags & 2) != 0;
     }
 }
 
@@ -7016,7 +7099,7 @@ static void * moe_cache_begin(
             if (candidate.allocated_bytes > slab_limit) {
                 return 0;
             }
-            if (moe_cache_find_pool(candidate, expert_size, wtype) >= 0) {
+            if (moe_cache_find_pool(candidate, expert_size, wtype, moe_cache_scope_draft()) >= 0) {
                 return slab_limit;
             }
             const size_t available = slab_limit - candidate.allocated_bytes;
@@ -7769,7 +7852,7 @@ static bool moe_cache_neuron_heat_enabled() {
 // else in this file.
 static int moe_cache_substitute_min_rank(moe_cache_device & device) {
     // -1 means "no pin, use the pace-driven floor below"; a live override lands here.
-    const int pinned = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK", -1);
+    const int pinned = moe_cache_tunable_int_scoped("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK", -1);
     if (pinned >= 0) {
         return pinned;
     }
@@ -7832,7 +7915,7 @@ static int moe_cache_substitute_min_rank(moe_cache_device & device) {
 // only applies when calibration has not run - it is a starting point, not a
 // decision.
 static double moe_cache_substitute_quality_sigma() {
-    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA", 1.0);
+    return moe_cache_tunable_double_scoped("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA", 1.0);
 }
 
 // Do we positively know this expert's pages are NOT in the page cache? False
@@ -8419,7 +8502,7 @@ static void moe_cache_prewarm_from_topic(float x, float y, int top_k_per_tensor)
                 if (seen == device.seen_tensors.end()) {
                     continue;
                 }
-                const int pool_index = moe_cache_find_pool(device, seen->second.expert_size, seen->second.wtype);
+                const int pool_index = moe_cache_find_pool(device, seen->second.expert_size, seen->second.wtype, seen->second.draft);
                 if (pool_index < 0) {
                     continue;
                 }
@@ -9820,7 +9903,7 @@ static int moe_cache_plan(
         const size_t row_bytes = node->expert_size / (size_t) node->n_out;
         if (reduce_k > 0 && row_bytes > 0) {
             const size_t reduced_expert_size = (size_t) reduce_k * row_bytes;
-            const int ridx = moe_cache_find_pool(device, reduced_expert_size, node->wtype);
+            const int ridx = moe_cache_find_pool(device, reduced_expert_size, node->wtype, node->pool && node->pool->draft);
             if (ridx >= 0) {
                 reduced_pool_ptr = device.pools[ridx].get();
             }
@@ -12210,7 +12293,7 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
 // their heat is zero and moe_cache_pick_coldest_unpinned ranks them coldest.
 // Adapted from the ring in thecodacus's fork, into this pool rather than beside it.
 static int moe_cache_ring_target(const moe_cache_pool & pool) {
-    const int raw = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_RING_PCT", 0);
+    const int raw = moe_cache_tunable_int_scoped("GGML_CUDA_MOE_CACHE_RING_PCT", 0);
     const int pct = raw < 0 ? 0 : (raw > 50 ? 50 : raw);
     return pct > 0 ? std::max(1, pool.n_slots * pct / 100) : 0;
 }
@@ -12293,7 +12376,7 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                 continue;
             }
             const size_t expert_size = seen->second.expert_size;
-            const int    pool_index  = moe_cache_find_pool(device, expert_size, seen->second.wtype);
+            const int    pool_index  = moe_cache_find_pool(device, expert_size, seen->second.wtype, seen->second.draft);
             if (pool_index < 0) {
                 continue;
             }
@@ -12787,7 +12870,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.owner = owner;
     ggml_moe_cache.session_create = moe_cache_session_create;
     ggml_moe_cache.session_share = moe_cache_session_share;
-    ggml_moe_cache.session_enter_exact = moe_cache_session_enter_exact;
+    ggml_moe_cache.session_enter_scope = moe_cache_session_enter_scope;
     ggml_moe_cache.set_tunable = moe_cache_set_tunable;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;

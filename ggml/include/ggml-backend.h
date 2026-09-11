@@ -329,9 +329,10 @@ extern "C" {
     // Take an extra reference to sched's session without removing it, so a second scheduler
     // can adopt the same expert cache (speculative decoding: draft and target as one model).
     GGML_API void * ggml_backend_sched_share_moe_cache_session(ggml_backend_sched_t sched);
-    // Serve exact experts only on this scheduler's computes - no stand-ins. For a
-    // speculative draft, whose job is to predict the target; the target keeps them.
-    GGML_API void   ggml_backend_sched_set_moe_cache_exact(ggml_backend_sched_t sched, bool exact);
+    // Tag what computes on this scheduler, for the moe-cache: bit 0 = serve exact
+    // experts only (no stand-ins), bit 1 = this is a speculative draft. The draft
+    // bit gives it its own pools, heat and knob values; see session_enter_scope.
+    GGML_API void   ggml_backend_sched_set_moe_cache_scope(ggml_backend_sched_t sched, int flags);
 
     // Set a moe-cache policy knob at runtime (see set_tunable in
     // ggml-backend-moe-cache.h). Returns false when no cache provider is registered.

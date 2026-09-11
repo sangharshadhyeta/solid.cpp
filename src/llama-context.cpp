@@ -676,7 +676,11 @@ void llama_context::sched_reserve() {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_DRAFT_EXACT");
         return !env || atoi(env) != 0;
     }();
-    ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr && draft_exact);
+    // bit0 exact, bit1 draft. The draft bit is set whenever this context is a
+    // draft, independent of exactness: it is what gives the draft its own pools,
+    // its own heat and its own knob values inside the shared session.
+    ggml_backend_sched_set_moe_cache_scope(sched.get(),
+            cparams.ctx_other == nullptr ? 0 : ((draft_exact ? 1 : 0) | 2));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -716,7 +720,8 @@ void llama_context::sched_reserve() {
                 if (moe_cache_session_retry) {
                     ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session_retry);
                 }
-                ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr && draft_exact);
+                ggml_backend_sched_set_moe_cache_scope(sched.get(),
+                        cparams.ctx_other == nullptr ? 0 : ((draft_exact ? 1 : 0) | 2));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
