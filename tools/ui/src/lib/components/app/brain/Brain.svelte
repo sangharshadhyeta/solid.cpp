@@ -28,6 +28,18 @@
 		[90, 155, 216], // warm / probation
 		[78, 214, 165] // hot / protected
 	];
+	// The speculative draft's own experts, in their own hue family: same three
+	// residency states, red -> purple -> pink instead of slate -> blue -> green.
+	// The draft keeps its own pools, heat and knob values (see moe-cache.cu's
+	// scope flags), so "is the draft holding slots the target wants" is a real
+	// question - and without a colour it is invisible, because a draft cell is
+	// otherwise indistinguishable from a target cell in the same row.
+	const TIER_RGB_DRAFT: [number, number, number][] = [
+		[92, 52, 60], // cold / not cached
+		[150, 104, 208], // warm / probation
+		[236, 110, 173] // hot / protected
+	];
+	let draftMask: Uint8Array | null = null;
 	// A resident expert dispatched as a stand-in for a different, missed
 	// expert (GGML_CUDA_MOE_CACHE_SUBSTITUTE) - distinct from a real hit
 	// (white pulse below), since the cell's OWN residency tier already says
@@ -191,6 +203,10 @@
 				}
 			}
 
+			// A live snapshot, not read-and-cleared: a tensor's role never changes,
+			// so it is re-read on every poll and simply absent when no draft is loaded.
+			draftMask = next.draft ? hexToBytes(next.draft) : null;
+
 			if (next.neuron_concentration && next.neuron_concentration.length === rows * cols) {
 				neuronConcentration = Float32Array.from(next.neuron_concentration);
 			} else {
@@ -214,7 +230,9 @@
 		const byte = row < rows && col < cols ? (mapBytes[i] ?? 0) : 0;
 		const tier = byte >> 6;
 		const heat = byte & 63;
-		const [R, G, B] = TIER_RGB[tier] ?? TIER_RGB[0];
+		const isDraft = !!(draftMask && (draftMask[i >> 3] ?? 0) & (1 << (i & 7)));
+		const palette = isDraft ? TIER_RGB_DRAFT : TIER_RGB;
+		const [R, G, B] = palette[tier] ?? palette[0];
 		// Brightness reflects the expert's own live neuron activity (1 - dead
 		// fraction) rather than how often the router picked it - two experts
 		// selected equally often can differ a lot in how much of themselves
@@ -652,6 +670,17 @@
 				<i class="inline-block size-2.5 rounded-full" style="background: #3a4750"></i>
 				cold {totals[0].toLocaleString()}
 			</span>
+			{#if draftMask}
+				<span
+					class="flex items-center gap-1.5"
+					title="The speculative draft's experts, in their own hue family - same three residency states, own pools and own knob values"
+				>
+					<i class="inline-block size-2.5 rounded-full" style="background: #ec6ead"></i>
+					<i class="inline-block size-2.5 rounded-full" style="background: #9668d0"></i>
+					<i class="inline-block size-2.5 rounded-full" style="background: #5c343c"></i>
+					draft
+				</span>
+			{/if}
 			{#if stats.substitutions}
 				<span
 					class="flex items-center gap-1.5"

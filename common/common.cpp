@@ -2574,7 +2574,61 @@ static long long common_moe_steady_now_ms() {
             std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+// Per-stage share of what is left.
+//
+// The budget was one global deadline, so whichever stage happened to run while it
+// expired consumed everything and every stage after it was skipped in
+// milliseconds - and a skipped stage records "failed", which a cached entry
+// cannot tell apart from "measured and no good". That is how a run ends up
+// serving settings nothing measured.
+//
+// A stage now gets the remaining time in proportion to the candidates it plans,
+// against the candidates the whole run still plans, with slack so a stage may
+// overrun its exact share without eating its successors'. Stages already treat
+// budget_spent() as "stop and keep the best so far", so hitting a stage deadline
+// degrades to a shorter search rather than to nothing - and with the entry saved
+// after each stage, what it did measure survives.
+static std::atomic<long long> g_moe_stage_deadline_ms{0};
+static std::atomic<int>       g_moe_stage_planned{0};
+
+static void common_moe_stage_begin(const char * name, int planned) {
+    g_moe_stage_deadline_ms.store(0, std::memory_order_relaxed);
+    const long long global = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
+    if (global == 0 || planned <= 0) {
+        return;
+    }
+    const long long now = common_moe_steady_now_ms();
+    const long long left = global - now;
+    if (left <= 0) {
+        return;
+    }
+    const int planned_total = g_moe_planned_candidates.load(std::memory_order_relaxed);
+    const int done          = g_moe_candidate_count.load(std::memory_order_relaxed);
+    const int remaining     = std::max(planned, planned_total - done);
+    // 1.6x slack: a stage may run over its exact share (candidates vary in cost)
+    // without being able to claim the whole remainder.
+    const double share = 1.6 * (double) planned / (double) remaining;
+    const long long budget = (long long) ((double) left * std::min(1.0, share));
+    g_moe_stage_planned.store(planned, std::memory_order_relaxed);
+    g_moe_stage_deadline_ms.store(now + std::max(60000LL, budget), std::memory_order_relaxed);
+    LOG_DBG("%s: stage '%s' may use %llds of the %llds left (%d of %d candidates still planned)\n",
+            __func__, name, (long long) std::max(60000LL, budget) / 1000, left / 1000, planned, remaining);
+}
+
+static void common_moe_stage_end() {
+    g_moe_stage_deadline_ms.store(0, std::memory_order_relaxed);
+}
+
 static bool common_moe_calibrate_budget_spent() {
+    const long long stage = g_moe_stage_deadline_ms.load(std::memory_order_relaxed);
+    if (stage != 0 && common_moe_steady_now_ms() >= stage) {
+        static std::atomic<bool> stage_warned{false};
+        if (!stage_warned.exchange(true)) {
+            LOG_WRN("%s: a stage reached its own share of the budget and stopped early - later stages "
+                    "keep their share instead of being skipped entirely\n", __func__);
+        }
+        return true;
+    }
     const long long deadline = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
     if (deadline == 0 || common_moe_steady_now_ms() < deadline) {
         return false;
@@ -3929,6 +3983,7 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the offload threshold (GGML_OP_OFFLOAD_MIN_BATCH) on prompt processing ...\n", __func__);
         common_moe_calibration_status_set("measuring the MoE offload threshold");
+        common_moe_stage_begin("offload threshold", 5);
         g_moe_calib_measure_prefill.store(true);
         double best_pp = -1.0;
         // One server for all five. The threshold is read per op-assignment through
@@ -3969,6 +4024,7 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         common_moe_live_stop();
+        common_moe_stage_end();
         g_moe_calib_measure_prefill.store(false);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         entry.op_offload_min_batch = best_offload_min_batch;
@@ -4062,6 +4118,7 @@ void common_moe_calibrate(common_params & params) {
             // ordinary run-to-run noise).
             LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
             common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
+            common_moe_stage_begin("draft depth", 14);
             // No draft at all, measured exactly like every depth below. Without it
             // the search can only rank depths against each other, so it would ship
             // a depth even on a machine where speculative decoding loses outright.
@@ -4189,6 +4246,7 @@ void common_moe_calibrate(common_params & params) {
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
                 entry.spec_n_max = best_n_max;
                 checkpoint("draft depth");
+                common_moe_stage_end();
                 // The whole speculative-decoding stage wrote no row, so a model
                 // with a draft head showed nothing for it in the decisions table
                 // even though it is one of the largest levers such a model has.
@@ -4337,6 +4395,7 @@ void common_moe_calibrate(common_params & params) {
         LOG_INF("%s: measuring substitution aggressiveness at ncmoe=%u (degenerate output is rejected, "
                 "not ranked) ...\n", __func__, best_n);
         common_moe_calibration_status_set("measuring substitution aggressiveness");
+        common_moe_stage_begin("substitution ladder", 9);
         // Coarse ladder rather than a golden-section search: the response is
         // a quality cliff, not a smooth curve, and each point costs a full
         // server spawn on a budget that is already tight for slow models.
@@ -4540,6 +4599,7 @@ void common_moe_calibrate(common_params & params) {
             best_min_rank     = -1;
             best_min_rank_tps = 0.0;
         }
+        common_moe_stage_end();   // the confirm below is part of the decision, not of the search
         common_moe_live_stop();   // the confirm step below runs at a different length, with reasoning on
         const int confirm_predict = n_predict * 4;
 
@@ -5523,6 +5583,7 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring heat-aware neuron subsetting (it has been on at K=256, unmeasured) ...\n", __func__);
         common_moe_calibration_status_set("measuring neuron subsetting");
+        common_moe_stage_begin("neuron subsetting", 5);
         double best_neuron_tps = -1.0;
         for (const int k : { 0, 128, 256, 512 }) {
             if (common_moe_calibrate_budget_spent()) {
@@ -5566,6 +5627,7 @@ void common_moe_calibrate(common_params & params) {
                     string_format("SELECTED - %.2f tok/s", best_neuron_tps), true, true);
         }
     }
+    common_moe_stage_end();
     const std::string neuron_env = common_moe_calib_get_env();
 
     // The remaining knobs, each on/off against the incumbent. All three have been
@@ -5584,11 +5646,28 @@ void common_moe_calibrate(common_params & params) {
             { "coverage evict", "on",      "GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1", &best_coverage_evict },
             { "host buffer",    "512 MiB", "GGML_CUDA_MOE_CACHE_HOST_MB=512",      &best_host_mb        },
         };
+        // Group admit and coverage eviction are live policy knobs now, so those two
+        // are POSTed to the incumbent's own server rather than relaunching. The host
+        // buffer is not - it allocates - so it still needs its own launch.
         for (const auto & f : features) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
-            const double tps = measure_feature(f.label, f.value, neuron_env + " " + f.env);
+            const bool live_ok = g_moe_live_port > 0 && strcmp(f.label, "host buffer") != 0;
+            double tps = -1.0;
+            if (live_ok) {
+                const std::string key = strcmp(f.label, "group admit") == 0
+                        ? "GGML_CUDA_MOE_CACHE_GROUP_ADMIT" : "GGML_CUDA_MOE_CACHE_COVERAGE_EVICT";
+                tps = measure_live(string_format("{\"%s\": \"1\"}", key.c_str()), n_predict);
+                LOG_INF("%s:   %s=%s -> %s\n", __func__, f.label, f.value,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                common_moe_calibration_status_note(f.label, f.value,
+                        tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+                // put it back before the next feature is judged
+                (void) measure_live(string_format("{\"%s\": \"0\"}", key.c_str()), 1);
+            } else {
+                tps = measure_feature(f.label, f.value, neuron_env + " " + f.env);
+            }
             // Only adopted on a real gain over the incumbent - a tie keeps the
             // simpler configuration, and every one of these costs memory or work.
             const bool win = tps > 0 && incumbent > 0 && tps > incumbent * 1.02;
@@ -5611,6 +5690,7 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: sweeping the ranking and timing constants that shipped as guesses ...\n", __func__);
         common_moe_calibration_status_set("sweeping the tuning constants");
+        common_moe_stage_begin("tuning constants", 21);
         struct knob { const char * label; const char * env; const char * values[3]; };
         const knob knobs[] = {
             // read by eviction, admission and substitution - the widest blast radius
@@ -5684,6 +5764,7 @@ void common_moe_calibrate(common_params & params) {
         }
         }
         common_moe_live_stop();
+        common_moe_stage_end();
         common_moe_calib_set_env(carried);
     }
 
@@ -6040,6 +6121,30 @@ bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & 
     const size_t need = ((size_t) rows * (size_t) cols + 7) / 8;
     out_bits.assign(need, 0);
     if (!ggml_moe_cache.get_substitute_map(out_bits.data(), (int) out_bits.size(), &rows, &cols)) {
+        out_bits.clear();
+        return false;
+    }
+    out_rows = rows;
+    out_cols = cols;
+    return true;
+}
+
+// Which (layer,expert) cells belong to the speculative draft rather than the
+// target. A live snapshot, unlike the substitute map, which is read-and-cleared.
+bool common_moe_cache_get_draft_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols) {
+    out_rows = 0;
+    out_cols = 0;
+    if (!ggml_moe_cache.get_draft_map) {
+        return false;
+    }
+    int rows = 0, cols = 0;
+    ggml_moe_cache.get_draft_map(nullptr, 0, &rows, &cols);
+    if (rows <= 0 || cols <= 0) {
+        return false;
+    }
+    const size_t need = ((size_t) rows * (size_t) cols + 7) / 8;
+    out_bits.assign(need, 0);
+    if (!ggml_moe_cache.get_draft_map(out_bits.data(), (int) out_bits.size(), &rows, &cols)) {
         out_bits.clear();
         return false;
     }

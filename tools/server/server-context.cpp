@@ -5156,9 +5156,27 @@ void server_routes::init_routes() {
         // GGML_CUDA_MOE_CACHE_NEURON_HEAT is enabled server-side - omitted
         // entirely otherwise, so the UI can tell "not measured" from "flat
         // zero" without a magic sentinel in the JSON itself.
+        // Which cells are the speculative draft's. Same shape and encoding as the
+        // maps above; a live snapshot, so unlike "substitutions" it is not consumed
+        // by reading. Absent entirely when no draft is loaded.
+        std::vector<uint8_t> draft_bits;
+        int draft_rows = 0, draft_cols = 0;
+        std::string draft_hex;
+        if (common_moe_cache_get_draft_map(draft_bits, draft_rows, draft_cols) &&
+            draft_rows == rows && draft_cols == cols) {
+            draft_hex.reserve(draft_bits.size() * 2);
+            for (uint8_t b : draft_bits) {
+                draft_hex.push_back(hex_digits[b >> 4]);
+                draft_hex.push_back(hex_digits[b & 0xf]);
+            }
+        }
+
         std::vector<float> concentration;
         int conc_rows = 0, conc_cols = 0;
         json body = {{"rows", rows}, {"cols", cols}, {"map", map_hex}, {"hits", hits_hex}, {"substitutions", sub_hex}, {"seq", seq}, {"stats", stats}};
+        if (!draft_hex.empty()) {
+            body["draft"] = draft_hex;
+        }
         if (common_moe_cache_get_neuron_concentration_map(concentration, conc_rows, conc_cols) &&
             conc_rows == rows && conc_cols == cols) {
             body["neuron_concentration"] = concentration;

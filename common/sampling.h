@@ -88,11 +88,21 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 // each token in `draft`, same length as `draft`. When null, behavior is unchanged from
 // before this parameter existed - exact-match-only acceptance. When set, a draft token
 // that doesn't exactly match the target's independently-sampled token at that position
-// gets one more chance: accepted anyway with probability min(1, p_target/p_draft) - the
-// classic speculative-decoding acceptance test - before falling back to the target's own
-// sample. This is a strict superset of exact-match acceptance (every case it accepts,
-// exact-match also accepts, plus some it doesn't), so it can only raise or match the
-// accept rate for the same draft/target pair, never lower it.
+// gets one more chance: accepted anyway with probability min(1, p_target/p_draft) before
+// falling back to the target's own sample. This is a strict superset of exact-match
+// acceptance (every case it accepts, exact-match also accepts, plus some it doesn't), so
+// it can only raise or match the accept rate for the same draft/target pair.
+//
+// It is NOT the classic speculative-decoding test, and it does NOT preserve the target's
+// output distribution. That test pairs the same alpha with sampling a REJECTED position
+// from the residual norm(max(0, p_target - p_draft)); here a rejection falls back to the
+// target's ordinary sample. A token the draft favours can therefore be accepted by the
+// alpha test and also drawn on rejection, leaving it over-represented. The shift is small
+// at high acceptance and grows as the draft diverges.
+//
+// Exact-match mode (draft_probs == nullptr) has no such shift: match or mismatch, the
+// emitted token is the target's own sample, so the output distribution is exactly the
+// target's.
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first = false, const std::vector<float> * draft_probs = nullptr);
 
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
