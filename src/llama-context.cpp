@@ -660,9 +660,23 @@ void llama_context::sched_reserve() {
         ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session);
         moe_cache_session = nullptr;
     }
-    // A draft context predicts its target, so it is served exact experts: a
-    // stand-in there only lowers acceptance. The target keeps substitution.
-    ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr);
+    // A draft context predicts its target, so by default it is served exact
+    // experts: a stand-in there only lowers acceptance, and the target keeps
+    // substitution either way. That default only matters when the draft's experts
+    // are CPU-offloaded - left on the GPU (its own n_gpu_layers resolves to every
+    // layer, and the target's -ncmoe is not applied to it) nothing of the draft
+    // reaches this cache and the flag is inert.
+    //
+    // When they ARE offloaded the trade reverses and is worth measuring: a miss
+    // then costs a host/NVMe read, which is far more expensive than a slightly
+    // worse guess, and a bad draft token is only a lost acceptance, never wrong
+    // output. GGML_CUDA_MOE_CACHE_DRAFT_EXACT=0 allows stand-ins in the draft;
+    // calibration sets it when the draft placement stage chose CPU.
+    const bool draft_exact = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_DRAFT_EXACT");
+        return !env || atoi(env) != 0;
+    }();
+    ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr && draft_exact);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -702,7 +716,7 @@ void llama_context::sched_reserve() {
                 if (moe_cache_session_retry) {
                     ggml_backend_sched_adopt_moe_cache_session(sched.get(), moe_cache_session_retry);
                 }
-                ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr);
+                ggml_backend_sched_set_moe_cache_exact(sched.get(), cparams.ctx_other != nullptr && draft_exact);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
