@@ -5763,9 +5763,14 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
     // The variable is read on every call rather than cached so a value set after
     // the first graph is honoured too; it is a getenv on the scheduler's
     // op-assignment path, negligible beside the op itself.
-    const char * env = getenv("GGML_OP_OFFLOAD_MIN_BATCH");
-    const int min_batch = env && atoi(env) > 0 ? atoi(env) : dev_ctx->op_offload_min_batch_size;
-    return get_op_batch_size(op) >= min_batch;
+    // Through the moe-cache tunables registry, not getenv: a runtime override
+    // (POST /moe-tuning) cannot change this process's environment, and this
+    // threshold decides which batches the expert cache gets to serve at all.
+    // Falls back to the device's registration-time value when nothing is set.
+    extern int ggml_moe_cache_tunable_int(const char * name, int def);
+    const int min_batch = ggml_moe_cache_tunable_int(
+            "GGML_OP_OFFLOAD_MIN_BATCH", dev_ctx->op_offload_min_batch_size);
+    return get_op_batch_size(op) >= (min_batch > 0 ? min_batch : dev_ctx->op_offload_min_batch_size);
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {

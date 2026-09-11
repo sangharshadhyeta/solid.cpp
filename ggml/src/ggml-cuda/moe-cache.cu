@@ -1293,6 +1293,17 @@ static T moe_cache_tunable(const char * name, T def, std::atomic<uint32_t> & see
     return cached.load(std::memory_order_acquire);
 }
 
+// Exported (not static) so other translation units in this backend - the
+// scheduler's op-offload decision in ggml-cuda.cu - can read a live knob through
+// the same registry instead of getenv, which a runtime override cannot reach.
+int ggml_moe_cache_tunable_int(const char * name, int def) {
+    if (!name) {
+        return def;
+    }
+    const std::string raw = moe_cache_tunable_raw(name);
+    return raw.empty() ? def : atoi(raw.c_str());
+}
+
 #define MOE_CACHE_TUNABLE_INT(name, def)                                        \
     ([]() -> int {                                                              \
         static std::atomic<uint32_t> seen{0};                                   \
