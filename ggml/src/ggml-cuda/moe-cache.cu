@@ -1219,6 +1219,84 @@ static double moe_cache_wall_clock() {
     return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
+// ---------------------------------------------------------------------
+// Live tunables.
+//
+// Every policy knob here used to latch its environment variable in a
+// `static const` lambda on first use, so changing one meant restarting the
+// process. Calibration paid for that: ~80% of a candidate's ~49s was loading
+// 88 GB from NVMe to measure ~10s of generation, once per knob VALUE.
+//
+// An override set through moe_cache_set_tunable() wins over the environment and
+// bumps a generation counter; each call site caches its parsed value and
+// re-reads only when the generation moves. So the steady-state cost is one
+// relaxed atomic load, and a sweep can measure many values in one process.
+//
+// Only policy knobs can work this way. Anything that decides an allocation -
+// expert-cache size, placement, ubatch - is fixed once the pools exist and
+// still needs a reload; those are left latched on purpose.
+static std::mutex                                    g_tunables_mu;
+static std::unordered_map<std::string, std::string>  g_tunables;
+static std::atomic<uint32_t>                         g_tunables_gen{1};
+
+static void moe_cache_set_tunable(const char * name, const char * value) {
+    if (!name || !*name) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_tunables_mu);
+        if (value && *value) {
+            g_tunables[name] = value;
+        } else {
+            g_tunables.erase(name);   // empty value clears the override, back to the environment
+        }
+    }
+    g_tunables_gen.fetch_add(1, std::memory_order_release);
+}
+
+static std::string moe_cache_tunable_raw(const char * name) {
+    {
+        std::lock_guard<std::mutex> lock(g_tunables_mu);
+        const auto it = g_tunables.find(name);
+        if (it != g_tunables.end()) {
+            return it->second;
+        }
+    }
+    const char * env = getenv(name);
+    return env ? std::string(env) : std::string();
+}
+
+// Cache one parsed value per call site, refreshed when an override lands.
+// `parse` receives the raw string and returns the value; it is called only on a
+// miss, so it may be as expensive as it likes.
+template <typename T, typename Parse>
+static T moe_cache_tunable(const char * name, T def, std::atomic<uint32_t> & seen,
+                           std::atomic<T> & cached, Parse parse) {
+    const uint32_t gen = g_tunables_gen.load(std::memory_order_acquire);
+    if (seen.load(std::memory_order_acquire) != gen) {
+        const std::string raw = moe_cache_tunable_raw(name);
+        cached.store(raw.empty() ? def : parse(raw), std::memory_order_release);
+        seen.store(gen, std::memory_order_release);
+    }
+    return cached.load(std::memory_order_acquire);
+}
+
+#define MOE_CACHE_TUNABLE_INT(name, def)                                        \
+    ([]() -> int {                                                              \
+        static std::atomic<uint32_t> seen{0};                                   \
+        static std::atomic<int>      cached{(def)};                             \
+        return moe_cache_tunable<int>((name), (def), seen, cached,              \
+                [](const std::string & v) { return atoi(v.c_str()); });         \
+    }())
+
+#define MOE_CACHE_TUNABLE_DOUBLE(name, def)                                     \
+    ([]() -> double {                                                           \
+        static std::atomic<uint32_t> seen{0};                                   \
+        static std::atomic<double>   cached{(def)};                             \
+        return moe_cache_tunable<double>((name), (def), seen, cached,           \
+                [](const std::string & v) { return atof(v.c_str()); });         \
+    }())
+
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
@@ -1564,12 +1642,8 @@ static constexpr int MOE_CACHE_EVICT_WINDOW = 32;
 // which is the point. Calibration searches them now; these values only apply
 // when it has not run.
 static int moe_cache_evict_window() {
-    static const int n = [] {
-        const char * e = getenv("GGML_CUDA_MOE_CACHE_EVICT_WINDOW");
-        const int v = e ? atoi(e) : 8;
-        return v < 1 ? 1 : (v > MOE_CACHE_EVICT_WINDOW ? MOE_CACHE_EVICT_WINDOW : v);
-    }();
-    return n;
+    const int v = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_EVICT_WINDOW", 8);
+    return v < 1 ? 1 : (v > MOE_CACHE_EVICT_WINDOW ? MOE_CACHE_EVICT_WINDOW : v);
 }
 
 // Two things were tried and measured here before landing on this one:
@@ -1652,12 +1726,8 @@ static bool moe_cache_colder_enough(double a_score, double b_score) {
 // calibration sweeps it. (A real bandwidth profiler exists further up, but it
 // measures device-side contention - a different hop than this host-storage tier.)
 static double moe_cache_cost_tier_nvme() {
-    static const double value = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_COST_TIER_NVME");
-        const double v = env ? atof(env) : 5.8;
-        return v > 0.0 ? v : 5.8;
-    }();
-    return value;
+    const double v = MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_COST_TIER_NVME", 5.8);
+    return v > 0.0 ? v : 5.8;
 }
 static constexpr double MOE_CACHE_COST_TIER_RAM  = 1.0;
 
@@ -2101,12 +2171,8 @@ static double moe_cache_weighted_heat(const moe_cache_device & device, const moe
 static constexpr int MOE_CACHE_PROTECTED_CAP_PCT = 50;
 
 static int moe_cache_protected_cap_pct() {
-    static const int n = [] {
-        const char * e = getenv("GGML_CUDA_MOE_CACHE_PROTECTED_CAP_PCT");
-        const int v = e ? atoi(e) : MOE_CACHE_PROTECTED_CAP_PCT;
-        return v < 1 ? 1 : (v > 99 ? 99 : v);
-    }();
-    return n;
+    const int v = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_PROTECTED_CAP_PCT", MOE_CACHE_PROTECTED_CAP_PCT);
+    return v < 1 ? 1 : (v > 99 ? 99 : v);
 }
 
 // Coldest-first, bounded-window pick from a segment, skipping anything with
@@ -3608,12 +3674,8 @@ static const void * moe_cache_prefill_wait(
 // a full pass over the residency maps, too rarely lets the cold flags go stale.
 // GGML_CUDA_MOE_CACHE_COLD_SWEEP_S makes it measurable.
 static std::chrono::seconds moe_cache_cold_sweep_interval() {
-    static const std::chrono::seconds value = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_COLD_SWEEP_S");
-        const int v = env ? atoi(env) : 3;
-        return std::chrono::seconds{v > 0 ? v : 3};
-    }();
-    return value;
+    const int v = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_COLD_SWEEP_S", 3);
+    return std::chrono::seconds{v > 0 ? v : 3};
 }
 
 // Defined further down, next to the other cache-policy helpers; used by the
@@ -7706,10 +7768,10 @@ static bool moe_cache_neuron_heat_enabled() {
 // outright - same "never override an explicit choice" rule as everywhere
 // else in this file.
 static int moe_cache_substitute_min_rank(moe_cache_device & device) {
-    const char * pinned_env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK");
-    if (pinned_env) {
-        const int n = atoi(pinned_env);
-        return n < 0 ? 0 : n;
+    // -1 means "no pin, use the pace-driven floor below"; a live override lands here.
+    const int pinned = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK", -1);
+    if (pinned >= 0) {
+        return pinned;
     }
 
     // How far above this system's own recent-normal pace counts as "falling
@@ -7770,11 +7832,7 @@ static int moe_cache_substitute_min_rank(moe_cache_device & device) {
 // only applies when calibration has not run - it is a starting point, not a
 // decision.
 static double moe_cache_substitute_quality_sigma() {
-    static const double k = [] {
-        const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA");
-        return e ? atof(e) : 1.0;
-    }();
-    return k;
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA", 1.0);
 }
 
 // Do we positively know this expert's pages are NOT in the page cache? False
@@ -12152,11 +12210,8 @@ static const void * moe_cache_host_ptr(const void * host_base, int expert) {
 // their heat is zero and moe_cache_pick_coldest_unpinned ranks them coldest.
 // Adapted from the ring in thecodacus's fork, into this pool rather than beside it.
 static int moe_cache_ring_target(const moe_cache_pool & pool) {
-    static const int pct = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_RING_PCT");
-        const int v = env ? atoi(env) : 0;
-        return v < 0 ? 0 : (v > 50 ? 50 : v);
-    }();
+    const int raw = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_RING_PCT", 0);
+    const int pct = raw < 0 ? 0 : (raw > 50 ? 50 : raw);
     return pct > 0 ? std::max(1, pool.n_slots * pct / 100) : 0;
 }
 
@@ -12733,6 +12788,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.session_create = moe_cache_session_create;
     ggml_moe_cache.session_share = moe_cache_session_share;
     ggml_moe_cache.session_enter_exact = moe_cache_session_enter_exact;
+    ggml_moe_cache.set_tunable = moe_cache_set_tunable;
     ggml_moe_cache.session_destroy = moe_cache_session_destroy;
     ggml_moe_cache.session_enter = moe_cache_session_enter;
     ggml_moe_cache.session_leave = moe_cache_session_leave;
