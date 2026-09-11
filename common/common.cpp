@@ -3440,6 +3440,7 @@ void common_moe_calibrate(common_params & params) {
         if (params.speculative.has_dft()) {
             est += 6;                                                // spec-draft-n-max envelope doubling
             est += 2;                                                 // no-draft baseline + draft placement
+            est += 2;                                                 // depth winner + runner-up measured again
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
             est += 2;                                                 // spec-prob-accept: off, on
             est += 2;                                                 // drafter cascade: mtp alone, ngram-suffix in front
@@ -3606,11 +3607,21 @@ void common_moe_calibrate(common_params & params) {
             // drafter cascade with it - four MTP knobs behind one fragile
             // candidate. A failure now costs only its own rung.
             int n_failures = 0;
+            // Stop once two rungs in a row come in below the best so far - past the
+            // peak, measured, rather than "below half of depth 1", which on
+            // Qwen3.8-Flash-Next let the envelope run to 32 (2.66 tok/s is still
+            // above half of 4.59) after the peak at 8 and spend three candidates
+            // on depths that were never going to win.
+            double best_so_far = -1.0;
+            int    n_below     = 0;
             for (int n = 1; n <= 32; n *= 2) {
                 const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                 nmax_trace[n] = tps;
                 LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
                         tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                common_moe_calibration_status_note("speculative depth", string_format("n-max %d", n),
+                        tps > 0 ? string_format("%.2f tok/s%s", tps, common_moe_last_acceptance_str().c_str())
+                                : std::string("failed"), tps > 0);
                 common_moe_calibration_status_candidate_done();
                 if (tps > 0 && baseline <= 0.0) {
                     baseline = tps; // first depth that stood up anchors the collapse test
@@ -3625,10 +3636,13 @@ void common_moe_calibrate(common_params & params) {
                     continue;
                 }
                 n_failures = 0;
-                if (baseline > 0 && tps < baseline * 0.5) {
+                last_good = n; // the golden search may still land between this rung and the peak
+                if (tps > best_so_far) {
+                    best_so_far = tps;
+                    n_below     = 0;
+                } else if (++n_below >= 2) {
                     break;
                 }
-                last_good = n;
             }
             const int nmax_hi = std::max(1, last_good);
 
@@ -3643,6 +3657,9 @@ void common_moe_calibrate(common_params & params) {
                     const double tps = bench_with_retry(best_n, n, params.speculative.draft.mparams.path, n_threads_default);
                     LOG_INF("%s:   spec-draft-n-max=%d -> %s%s\n", __func__, n, tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
                         tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                common_moe_calibration_status_note("speculative depth", string_format("n-max %d", n),
+                        tps > 0 ? string_format("%.2f tok/s%s", tps, common_moe_last_acceptance_str().c_str())
+                                : std::string("failed"), tps > 0);
                     common_moe_calibration_status_candidate_done();
                     return tps;
                 };
@@ -3662,16 +3679,43 @@ void common_moe_calibrate(common_params & params) {
                         best_n_max = kv.first;
                     }
                 }
+                // Every depth above is one short probe, and a single lucky sample can
+                // win outright - on Qwen3.8-Flash-Next depth 8 read 6.59 tok/s between
+                // neighbours at 4.40-5.10. Measure the top two again and decide on the
+                // mean of both samples each.
+                {
+                    int runner_up = -1;
+                    for (const auto & kv : nmax_trace) {
+                        if (kv.first != best_n_max && kv.second > 0 &&
+                            (runner_up < 0 || kv.second > nmax_trace.at(runner_up))) {
+                            runner_up = kv.first;
+                        }
+                    }
+                    for (const int depth : { best_n_max, runner_up }) {
+                        if (depth <= 0 || common_moe_calibrate_budget_spent()) {
+                            continue;
+                        }
+                        const double again = bench_with_retry(best_n, depth, params.speculative.draft.mparams.path, n_threads_default);
+                        common_moe_calibration_status_candidate_done();
+                        if (again > 0) {
+                            LOG_INF("%s:   spec-draft-n-max=%d measured again -> %.2f tok/s (first %.2f, mean %.2f)%s\n",
+                                    __func__, depth, again, nmax_trace.at(depth), (again + nmax_trace.at(depth)) / 2.0,
+                                    common_moe_last_acceptance_str().c_str());
+                            nmax_trace[depth] = (again + nmax_trace.at(depth)) / 2.0;
+                        }
+                    }
+                    if (runner_up > 0 && nmax_trace.at(runner_up) > nmax_trace.at(best_n_max)) {
+                        best_n_max = runner_up;
+                    }
+                }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
                 // The whole speculative-decoding stage wrote no row, so a model
                 // with a draft head showed nothing for it in the decisions table
                 // even though it is one of the largest levers such a model has.
-                for (const auto & kv : nmax_trace) {
-                    common_moe_calibration_status_note("speculative depth",
-                            string_format("n-max %d", kv.first),
-                            kv.second > 0 ? string_format("%.2f tok/s", kv.second) : std::string("failed"),
-                            kv.second > 0, /* chosen */ kv.first == best_n_max);
-                }
+                common_moe_calibration_status_note("speculative depth",
+                        string_format("n-max %d", best_n_max),
+                        string_format("SELECTED - %.2f tok/s (mean of two samples where confirmed)", nmax_trace.at(best_n_max)),
+                        true, /* chosen */ true);
                 // The n_max search's own winning number (MTP active) is the
                 // real answer for this deployment, not the earlier ncmoe-only
                 // number (MTP off) - carry it forward so the final report and
