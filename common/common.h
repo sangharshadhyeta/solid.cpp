@@ -334,9 +334,22 @@ struct common_params_speculative_draft {
     // off by default - exact-match-only verification, unchanged from before this existed.
     // when on, a draft token that doesn't exactly match the target's independently-sampled
     // token gets a second chance: accepted anyway with probability min(1, p_target/p_draft)
-    // (the classic speculative-decoding acceptance test) before falling back to the
-    // target's own sample. Strictly raises or matches accept rate versus exact-match-only,
-    // never lowers it - see common_sampler_sample_and_accept_n() in common/sampling.h.
+    // before falling back to the target's own sample. Raises the accept rate; it does not
+    // lower it.
+    //
+    // NOT distribution-preserving, despite resembling the classic speculative-decoding
+    // test. That test also requires that a REJECTED draft token be replaced by a sample
+    // from the residual distribution norm(max(0, p_target - p_draft)); this implementation
+    // falls back to the target's ordinary sample instead (common/sampling.cpp, the
+    // `common_sampler_accept(gsmpl, id, ...)` after the alpha test). A token the draft
+    // favours can therefore be accepted by the alpha test AND drawn again on rejection, so
+    // it ends up over-represented relative to the target's own distribution.
+    //
+    // The bias is small at high acceptance and grows as the draft diverges. Exact-match
+    // mode has no such shift: a match yields the target's token and a mismatch yields the
+    // target's token, so the output is exactly the target's distribution. That is why this
+    // is off by default and why calibration measures it as a throughput knob rather than
+    // treating it as free.
     // Currently only MTP tracks a real per-token probability; other drafters (pattern-
     // matching ones like ngram-suffix) are treated as maximally confident (1.0) for their
     // own tokens, which still lets this help without requiring every drafter to change.
@@ -978,6 +991,7 @@ bool common_moe_cache_get_expert_map(std::vector<uint8_t> & out_bytes, int & out
 // correct for exactly one poller. Returns false under the same conditions
 // as get_expert_map.
 bool common_moe_cache_get_substitute_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols);
+bool common_moe_cache_get_draft_map(std::vector<uint8_t> & out_bits, int & out_rows, int & out_cols);
 
 // Live per-(layer,expert) neuron concentration (dead-neuron-fraction
 // proxy, 0.0-1.0, -1.0 for no data yet), same rows/cols shape convention

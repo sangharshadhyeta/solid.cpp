@@ -2255,11 +2255,7 @@ static constexpr size_t MOE_CACHE_MAX_PARTNERS = 32;
 // calibrated log-additive) lost to rank aggregation because one factor's range
 // dominated. See docs/plan.md.
 static bool moe_cache_coverage_evict_enabled() {
-    static const bool on = [] {
-        const char * e = getenv("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT");
-        return e && atoi(e) != 0;
-    }();
-    return on;
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT", 0) != 0;
 }
 
 // Rank-combined victim choice over the same LRU window the heat-only scan uses.
@@ -7656,11 +7652,7 @@ static bool moe_cache_measure_pred_enabled() {
 
 // Step 7a follow-on: group-aware admission. Off by default.
 static bool moe_cache_group_admit_enabled() {
-    static const bool on = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_GROUP_ADMIT");
-        return env && atoi(env) != 0;
-    }();
-    return on;
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_GROUP_ADMIT", 0) != 0;
 }
 
 // partner_best has two consumers now - the 7a measurement and group

@@ -288,6 +288,13 @@ export interface ApiExpertMapResponse {
 	 * Empty string when the provider has nothing to report (older builds,
 	 * or a mid-poll shape mismatch) - treat as "no substitutions this poll". */
 	substitutions: string;
+	/** Bitset (1 bit/cell, same shape as `map`) of cells belonging to the
+	 * speculative draft rather than the target. A live snapshot, not
+	 * read-and-cleared: a tensor's role never changes. Absent entirely when no
+	 * draft is loaded, or when the draft's experts are GPU-resident and so never
+	 * enter the expert cache at all. The draft keeps its own pools, heat and knob
+	 * values, so these cells are shown in their own hue family. */
+	draft?: string;
 	/** Live per-cell dead-neuron-fraction proxy (0.0-1.0, -1.0 = no data
 	 * yet), same rows x cols shape as `map`, row-major flat array. Only
 	 * present when the server has GGML_CUDA_MOE_CACHE_NEURON_HEAT enabled
