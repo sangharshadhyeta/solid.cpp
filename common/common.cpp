@@ -2196,6 +2196,10 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
 // among them) call this directly instead, so a 600s budget sailed 26 minutes
 // past its deadline with 89 more projected. Zero means "no deadline set".
 static std::atomic<long long> g_moe_calibrate_deadline_ms{0};
+// How many of the reproducibility probes agreed for the first configuration this
+// calibration measured - the noise floor later candidates are judged against.
+// -1 until something has been measured.
+static std::atomic<int> g_moe_repro_floor{-1};
 static std::atomic<bool>      g_moe_calibrate_budget_warned{false};
 
 static long long common_moe_steady_now_ms() {
@@ -2268,7 +2272,15 @@ static double common_moe_bench_candidate_server(
     // FR-Spec vocab trimming toward this benchmark's own prompt pool
     // instead of real traffic.
     char cache_arg[32];
-    snprintf(cache_arg, sizeof(cache_arg), moe_cache_mb > 0 ? "%d" : "auto", moe_cache_mb);
+    // 0 is a real candidate - the cache switched off - not "unset": on
+    // Qwen3.8-Flash-Next the cache is the only source of run-to-run variation
+    // (five greedy repeats byte-identical with it off), so whether it earns its
+    // place has to be measured, not assumed.
+    if (moe_cache_mb == 0) {
+        snprintf(cache_arg, sizeof(cache_arg), "off");
+    } else {
+        snprintf(cache_arg, sizeof(cache_arg), moe_cache_mb > 0 ? "%d" : "auto", moe_cache_mb);
+    }
     // -fitt controls the VRAM margin common_maybe_raise_moe_for_ctx reserves
     // before deciding placement, and that margin is what silently raises
     // -ncmoe until the requested context fits. Passing it through means a
@@ -2474,11 +2486,28 @@ static double common_moe_bench_candidate_server(
             for (const auto & a : answers) {
                 modal = std::max(modal, (int) std::count(answers.begin(), answers.end(), a));
             }
-            if (!answers.empty() && modal * 2 <= (int) answers.size()) {
-                LOG_WRN("%s: candidate rejected - not reproducible: the same request at the same seed, "
-                        "sampled greedily, agreed only %d times in %zu at %.2f tok/s. A forward pass that "
-                        "varies run to run is reading memory it does not own, and no throughput redeems it\n",
-                        __func__, modal, answers.size(), result_tps);
+            // Exact agreement is not a property this stack has even when correct:
+            // the expert cache admits experts between requests by design, and an
+            // expert computed on the GPU and on the CPU goes through different
+            // quantized dot products, so identical greedy requests can diverge by a
+            // word as the cache warms. Measured on Qwen3.8-Flash-Next: 1 of 5
+            // agreed, all five fluent and saying the same thing - and the
+            // substitution-free baseline failed the absolute test the same way.
+            // So judge against the noise this run actually has: the first
+            // configuration measured sets the floor, and a candidate is rejected
+            // only for agreeing less than that. Garbage is still caught by the
+            // degeneracy check above; corruption shows up as worse than the floor.
+            int repro_floor = g_moe_repro_floor.load();
+            if (repro_floor < 0 && !answers.empty()) {
+                g_moe_repro_floor.store(modal);
+                repro_floor = modal;
+                LOG_INF("%s: reproducibility repro_floor for this run: %d of %zu greedy repeats agree\n",
+                        __func__, modal, answers.size());
+            }
+            if (!answers.empty() && modal < repro_floor) {
+                LOG_WRN("%s: candidate rejected - less reproducible than this run's baseline: %d of %zu "
+                        "greedy repeats agreed against a repro_floor of %d, at %.2f tok/s\n",
+                        __func__, modal, answers.size(), repro_floor, result_tps);
                 common_moe_calibration_status_note("output check", "reproducibility",
                         string_format("rejected - %d of %zu agreed (was %.2f tok/s)",
                                 modal, answers.size(), result_tps), false);
@@ -2727,6 +2756,22 @@ void common_moe_calibrate(common_params & params) {
     common_enforce_moe_cache_parallel_limit(params, cparams);
     const int concurrency = std::max(1, (int) params.n_parallel);
 
+    // Free device memory, sampled now - before any candidate server exists.
+    // The expert-cache size ladder below is derived from this. It cannot be
+    // read at that stage instead: by then a child server is holding the model
+    // and the card looks nearly full, which would collapse the ladder to its
+    // smallest rung for reasons that have nothing to do with this model.
+    size_t calib_free_vram_bytes = 0;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            continue;
+        }
+        size_t dfree = 0, dtotal = 0;
+        ggml_backend_dev_memory(dev, &dfree, &dtotal);
+        calib_free_vram_bytes = std::max(calib_free_vram_bytes, std::min(dfree, dtotal));
+    }
+
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
     common_moe_calibration_status_set("probing safe MoE CPU-offload floor");
     // Probe with the SAME margin common_maybe_raise_moe_for_ctx will demand at
@@ -2842,6 +2887,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calibrate_budget_warned.store(false);
     g_moe_calibrate_deadline_ms.store(
             common_moe_steady_now_ms() + (long long) (calibration_budget_s * 1000.0));
+    g_moe_repro_floor.store(-1);
     LOG_INF("%s: time budget for this run: %.0fs (GGML_MOE_CALIBRATE_BUDGET_S)\n", __func__, calibration_budget_s);
 
     const std::string self_exe = common_self_exe_path();
@@ -3178,10 +3224,17 @@ void common_moe_calibrate(common_params & params) {
             best_min_rank     = subst_off_rank;
         }
 
+        // Whether any rung was actually measured. The reference run alone takes
+        // minutes on a model that does not fit, and on Qwen3.8-Flash-Next it used
+        // the rest of the budget: the ladder never ran, and the "substitution
+        // off" placeholder below was cached as if it had been measured, so every
+        // later launch applied it and the runtime default never got a say.
+        bool ladder_ran = false;
         for (const int rank : {10, 6, 4, 2, 1, 0}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
+            ladder_ran = true;
             std::string cand_text;
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
@@ -3229,6 +3282,13 @@ void common_moe_calibrate(common_params & params) {
         // re-measure the winner at 4x the probe length and, if the guard
         // rejects it there, fall back one rung toward the safe end and
         // confirm that instead.
+        if (!ladder_ran && best_min_rank == subst_off_rank) {
+            LOG_WRN("%s:   substitution ladder did not run before the time budget was spent - recording it as "
+                    "not calibrated rather than off, so the runtime default applies until a run measures it\n",
+                    __func__);
+            best_min_rank     = -1;
+            best_min_rank_tps = 0.0;
+        }
         while (best_min_rank >= 0 && !common_moe_calibrate_budget_spent()) {
             const int confirm_predict = n_predict * 4;
             // Say so. This step re-runs the winner at 4x the probe length and
@@ -3243,6 +3303,11 @@ void common_moe_calibrate(common_params & params) {
                     confirm_predict, concurrency, -1, -1, active_ngl, best_min_rank);
             common_moe_calibration_status_candidate_done();
             if (tps > 0) {
+                // The ladder's best may belong to a rank this step has since backed
+                // away from - rank 2 measured 24.27 tok/s on Qwen3.8-Flash-Next, did
+                // not hold, and rank 6 was confirmed at 9.80 while 24.27 was the
+                // number logged and cached. Report what was actually confirmed.
+                best_min_rank_tps = tps;
                 LOG_INF("%s:   rank %d confirmed over %d tokens -> %.2f tok/s\n",
                         __func__, best_min_rank, confirm_predict, tps);
                 common_moe_calibration_status_note("substitution floor",
@@ -3578,7 +3643,31 @@ void common_moe_calibrate(common_params & params) {
     LOG_INF("%s: finding expert-cache size knee (growing while it still helps) at ncmoe=%u ...\n",
             __func__, best_n);
     common_moe_calibration_status_set("searching expert-cache VRAM budget size");
-    static const int cache_candidates_mb[] = {512, 1024, 2048, 4096, 6144, 8192, 12288, 16384};
+    // Derived from this GPU, not a fixed list. The runtime clamps the cache to
+    // what is actually free after the model and KV cache land
+    // (available = free + already-allocated - reserve), so any rung above that
+    // ceiling is silently the same configuration as the one below it: on a
+    // 12 GiB card the old ladder's 6144/8192/12288/16384 rungs were four extra
+    // server spawns all measuring the same thing, on a stage that already ran
+    // out of time before reaching them. Measured on this box: a 12 GiB card
+    // serving Qwen3.8-Flash-Next settles at a 3966 MiB budget, so the ceiling
+    // is what free VRAM allows, never the card's nominal size.
+    //
+    // 0 = cache off, measured first. The pick below takes the smallest
+    // candidate within 3% of the best, so off wins a tie - and off is also
+    // the only configuration whose greedy output is exactly reproducible.
+    std::vector<int> cache_candidates_mb = { 0 };
+    {
+        // Free, not total: the cache is only ever offered what is left. Sampled
+        // at the top of this function, before any candidate server took the card.
+        const int cap_mb = (int) (calib_free_vram_bytes >> 20);
+        for (int mb = 512; mb <= cap_mb; mb *= 2) {
+            cache_candidates_mb.push_back(mb);
+        }
+        LOG_INF("%s: expert-cache size candidates derived from %d MiB of free device memory: %zu rung(s) up to %d MiB\n",
+                __func__, cap_mb, cache_candidates_mb.size() - 1,
+                cache_candidates_mb.size() > 1 ? cache_candidates_mb.back() : 0);
+    }
     // Test every candidate rather than stopping at the first non-improving
     // step: the curve is not guaranteed monotonic below the knee - our own
     // sweep found a placement cliff at small cache sizes (too little VRAM
@@ -3588,7 +3677,7 @@ void common_moe_calibrate(common_params & params) {
     // of the *global* max, after seeing the whole curve, is robust to that
     // dip in a way a running best-so-far comparison is not.
     std::vector<std::pair<int, double>> cache_results;
-    for (size_t i = 0; i < sizeof(cache_candidates_mb) / sizeof(cache_candidates_mb[0]); i++) {
+    for (size_t i = 0; i < cache_candidates_mb.size(); i++) {
         const int mb = cache_candidates_mb[i];
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
@@ -4212,6 +4301,21 @@ static bool common_maybe_autoplace_moe_cpu(
             // already decided and calibration should not second-guess it.
             const char * cache_mode_env = getenv("GGML_CUDA_MOE_CACHE_MODE");
             const bool cache_mode_is_auto = !cache_mode_env || std::string(cache_mode_env) == "auto";
+            // A calibrated 0 means calibration measured the cache off as the winner:
+            // apply it the way --moe-cache off does, not as "unset" (which left the
+            // cache on under auto and silently overrode the measurement).
+            if (cached.moe_cache_mb == 0 && cache_mode_is_auto && use_placement) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE", "0");
+                _putenv_s("GGML_CUDA_MOE_CACHE_MODE", "off");
+                _putenv_s("GGML_CUDA_MOE_CACHE_BUDGET_MB", "");
+#else
+                setenv("GGML_CUDA_MOE_CACHE", "0", 1);
+                setenv("GGML_CUDA_MOE_CACHE_MODE", "off", 1);
+                unsetenv("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+#endif
+                LOG_WRN("%s: using calibrated expert cache: off (measured as the winner)\n", __func__);
+            }
             if (cached.moe_cache_mb > 0 && cache_mode_is_auto && use_placement) {
 #if defined(_WIN32)
                 _putenv_s("GGML_CUDA_MOE_CACHE", "1");
@@ -4480,6 +4584,18 @@ static bool common_maybe_raise_moe_for_ctx(
                 {
                     const char * cache_mode_env = getenv("GGML_CUDA_MOE_CACHE_MODE");
                     const bool cache_mode_is_auto = !cache_mode_env || std::string(cache_mode_env) == "auto";
+                    if (cal.moe_cache_mb == 0 && cache_mode_is_auto) {
+#if defined(_WIN32)
+                        _putenv_s("GGML_CUDA_MOE_CACHE", "0");
+                        _putenv_s("GGML_CUDA_MOE_CACHE_MODE", "off");
+                        _putenv_s("GGML_CUDA_MOE_CACHE_BUDGET_MB", "");
+#else
+                        setenv("GGML_CUDA_MOE_CACHE", "0", 1);
+                        setenv("GGML_CUDA_MOE_CACHE_MODE", "off", 1);
+                        unsetenv("GGML_CUDA_MOE_CACHE_BUDGET_MB");
+#endif
+                        LOG_WRN("%s: using calibrated expert cache: off (measured as the winner)\n", __func__);
+                    }
                     if (cal.moe_cache_mb > 0 && cache_mode_is_auto) {
 #if defined(_WIN32)
                         _putenv_s("GGML_CUDA_MOE_CACHE", "1");
