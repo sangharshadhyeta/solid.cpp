@@ -2361,6 +2361,14 @@ void * ggml_backend_sched_take_moe_cache_session(ggml_backend_sched_t sched) {
     return session;
 }
 
+void * ggml_backend_sched_share_moe_cache_session(ggml_backend_sched_t sched) {
+    if (!sched || !sched->moe_cache_session || !ggml_moe_cache.session_share) {
+        return NULL;
+    }
+    // Unlike take(), the source keeps its session; both holders release it on free.
+    return ggml_moe_cache.session_share(sched->moe_cache_session);
+}
+
 void ggml_backend_sched_adopt_moe_cache_session(ggml_backend_sched_t sched, void * session) {
     if (!sched || !session) {
         return;

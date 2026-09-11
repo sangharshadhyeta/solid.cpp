@@ -87,6 +87,18 @@ struct ggml_moe_cache_api {
     // The scheduler owns one cache session. backends contains the scheduler's
     // actual backend set, so the provider can use only selected CUDA devices.
     void * (*session_create)(void * const * backends, int n_backends);
+
+    // Take an additional reference to an existing session, so two schedulers can
+    // share one expert cache. Returns the same pointer; every holder calls
+    // session_destroy and only the last release tears down.
+    //
+    // Used for speculative decoding: the draft head and its target otherwise get
+    // a session each, which means two pools, two budgets - split by whichever
+    // context initialised first rather than by anything measured - and no shared
+    // ranking between the draft's experts and the target's. The draft runs on
+    // every decode step, so under one session its experts earn residency on
+    // measured access like any other.
+    void * (*session_share)(void * session);
     void   (*session_destroy)(void * session);
     // NULL and dormant sessions still create a suppressing thread-local scope.
     void   (*session_enter)(void * session);
