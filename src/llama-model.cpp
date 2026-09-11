@@ -1807,6 +1807,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 unreg_fn = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_unregister_host_buffer");
             }
         }
+        // Pinning a mmap-backed buffer is only free while the model fits in RAM.
+        // The mapping is MAP_PRIVATE (see llama_mmap: needed for the rw register
+        // fallback), and page-locking a private mapping for write makes the kernel
+        // break copy-on-write on every page up front - the whole buffer turns into
+        // anonymous memory that can never be dropped back to the file. When the
+        // model already fits that costs nothing. When it does not, it locks an
+        // arbitrary slice of cold experts in place and leaves the rest competing for
+        // what RAM is left: Qwen3.8-Flash-Next (88 GiB on 30 GiB RAM) lost 18.4 GiB
+        // this way and decoded at 2.8 tok/s from the NVMe. The loader has already
+        // measured that case above (mmap_prefetch), so reuse that decision.
+        if (reg_fn && unreg_fn && ml.use_mmap && !mmap_prefetch) {
+            LLAMA_LOG_WARN("%s: not pinning mmap-backed CPU weights - the model is larger than a safe fraction "
+                    "of host RAM, and pinning would turn them into unevictable copies\n", __func__);
+            reg_fn = nullptr;
+        }
         if (reg_fn && unreg_fn) {
             for (auto & [ctx, bufs] : pimpl->ctxs_bufs) {
                 for (auto & buf : bufs) {
