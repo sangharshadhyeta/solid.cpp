@@ -2740,9 +2740,10 @@ static double common_moe_bench_candidate_server(
     // failure (spec-draft-n-max=1 on qwen4exp) skipped four MTP stages and could
     // not be diagnosed afterwards at all. One file per port, overwritten by the
     // next candidate on that port, so this costs one small file, not a pile.
-    // The offload threshold is read from the environment by the CUDA backend
-    // (and by the moe-cache, for its batch floor), so it travels as env.
-    std::string env_prefix = extra_env;
+    // Candidates are launched without --moe-calibrate (they must not calibrate
+    // recursively), so the runtime tuning endpoint is enabled by its own variable -
+    // without it every live POST was silently rejected and the knob never changed.
+    std::string env_prefix = std::string("LLAMA_MOE_TUNING_ENDPOINT=1 ") + extra_env;
     if (g_moe_calib_offload_min_batch.load() > 0) {
         env_prefix = string_format("GGML_OP_OFFLOAD_MIN_BATCH=%d ", g_moe_calib_offload_min_batch.load()) + env_prefix;
     }
@@ -2797,10 +2798,13 @@ static double common_moe_bench_candidate_server(
         }
     }
 
-    // A reused or kept-alive candidate is not torn down here: the first is not
-    // ours to kill, the second is about to be measured again.
+    // A reused candidate is never ours to kill. A kept-alive one is spared only at
+    // the single success return at the end - not here: this lambda also runs on
+    // every failure path, and sparing it there leaked the process, which then held
+    // the GPU so every later launch died with "unable to allocate CUDA0 buffer"
+    // while calibration waited on candidates that could never load.
     auto cleanup = [&]() {
-        if (reuse || keep_alive || pid <= 0) {
+        if (reuse || pid <= 0) {
             return;
         }
         kill(pid, SIGKILL);
@@ -3255,10 +3259,14 @@ static double common_moe_bench_candidate_server(
         result_tps = (n_ok == n_concurrency && wall_s > 0) ? total_tokens / wall_s : -1.0;
     }
 
-    if (keep_alive && !reuse && pid > 0) {
+    if (keep_alive && !reuse && pid > 0 && result_tps > 0) {
+        // Held open for the sweep that asked for it, and only on a real
+        // measurement: a candidate that failed has nothing to reuse and would just
+        // hold the GPU against every launch that follows.
         common_moe_live_stop();          // replace any previous live candidate
         g_moe_live_pid  = pid;
         g_moe_live_port = port;
+        return result_tps;
     }
     cleanup();
     return result_tps;
