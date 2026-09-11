@@ -1549,6 +1549,9 @@ struct common_moe_calibration_entry {
     // Whether the MTP draft is served exact experts. Only measured when the draft's
     // experts are CPU-offloaded; on the GPU nothing of the draft reaches the cache.
     int         draft_exact      = -1;
+    // Ranking and timing constants that shipped as guesses. Stored as the winning
+    // value, or -1 when the sweep did not run. Empty string = nothing measured.
+    std::string tuned_constants;
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1764,6 +1767,27 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         set_env_int("GGML_CUDA_MOE_CACHE_COVERAGE_EVICT", 1);
         LOG_WRN("%s: using calibrated coverage eviction (on)\n", __func__);
     }
+    // The tuning constants, stored as the env assignments that beat their defaults.
+    // Each is skipped when the operator set it; a value that never won was never
+    // recorded, so the shipped default stands on its own.
+    if (!cal.tuned_constants.empty()) {
+        for (const auto & kv : string_split<std::string>(cal.tuned_constants, ' ')) {
+            const auto eq = kv.find('=');
+            if (eq == std::string::npos || eq == 0) {
+                continue;
+            }
+            const std::string name = kv.substr(0, eq);
+            if (getenv(name.c_str())) {
+                continue;
+            }
+#if defined(_WIN32)
+            _putenv_s(name.c_str(), kv.substr(eq + 1).c_str());
+#else
+            setenv(name.c_str(), kv.substr(eq + 1).c_str(), 1);
+#endif
+            LOG_WRN("%s: using calibrated %s\n", __func__, kv.c_str());
+        }
+    }
     if (cal.draft_exact == 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_EXACT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_EXACT", 0);
         LOG_WRN("%s: stand-ins measured faster than exact experts in the draft - allowing them\n", __func__);
@@ -1883,6 +1907,7 @@ static bool common_moe_calibration_lookup(
         out.coverage_evict         = e.value("coverage_evict", -1);
         out.host_expert_mb         = e.value("host_expert_mb", -1);
         out.draft_exact            = e.value("draft_exact", -1);
+        out.tuned_constants        = e.value("tuned_constants", std::string());
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -1950,6 +1975,7 @@ static void common_moe_calibration_save(
         {"coverage_evict", entry.coverage_evict},
         {"host_expert_mb", entry.host_expert_mb},
         {"draft_exact", entry.draft_exact},
+        {"tuned_constants", entry.tuned_constants},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -3661,6 +3687,7 @@ void common_moe_calibrate(common_params & params) {
         est += 4; // prediction ring: 0, 5, 10 percent, then the winner answer-checked
         est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
         est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
+        est += 15; // tuning-constant sweep: 5 knobs x 3 values
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -5302,6 +5329,67 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calib_set_env(neuron_env);
     }
 
+    // The ranking and timing constants. Every one of these decides which experts
+    // survive, or how fast the cache reacts, and every one shipped as a number
+    // somebody picked. Swept one at a time, each against the incumbent, keeping a
+    // winner only on a real margin so a tie leaves the existing default in place.
+    // Ordered by how much of the system reads them, because a spent budget stops
+    // the sweep wherever it has got to.
+    std::string tuned_constants;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: sweeping the ranking and timing constants that shipped as guesses ...\n", __func__);
+        common_moe_calibration_status_set("sweeping the tuning constants");
+        struct knob { const char * label; const char * env; const char * values[3]; };
+        const knob knobs[] = {
+            // read by eviction, admission and substitution - the widest blast radius
+            { "NVMe cost tier",     "GGML_CUDA_MOE_CACHE_COST_TIER_NVME",       { "2.0", "5.8", "12.0" } },
+            // how long an expert may sit untouched before it counts as cold
+            { "cold after",         "GGML_CUDA_MOE_CACHE_COLD_AFTER_S",         { "30",  "120", "300"  } },
+            // how much of the pool may be protected from eviction at once
+            { "protected cap",      "GGML_CUDA_MOE_CACHE_PROTECTED_CAP_PCT",    { "25",  "50",  "75"   } },
+            // how many slots the victim search examines
+            { "evict window",       "GGML_CUDA_MOE_CACHE_EVICT_WINDOW",         { "16",  "32",  "64"   } },
+            // how often the cold sweep runs
+            { "cold sweep",         "GGML_CUDA_MOE_CACHE_COLD_SWEEP_S",         { "1",   "3",   "10"   } },
+        };
+        std::string carried = neuron_env;
+        for (const auto & k : knobs) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            double best_tps = -1.0;
+            const char * best_value = nullptr;
+            for (const char * v : k.values) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                const double tps = measure_feature(k.label, v,
+                        carried + " " + std::string(k.env) + "=" + v);
+                if (tps > best_tps) {
+                    best_tps   = tps;
+                    best_value = v;
+                }
+            }
+            // The middle entry of each row is the shipped default; only carry a
+            // winner forward when it actually beat it, so the sweep cannot drift
+            // the configuration on noise.
+            if (best_value && strcmp(best_value, k.values[1]) != 0) {
+                carried += " " + std::string(k.env) + "=" + best_value;
+                if (!tuned_constants.empty()) {
+                    tuned_constants += " ";
+                }
+                tuned_constants += std::string(k.env) + "=" + best_value;
+                LOG_INF("%s:   %s: %s beats the default %s (%.2f tok/s)\n",
+                        __func__, k.label, best_value, k.values[1], best_tps);
+                common_moe_calibration_status_note(k.label, best_value,
+                        string_format("SELECTED - %.2f tok/s", best_tps), true, true);
+            } else if (best_value) {
+                LOG_INF("%s:   %s: the default %s stands\n", __func__, k.label, k.values[1]);
+            }
+        }
+        common_moe_calib_set_env(carried);
+    }
+
     common_moe_calibration_entry entry;
     entry.n_cpu_moe       = (int) best_n;
     entry.n_threads       = best_threads;
@@ -5346,6 +5434,7 @@ void common_moe_calibrate(common_params & params) {
     entry.coverage_evict         = best_coverage_evict;
     entry.host_expert_mb         = best_host_mb;
     entry.draft_exact            = best_draft_exact;
+    entry.tuned_constants        = tuned_constants;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.

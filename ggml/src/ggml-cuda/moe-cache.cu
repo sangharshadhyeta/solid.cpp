@@ -1646,7 +1646,19 @@ static bool moe_cache_colder_enough(double a_score, double b_score) {
 // wired to the H2D/D2D bandwidth profile above: that measures device-side
 // contention, a different hop in the path than the host-storage tier this
 // weight is about.
-static constexpr double MOE_CACHE_COST_TIER_NVME = 5.8;
+// 5.8 was a guess at how much more a slice costs from NVMe than from RAM. It
+// weights eviction (and anything else reading cost_tier), so it decides which
+// experts survive - GGML_CUDA_MOE_CACHE_COST_TIER_NVME makes it measurable, and
+// calibration sweeps it. (A real bandwidth profiler exists further up, but it
+// measures device-side contention - a different hop than this host-storage tier.)
+static double moe_cache_cost_tier_nvme() {
+    static const double value = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_COST_TIER_NVME");
+        const double v = env ? atof(env) : 5.8;
+        return v > 0.0 ? v : 5.8;
+    }();
+    return value;
+}
 static constexpr double MOE_CACHE_COST_TIER_RAM  = 1.0;
 
 // Off switch for A/B isolation only - lets the cost-weighted and
@@ -1771,7 +1783,7 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
     // advised. An expert that is simply not in the page cache costs an NVMe read
     // on a miss whether or not this process ever advised it away.
     if (e < res.is_resident.size() && !res.is_resident[e]) {
-        return MOE_CACHE_COST_TIER_NVME;
+        return moe_cache_cost_tier_nvme();
     }
     if (e < res.is_cold.size() && res.is_cold[e]) {
         // Ground-truth check before trusting our own advisory flag - see the
@@ -1785,7 +1797,7 @@ static double moe_cache_cost_tier_weight(const moe_cache_device & device, const 
         if (verify && moe_cache_pages_actually_resident(key.tensor, res.expert_size, e)) {
             return MOE_CACHE_COST_TIER_RAM; // advised cold, but still actually resident - not expensive yet
         }
-        return MOE_CACHE_COST_TIER_NVME; // verified gone (or verification disabled): assume NVMe cost
+        return moe_cache_cost_tier_nvme(); // verified gone (or verification disabled): assume NVMe cost
     }
     return MOE_CACHE_COST_TIER_RAM;
 }
@@ -3592,7 +3604,17 @@ static const void * moe_cache_prefill_wait(
 // Sweep often enough that the classification is still true when the kernel acts
 // on it. 30s was chosen when the threshold was wall-clock minutes; with a
 // routing-relative threshold the useful signal changes on the order of seconds.
-static constexpr std::chrono::seconds MOE_CACHE_COLD_SWEEP_INTERVAL{3};
+// How often the cold sweep runs. 3s was never measured; sweeping too often costs
+// a full pass over the residency maps, too rarely lets the cold flags go stale.
+// GGML_CUDA_MOE_CACHE_COLD_SWEEP_S makes it measurable.
+static std::chrono::seconds moe_cache_cold_sweep_interval() {
+    static const std::chrono::seconds value = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_COLD_SWEEP_S");
+        const int v = env ? atoi(env) : 3;
+        return std::chrono::seconds{v > 0 ? v : 3};
+    }();
+    return value;
+}
 
 // Defined further down, next to the other cache-policy helpers; used by the
 // fill worker's idle tick above it.
@@ -4215,7 +4237,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // when experts have gone cold and when reclaiming their pages costs
             // nothing - so hanging it off decode traffic (where it started out)
             // meant it could never fire in the one state it exists for.
-            const bool have_work = session->cv.wait_for(lock, MOE_CACHE_COLD_SWEEP_INTERVAL, [&] {
+            const bool have_work = session->cv.wait_for(lock, moe_cache_cold_sweep_interval(), [&] {
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty() || !device->warm_queue.empty();
             });
@@ -4307,7 +4329,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // instead, independent of queue state.
             if (!device->dead.load()) {
                 const auto now_tick = std::chrono::steady_clock::now();
-                if (now_tick - device->last_cold_sweep >= MOE_CACHE_COLD_SWEEP_INTERVAL) {
+                if (now_tick - device->last_cold_sweep >= moe_cache_cold_sweep_interval()) {
                     device->last_cold_sweep = now_tick;
                     moe_cache_cold_sweep(*device, now_tick);
                     // Same tick, same lock: check whether this cache is now
