@@ -3743,10 +3743,10 @@ void common_moe_calibrate(common_params & params) {
         int est = ncmoe_will_search
                 ? common_golden_section_eval_estimate((int) safe_n, (int) ncmoe_hi)
                 : 1;
-        est += 7; // substitution-floor ladder (6 rungs) + long-probe confirmation
-        est += 5; // offload threshold: 32, 64, 128, 256, 400
+        est += 7; // substitution-floor ladder (6 rungs, 1 load) + long-probe confirmation
+        est += 5; // offload threshold: 32, 64, 128, 256, 400 - one load, live thereafter
         est += 3; // prompt micro-batch: 512, 2048, then expert prefetch on at the winner
-        est += 4; // prediction ring: 0, 5, 10 percent, then the winner answer-checked
+        est += 4; // prediction ring: 0, 5, 10 percent (one load) + the winner answer-checked
         est += 5; // neuron subsetting: off/128/256/512, then the winner answer-checked
         est += 4; // off-by-default cache features: incumbent + group admit, coverage evict, host buffer
         // The constant sweep shares ONE server: 1 launch + 15 live measurements +
@@ -3902,14 +3902,33 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_set("measuring the MoE offload threshold");
         g_moe_calib_measure_prefill.store(true);
         double best_pp = -1.0;
+        // One server for all five. The threshold is read per op-assignment through
+        // the tunables registry (see ggml_backend_cuda_device_offload_op), so a
+        // POST changes the very next graph rather than needing a reload.
+        bool offload_live = false;
         for (const int threshold : { 32, 64, 128, 256, 400 }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
             g_moe_calib_offload_min_batch.store(threshold);
-            const double pp = common_moe_bench_candidate_server(
-                    self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx, n_predict,
-                    concurrency, -1, -1, active_ngl, active_min_rank);
+            const std::string body = string_format("{\"GGML_OP_OFFLOAD_MIN_BATCH\": \"%d\"}", threshold);
+            double pp = -1.0;
+            if (offload_live && g_moe_live_port > 0) {
+                pp = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, g_moe_live_port, ctx,
+                        n_predict, concurrency, -1, -1, active_ngl, active_min_rank,
+                        nullptr, 1234, std::numeric_limits<double>::quiet_NaN(), false, false,
+                        std::string(), -1, std::string(), -1.0,
+                        g_moe_live_port, body, /* keep_alive */ true);
+            } else {
+                pp = common_moe_bench_candidate_server(
+                        self_exe, path_model, "", best_n, 0, n_threads_default, next_port(), ctx,
+                        n_predict, concurrency, -1, -1, active_ngl, active_min_rank,
+                        nullptr, 1234, std::numeric_limits<double>::quiet_NaN(), false, false,
+                        std::string(), -1, std::string(), -1.0,
+                        -1, std::string(), /* keep_alive */ true);
+                offload_live = g_moe_live_port > 0;
+            }
             common_moe_calibration_status_candidate_done();
             LOG_INF("%s:   offload threshold %d -> %s\n", __func__, threshold,
                     pp > 0 ? string_format("%.1f prompt tok/s", pp).c_str() : "failed");
@@ -3920,6 +3939,7 @@ void common_moe_calibrate(common_params & params) {
                 best_offload_min_batch = threshold;
             }
         }
+        common_moe_live_stop();
         g_moe_calib_measure_prefill.store(false);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         if (best_offload_min_batch > 0) {
@@ -4348,15 +4368,36 @@ void common_moe_calibrate(common_params & params) {
         // later launch applied it and the runtime default never got a say.
         bool ladder_ran = false;
         std::vector<std::pair<int, double>> ladder_results; // (rank, cheap-probe tok/s)
+        // One server for the whole ladder. The floor is a live policy knob, so each
+        // rung is a POST; and because the process persists, every rung is measured
+        // against a cache warmed the same way, which is what makes the rungs
+        // comparable to each other rather than to their own cold starts.
+        bool ladder_live = false;
         for (const int rank : {10, 6, 4, 2, 1, 0}) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
             ladder_ran = true;
             std::string cand_text;
-            const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
-                    concurrency, -1, -1, active_ngl, rank, &cand_text, 1234);
+            const std::string body =
+                    string_format("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK\": \"%d\"}", rank);
+            double tps = -1.0;
+            if (ladder_live && g_moe_live_port > 0) {
+                tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                        g_moe_live_port, ctx, n_predict, concurrency, -1, -1, active_ngl, rank,
+                        &cand_text, 1234, std::numeric_limits<double>::quiet_NaN(), false, false,
+                        std::string(), -1, std::string(), -1.0,
+                        g_moe_live_port, body, /* keep_alive */ true);
+            } else {
+                tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                        next_port(), ctx, n_predict, concurrency, -1, -1, active_ngl, rank,
+                        &cand_text, 1234, std::numeric_limits<double>::quiet_NaN(), false, false,
+                        std::string(), -1, std::string(), -1.0,
+                        -1, std::string(), /* keep_alive */ true);
+                ladder_live = g_moe_live_port > 0;
+            }
             common_moe_calibration_status_candidate_done();
             // Reported, not a veto - the same mistake the reproducibility check
             // made, found the same way. Fidelity is text similarity to the
@@ -4457,6 +4498,7 @@ void common_moe_calibrate(common_params & params) {
             best_min_rank     = -1;
             best_min_rank_tps = 0.0;
         }
+        common_moe_live_stop();   // the confirm step below runs at a different length, with reasoning on
         const int confirm_predict = n_predict * 4;
 
         // Confirm each shortlisted rung at full length, with reasoning on - the
@@ -5116,6 +5158,32 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // One measurement on the candidate held open for live sweeps, applying the
+    // given policy knobs first, and one that launches and holds a candidate open.
+    // Declared here because the ring is the first sweep that can use them; the
+    // speculative arguments are left at their defaults on purpose, since the
+    // stages that choose them run later and every live sweep below is a policy
+    // knob whose value is independent of them.
+    auto measure_live = [&](const std::string & body, int predict) -> double {
+        if (g_moe_live_port <= 0) {
+            return -1.0;
+        }
+        return common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, g_moe_live_port, ctx, predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                false, false, std::string(), -1, std::string(), -1.0,
+                g_moe_live_port, body, /* keep_alive */ true);
+    };
+    auto open_live = [&](int predict) -> double {
+        return common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                false, false, std::string(), -1, std::string(), -1.0,
+                -1, std::string(), /* keep_alive */ true);
+    };
+
     // Prediction ring: how much of each pool the router lookahead may use. At full
     // occupancy a prediction otherwise has nowhere to go; too large a ring takes
     // slots from experts that were really demanded. Measured on decode, as served
@@ -5127,15 +5195,25 @@ void common_moe_calibrate(common_params & params) {
         LOG_INF("%s: measuring the prediction ring (GGML_CUDA_MOE_CACHE_RING_PCT) ...\n", __func__);
         common_moe_calibration_status_set("measuring the prediction ring");
         double best_ring_tps = -1.0;
+        // One server, three ring sizes: the ring percentage is a live policy knob,
+        // so each value is a POST rather than a reload. The ring only fills as the
+        // pool runs, which a persistent process gives it - a cold start would
+        // measure an empty ring every time.
+        bool ring_live = false;
         for (const int pct : { 0, 5, 10 }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
             g_moe_calib_ring_pct.store(pct);
-            const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
-                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            const std::string body = string_format("{\"GGML_CUDA_MOE_CACHE_RING_PCT\": \"%d\"}", pct);
+            double tps = ring_live ? measure_live(body, n_predict) : -1.0;
+            if (!ring_live) {
+                tps = open_live(n_predict);
+                ring_live = g_moe_live_port > 0;
+                if (ring_live && pct != 0) {
+                    tps = measure_live(body, n_predict);   // the launch ran at the default
+                }
+            }
             common_moe_calibration_status_candidate_done();
             LOG_INF("%s:   ring %d%% -> %s%s\n", __func__, pct,
                     tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
@@ -5163,6 +5241,7 @@ void common_moe_calibrate(common_params & params) {
                 best_ring_pct = 0;
             }
         }
+        common_moe_live_stop();
         g_moe_calib_ring_pct.store(best_ring_pct > 0 ? best_ring_pct : -1);
         if (best_ring_pct >= 0) {
             LOG_INF("%s: prediction ring: %d%%\n", __func__, best_ring_pct);
@@ -5454,12 +5533,7 @@ void common_moe_calibrate(common_params & params) {
         // candidate is warmed by the one before it, which is the regime served.
         std::string carried = neuron_env;
         common_moe_calib_set_env(carried);
-        double live_incumbent = common_moe_bench_candidate_server(
-                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
-                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
-                false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
-                /* live_port */ -1, std::string(), /* keep_alive */ true);
+        const double live_incumbent = open_live(n_predict);
         common_moe_calibration_status_candidate_done();
         if (live_incumbent <= 0 || g_moe_live_port <= 0) {
             LOG_WRN("%s: could not hold a candidate open for the constant sweep - skipping it\n", __func__);
@@ -5476,12 +5550,7 @@ void common_moe_calibrate(common_params & params) {
                     break;
                 }
                 const std::string body = string_format("{\"%s\": \"%s\"}", k.env, v);
-                const double tps = common_moe_bench_candidate_server(
-                        self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                        best_threads, g_moe_live_port, ctx, n_predict, concurrency, best_cache_mb, -1,
-                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
-                        false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
-                        g_moe_live_port, body, /* keep_alive */ true);
+                const double tps = measure_live(body, n_predict);
                 common_moe_calibration_status_candidate_done();
                 LOG_INF("%s:   %s=%s -> %s\n", __func__, k.label, v,
                         tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
@@ -5495,13 +5564,8 @@ void common_moe_calibrate(common_params & params) {
             // Leave the knob on its winner for the knobs that follow, so each is
             // measured against the configuration the earlier ones chose.
             if (best_value) {
-                const std::string body = string_format("{\"%s\": \"%s\"}", k.env, best_value);
-                (void) common_moe_bench_candidate_server(
-                        self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                        best_threads, g_moe_live_port, ctx, 1, concurrency, best_cache_mb, -1,
-                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
-                        false, false, std::string(), best_prob_accept, best_spec_types, best_p_min,
-                        g_moe_live_port, body, /* keep_alive */ true);
+                // leave the knob on its winner for the knobs that follow
+                (void) measure_live(string_format("{\"%s\": \"%s\"}", k.env, best_value), 1);
             }
             // The middle entry of each row is the shipped default; only carry a
             // winner forward when it actually beat it, so the sweep cannot drift
