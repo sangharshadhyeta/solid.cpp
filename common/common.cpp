@@ -1770,8 +1770,15 @@ static bool common_moe_calibration_lookup(
         out.tok_per_sec     = e.value("tok_per_sec", 0.0);
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
-        out.substitute_quality_sigma = e.value("substitute_quality_sigma",
-                std::numeric_limits<double>::quiet_NaN());
+        // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
+        // as null. value() only falls back to its default when the key is absent -
+        // on a present null it throws, the catch below turns that into a miss, and
+        // every such entry could never be read back: each launch recalibrated.
+        {
+            const auto it = e.find("substitute_quality_sigma");
+            out.substitute_quality_sigma = it != e.end() && it->is_number()
+                    ? it->get<double>() : std::numeric_limits<double>::quiet_NaN();
+        }
         // Absent in entries written before these were calibrated - the
         // value() defaults keep such an entry loadable rather than making
         // it a hard cache miss, since the fields it DOES carry are still
@@ -1783,7 +1790,11 @@ static bool common_moe_calibration_lookup(
         out.calibrated_at   = e.value("calibrated_at", std::string());
         out.gates_version   = e.value("gates_version", 0);
         return true;
-    } catch (const std::exception &) {
+    } catch (const std::exception & err) {
+        // A read that throws used to vanish here as a plain miss, which looked
+        // exactly like "no entry" and sent the launch into recalibrating.
+        fprintf(stderr, "[calib] cached calibration entry could not be read, treating it as a miss: %s\n", err.what());
+        fflush(stderr);
         return false;
     }
 }
