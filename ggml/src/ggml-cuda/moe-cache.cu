@@ -7693,8 +7693,20 @@ static bool moe_cache_expert_known_cold(const moe_cache_device & device,
 //
 // The boundary this draws is the useful part: cost_tier answers "what does it
 // cost to FETCH this expert into VRAM". That is valid for fetch decisions -
-// eviction (which already uses it), admission, prefetch. It is not valid for a
-// decision whose alternative is computing the expert instead of fetching it.
+// eviction (which already uses it) and prefetch. It is not valid for a decision
+// whose alternative is computing the expert instead of fetching it.
+//
+// And there is a second reason, which outlives the cost model: substitution is
+// gated on rank_bucket >= substitute_min_rank - the router's own confidence
+// ordering decides what may be stood in for, so the router's most consequential
+// picks always get the exact expert. This gate bolted an unrelated property
+// (page-cache residency) onto that decision, so an expert the router had already
+// ranked as substitutable could be refused a stand-in for a reason the router
+// knows nothing about. The same mistake was made at admission, where demand
+// count is the promoter (see the note there). In both places the mechanism is an
+// *earned* signal - rank, or repeated demand - and residency is a property a
+// candidate merely has. Properties may inform how an earned signal is weighed;
+// they must not stand in for it.
 static bool moe_cache_substitute_cost_gate(const moe_cache_device & device,
         const void * host_base, int expert) {
     static const bool enabled = [] {
