@@ -3441,6 +3441,7 @@ void common_moe_calibrate(common_params & params) {
             est += 6;                                                // spec-draft-n-max envelope doubling
             est += 2;                                                 // no-draft baseline + draft placement
             est += 2;                                                 // depth winner + runner-up measured again
+            est += 2;                                                 // depth re-check after substitution (top two)
             est += common_golden_section_eval_estimate(1, 32);        // spec-draft-n-max golden-section
             est += 2;                                                 // spec-prob-accept: off, on
             est += 2;                                                 // drafter cascade: mtp alone, ngram-suffix in front
@@ -3574,6 +3575,7 @@ void common_moe_calibrate(common_params & params) {
     // substitution meant the substitution floor was chosen for a no-draft
     // configuration the server would never run.
     int    best_n_max     = -1; // -1 not calibrated; 0 measured: no draft beat every depth
+    int    depth_runner_up = -1; // the second-best depth, re-measured once substitution is chosen
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
     if (params.speculative.has_dft()) {
@@ -3704,9 +3706,11 @@ void common_moe_calibrate(common_params & params) {
                             nmax_trace[depth] = (again + nmax_trace.at(depth)) / 2.0;
                         }
                     }
+                    const int first_winner = best_n_max;
                     if (runner_up > 0 && nmax_trace.at(runner_up) > nmax_trace.at(best_n_max)) {
                         best_n_max = runner_up;
                     }
+                    depth_runner_up = best_n_max == first_winner ? runner_up : first_winner;
                 }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
                 // The whole speculative-decoding stage wrote no row, so a model
@@ -4209,6 +4213,52 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         active_quality_sigma = best_sigma;
+    }
+
+    // Depth again, now that substitution is chosen. The depth search ran at the
+    // runtime's default substitution, and the two interact both ways: a deeper
+    // draft widens each verify pass's expert union, which changes how often a
+    // stand-in is needed; a floor changes what each verify pass costs. Top
+    // candidates only - the winner and the runner-up, both measured fresh under
+    // the chosen floor and stand-in bar so neither carries a number from the
+    // other regime.
+    if (best_n_max > 0 && depth_runner_up > 0 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: re-checking speculative depth %d vs %d at the chosen substitution settings ...\n",
+                __func__, best_n_max, depth_runner_up);
+        common_moe_calibration_status_set("re-checking speculative depth after substitution");
+        double recheck_tps   = -1.0;
+        int    recheck_depth = -1;
+        for (const int depth : { best_n_max, depth_runner_up }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, sub_mtp_path, best_n, depth, n_threads_default, next_port(), ctx,
+                    n_predict, concurrency, -1, -1, active_ngl, active_min_rank, nullptr, 1234,
+                    active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   spec-draft-n-max=%d after substitution -> %s%s\n", __func__, depth,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed",
+                    tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+            common_moe_calibration_status_note("speculative depth (after substitution)",
+                    string_format("n-max %d", depth),
+                    tps > 0 ? string_format("%.2f tok/s%s", tps, common_moe_last_acceptance_str().c_str())
+                            : std::string("failed"), tps > 0);
+            if (tps > recheck_tps) {
+                recheck_tps   = tps;
+                recheck_depth = depth;
+            }
+        }
+        if (recheck_depth > 0) {
+            if (recheck_depth != best_n_max) {
+                LOG_INF("%s: speculative depth moves %d -> %d under the chosen substitution settings\n",
+                        __func__, best_n_max, recheck_depth);
+                best_n_max = recheck_depth;
+            }
+            common_moe_calibration_status_note("speculative depth (after substitution)",
+                    string_format("n-max %d", best_n_max),
+                    string_format("SELECTED - %.2f tok/s", recheck_tps), true, true);
+        }
     }
 
     uint32_t best_ngl = (uint32_t) probe.n_layer + 1; // "all" - mirrors llama_model::n_gpu_layers()'s own +1
