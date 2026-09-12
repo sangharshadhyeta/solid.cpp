@@ -1680,6 +1680,7 @@ struct common_moe_calibration_entry {
     double      tps_offload_min_batch = -1.0;
     double      tps_ubatch            = -1.0;
     double      tps_spec_n_max        = -1.0;
+    int         predictor_admit      = -1;  // may it warm experts (needs a slot)
     int         predictor_next_layer = -1;  // predict the NEXT layer's picks
     int         predictor_prev_buckets = -1; // hashed previous-selection block width
     int         lookahead_depth  = -1;
@@ -1970,6 +1971,10 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         LOG_WRN("%s: prerouter previous-selection block: %d buckets (calibrated)\n", __func__,
                 cal.predictor_prev_buckets);
     }
+    if (cal.predictor_admit >= 0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT", cal.predictor_admit);
+        LOG_WRN("%s: prerouter warming %s (calibrated)\n", __func__, cal.predictor_admit ? "on" : "off");
+    }
     if (cal.predictor_evict_w >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT")) {
         set_env_double("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", cal.predictor_evict_w);
         LOG_WRN("%s: prerouter eviction protection at weight %.2f (calibrated)\n", __func__, cal.predictor_evict_w);
@@ -2121,6 +2126,7 @@ static bool common_moe_calibration_lookup(
         out.tps_offload_min_batch  = e.value("tps_offload_min_batch", -1.0);
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
+        out.predictor_admit        = e.value("predictor_admit", -1);
         out.predictor_next_layer   = e.value("predictor_next_layer", -1);
         out.predictor_prev_buckets = e.value("predictor_prev_buckets", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
@@ -2200,6 +2206,7 @@ static void common_moe_calibration_save(
         {"tps_offload_min_batch", entry.tps_offload_min_batch},
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
+        {"predictor_admit", entry.predictor_admit},
         {"predictor_next_layer", entry.predictor_next_layer},
         {"predictor_prev_buckets", entry.predictor_prev_buckets},
         {"lookahead_depth", entry.lookahead_depth},
@@ -4131,6 +4138,36 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_prefetch.store(false);
     g_moe_calib_ring_pct.store(-1);
     common_moe_calib_set_env(std::string());
+
+    // Train the prerouter from the first candidate of the run, not in a stage
+    // of its own near the end.
+    //
+    // Learning is free of measurement bias in a way that acting is not: an SGD
+    // step on a worker thread changes nothing about a candidate's throughput,
+    // so every candidate pays the same negligible cost and none of them is
+    // advantaged by running later. Acting - warming, eviction protection,
+    // substitution - is what would bias a comparison, and that stays off
+    // (GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT and the two influence weights all
+    // default to 0) until the stages that measure it turn it on.
+    //
+    // The dedicated-stage version threw away every routing decision made
+    // before it ran, which on a long run is most of them.
+    {
+        const std::string cache_dir = fs_get_cache_directory();
+        const std::string base = path_model ? std::string(path_model) : std::string("model");
+        const size_t slash = base.find_last_of("/\\");
+        const std::string state = cache_dir + "predictor-" +
+            (slash == std::string::npos ? base : base.substr(slash + 1)) + ".bin";
+        // Same path serving reads, so what this run learns is what serving
+        // starts from - and it accumulates across runs rather than being
+        // rebuilt from nothing each time.
+        common_moe_calib_set_base_env(string_format(
+                "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=1 "
+                "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s", state.c_str()));
+        LOG_INF("%s: the prerouter trains on every candidate of this run, into %s - what it learns is "
+                "kept, and it does not act until the stages that measure it say so\n", __func__, state.c_str());
+    }
+
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
     g_moe_planned_candidates.store(0);
@@ -6331,28 +6368,36 @@ void common_moe_calibrate(common_params & params) {
     // Only worth spending budget on when the predictor itself won: with it
     // off there is no score to weight, and every candidate here would measure
     // the same thing twice.
+    int    best_pred_admit   = -1;
     double best_pred_evict_w = -1.0;
     double best_pred_sub_w   = -1.0;
     if (best_train_predictor > 0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring what the prerouter may influence beyond admission ...\n", __func__);
         common_moe_calibration_status_set("measuring prerouter influence");
-        common_moe_stage_begin("prerouter influence", 3);
+        common_moe_stage_begin("prerouter influence", 5);
         double best_infl_tps = -1.0;
-        struct infl_cand { const char * label; double evict_w; double sub_w; };
+        struct infl_cand { const char * label; int admit; double evict_w; double sub_w; };
         const infl_cand cands[] = {
-            { "admission only",          0.0, 0.0 },
-            { "+ eviction protection",   1.0, 0.0 },
-            { "+ substitution tiebreak", 1.0, 1.0 },
+            { "nothing (trained, inert)", 0, 0.0, 0.0 },
+            { "admission only",           1, 0.0, 0.0 },
+            { "eviction protection",      0, 1.0, 0.0 },
+            { "eviction + substitution",  0, 1.0, 1.0 },
+            { "admission + eviction",     1, 1.0, 0.0 },
         };
         for (const auto & c : cands) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
+            // Admission is switched on only for the arm that measures it; the
+            // other two arms measure consumers that need no slot at all, and
+            // giving them a warming path would fold two effects into one
+            // number.
             common_moe_calib_set_env(string_format(
                     "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 "
-                    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 "
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT=%d "
                     "GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT=%.3f "
-                    "GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT=%.3f", c.evict_w, c.sub_w));
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT=%.3f",
+                    c.admit, c.evict_w, c.sub_w));
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                     best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
@@ -6363,13 +6408,15 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calibration_status_note("prerouter influence", c.label,
                     tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
             if (tps > best_infl_tps) {
-                best_infl_tps    = tps;
+                best_infl_tps     = tps;
+                best_pred_admit   = c.admit;
                 best_pred_evict_w = c.evict_w;
                 best_pred_sub_w   = c.sub_w;
             }
         }
         common_moe_calib_set_env(std::string());
         common_moe_stage_end();
+        entry.predictor_admit   = best_pred_admit;
         entry.predictor_evict_w = best_pred_evict_w;
         entry.predictor_sub_w   = best_pred_sub_w;
         checkpoint("prerouter influence");
@@ -6865,6 +6912,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
+    entry.predictor_admit        = best_pred_admit;
     entry.predictor_evict_w      = best_pred_evict_w;
     entry.predictor_sub_w        = best_pred_sub_w;
     // -1 ("not calibrated / use default") when full GPU residency won its own
