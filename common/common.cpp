@@ -2765,6 +2765,12 @@ static std::atomic<bool>      g_moe_budget_is_derived{false};
 // and only ever extend - never cut a budget the user asked for. An explicit
 // GGML_MOE_CALIBRATE_BUDGET_S disables this entirely; the ceiling exists because
 // this can block a plain launch, and is itself overridable.
+static long long common_moe_steady_now_ms();
+// Defined here rather than with the rest of the per-stage budget machinery
+// below, because the budget derivation above it has to extend an in-flight
+// stage's deadline when the global budget grows. See common_moe_stage_begin.
+static std::atomic<long long> g_moe_stage_deadline_ms{0};
+
 static void common_moe_maybe_derive_budget() {
     if (!g_moe_budget_is_derived.load(std::memory_order_relaxed)) {
         return;
@@ -2800,7 +2806,38 @@ static void common_moe_maybe_derive_budget() {
     if (deadline_ms <= g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed)) {
         return;
     }
+    const long long prev_deadline = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
     g_moe_calibrate_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+
+    // The stage that is running right now took its share from the PROVISIONAL
+    // budget, and that share was frozen at stage start. Growing the global
+    // budget without revisiting it leaves that stage on a deadline derived
+    // from a number that no longer exists - measured directly: the draft-depth
+    // stage opened at ~36s against the 600s provisional budget, took ~107s,
+    // and the budget was re-derived to 4988s thirty seconds later. It still
+    // stopped at ~143s, and the candidates it had left to run (n-max 4 and 8)
+    // were recorded as "failed". n-max 4 was the winner in the run before.
+    //
+    // Scale the in-flight stage's remaining time by the same factor the global
+    // budget grew, so a stage that opened under a provisional number is not
+    // punished for having started early.
+    const long long stage_deadline = g_moe_stage_deadline_ms.load(std::memory_order_relaxed);
+    if (stage_deadline != 0 && prev_deadline > 0 && deadline_ms > prev_deadline) {
+        const long long now_ms = common_moe_steady_now_ms();
+        const long long prev_left = prev_deadline - now_ms;
+        const long long new_left  = deadline_ms - now_ms;
+        if (prev_left > 0 && new_left > prev_left) {
+            const long long stage_left = stage_deadline - now_ms;
+            if (stage_left > 0) {
+                const long long grown = (long long) ((double) stage_left *
+                        ((double) new_left / (double) prev_left));
+                g_moe_stage_deadline_ms.store(now_ms + grown, std::memory_order_relaxed);
+                LOG_DBG("%s: extended the in-flight stage's deadline from %llds to %llds to match the "
+                        "re-derived budget\n", __func__, stage_left / 1000, grown / 1000);
+            }
+        }
+    }
+
     LOG_WRN("%s: time budget derived from this model's measured cost: %.0fs "
             "(%.0fs per candidate x %d planned candidates, capped at %.0fs - "
             "set GGML_MOE_CALIBRATE_BUDGET_S to fix it, GGML_MOE_CALIBRATE_BUDGET_MAX_S to raise the cap)\n",
@@ -2827,7 +2864,6 @@ static long long common_moe_steady_now_ms() {
 // budget_spent() as "stop and keep the best so far", so hitting a stage deadline
 // degrades to a shorter search rather than to nothing - and with the entry saved
 // after each stage, what it did measure survives.
-static std::atomic<long long> g_moe_stage_deadline_ms{0};
 static std::atomic<int>       g_moe_stage_planned{0};
 
 static void common_moe_stage_begin(const char * name, int planned) {
@@ -4353,6 +4389,12 @@ void common_moe_calibrate(common_params & params) {
         best_offload_min_batch = entry.op_offload_min_batch;
         LOG_WRN("%s: resuming - offload threshold %d already measured, skipping that stage\n",
                 __func__, best_offload_min_batch);
+        // Show it. A resumed value is still this run's answer, and a decisions
+        // table with a hole where a lever should be reads as "never measured"
+        // rather than "measured earlier".
+        common_moe_calibration_status_note("offload threshold",
+                string_format("%d tokens", best_offload_min_batch),
+                "RESUMED - measured by an earlier run", true, true);
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the offload threshold (GGML_OP_OFFLOAD_MIN_BATCH) on prompt processing ...\n", __func__);
         common_moe_calibration_status_set("measuring the MoE offload threshold");
@@ -4419,6 +4461,14 @@ void common_moe_calibrate(common_params & params) {
         best_prefetch = entry.sched_prefetch_experts;
         LOG_WRN("%s: resuming - prompt micro-batch -ub %d and expert prefetch already measured, "
                 "skipping that stage\n", __func__, best_ubatch);
+        common_moe_calibration_status_note("prompt micro-batch",
+                string_format("-ub %d", best_ubatch),
+                "RESUMED - measured by an earlier run", true, true);
+        if (best_prefetch >= 0) {
+            common_moe_calibration_status_note("expert prefetch",
+                    best_prefetch ? "on" : "off",
+                    "RESUMED - measured by an earlier run", true, true);
+        }
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the prompt micro-batch size (-ub) on a long prompt ...\n", __func__);
         common_moe_calibration_status_set("measuring the prompt micro-batch size");
@@ -4490,6 +4540,9 @@ void common_moe_calibrate(common_params & params) {
         best_n_max = entry.spec_n_max;
         LOG_WRN("%s: resuming - speculative depth %d already measured, skipping the envelope search "
                 "and the golden-section refinement\n", __func__, best_n_max);
+        common_moe_calibration_status_note("speculative depth",
+                best_n_max > 0 ? string_format("n-max %d", best_n_max) : std::string("off"),
+                "RESUMED - measured by an earlier run", true, true);
     } else if (params.speculative.has_dft()) {
         {
             // Find the envelope: double n_max until throughput drops below
@@ -4542,6 +4595,22 @@ void common_moe_calibrate(common_params & params) {
                     baseline = tps; // first depth that stood up anchors the collapse test
                 }
                 if (tps < 0) {
+                    // A candidate the clock skipped is not a candidate that
+                    // failed. When a stage reaches its share of the budget every
+                    // remaining launch returns instantly, and reading those as
+                    // failures is how an incomplete search gets recorded as a
+                    // finished one: measured here, n-max 4 and 8 were "failed"
+                    // 1ms apart, tripped the two-in-a-row rule below, and the
+                    // search settled on n-max 1 at 9.20 tok/s - while the run
+                    // before had measured n-max 4 at 10.87. Stop cleanly and
+                    // say why, so the depths that never ran are not mistaken
+                    // for depths that were measured and rejected.
+                    if (common_moe_calibrate_budget_spent()) {
+                        LOG_WRN("%s: the draft-depth stage ran out of its share of the budget before "
+                                "n-max %d - keeping the best of the depths that did run, and NOT "
+                                "recording the rest as failures\n", __func__, n);
+                        break;
+                    }
                     // Two consecutive failures means something is wrong with the
                     // draft itself rather than with this depth - stop paying for it.
                     if (++n_failures >= 2) {
