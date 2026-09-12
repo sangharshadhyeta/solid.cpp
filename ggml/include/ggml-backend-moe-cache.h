@@ -140,6 +140,24 @@ struct ggml_moe_cache_api {
     // first token of the batch is sampled per call - see moe_cache_train's
     // comment for why one example per dispatch is enough and cheap is safer
     // than complete on this specific hot path.
+    // Optional, may be NULL. Hand the predictor an architecture-specific
+    // feature block to condition on, for the layer that is about to route.
+    //
+    // The predictor's default input is the hidden state at the MoE op, which
+    // is STALE for cross-layer prediction: the next layer's residual has not
+    // been added yet, and that staleness is the measured ceiling on router
+    // lookahead (59.3% at depth 1). Some architectures carry a component of
+    // the next layer's input that is known exactly and early - Qwen3.8-Flash-
+    // Next gathers its whole per-layer n-gram embedding (PLE) once, before
+    // the layer loop, and injects a slice of it into every layer's residual.
+    // That slice is not a guess about the next layer; it is part of the next
+    // layer's input, available now.
+    //
+    // Generic by construction: this file cannot know what the block means,
+    // and models that have nothing to offer simply never call it. The block
+    // is appended to the predictor's input vector as-is.
+    void (*set_aux_features)(const float * feats, int n_feats);
+
     void (*train)(void * node, const int32_t * ids, int n_ids_per_token, int n_tokens,
                   const float * acts, size_t act_stride, int64_t hidden_dim);
 

@@ -1669,6 +1669,10 @@ struct common_moe_calibration_entry {
     // -1 = not calibrated; 0 = no influence.
     double      predictor_evict_w = -1.0;
     double      predictor_sub_w   = -1.0;
+    // What the predictor is trained to answer and what it gets to see.
+    // -1 = not calibrated.
+    int         predictor_next_layer = -1;  // predict the NEXT layer's picks
+    int         predictor_prev_buckets = -1; // hashed previous-selection block width
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1933,11 +1937,30 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             setenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE", state.c_str(), 1);
 #endif
             LOG_WRN("%s: prerouter state: %s (loaded, and kept learning)\n", __func__, state.c_str());
+            // The input shape travels with the weights here too - serving that
+            // built a different vector than the weights were fitted against
+            // would fail the dimension check and silently run untrained.
+            if (cal.predictor_next_layer >= 0) {
+                set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER", cal.predictor_next_layer);
+            }
+            if (cal.predictor_prev_buckets >= 0) {
+                set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS", cal.predictor_prev_buckets);
+            }
         }
         LOG_WRN("%s: live-trained prerouter %s (calibrated)\n", __func__,
                 cal.train_predictor ? "on" : "off");
     }
 
+    if (cal.predictor_next_layer >= 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER", cal.predictor_next_layer);
+        LOG_WRN("%s: prerouter target: %s (calibrated)\n", __func__,
+                cal.predictor_next_layer ? "the next layer's picks" : "this layer's picks");
+    }
+    if (cal.predictor_prev_buckets >= 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS", cal.predictor_prev_buckets);
+        LOG_WRN("%s: prerouter previous-selection block: %d buckets (calibrated)\n", __func__,
+                cal.predictor_prev_buckets);
+    }
     if (cal.predictor_evict_w >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT")) {
         set_env_double("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", cal.predictor_evict_w);
         LOG_WRN("%s: prerouter eviction protection at weight %.2f (calibrated)\n", __func__, cal.predictor_evict_w);
@@ -2086,6 +2109,8 @@ static bool common_moe_calibration_lookup(
         out.train_predictor        = e.value("train_predictor", -1);
         out.predictor_evict_w      = e.value("predictor_evict_w", -1.0);
         out.predictor_sub_w        = e.value("predictor_sub_w", -1.0);
+        out.predictor_next_layer   = e.value("predictor_next_layer", -1);
+        out.predictor_prev_buckets = e.value("predictor_prev_buckets", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -2160,6 +2185,8 @@ static void common_moe_calibration_save(
         {"train_predictor", entry.train_predictor},
         {"predictor_evict_w", entry.predictor_evict_w},
         {"predictor_sub_w", entry.predictor_sub_w},
+        {"predictor_next_layer", entry.predictor_next_layer},
+        {"predictor_prev_buckets", entry.predictor_prev_buckets},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -5783,15 +5810,70 @@ void common_moe_calibrate(common_params & params) {
 
         LOG_INF("%s: training the prerouter on this run's own traffic (one pass, then frozen) ...\n", __func__);
         common_moe_calibration_status_set("training the prerouter");
-        common_moe_stage_begin("prerouter training", 1);
-        common_moe_calib_set_env(string_format(
-                "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s",
-                predictor_state_file.c_str()));
-        const double train_tps = common_moe_bench_candidate_server(
-                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
-                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
-        common_moe_calibration_status_candidate_done();
+        // What the predictor is asked to answer, and what it is allowed to
+        // see, are not one question - so each shape trains its own weights and
+        // is judged on them. Each candidate writes its own state file; the
+        // winner's is what every later stage freezes against.
+        //
+        //   this layer    the original target. Asks which experts THIS layer
+        //                 wants, of an input the real router is about to
+        //                 answer exactly - so it can only ever rank experts
+        //                 outside the current selection.
+        //   next layer    the actual prerouter question, and the only one
+        //                 prefetch can spend.
+        //   + prev picks  a hashed block of what the previous layer chose.
+        //                 The hidden state (59.3% at depth 1) and the expert-id
+        //                 successor table (33.8% raw) were only ever measured
+        //                 SEPARATELY; this is the first time one model sees
+        //                 both.
+        //   - ngram       drop the architecture block the model supplies (the
+        //                 PLE n-gram identity on qwen4exp), to measure what it
+        //                 is worth rather than assume it.
+        struct train_shape { const char * label; int next_layer; int prev_buckets; int aux_cap; };
+        const train_shape shapes[] = {
+            { "this layer's picks",        0,  0, 32 },
+            { "next layer's picks",        1,  0, 32 },
+            { "next layer + prev picks",   1, 64, 32 },
+            { "next layer, no n-gram",     1, 64,  0 },
+        };
+        common_moe_stage_begin("prerouter training", (int)(sizeof(shapes)/sizeof(shapes[0])));
+        double train_tps = -1.0;
+        int best_next_layer = -1, best_prev_buckets = -1, best_aux_cap = 32;
+        std::string best_state_file;
+        for (size_t si = 0; si < sizeof(shapes)/sizeof(shapes[0]); si++) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const auto & sh = shapes[si];
+            const std::string state_i = predictor_state_file + "." + std::to_string(si);
+            common_moe_calib_set_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s "
+                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
+                    "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
+                    state_i.c_str(), sh.next_layer, sh.prev_buckets, sh.aux_cap));
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   prerouter input %s -> %s\n", __func__, sh.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("prerouter input", sh.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > train_tps) {
+                train_tps         = tps;
+                best_next_layer   = sh.next_layer;
+                best_prev_buckets = sh.prev_buckets;
+                best_aux_cap      = sh.aux_cap;
+                best_state_file   = state_i;
+            }
+        }
+        entry.predictor_next_layer   = best_next_layer;
+        entry.predictor_prev_buckets = best_prev_buckets;
+        checkpoint("prerouter input");
+        if (!best_state_file.empty()) {
+            predictor_state_file = best_state_file;
+        }
         common_moe_calib_set_env(std::string());
         common_moe_stage_end();
         LOG_INF("%s: prerouter training pass %s (state: %s)\n", __func__,
@@ -5803,9 +5885,16 @@ void common_moe_calibrate(common_params & params) {
         // From here on every candidate loads those weights and none of them
         // writes back - see moe_cache_train_frozen.
         if (train_tps > 0) {
+            // The shape travels with the weights. A frozen candidate that built
+            // a different input vector than the weights were fitted against
+            // would score against the wrong layout - the dimension check would
+            // reject it and silently serve an untrained predictor, which reads
+            // as "the predictor does not help" rather than as a bug.
             common_moe_calib_set_base_env(string_format(
-                    "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s GGML_CUDA_MOE_CACHE_TRAIN_FREEZE=1",
-                    predictor_state_file.c_str()));
+                    "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s GGML_CUDA_MOE_CACHE_TRAIN_FREEZE=1 "
+                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
+                    "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
+                    predictor_state_file.c_str(), best_next_layer, best_prev_buckets, best_aux_cap));
         }
     }
 
