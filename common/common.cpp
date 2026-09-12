@@ -6946,10 +6946,16 @@ void common_moe_calibrate(common_params & params) {
         //                 PLE n-gram identity on qwen4exp), to measure what it
         //                 is worth rather than assume it.
         struct train_shape { const char * label; int next_layer; int aux_cap; };
+        // Two shapes, not three. The n-gram question is settled: removing the
+        // architecture's PLE block cost 70.00 -> 49.88 tok/s on gemma-4 and
+        // 12.37 -> 9.51 on qwen3.8-flash-next - 29% and 23%, well outside this
+        // machine's spread and in the same direction both times. Re-measuring a
+        // settled 25% every run spends a candidate re-deriving a known answer.
+        // Same-layer against next-layer stays, because that is a question about
+        // what the model is asked to predict rather than about noise.
         const train_shape shapes[] = {
             { "this layer's picks",        0, 32 },
             { "next layer's picks",        1, 32 },
-            { "next layer, no n-gram",     1, 0 },
         };
         common_moe_stage_begin("prerouter training", (int)(sizeof(shapes)/sizeof(shapes[0])));
         double train_tps = -1.0;
@@ -7256,17 +7262,21 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the live-trained prerouter (it ships off, unmeasured) ...\n", __func__);
         common_moe_calibration_status_set("measuring the trained prerouter");
-        common_moe_stage_begin("trained prerouter", 3);
+        common_moe_stage_begin("trained prerouter", 2);
         double best_pred_tps = -1.0;
         struct pred_cand { const char * label; const char * env; int on; };
         // Every arm carries the same ring, including "off" - the ring changes
         // throughput on its own (it is the router-lookahead's landing space
         // too), so an A/B where only the "on" arms have one measures the ring,
         // not the predictor.
+        // Two arms. The learning rate is dropped: 11.07 against 10.84 tok/s
+        // between lr 0.01 and 0.05 is 2%, a quarter of the spread this machine
+        // shows between identical candidates, so that candidate resolves
+        // nothing. On/off is worth measuring - that is a mechanism acting or
+        // not, rather than a parameter tweak.
         const pred_cand cands[] = {
-            { "off",            "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0", 0 },
-            { "on, lr 0.01",    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.01", 1 },
-            { "on, lr 0.05",    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.05", 1 },
+            { "off",  "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0", 0 },
+            { "on",   "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1", 1 },
         };
         for (const auto & c : cands) {
             if (common_moe_calibrate_budget_spent()) {
@@ -7316,7 +7326,7 @@ void common_moe_calibrate(common_params & params) {
     if (best_train_predictor > 0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring what the prerouter may influence beyond admission ...\n", __func__);
         common_moe_calibration_status_set("measuring prerouter influence");
-        common_moe_stage_begin("prerouter influence", 5);
+        common_moe_stage_begin("prerouter influence", 3);
         double best_infl_tps = -1.0;
         struct infl_cand { const char * label; int admit; double evict_w; double sub_w; };
         // The roles are assigned now, not searched: lookahead owns admission
@@ -7329,9 +7339,12 @@ void common_moe_calibrate(common_params & params) {
         // model exists where the prerouter's queue is never contended and it
         // can be punctual after all.
         const infl_cand cands[] = {
+            // Three arms. The strength sweep is gone - 1.0 against 2.0 on a
+            // capped additive bias is a second-order difference on a machine
+            // that cannot resolve first-order ones. What remains: the inert
+            // floor (is it doing anything), the role plus the one consumer the
+            // two models disagreed about, and the falsifier.
             { "inert (floor)",                  0, 0.0, 0.0 },
-            { "eviction protection",            0, 1.0, 0.0 },
-            { "eviction, stronger",             0, 2.0, 0.0 },
             { "eviction + substitution",        0, 1.0, 1.0 },
             { "eviction + admission (falsify)", 1, 1.0, 0.0 },
         };
@@ -7735,6 +7748,40 @@ void common_moe_calibrate(common_params & params) {
     std::string tuned_constants;
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: sweeping the ranking and timing constants that shipped as guesses ...\n", __func__);
+        // 21 candidates, one sample each, at effect sizes this machine cannot
+        // resolve. Off unless asked for.
+        //
+        // These five are internal policy constants - the NVMe cost tier, the
+        // cold-after threshold, the protected-segment cap, the eviction window,
+        // the cold-sweep interval. Each was swept across three values with a
+        // single measurement per value, and the spreads that came back are
+        // inside the run-to-run spread of an unchanged configuration on this
+        // hardware: 12-20% has been measured repeatedly between identical
+        // candidates (exact-match 7.52 then 6.71, fitt=448 12.45 then 10.35,
+        // ncmoe=21 68.39 then 61.47). A stage that cannot separate its own
+        // effect from noise is not measuring its knob; it is sampling the
+        // noise, and then FIXING a value that every later stage inherits.
+        //
+        // That is not hypothetical. It is how the substitution floor settled on
+        // rank 6 over a rank 4 that ran 59% faster, and how -ub 2048 was locked
+        // in before the draft that cannot coexist with it existed.
+        //
+        // So they keep their defaults, which are the values this fork has
+        // actually run on, and the budget goes to the stages whose effects are
+        // larger than the noise: what fits (deterministic), and what the answer
+        // gate judges (where quality decides rather than throughput).
+        // GGML_MOE_CALIBRATE_TUNE_CONSTANTS=1 restores the sweep.
+        const bool sweep_constants = [] {
+            const char * e = getenv("GGML_MOE_CALIBRATE_TUNE_CONSTANTS");
+            return e && atoi(e) != 0;
+        }();
+        if (!sweep_constants) {
+            LOG_INF("%s: skipping the tuning-constant sweep - 21 candidates at effect sizes inside this "
+                    "machine's measured run-to-run spread, which samples noise and then fixes it for every "
+                    "later stage (set GGML_MOE_CALIBRATE_TUNE_CONSTANTS=1 to sweep them)\n", __func__);
+            common_moe_calibration_status_note("tuning constants", "left at their defaults",
+                    "not measured - effects are inside this machine's noise floor", true, true);
+        } else {
         common_moe_calibration_status_set("sweeping the tuning constants");
         common_moe_stage_begin("tuning constants", 21);
         struct knob { const char * label; const char * env; const char * values[3]; };
@@ -7812,6 +7859,7 @@ void common_moe_calibrate(common_params & params) {
         common_moe_live_stop();
         common_moe_stage_end();
         common_moe_calib_set_env(carried);
+        }   // sweep_constants
     }
 
     entry.n_cpu_moe       = (int) best_n;
