@@ -158,6 +158,22 @@ struct ggml_moe_cache_api {
     // is appended to the predictor's input vector as-is.
     void (*set_aux_features)(const float * feats, int n_feats);
 
+    // Enumerate the budget partitions worth measuring.
+    //
+    // The cache's consumers - the reduced pool, the draft's experts, the
+    // primary pool - all bid for one number, and which splits are even legal
+    // is the arbiter's business, not the caller's: the primary is the
+    // remainder and has a floor no combination of shares may cross. A caller
+    // that hardcoded its own list would be re-deciding the constraint from
+    // outside, and would drift from it the moment the floor changed.
+    //
+    // Fills out_reduced_pct / out_draft_pct with at most `max` feasible
+    // partitions (a draft percentage of -1 means "leave the draft on the
+    // weight-based default") and returns how many were written. Ordered with
+    // the incumbent first, so a caller that runs out of budget partway has
+    // still measured the configuration it would otherwise have shipped.
+    int (*partition_candidates)(int * out_reduced_pct, int * out_draft_pct, int max);
+
     void (*train)(void * node, const int32_t * ids, int n_ids_per_token, int n_tokens,
                   const float * acts, size_t act_stride, int64_t hidden_dim);
 

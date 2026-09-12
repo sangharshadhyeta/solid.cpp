@@ -2268,6 +2268,23 @@ static void moe_cache_lookahead_report(const moe_cache_device & device) {
 
 // Defined with the rest of the predictor, far below; eviction is one of its
 // consumers and sits above it.
+struct moe_cache_budget_split {
+    size_t total   = 0;  // post-reserve bytes being divided
+    size_t reduced = 0;  // heat-aware neuron subsetting pool
+    size_t draft   = 0;  // the draft model's experts
+    size_t primary = 0;  // the remainder - never a declared share
+    // The shares AFTER the primary floor has been enforced. The draft's pool is
+    // sized by rescaling shape weights rather than by reserving bytes, so it
+    // needs the percentage the arbiter actually settled on, not the one that
+    // was asked for - otherwise two consumers that each fit alone can still
+    // overrun the budget together, which is the whole failure this exists to
+    // prevent.
+    int reduced_pct = 0;
+    int draft_pct   = -1;  // -1 = not set, keep the weight-based behaviour
+};
+
+static moe_cache_budget_split moe_cache_split_budget(const moe_cache_device & device);
+
 static double moe_cache_predictor_score(const moe_cache_device & device, const moe_cache_key & key);
 static double moe_cache_predictor_evict_weight();
 
@@ -6215,8 +6232,19 @@ static void moe_cache_build_pending(
         const size_t claimable = spare > primary_floor ? spare - primary_floor : 0;
         const size_t fraction_cap = device.budget_limit / MOE_CACHE_REDUCE_RESERVE_MAX_DEN
                                                         * MOE_CACHE_REDUCE_RESERVE_MAX_NUM;
+        // The arbiter decides the share; the local caps stay as a safety net.
+        //
+        // fraction_cap is the old rule - a flat 1/8 of the budget, chosen once
+        // and never measured. It is kept as a ceiling because it is the
+        // conservative bound that has actually been run, but the arbiter's
+        // share is what is consulted first, so the split can be measured
+        // instead of assumed. With the default share (12%) this is within a
+        // rounding error of the old behaviour, which is the point: turning it
+        // on changes nothing until something calibrates it.
+        const moe_cache_budget_split split = moe_cache_split_budget(device);
+        const size_t arbitrated = split.reduced > 0 ? split.reduced : fraction_cap;
         reduce_reserve = std::min(moe_cache_neuron_reduce_budget_bytes(),
-                                  std::min(claimable, fraction_cap));
+                                  std::min(claimable, std::min(arbitrated, fraction_cap)));
     }
     const size_t total_reserve = scratch_reserve <= SIZE_MAX - reduce_reserve
         ? scratch_reserve + reduce_reserve : SIZE_MAX;
@@ -6264,7 +6292,15 @@ static void moe_cache_build_pending(
     // split the rest by weight as before. -1 (default) keeps the weight-based
     // behaviour, so this changes nothing until a value is measured.
     {
-        const int pct = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", -1);
+        // From the arbiter, not straight from the environment. Read raw, the
+        // draft's share and the reduced pool's share were decided
+        // independently and could together leave the primary pool with less
+        // than it needs - each one individually "fits" while the combination
+        // does not. The arbiter scales the declared shares down together when
+        // they would breach the primary's floor, and this is the value that
+        // survives that.
+        const moe_cache_budget_split split = moe_cache_split_budget(device);
+        const int pct = split.draft_pct;
         if (pct >= 0 && pct <= 100) {
             double draft_weight = 0.0;
             for (const moe_cache_shape * shape : pending) {
@@ -9086,12 +9122,6 @@ static bool moe_cache_train_predictor_enabled() {
 // share - it is the remainder, and it has a floor no other consumer may cross,
 // because a cache whose primary pool cannot exist is worse than no cache at
 // all (measured above).
-struct moe_cache_budget_split {
-    size_t total   = 0;  // post-reserve bytes being divided
-    size_t reduced = 0;  // heat-aware neuron subsetting pool
-    size_t draft   = 0;  // the draft model's experts
-    size_t primary = 0;  // the remainder - never a declared share
-};
 
 // Floor on the primary pool, as a percentage of the divisible budget. No
 // combination of shares may push it below this.
@@ -9112,13 +9142,8 @@ static moe_cache_budget_split moe_cache_split_budget(const moe_cache_device & de
     }
 
     int reduced_pct = moe_cache_neuron_reduce_enabled() ? moe_cache_reduced_share_pct() : 0;
-    int draft_pct   = 0;
-    {
-        const int pct = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", -1);
-        if (pct > 0) {
-            draft_pct = pct;
-        }
-    }
+    const int draft_declared = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", -1);
+    int draft_pct = draft_declared > 0 ? draft_declared : 0;
     reduced_pct = std::max(0, std::min(100, reduced_pct));
     draft_pct   = std::max(0, std::min(100, draft_pct));
 
@@ -9133,10 +9158,64 @@ static moe_cache_budget_split moe_cache_split_budget(const moe_cache_device & de
         draft_pct   = (int) (draft_pct   * scale);
     }
 
-    out.reduced = out.total / 100 * (size_t) reduced_pct;
-    out.draft   = out.total / 100 * (size_t) draft_pct;
-    out.primary = out.total - out.reduced - out.draft;
+    out.reduced     = out.total / 100 * (size_t) reduced_pct;
+    out.draft       = out.total / 100 * (size_t) draft_pct;
+    out.primary     = out.total - out.reduced - out.draft;
+    out.reduced_pct = reduced_pct;
+    out.draft_pct   = draft_declared < 0 ? -1 : draft_pct;
     return out;
+}
+
+// See ggml_moe_cache::partition_candidates. The arbiter enumerates, because it
+// owns the constraint: the primary pool is the remainder and may not fall below
+// its floor, so which splits are legal follows from that rule and nothing else.
+// A caller with its own hardcoded list would be re-deciding the constraint from
+// outside and drifting from it silently the moment the floor moved.
+static int moe_cache_partition_candidates(int * out_reduced, int * out_draft, int max) {
+    if (!out_reduced || !out_draft || max <= 0) {
+        return 0;
+    }
+    const int floor_pct = std::max(0, std::min(90, moe_cache_primary_floor_pct()));
+    const int budget    = 100 - floor_pct;   // all declared shares must fit in this
+
+    // The grid is coarse on purpose. Each point costs a real candidate launch,
+    // and the differences these shares produce are large (measured: an 8192 MiB
+    // cache at 9.90 tok/s against 2048 MiB at 11.40) - far larger than the
+    // spacing here, so a finer grid would spend the budget resolving noise.
+    static const int reduced_grid[] = { 0, 12, 25, 40 };
+    static const int draft_grid[]   = { -1, 10, 25 };
+
+    int n = 0;
+    // Incumbent first: the split the cache would use with nothing calibrated.
+    out_reduced[n] = moe_cache_neuron_reduce_enabled() ? moe_cache_reduced_share_pct() : 0;
+    out_draft[n]   = -1;
+    n++;
+
+    for (const int r : reduced_grid) {
+        for (const int d : draft_grid) {
+            if (n >= max) {
+                return n;
+            }
+            const int declared = r + (d > 0 ? d : 0);
+            if (declared > budget) {
+                continue;   // would push the primary below its floor
+            }
+            bool dup = false;
+            for (int i = 0; i < n; i++) {
+                if (out_reduced[i] == r && out_draft[i] == d) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                continue;
+            }
+            out_reduced[n] = r;
+            out_draft[n]   = d;
+            n++;
+        }
+    }
+    return n;
 }
 
 static int moe_cache_admit_exact_weight() {
@@ -13744,6 +13823,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.train = moe_cache_train;
     ggml_moe_cache.set_aux_features = moe_cache_set_aux_features;
+    ggml_moe_cache.partition_candidates = moe_cache_partition_candidates;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;

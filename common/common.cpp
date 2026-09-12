@@ -1680,6 +1680,7 @@ struct common_moe_calibration_entry {
     double      tps_offload_min_batch = -1.0;
     double      tps_ubatch            = -1.0;
     double      tps_spec_n_max        = -1.0;
+    int         reduced_share_pct    = -1;  // the arbiter's split: reduced pool's share of the budget
     int         admit_exact_weight   = -1;  // extra admission weight for un-substitutable demand
     int         predictor_admit      = -1;  // may it warm experts (needs a slot)
     int         predictor_next_layer = -1;  // predict the NEXT layer's picks
@@ -1972,6 +1973,10 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         LOG_WRN("%s: prerouter previous-selection block: %d buckets (calibrated)\n", __func__,
                 cal.predictor_prev_buckets);
     }
+    if (cal.reduced_share_pct >= 0 && !getenv("GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT", cal.reduced_share_pct);
+        LOG_WRN("%s: budget split - reduced pool gets %d%% (calibrated)\n", __func__, cal.reduced_share_pct);
+    }
     if (cal.admit_exact_weight >= 0 && !getenv("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT", cal.admit_exact_weight);
         LOG_WRN("%s: admission weights un-substitutable demand %dx (calibrated)\n",
@@ -2132,6 +2137,7 @@ static bool common_moe_calibration_lookup(
         out.tps_offload_min_batch  = e.value("tps_offload_min_batch", -1.0);
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
+        out.reduced_share_pct      = e.value("reduced_share_pct", -1);
         out.admit_exact_weight     = e.value("admit_exact_weight", -1);
         out.predictor_admit        = e.value("predictor_admit", -1);
         out.predictor_next_layer   = e.value("predictor_next_layer", -1);
@@ -2213,6 +2219,7 @@ static void common_moe_calibration_save(
         {"tps_offload_min_batch", entry.tps_offload_min_batch},
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
+        {"reduced_share_pct", entry.reduced_share_pct},
         {"admit_exact_weight", entry.admit_exact_weight},
         {"predictor_admit", entry.predictor_admit},
         {"predictor_next_layer", entry.predictor_next_layer},
@@ -6419,6 +6426,97 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // The budget partition, searched as a vector rather than as scalars.
+    //
+    // Every consumer here bids for one number, and each was deciding its own
+    // share at a different moment by a different rule - the reduced pool at a
+    // flat 1/8, the draft at a percentage, the primary taking whatever was
+    // left. Measured consequence on Qwen3.8-Flash-Next at 64k: an 8192 MiB
+    // cache ran at 9.90 tok/s against 2048 MiB's 11.40, four times smaller and
+    // 15% faster, because the extra bytes came out of consumers that needed
+    // them more. Optimising each share while holding the others fixed is
+    // coordinate descent on a shared constraint - it finds a local optimum and
+    // the stage order decides which one.
+    //
+    // So the shares are measured together. The primary is never a declared
+    // share: it is the remainder, with a floor no combination may cross,
+    // because a cache whose primary pool cannot exist is worse than no cache.
+    int best_reduced_share = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the budget partition (reduced pool's share of the expert cache) ...\n", __func__);
+        common_moe_calibration_status_set("measuring the budget partition");
+        // The arbiter enumerates; this stage only measures. Which splits are
+        // legal follows from the primary pool's floor, which the arbiter owns -
+        // a list written here would be re-deciding that constraint from outside
+        // and would drift from it the moment the floor changed.
+        int part_reduced[16];
+        int part_draft[16];
+        int n_parts = 0;
+        if (ggml_moe_cache.partition_candidates) {
+            n_parts = ggml_moe_cache.partition_candidates(part_reduced, part_draft, 16);
+        }
+        if (n_parts <= 0) {
+            // No cache registered (CPU-only build, or the cache is off): there
+            // is no partition to search.
+            LOG_INF("%s: no expert cache registered - nothing to partition\n", __func__);
+        }
+        common_moe_stage_begin("budget partition", std::max(1, n_parts));
+        double best_part_tps = -1.0;
+        int    best_draft_share_from_part = -1;
+        for (int pi = 0; pi < n_parts; pi++) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            const int pct   = part_reduced[pi];
+            const int dpct  = part_draft[pi];
+            // A draft share is only meaningful when a draft is attached.
+            if (dpct > 0 && !mtp_configured) {
+                continue;
+            }
+            std::string part_env = string_format(
+                    "GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT=%d GGML_CUDA_MOE_CACHE_NEURON_REDUCE=%d",
+                    pct, pct > 0 ? 1 : 0);
+            if (dpct >= 0) {
+                part_env += string_format(" GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT=%d", dpct);
+            }
+            common_moe_calib_set_env(part_env);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            const std::string label = (pct == 0 && dpct < 0)
+                ? std::string("all to the primary pool")
+                : string_format("reduced %d%%%s", pct,
+                                dpct >= 0 ? string_format(", draft %d%%", dpct).c_str() : "");
+            LOG_INF("%s:   %s -> %s\n", __func__, label.c_str(),
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("budget partition", label,
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_part_tps) {
+                best_part_tps              = tps;
+                best_reduced_share         = pct;
+                best_draft_share_from_part = dpct;
+            }
+        }
+        if (best_draft_share_from_part >= 0) {
+            best_share_pct = best_draft_share_from_part;
+            entry.draft_share_pct = best_share_pct;
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.reduced_share_pct = best_reduced_share;
+        checkpoint("budget partition");
+        if (best_reduced_share >= 0) {
+            LOG_INF("%s: budget partition: reduced pool %d%% at %.2f tok/s\n",
+                    __func__, best_reduced_share, best_part_tps);
+            common_moe_calibration_status_note("budget partition",
+                    best_reduced_share == 0 ? std::string("all to the primary pool")
+                                            : string_format("reduced %d%%", best_reduced_share),
+                    string_format("SELECTED - %.2f tok/s", best_part_tps), true, true);
+        }
+    }
+
     // Rank-weighted admission: how much an un-substitutable miss counts.
     //
     // With top-10 routing and a substitution floor of 4, ranks 0-3 are 40% of
@@ -7094,6 +7192,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
+    entry.reduced_share_pct      = best_reduced_share;
     entry.admit_exact_weight     = best_admit_exact_w;
     entry.predictor_admit        = best_pred_admit;
     entry.predictor_evict_w      = best_pred_evict_w;
