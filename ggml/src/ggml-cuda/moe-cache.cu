@@ -9406,6 +9406,31 @@ static int moe_cache_admit_exact_weight() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT", 0);
 }
 
+// Whether the prerouter may WARM experts - i.e. take on admission, which is
+// lookahead's role.
+//
+// Default 0, and that is a role assignment rather than a shipping-off-until-
+// measured default. Admission requires punctuality: a fetch that lands after
+// the layer needed it is pure waste. The prerouter cannot promise punctuality
+// - it enqueues and its queue drops rather than falls behind - while lookahead
+// is a graph node that fires every time, one layer ahead. See the spec_src
+// comment for the full argument.
+//
+// Two models agree with it, measured on the configuration each was being
+// calibrated for:
+//
+//                            gemma-4      qwen3.8-flash-next
+//   trained but inert           -              9.44 tok/s
+//   admission only           56.59              9.45     <- adds nothing
+//   eviction protection      71.41              9.86
+//   eviction + substitution  52.81             10.69     <- best
+//   admission + eviction        -               9.87
+//
+// The prerouter earns its place on decisions about experts already resident,
+// where being a layer late costs nothing, and loses on the one decision that
+// has to be on time. Still a knob, so the rule can be falsified on a model
+// where the queue is never contended - but it is off because of what it is,
+// not because nobody has measured it.
 static bool moe_cache_predictor_admit_enabled() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT", 0) != 0;
 }
@@ -9586,11 +9611,40 @@ static double moe_cache_predictor_score(const moe_cache_device & device, const m
 
 // How much the predictor may protect a resident expert from eviction, as a
 // multiplier on its heat. 0 disables it entirely (the default until measured).
+// The prerouter's own role: protect what is about to be wanted from eviction.
+//
+// Default 1.0, not 0. This is the consumer it won on both models measured
+// (71.41 against 56.59 for admission on gemma-4; 9.86 and 10.69 with
+// substitution against 9.44 inert on qwen3.8-flash-next), and the timing
+// argument says why - retention tolerates a late prediction and admission does
+// not. Shipping it at 0 would mean the mechanism that pays for itself is off
+// unless a calibration entry happens to turn it on, which is the trap this
+// file has spent its history climbing out of.
+//
+// The bias is still additive and capped (see moe_cache_weighted_heat), so a
+// confident predictor delays an eviction and can never pin a slot against real
+// demand.
 static double moe_cache_predictor_evict_weight() {
-    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", 0.0);
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", 1.0);
 }
 
 // How much the predictor may influence the choice of stand-in. 0 disables it.
+// The prerouter's contribution to choosing a stand-in. Stays at 0 by default,
+// because unlike eviction protection the two models measured DISAGREE:
+//
+//   gemma-4              52.81 tok/s with it, against 71.41 without  - hurts
+//   qwen3.8-flash-next   10.69 with it, against 9.86 without         - helps
+//
+// Which is explicable, and the explanation is why this is not a role: a
+// stand-in is a resemblance question - does this resident expert do the
+// missing one's job - and "is about to be wanted" is a different question that
+// happens to be available. On a model whose working set mostly fits (gemma)
+// there is little to gain and the wrong stand-in costs quality; on one that
+// does not fit (qwen, 48 expert layers on CPU) nearly every miss needs a
+// stand-in and the extra signal earns its place.
+//
+// So it is left to the calibration stage rather than assigned, since the right
+// answer genuinely depends on the model.
 static double moe_cache_predictor_substitute_weight() {
     return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT", 0.0);
 }
