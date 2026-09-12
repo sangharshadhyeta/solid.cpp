@@ -8411,6 +8411,15 @@ static bool moe_cache_live_prefetch_enabled() {
 }
 #endif
 
+// Whether the suggestion-only admission path may take a ring slot when no slot
+// is free. Off by default like every other prefetch lever here, and measured
+// rather than assumed - a prediction that lands still has to earn its keep.
+static bool moe_cache_atlas_admit_ring_enabled() {
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING", 0) != 0;
+}
+static int moe_cache_ring_target(const moe_cache_pool & pool);
+static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target);
+
 static bool moe_cache_atlas_admit(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
         const void * host_base, size_t expert_size,
@@ -8451,11 +8460,34 @@ static bool moe_cache_atlas_admit(
         if (pool.map.find(key) != pool.map.end()) {
             continue; // already resident or in flight - the only residency check now, see MOE_CACHE_ATLAS_RANK_K
         }
-        if (pool.free_slots.empty()) {
-            break; // nothing free right now - a suggestion with nowhere to land is a no-op, not a reason to evict
+        int slot_index = -1;
+        if (!pool.free_slots.empty()) {
+            slot_index = pool.free_slots.back();
+            pool.free_slots.pop_back();
+        } else if (moe_cache_atlas_admit_ring_enabled()) {
+            // Free slots are not a resource this path can rely on: as the
+            // comment above records, pool.free_slots empties permanently
+            // within the first few tokens of any real run. So a suggestion-
+            // only admission path is a no-op for essentially the whole run -
+            // which means the live-trained predictor that feeds it could
+            // never act, and any measurement of it was measuring nothing.
+            //
+            // The ring is the resource that exists for exactly this. It is
+            // NOT the eviction rights this function tried and reverted: a
+            // ring slot displaces only an older, unused PREDICTION, never a
+            // resident expert something actually asked for, and the ring is
+            // capped at a share of the pool (GGML_CUDA_MOE_CACHE_RING_PCT,
+            // default 0). So the worst case is that predictions replace
+            // predictions, which is the trade the ring was built and
+            // measured for on the router-lookahead path.
+            const int ring_target = moe_cache_ring_target(pool);
+            if (ring_target > 0) {
+                slot_index = moe_cache_ring_take(device, pool, ring_target);
+            }
         }
-        const int slot_index = pool.free_slots.back();
-        pool.free_slots.pop_back();
+        if (slot_index < 0) {
+            break; // nothing free and no ring slot - a suggestion with nowhere to land is a no-op, not a reason to evict
+        }
         moe_cache_slot & slot = pool.slots[slot_index];
         slot.key = key;
         slot.generation++;
