@@ -4519,6 +4519,10 @@ void common_moe_calibrate(common_params & params) {
     int best_offload_min_batch = -1;
     if (entry.op_offload_min_batch > 0) {
         best_offload_min_batch = entry.op_offload_min_batch;
+        // Carry it to the candidates, not just to the entry. A resumed value
+        // that is recorded but never applied means the run measures one
+        // configuration and saves another.
+        g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         LOG_WRN("%s: resuming - offload threshold %d already measured, skipping that stage\n",
                 __func__, best_offload_min_batch);
         // Show it. A resumed value is still this run's answer, and a decisions
@@ -4593,6 +4597,10 @@ void common_moe_calibrate(common_params & params) {
     if (entry.n_ubatch > 0) {
         best_ubatch   = entry.n_ubatch;
         best_prefetch = entry.sched_prefetch_experts;
+        g_moe_calib_ubatch.store(best_ubatch);
+        if (best_prefetch >= 0) {
+            g_moe_calib_prefetch.store(best_prefetch != 0);
+        }
         LOG_WRN("%s: resuming - prompt micro-batch -ub %d and expert prefetch already measured, "
                 "skipping that stage\n", __func__, best_ubatch);
         common_moe_calibration_status_note("prompt micro-batch",
@@ -4673,6 +4681,67 @@ void common_moe_calibrate(common_params & params) {
     int    depth_runner_up = -1; // the second-best depth, re-measured once substitution is chosen
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
+
+    // The micro-batch was chosen before any draft existed - check it survives one.
+    //
+    // -ub is measured on prompt processing, and that stage runs with no draft
+    // attached. The draft's compute buffers scale with the micro-batch, so a
+    // value that is comfortable without one can be impossible with it. Measured
+    // on Qwen3.8-Flash-Next at 64k: -ub 2048 won its stage at 47.5 prompt
+    // tok/s, and then every candidate from here on died with "failed to create
+    // MTP context", 676 MiB short - the draft depth search, substitution, the
+    // quality bar, the cache ladder, the prerouter. Nothing was wrong with any
+    // of them.
+    //
+    // This has to run BEFORE the depth search rather than after it: the first
+    // version keyed off mtp_configured, which is derived from best_n_max, which
+    // the depth search produces - so it only ran once the stage it was meant to
+    // protect had already failed.
+    //
+    // Earlier runs never saw any of this, because fit silently shrank the
+    // context until the combination fitted - the same mechanism that made a run
+    // asking for 64k measure 4k throughout.
+    if (params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty() &&
+        g_moe_calib_ubatch.load() > 0 && !common_moe_calibrate_budget_spent()) {
+        const std::string dft_path = params.speculative.draft.mparams.path;
+        const int probe_n_max = std::max(1, params.speculative.draft.n_max);
+        const int chosen_ub = g_moe_calib_ubatch.load();
+        auto try_with_draft = [&]() {
+            const double r = common_moe_bench_candidate_server(
+                    self_exe, path_model, dft_path, best_n, probe_n_max,
+                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
+                    active_ngl, active_min_rank);
+            common_moe_calibration_status_candidate_done();
+            return r;
+        };
+        double check = try_with_draft();
+        for (const int smaller : { 2048, 512 }) {
+            if (check != COMMON_MOE_TPS_LAUNCH_FAILED || smaller >= g_moe_calib_ubatch.load()) {
+                continue;
+            }
+            LOG_WRN("%s: -ub %d does not fit once the draft is attached at this context - stepping down "
+                    "to %d\n", __func__, g_moe_calib_ubatch.load(), smaller);
+            common_moe_calibration_status_note("prompt micro-batch",
+                    string_format("-ub %d", g_moe_calib_ubatch.load()),
+                    "does not fit with the draft attached", false, false);
+            g_moe_calib_ubatch.store(smaller);
+            entry.n_ubatch = smaller;
+            check = try_with_draft();
+        }
+        if (check == COMMON_MOE_TPS_LAUNCH_FAILED) {
+            LOG_WRN("%s: no micro-batch on the ladder fits with the draft attached - leaving it unset so "
+                    "the server's own default applies\n", __func__);
+            g_moe_calib_ubatch.store(-1);
+            entry.n_ubatch = -1;
+        } else if (g_moe_calib_ubatch.load() != chosen_ub) {
+            LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft\n",
+                    __func__, g_moe_calib_ubatch.load());
+            common_moe_calibration_status_note("prompt micro-batch",
+                    string_format("-ub %d", g_moe_calib_ubatch.load()),
+                    "REVISED - the larger value could not hold the draft", true, true);
+        }
+        checkpoint("micro-batch revalidated with the draft");
+    }
     if (params.speculative.has_dft() && entry.spec_n_max >= 0) {
         best_n_max = entry.spec_n_max;
         LOG_WRN("%s: resuming - speculative depth %d already measured, skipping the envelope search "
@@ -5702,66 +5771,6 @@ void common_moe_calibrate(common_params & params) {
             ? best_n_max
             : (mtp_configured ? std::max(1, params.speculative.draft.n_max) : 0);
 
-    // The micro-batch was chosen before the draft existed - check it survives it.
-    //
-    // -ub is measured on prompt processing, and that stage runs before any
-    // draft is attached. The draft's compute buffers scale with the
-    // micro-batch, so a value that is comfortable without one can be
-    // impossible with it. Measured on Qwen3.8-Flash-Next at 64k: -ub 2048 won
-    // its stage at 48.9 prompt tok/s, and then every single candidate from the
-    // draft-depth search onward died with "failed to create MTP context", 676
-    // MiB short. Cache size, admission, atlas prewarm, the prerouter - all of
-    // them reported "failed", none of them had anything wrong with it.
-    //
-    // Earlier runs never saw this, because fit quietly shrank the context until
-    // the combination fitted - which is the same mechanism that made the whole
-    // run measure 4k while asking for 64k.
-    //
-    // So: one launch with the draft attached. If the winner cannot hold it,
-    // step down the ladder. A smaller micro-batch costs some prompt
-    // throughput; a run where nothing after this point can launch costs the
-    // entire run.
-    if (mtp_configured && g_moe_calib_ubatch.load() > 0 && !common_moe_calibrate_budget_spent()) {
-        const int chosen = g_moe_calib_ubatch.load();
-        std::vector<int> smaller;
-        for (const int ub : { 2048, 512 }) {
-            if (ub < chosen) {
-                smaller.push_back(ub);
-            }
-        }
-        auto try_draft = [&]() {
-            const double r = common_moe_bench_candidate_server(
-                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
-                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
-                    active_ngl, active_min_rank);
-            common_moe_calibration_status_candidate_done();
-            return r;
-        };
-        double check = try_draft();
-        for (size_t i = 0; check == COMMON_MOE_TPS_LAUNCH_FAILED && i < smaller.size(); i++) {
-            LOG_WRN("%s: -ub %d does not fit once the draft is attached at this context - stepping down "
-                    "to %d\n", __func__, g_moe_calib_ubatch.load(), smaller[i]);
-            common_moe_calibration_status_note("prompt micro-batch",
-                    string_format("-ub %d", g_moe_calib_ubatch.load()),
-                    "does not fit with the draft attached", false, false);
-            g_moe_calib_ubatch.store(smaller[i]);
-            entry.n_ubatch = smaller[i];
-            check = try_draft();
-        }
-        if (check == COMMON_MOE_TPS_LAUNCH_FAILED) {
-            LOG_WRN("%s: no micro-batch on the ladder fits with the draft attached - leaving it unset so "
-                    "the server's own default applies\n", __func__);
-            g_moe_calib_ubatch.store(-1);
-            entry.n_ubatch = -1;
-        } else if (g_moe_calib_ubatch.load() != chosen) {
-            LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft\n",
-                    __func__, g_moe_calib_ubatch.load());
-            common_moe_calibration_status_note("prompt micro-batch",
-                    string_format("-ub %d", g_moe_calib_ubatch.load()),
-                    "REVISED - the larger value could not hold the draft", true, true);
-        }
-        checkpoint("micro-batch revalidated with the draft");
-    }
 
     const int n_threads_physical = common_cpu_get_num_physical_cores();
     const int n_threads_logical  = (int) std::thread::hardware_concurrency();
