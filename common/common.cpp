@@ -4030,9 +4030,21 @@ void common_moe_calibrate(common_params & params) {
     // "RESUMED - 64 tokens at 21.1 prompt tok/s (2026-09-12 01:34)" reads as a
     // measurement; "RESUMED" alone reads as a gap in the table.
     auto resumed_result = [](const std::string & what, double tps, const std::string & when) {
-        std::string out = "RESUMED - " + what;
+        GGML_UNUSED(what);
+        // The result column carries the measurement; the value column already
+        // carries the setting. Repeating the setting here fills the row
+        // without adding anything - which is what an entry written before the
+        // per-stage tps_* fields existed produced, since there was no
+        // throughput to show and the value was echoed instead.
+        //
+        // When the number is missing, say so. An entry from an older run
+        // genuinely does not know what its stages measured, and "no throughput
+        // recorded" is information; the value repeated back is not.
+        std::string out = "RESUMED";
         if (tps > 0.0) {
-            out += string_format(" at %.2f tok/s", tps);
+            out += string_format(" - %.2f tok/s", tps);
+        } else {
+            out += " - earlier run recorded no throughput for this stage";
         }
         if (!when.empty()) {
             out += " (measured " + when + ")";
@@ -6065,10 +6077,20 @@ void common_moe_calibrate(common_params & params) {
             }
             const auto & sh = shapes[si];
             const std::string state_i = predictor_state_file + "." + std::to_string(si);
+            // The ring, and permission to use it, on every prerouter candidate.
+            // Without them the predictor cannot act at all: its admissions go
+            // through the suggestion-only path, and that path's own comment
+            // records that pool.free_slots empties permanently within the
+            // first few tokens of any real run. Measured with the ring at its
+            // default of 0, every candidate here would score the cost of
+            // training with none of the benefit - and the stage would report
+            // "the predictor does not help" about a predictor that was never
+            // allowed to place anything.
             common_moe_calib_set_env(string_format(
-                    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s "
+                    "%sGGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s "
                     "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
                     "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
+                    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 ",
                     state_i.c_str(), sh.next_layer, sh.prev_buckets, sh.aux_cap));
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
@@ -6110,6 +6132,7 @@ void common_moe_calibrate(common_params & params) {
             // reject it and silently serve an untrained predictor, which reads
             // as "the predictor does not help" rather than as a bug.
             common_moe_calib_set_base_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 "
                     "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s GGML_CUDA_MOE_CACHE_TRAIN_FREEZE=1 "
                     "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
                     "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
@@ -6143,10 +6166,14 @@ void common_moe_calibrate(common_params & params) {
         common_moe_stage_begin("trained prerouter", 3);
         double best_pred_tps = -1.0;
         struct pred_cand { const char * label; const char * env; int on; };
+        // Every arm carries the same ring, including "off" - the ring changes
+        // throughput on its own (it is the router-lookahead's landing space
+        // too), so an A/B where only the "on" arms have one measures the ring,
+        // not the predictor.
         const pred_cand cands[] = {
-            { "off",            "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0", 0 },
-            { "on, lr 0.01",    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.01", 1 },
-            { "on, lr 0.05",    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.05", 1 },
+            { "off",            "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0", 0 },
+            { "on, lr 0.01",    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.01", 1 },
+            { "on, lr 0.05",    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.05", 1 },
         };
         for (const auto & c : cands) {
             if (common_moe_calibrate_budget_spent()) {
@@ -6208,6 +6235,7 @@ void common_moe_calibrate(common_params & params) {
                 break;
             }
             common_moe_calib_set_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 "
                     "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 "
                     "GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT=%.3f "
                     "GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT=%.3f", c.evict_w, c.sub_w));
