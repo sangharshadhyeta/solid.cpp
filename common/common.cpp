@@ -1659,6 +1659,12 @@ struct common_moe_calibration_entry {
     // Atlas prewarm on a restored prompt-cache prefix (top_k per tensor).
     // -1 = not calibrated, 0 = measured and not worth it.
     int         atlas_prewarm_k  = -1;
+    // The live-trained prerouter (moe-cache.cu: predictor_weights, an online
+    // logistic regression on the hidden state that feeds moe_cache_atlas_admit
+    // and persists across restarts). It has shipped off and unmeasured behind
+    // GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR since it was written - the same
+    // opt-in trap the substitution floor was in. -1 = not calibrated.
+    int         train_predictor  = -1;
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1895,6 +1901,12 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             LOG_WRN("%s: using calibrated %s\n", __func__, kv.c_str());
         }
     }
+    if (cal.train_predictor >= 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR", cal.train_predictor);
+        LOG_WRN("%s: live-trained prerouter %s (calibrated)\n", __func__,
+                cal.train_predictor ? "on" : "off");
+    }
+
     if (cal.atlas_prewarm_k > 0 && !getenv("LLAMA_PROMPT_CACHE_MOE_PREWARM")) {
         set_env_int("LLAMA_PROMPT_CACHE_MOE_PREWARM", 1);
         set_env_int("LLAMA_PROMPT_CACHE_MOE_PREWARM_K", cal.atlas_prewarm_k);
@@ -2031,6 +2043,7 @@ static bool common_moe_calibration_lookup(
         out.draft_share_pct        = e.value("draft_share_pct", -1);
         out.substitute_atlas       = e.value("substitute_atlas", -1);
         out.atlas_prewarm_k        = e.value("atlas_prewarm_k", -1);
+        out.train_predictor        = e.value("train_predictor", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -2102,6 +2115,7 @@ static void common_moe_calibration_save(
         {"draft_share_pct", entry.draft_share_pct},
         {"substitute_atlas", entry.substitute_atlas},
         {"atlas_prewarm_k", entry.atlas_prewarm_k},
+        {"train_predictor", entry.train_predictor},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -5645,6 +5659,69 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // The live-trained prerouter. moe-cache already carries a full online
+    // predictor - a logistic regression over the hidden state, trained by SGD
+    // on every real routing decision (positives: the experts the router chose;
+    // negatives: sampled non-choices), scored before each update so its
+    // accuracy is not self-confirming, feeding the same free-slot-only
+    // admission the atlas uses, and persisted across restarts. None of that
+    // has ever been measured: it sits behind GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR
+    // and defaults to 0, so every run so far has served with it off.
+    //
+    // It is measured here rather than shipped on for the reason prefetch
+    // always is in this file: a predictor that is wrong is not neutral. The
+    // ring at 5% collapsed the hit rate from 28.8% to 6.4% by spending slots
+    // on guesses, and this admits on the same kind of evidence. So: measure
+    // off against on, and let the number decide.
+    //
+    // Learning rate is swept with it because the two are not separable - the
+    // predictor trains during the same short candidate run it is judged on, so
+    // a rate too low never leaves its prior inside the window and a rate too
+    // high tracks noise. Both look like "the predictor does not help".
+    int best_train_predictor = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring the live-trained prerouter (it ships off, unmeasured) ...\n", __func__);
+        common_moe_calibration_status_set("measuring the trained prerouter");
+        common_moe_stage_begin("trained prerouter", 3);
+        double best_pred_tps = -1.0;
+        struct pred_cand { const char * label; const char * env; int on; };
+        const pred_cand cands[] = {
+            { "off",            "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0", 0 },
+            { "on, lr 0.01",    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.01", 1 },
+            { "on, lr 0.05",    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_LR=0.05", 1 },
+        };
+        for (const auto & c : cands) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_env(c.env);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   prerouter %s -> %s\n", __func__, c.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("trained prerouter", c.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_pred_tps) {
+                best_pred_tps       = tps;
+                best_train_predictor = c.on;
+            }
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.train_predictor = best_train_predictor;
+        checkpoint("trained prerouter");
+        if (best_train_predictor >= 0) {
+            LOG_INF("%s: trained prerouter: %s at %.2f tok/s\n", __func__,
+                    best_train_predictor ? "on" : "off", best_pred_tps);
+            common_moe_calibration_status_note("trained prerouter",
+                    best_train_predictor ? std::string("on") : std::string("off"),
+                    string_format("SELECTED - %.2f tok/s", best_pred_tps), true, true);
+        }
+    }
+
     // Prediction ring: how much of each pool the router lookahead may use. At full
     // occupancy a prediction otherwise has nowhere to go; too large a ring takes
     // slots from experts that were really demanded. Measured on decode, as served
@@ -6127,6 +6204,7 @@ void common_moe_calibrate(common_params & params) {
     entry.draft_share_pct        = best_share_pct;
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
+    entry.train_predictor        = best_train_predictor;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
