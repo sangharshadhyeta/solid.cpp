@@ -181,6 +181,57 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     return ret;
 }
 
+common_probe_context::~common_probe_context() {
+    if (ctx) {
+        llama_free(ctx);
+        ctx = nullptr;
+    }
+    if (model) {
+        llama_model_free(model);
+        model = nullptr;
+    }
+}
+
+void common_make_probe_context(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        common_probe_context & out,
+        ggml_log_level log_level) {
+    struct probe_log_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+    };
+    probe_log_t pl;
+    llama_log_get(&pl.callback, &pl.user_data);
+    pl.min_level = log_level;
+
+    // the probe is expected to be noisy (and to fail on some models); keep its
+    // output out of the way exactly like common_get_device_memory_data does.
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        const probe_log_t * pl = (const probe_log_t *) user_data;
+        const ggml_log_level level_eff = level >= pl->min_level ? level : GGML_LOG_LEVEL_DEBUG;
+        pl->callback(level_eff, text, pl->user_data);
+    }, &pl);
+
+    llama_model_params mparams_copy = *mparams;
+    mparams_copy.no_alloc  = true;
+    mparams_copy.load_mode = LLAMA_LOAD_MODE_NONE;
+
+    out.model = llama_model_load_from_file(path_model, mparams_copy);
+    if (out.model != nullptr) {
+        out.ctx = llama_init_from_model(out.model, *cparams);
+        if (out.ctx == nullptr) {
+            llama_model_free(out.model);
+            out.model = nullptr;
+        }
+    }
+
+    llama_log_set(pl.callback, pl.user_data);
+}
+
+
 common_device_memory_data_vec common_get_device_memory_data(
         const char * path_model,
         const llama_model_params * mparams,

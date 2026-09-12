@@ -52,6 +52,35 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+// A no_alloc model + context pair, kept alive only to stand in as
+// cparams.ctx_other while something else is measured.
+//
+// A draft head that ships without its own embeddings / LM head (qwen4exp MTP,
+// eagle3, dflash) borrows them from its target, and cannot build a context -
+// let alone a graph - without one. Measuring such a draft before the real
+// target context exists therefore needs a stand-in, and a no_alloc context is
+// exactly that: it reads metadata and allocates nothing, so it is cheap enough
+// to build and throw away inside a fitting pass.
+struct common_probe_context {
+    llama_model   * model = nullptr;
+    llama_context * ctx   = nullptr;
+
+    common_probe_context() = default;
+    common_probe_context(const common_probe_context &) = delete;
+    common_probe_context & operator=(const common_probe_context &) = delete;
+    ~common_probe_context();
+};
+
+// Build a no_alloc context for path_model, for use as cparams.ctx_other.
+// Returns a pair whose ctx is nullptr if the model could not provide one; the
+// caller should then measure without it rather than treat this as fatal.
+void common_make_probe_context(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
+              common_probe_context  & out,
+                     ggml_log_level   log_level);
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,
