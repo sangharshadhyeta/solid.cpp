@@ -5737,15 +5737,19 @@ void common_moe_calibrate(common_params & params) {
         // the size won on a difference an order of magnitude below the noise
         // floor, taking VRAM from everything else for nothing.
         //
-        // Widening alone would be the wrong fix: it would hand the decision to
-        // a single cheap probe of a much smaller cache. So the wider band only
-        // nominates, and the nomination has to survive a re-measure against the
-        // best rung - the same confirm-before-believing the depth search
-        // already does with its "measured again" pass.
+        // 5%: wide enough to catch a rung the old 3% excluded on noise (2048
+        // MiB at 11.14 against 11.52 is 3.3% back, inside 5% and outside 3%),
+        // narrow enough that it is not simply preferring the smallest cache.
+        // Widening alone would be the wrong fix either way - it would hand the
+        // decision to a single cheap probe of a much smaller cache - so the
+        // band only nominates, and the nomination has to survive a re-measure
+        // against the best rung, the same confirm-before-believing the depth
+        // search already does with its "measured again" pass. Override with
+        // GGML_MOE_CALIBRATE_CACHE_BAND_PCT.
         static const double band = [] {
             const char * e = getenv("GGML_MOE_CALIBRATE_CACHE_BAND_PCT");
-            const double v = e ? atof(e) : 10.0;
-            return v > 0.0 && v < 50.0 ? v : 10.0;
+            const double v = e ? atof(e) : 5.0;
+            return v > 0.0 && v < 50.0 ? v : 5.0;
         }();
         int    nominee_mb  = -1;
         double nominee_tps = -1.0;
