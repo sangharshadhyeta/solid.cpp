@@ -8972,6 +8972,25 @@ static bool moe_cache_train_predictor_enabled() {
     }();
     return enabled;
 }
+// Active, but not learning. The predictor's weights are loaded and every
+// consumer scores against them; the SGD updates and the periodic save are
+// skipped.
+//
+// This exists because calibration needs both halves separately. A predictor
+// that keeps learning ACROSS candidate runs makes every comparison in the run
+// order-biased - the same candidate measured late beats itself measured early,
+// purely from accumulated training - and that would quietly corrupt the thread
+// count, -ub and offload-threshold stages, none of which are about the
+// predictor at all. So calibration trains once, in a designated pass, then
+// freezes and measures every candidate against identical weights.
+static bool moe_cache_train_frozen() {
+    static const bool frozen = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_FREEZE");
+        return env && atoi(env) != 0;
+    }();
+    return frozen;
+}
+
 static float moe_cache_train_lr() {
     static const float v = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_LR");
@@ -9386,16 +9405,18 @@ static void moe_cache_train_service(moe_cache_device & device) {
             device.predictor_top1_hits++;
         }
     }
-    for (int32_t e : req.ids) {
-        sgd_step(e, 1.0f);
-    }
-    static thread_local std::mt19937 rng(0xC0FFEE);
-    std::uniform_int_distribution<int32_t> dist(0, (int32_t) req.n_expert - 1);
-    const int negs = moe_cache_train_negs();
-    for (int i = 0; i < negs; i++) {
-        int32_t e = dist(rng);
-        if (std::find(req.ids.begin(), req.ids.end(), e) == req.ids.end()) {
-            sgd_step(e, 0.0f);
+    if (!moe_cache_train_frozen()) {
+        for (int32_t e : req.ids) {
+            sgd_step(e, 1.0f);
+        }
+        static thread_local std::mt19937 rng(0xC0FFEE);
+        std::uniform_int_distribution<int32_t> dist(0, (int32_t) req.n_expert - 1);
+        const int negs = moe_cache_train_negs();
+        for (int i = 0; i < negs; i++) {
+            int32_t e = dist(rng);
+            if (std::find(req.ids.begin(), req.ids.end(), e) == req.ids.end()) {
+                sgd_step(e, 0.0f);
+            }
         }
     }
     // Warming: rank every expert by the (just-updated) predictor score and
@@ -9483,7 +9504,8 @@ static void moe_cache_train_service(moe_cache_device & device) {
     // Periodic, not save-on-shutdown-only - see moe_cache_predictor_save's
     // comment for why (this session's own testing kills servers with
     // SIGKILL routinely).
-    if (moe_cache_predictor_state_path() && device.predictor_steps % moe_cache_predictor_save_interval() == 0) {
+    if (!moe_cache_train_frozen() && moe_cache_predictor_state_path() &&
+        device.predictor_steps % moe_cache_predictor_save_interval() == 0) {
         moe_cache_predictor_save(device);
     }
 }
