@@ -161,6 +161,21 @@ struct moe_cache_slot {
     // slot (see moe_cache_ring_take). Cleared by the first real hit, which turns
     // it into an ordinary resident, or by the slot being reset.
     bool spec = false;
+    // How confident the prediction that filled this slot was, in [0,1].
+    //
+    // Two mechanisms predict into this ring - the router-lookahead matmul and
+    // the live-trained prerouter - and they competed for slots
+    // first-come-first-served, because the rotation below is FIFO. That hands
+    // the ring to whichever one fires more OFTEN, which is not the same as
+    // whichever one is more often right: lookahead runs once per layer, the
+    // prerouter once per routing decision, so the ring filled by arrival
+    // order and the better prediction could be rotated out by a worse one
+    // that happened to be newer.
+    //
+    // Recording it lets the rotation prefer displacing a weaker prediction
+    // over a merely older one. 0 means unknown, which sorts as weakest -
+    // a caller that does not say how sure it is gets no protection.
+    float spec_conf = 0.0f;
 };
 
 struct moe_cache_pool {
@@ -1124,6 +1139,11 @@ struct moe_cache_device {
     // this token, or the scored scan over every resident expert. Two numbers
     // rather than one, because "substitutions happened" does not say whether
     // the strong evidence or the weak evidence produced them.
+    // Ring contention between the two predictors: how often an arriving
+    // prediction displaced a less confident one, and how often it was refused
+    // because everything already in the ring was more confident than it.
+    long long ring_displaced_weaker = 0;
+    long long ring_declined_weaker  = 0;
     long long substitute_rank_hits  = 0;
     long long substitute_fused_hits = 0;
     long long ring_hits = 0;
@@ -6957,6 +6977,11 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            if (d.ring_displaced_weaker || d.ring_declined_weaker) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d ring contention: %lld predictions displaced a "
+                        "less confident one, %lld were refused because the ring held better ones\n",
+                        d.physical, d.ring_displaced_weaker, d.ring_declined_weaker);
+            }
             if (d.substitute_rank_hits || d.substitute_fused_hits) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d fused stand-ins: %lld from this token's own "
                         "router ranking, %lld from the scored scan over residents\n",
@@ -8507,7 +8532,8 @@ static bool moe_cache_atlas_admit_ring_enabled() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING", 0) != 0;
 }
 static int moe_cache_ring_target(const moe_cache_pool & pool);
-static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target);
+static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target,
+                               float incoming_conf = 0.0f);
 
 static bool moe_cache_atlas_admit(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
@@ -8571,7 +8597,14 @@ static bool moe_cache_atlas_admit(
             // measured for on the router-lookahead path.
             const int ring_target = moe_cache_ring_target(pool);
             if (ring_target > 0) {
-                slot_index = moe_cache_ring_take(device, pool, ring_target);
+                // The predictor's own score for this expert, so the ring can
+                // compare this prediction against the ones already in it
+                // rather than just against their age.
+                const float conf = (float) moe_cache_predictor_score(device, key);
+                slot_index = moe_cache_ring_take(device, pool, ring_target, conf);
+                if (slot_index >= 0) {
+                    pool.slots[slot_index].spec_conf = conf;
+                }
             }
         }
         if (slot_index < 0) {
@@ -13218,7 +13251,8 @@ static int moe_cache_ring_target(const moe_cache_pool & pool) {
     return pct > 0 ? std::max(1, pool.n_slots * pct / 100) : 0;
 }
 
-static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target) {
+static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target,
+                               float incoming_conf) {
     // Carve the ring out of probation ONCE: at most ring_target evictions over the
     // whole run, not per step. A per-step budget looked bounded and was not - the
     // clock available here (collect_calls) ticks per MoE op, ~48x per token on this
@@ -13238,9 +13272,52 @@ static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool,
             return candidate;
         }
     }
-    // Otherwise rotate: the oldest prediction still unused gives up its slot.
-    // Entries that were hit or reset since are dropped; ones still copying or
-    // pinned are kept for a later pass.
+    // Otherwise rotate. The slot given up is the WEAKEST prediction still
+    // unused, not simply the oldest.
+    //
+    // FIFO alone handed the ring to whichever mechanism fires more often
+    // rather than to whichever is more often right - the lookahead matmul runs
+    // once per layer, the prerouter once per routing decision, so arrival rate
+    // decided occupancy. Scanning for the least-confident entry first costs a
+    // pass over a list bounded by the ring size (a few dozen slots at the
+    // default 10%), and keeps the ordering as the tiebreak so two equally
+    // confident predictions still rotate oldest-first.
+    if (incoming_conf > 0.0f && !pool.ring_fifo.empty()) {
+        auto weakest = pool.ring_fifo.end();
+        float weakest_conf = incoming_conf;
+        for (auto it = pool.ring_fifo.begin(); it != pool.ring_fifo.end(); ++it) {
+            const moe_cache_slot & cand = pool.slots[*it];
+            if (!cand.spec || cand.readers > 0 || cand.state != moe_cache_slot_state::valid) {
+                continue;
+            }
+            if (cand.spec_conf < weakest_conf) {
+                weakest_conf = cand.spec_conf;
+                weakest = it;
+            }
+        }
+        if (weakest != pool.ring_fifo.end()) {
+            const int index = *weakest;
+            pool.ring_fifo.erase(weakest);
+            const auto lit = device.lookahead_admitted.find(pool.slots[index].key);
+            if (lit != device.lookahead_admitted.end()) {
+                device.lookahead_wasted++;
+                device.lookahead_admitted.erase(lit);
+            }
+            moe_cache_slot_reset(pool, index, false);
+            device.evictions++;
+            device.ring_rotations++;
+            device.ring_displaced_weaker++;
+            return index;
+        }
+        // Nothing in the ring is weaker than what is arriving: the incoming
+        // prediction is the weakest thing here, so it does not get a slot.
+        // That is the point of scoring them - a low-confidence guess should
+        // not displace a high-confidence one just for being newer.
+        device.ring_declined_weaker++;
+        return -1;
+    }
+    // Unknown incoming confidence (or an empty ring): fall back to the
+    // original oldest-first rotation.
     for (size_t n = pool.ring_fifo.size(); n > 0; n--) {
         const int index = pool.ring_fifo.front();
         pool.ring_fifo.pop_front();
@@ -13378,7 +13455,17 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     slot_index = pool.free_slots.back();
                     pool.free_slots.pop_back();
                 } else if (ring_target > 0) {
-                    slot_index = moe_cache_ring_take(device, pool, ring_target);
+                    // Router-lookahead's confidence is its measured per-depth
+                    // precision: 59.3% at depth 1, 48.0% at 2, 41.1% at 3.
+                    // Those are real numbers for this mechanism, so a depth-1
+                    // prediction correctly outranks a depth-3 one, and the
+                    // prerouter's learned probability is compared against them
+                    // on the same scale rather than by who arrived first.
+                    const float la_conf = depth <= 1 ? 0.593f : (depth == 2 ? 0.480f : 0.411f);
+                    slot_index = moe_cache_ring_take(device, pool, ring_target, la_conf);
+                    if (slot_index >= 0) {
+                        pool.slots[slot_index].spec_conf = la_conf;
+                    }
                     if (slot_index < 0) {
                         if (!moe_cache_lookahead_disk_prefetch_enabled()) {
                             break;
