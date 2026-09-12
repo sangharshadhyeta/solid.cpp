@@ -9030,6 +9030,24 @@ static bool moe_cache_train_predictor_enabled() {
 // count, -ub and offload-threshold stages, none of which are about the
 // predictor at all. So calibration trains once, in a designated pass, then
 // freezes and measures every candidate against identical weights.
+// Whether the predictor may WARM experts (admission). Training is separate and
+// deliberately so.
+//
+// Learning changes nothing about a candidate's throughput - it is one SGD step
+// on a worker thread, one request deep, dropped when busy. Acting does. That
+// distinction is what lets calibration train the predictor from its very first
+// candidate, accumulating over the whole run, while still measuring its
+// influence honestly later: every candidate pays the same (tiny) training cost,
+// so there is no order bias, and the on/off comparison then varies only what
+// the predictor is allowed to DO.
+//
+// The earlier arrangement trained in one dedicated stage and froze afterwards,
+// which avoided the bias but threw away every routing decision the run had
+// already made before that stage - hours of traffic on a long run.
+static bool moe_cache_predictor_admit_enabled() {
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT", 0) != 0;
+}
+
 static bool moe_cache_train_frozen() {
     static const bool frozen = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_FREEZE");
@@ -9521,7 +9539,7 @@ static void moe_cache_train_service(moe_cache_device & device) {
     if (req.pool_index >= 0 && (size_t) req.pool_index < device.pools.size()) {
         moe_cache_pool * pool = device.pools[req.pool_index].get();
         if (pool && pool->slab && pool->expert_size == req.expert_size &&
-            pool->n_slots > 0 &&
+            pool->n_slots > 0 && moe_cache_predictor_admit_enabled() &&
             pool->free_slots.size() > (size_t) (pool->n_slots * moe_cache_train_warm_slot_floor_frac())) {
             const int rank_k = moe_cache_train_rank_k();
             moe_cache_atlas_cand cands[MOE_CACHE_ATLAS_RANK_K];
