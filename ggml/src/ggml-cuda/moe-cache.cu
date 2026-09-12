@@ -9225,6 +9225,13 @@ static int moe_cache_partition_candidates(int * out_reduced, int * out_draft, in
     // and the differences these shares produce are large (measured: an 8192 MiB
     // cache at 9.90 tok/s against 2048 MiB at 11.40) - far larger than the
     // spacing here, so a finer grid would spend the budget resolving noise.
+    // Scheduler expert prefetch is a budget consumer too - it holds
+    // prefetch_n_slots max-sized expert tensors of device memory - and it was
+    // being decided in isolation on a prompt-throughput number while every
+    // other consumer bid against the arbiter. It is single-digit MiB on a
+    // model with 2.3 MiB experts, so it is not a partition dimension worth a
+    // grid axis; what matters is that the arbiter knows it is there, which the
+    // primary floor now covers.
     static const int reduced_grid[] = { 0, 12, 25, 40 };
     static const int draft_grid[]   = { -1, 10, 25 };
 
