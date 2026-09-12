@@ -4797,6 +4797,28 @@ void common_moe_calibrate(common_params & params) {
         // all; q8_0 leaves 2393 MiB and fits it with room to spare. That is
         // the difference between serving 64k with speculative decoding and
         // choosing between them.
+        // q8_0 for the target, f16 for the draft. The asymmetry is the point.
+        //
+        // common_base_params_to_speculative gives the draft its own
+        // cache_type_k/v, so -ctk/-ctv here quantize the target only - which is
+        // what we want, for opposite reasons on each side.
+        //
+        // The target is where the bytes are: 48 layers against the draft's
+        // single NextN block, so q8_0 on the target frees ~1 GiB at 64k while
+        // q8_0 on the draft would free almost nothing. And the target's
+        // degradation is the kind the answer gate can see - it checks what the
+        // model answers.
+        //
+        // The draft's cannot be seen that way. Acceptance is the draft's
+        // entire value, and it is measured in AGREEMENT with the target, not
+        // in output anyone reads: at 0.97 the draft pays for itself, at 0.43 it
+        // costs more than it returns (both measured today at 64k). A quantized
+        // KV degrades precisely that agreement, since the head predicts from
+        // state it then has to agree with - and it would buy a rounding error
+        // of VRAM for the risk.
+        //
+        // So: quantize the large consumer whose output is checked, and leave
+        // the small one whose worth is measured in how often it is right.
         common_moe_stage_begin("KV precision", 2);
         double best_kv_tps = -1.0;
         for (const char * kvt : { "f16", "q8_0" }) {
