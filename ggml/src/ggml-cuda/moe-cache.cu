@@ -195,6 +195,38 @@ struct moe_cache_slot {
     uint8_t spec_src = 0;
 };
 
+// Which mechanism leads, and why it is not a matter of taste.
+//
+// They do not fire at the same time or with the same reliability:
+//
+//   lookahead   a ggml_map_custom1 graph node. It fires while the current
+//               layer is still computing and before the next layer's expert
+//               matmul is reached, every time, because it is part of the
+//               graph. Lead time is exactly one layer of compute.
+//   prerouter   enqueues a request and returns; the work happens on the cache
+//               worker thread. The queue is one deep and drops rather than
+//               falling behind, so a prediction may arrive after the layer
+//               that needed it has already run - or never.
+//
+// So lookahead is punctual and certain, and the prerouter is late and lossy.
+// That is not a defect in either: it is what each can be, given where it runs.
+//
+// It also explains a result that otherwise looks contradictory. Measured on
+// gemma-4, the prerouter LOST at admission (56.59 tok/s) and WON at eviction
+// protection (71.41), with substitution between them. Admission has to be
+// timely - a fetch that lands after the layer ran is pure waste - while
+// retention does not: a slightly stale "this will be wanted" is still exactly
+// what you need to decide what not to throw away. The droppable, asynchronous
+// mechanism lost the job that requires punctuality and won the one that does
+// not.
+//
+// Hence the division of labour, which the defaults already encode:
+// GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT is 0, so lookahead owns admission, and
+// the prerouter's weights act on eviction and substitution - decisions about
+// what is already resident, where being a layer late costs nothing. Agreement
+// between them is then a third thing, stronger than either, and the only case
+// where the prerouter contributes to admission at all.
+//
 // Bit values for moe_cache_slot::spec_src.
 enum : uint8_t {
     MOE_CACHE_SPEC_SRC_LOOKAHEAD = 1u << 0,
