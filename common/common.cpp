@@ -1791,7 +1791,7 @@ static std::string common_moe_calibration_key_prefix(const char * path_model, co
     return cut == std::string::npos ? key : key.substr(0, cut);
 }
 
-static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & cal) {
+static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & cal, const char * path_model) {
     // An entry recorded before the output gates existed says nothing about
     // output. The substitution floor is the clearest case: a gemma-4 entry
     // measured at 12:46 recorded rank 2 purely because it was fastest, and
@@ -1915,6 +1915,25 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
     }
     if (cal.train_predictor >= 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR")) {
         set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR", cal.train_predictor);
+        // Point serving at the weights calibration trained, and let it keep
+        // learning from there - NOT frozen. Freezing is a calibration-only
+        // device, to keep candidate comparisons fair; a served model has no
+        // comparison to protect and every reason to keep adapting to the
+        // traffic it actually gets. Calibration's corpus is a starting point,
+        // not the target distribution.
+        if (cal.train_predictor > 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE")) {
+            const std::string cache_dir = fs_get_cache_directory();
+            const std::string base = path_model ? std::string(path_model) : std::string("model");
+            const size_t slash = base.find_last_of("/\\");
+            const std::string state = cache_dir + "predictor-" +
+                (slash == std::string::npos ? base : base.substr(slash + 1)) + ".bin";
+#if defined(_WIN32)
+            _putenv_s("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE", state.c_str());
+#else
+            setenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE", state.c_str(), 1);
+#endif
+            LOG_WRN("%s: prerouter state: %s (loaded, and kept learning)\n", __func__, state.c_str());
+        }
         LOG_WRN("%s: live-trained prerouter %s (calibrated)\n", __func__,
                 cal.train_predictor ? "on" : "off");
     }
@@ -2633,9 +2652,20 @@ static void common_moe_calib_set_env(const std::string & kv) {
     std::lock_guard<std::mutex> lock(g_moe_calib_env_mu);
     g_moe_calib_extra_env = kv.empty() ? std::string() : kv + " ";
 }
+// Env that every candidate gets, on top of whatever the current stage sets.
+// Stages overwrite the per-stage slot freely, so anything that must hold for
+// the WHOLE run (the frozen predictor state, below) cannot live there.
+static std::string g_moe_calib_base_env;
+static void common_moe_calib_set_base_env(const std::string & kv) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_env_mu);
+    g_moe_calib_base_env = kv.empty() ? std::string() : kv + " ";
+}
 static std::string common_moe_calib_get_env() {
     std::lock_guard<std::mutex> lock(g_moe_calib_env_mu);
-    return g_moe_calib_extra_env;
+    // Base first, so a stage that deliberately sets the same knob (the
+    // prerouter stage toggling TRAIN_PREDICTOR) still wins - later
+    // assignments override earlier ones in the command line this builds.
+    return g_moe_calib_base_env + g_moe_calib_extra_env;
 }
 
 // A candidate can end badly in two different ways and they must not be
@@ -5684,6 +5714,59 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Train the prerouter on calibration's own traffic, once, before anything
+    // measures it.
+    //
+    // The traffic is already the right shape: the probe prompts span
+    // photosynthesis, binary search, mystery fiction, the water cycle,
+    // Newton's laws, car engines, inflation, vaccines and a step-by-step rate
+    // problem - eight or nine distinct topics, which is what a router-
+    // prediction corpus needs. It needs varied hidden states, not correct
+    // answers, so the existing prompts serve without being written for this.
+    //
+    // Deliberately ONE pass, with every later candidate frozen against what it
+    // produced. A predictor that kept learning across candidates would make
+    // the whole run order-biased: the same candidate measured late would beat
+    // itself measured early, on accumulated training alone, and that bias
+    // would land on stages that have nothing to do with the predictor. Every
+    // stage before this one runs with the predictor off entirely, for the same
+    // reason - uniform, not absent-then-present.
+    std::string predictor_state_file;
+    if (!common_moe_calibrate_budget_spent()) {
+        const std::string cache_dir = fs_get_cache_directory();
+        const std::string base = path_model ? std::string(path_model) : std::string("model");
+        const size_t slash = base.find_last_of("/\\");
+        predictor_state_file = cache_dir + "predictor-" +
+            (slash == std::string::npos ? base : base.substr(slash + 1)) + ".bin";
+
+        LOG_INF("%s: training the prerouter on this run's own traffic (one pass, then frozen) ...\n", __func__);
+        common_moe_calibration_status_set("training the prerouter");
+        common_moe_stage_begin("prerouter training", 1);
+        common_moe_calib_set_env(string_format(
+                "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s",
+                predictor_state_file.c_str()));
+        const double train_tps = common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+        common_moe_calibration_status_candidate_done();
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        LOG_INF("%s: prerouter training pass %s (state: %s)\n", __func__,
+                train_tps > 0 ? "completed" : "did not complete - later stages measure an untrained predictor",
+                predictor_state_file.c_str());
+        common_moe_calibration_status_note("prerouter training", "one pass over the probe set",
+                train_tps > 0 ? string_format("trained at %.2f tok/s", train_tps)
+                              : std::string("did not complete"), train_tps > 0);
+        // From here on every candidate loads those weights and none of them
+        // writes back - see moe_cache_train_frozen.
+        if (train_tps > 0) {
+            common_moe_calib_set_base_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s GGML_CUDA_MOE_CACHE_TRAIN_FREEZE=1",
+                    predictor_state_file.c_str()));
+        }
+    }
+
     // The live-trained prerouter. moe-cache already carries a full online
     // predictor - a logistic regression over the hidden state, trained by SGD
     // on every real routing decision (positives: the experts the router chose;
@@ -7093,7 +7176,7 @@ static void common_moe_apply_prefill_knobs(const common_moe_calibration_entry & 
 static void common_moe_apply_calibrated_quality(const char * path_model, common_params & params) {
     common_moe_calibration_entry cal_q;
     if (common_moe_calibration_lookup(path_model, params, cal_q)) {
-        common_moe_apply_quality_knobs(cal_q);
+        common_moe_apply_quality_knobs(cal_q, path_model);
         common_moe_apply_prefill_knobs(cal_q, params);
     }
 }
