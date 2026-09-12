@@ -283,6 +283,16 @@ struct moe_cache_demand {
     // queue depth ~3, never empty at pop), so this is what decides who gets
     // the front of it - see the enqueue in moe_cache_plan.
     uint16_t unsubstituted = 0;
+    // Misses on this expert at a rank BELOW substitute_min_rank - i.e. demand
+    // that policy says may never be served by a stand-in, however good one is.
+    //
+    // Distinct from `unsubstituted` above, which is an availability fact ("no
+    // resident stand-in happened to suit this"). This is a policy fact: the
+    // router ranked the expert among its most consequential picks, and those
+    // are required to be exact. A miss here has exactly one outcome - the CPU
+    // computes the expert - so residency is worth strictly more for it than
+    // for a miss the cache could have covered with a substitute for free.
+    uint16_t exact_required = 0;
 };
 
 struct moe_cache_config {
@@ -9044,6 +9054,14 @@ static bool moe_cache_train_predictor_enabled() {
 // The earlier arrangement trained in one dedicated stage and froze afterwards,
 // which avoided the bias but threw away every routing decision the run had
 // already made before that stage - hours of traffic on a long run.
+// How much an un-substitutable miss counts toward admission, on top of the
+// plain demand count. 0 = today's behaviour (rank-blind). Measured, not
+// assumed - this moves who gets scarce VRAM, and the fill worker is already
+// permanently backlogged.
+static int moe_cache_admit_exact_weight() {
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT", 0);
+}
+
 static bool moe_cache_predictor_admit_enabled() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT", 0) != 0;
 }
@@ -10786,13 +10804,36 @@ static int moe_cache_plan(
         if (!covered_by_standin && demand->unsubstituted < std::numeric_limits<uint16_t>::max()) {
             demand->unsubstituted++;
         }
+        if (rank_bucket < moe_cache_substitute_min_rank(device) &&
+            demand->exact_required < std::numeric_limits<uint16_t>::max()) {
+            demand->exact_required++;
+        }
         if (demand->count < std::numeric_limits<uint16_t>::max()) {
             demand->count++;
         }
         const int admit_after = pool.free_slots.empty()
             ? std::max(session.config.admit_after, session.config.readmit_after)
             : session.config.admit_after;
-        if (demand->count < admit_after) {
+        // Rank-weighted demand.
+        //
+        // Admission is earned by demand->count and that does not change here:
+        // this weighs the same earned signal, it does not stand in for it. The
+        // note above about the rejected cost gate draws the line - a candidate
+        // must not clear the bar on a PROPERTY it happens to have (page-cache
+        // residency). Rank is not such a property; it is the router's own
+        // confidence ordering, the identical signal substitution is already
+        // gated on, and it is earned the same way count is: by the router
+        // repeatedly putting this expert there.
+        //
+        // Why it matters arithmetically. With top-10 routing and a min_rank of
+        // 4, ranks 0-3 are 40% of activations and can never be substituted, so
+        // a miss on one has exactly one outcome: the CPU computes the expert.
+        // Ranks 4-9 miss for free - a resident stand-in covers them. Residency
+        // is therefore worth far more to the first group, and admission could
+        // not tell them apart. Weight 0 is exactly today's behaviour.
+        const int exact_w = moe_cache_admit_exact_weight();
+        const int effective_demand = (int) demand->count + exact_w * (int) demand->exact_required;
+        if (effective_demand < admit_after) {
             device.admission_skips++;
             continue;
         }

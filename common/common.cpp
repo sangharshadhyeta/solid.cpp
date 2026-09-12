@@ -1680,6 +1680,7 @@ struct common_moe_calibration_entry {
     double      tps_offload_min_batch = -1.0;
     double      tps_ubatch            = -1.0;
     double      tps_spec_n_max        = -1.0;
+    int         admit_exact_weight   = -1;  // extra admission weight for un-substitutable demand
     int         predictor_admit      = -1;  // may it warm experts (needs a slot)
     int         predictor_next_layer = -1;  // predict the NEXT layer's picks
     int         predictor_prev_buckets = -1; // hashed previous-selection block width
@@ -1971,6 +1972,11 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         LOG_WRN("%s: prerouter previous-selection block: %d buckets (calibrated)\n", __func__,
                 cal.predictor_prev_buckets);
     }
+    if (cal.admit_exact_weight >= 0 && !getenv("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT", cal.admit_exact_weight);
+        LOG_WRN("%s: admission weights un-substitutable demand %dx (calibrated)\n",
+                __func__, cal.admit_exact_weight);
+    }
     if (cal.predictor_admit >= 0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_PREDICTOR_ADMIT", cal.predictor_admit);
         LOG_WRN("%s: prerouter warming %s (calibrated)\n", __func__, cal.predictor_admit ? "on" : "off");
@@ -2126,6 +2132,7 @@ static bool common_moe_calibration_lookup(
         out.tps_offload_min_batch  = e.value("tps_offload_min_batch", -1.0);
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
+        out.admit_exact_weight     = e.value("admit_exact_weight", -1);
         out.predictor_admit        = e.value("predictor_admit", -1);
         out.predictor_next_layer   = e.value("predictor_next_layer", -1);
         out.predictor_prev_buckets = e.value("predictor_prev_buckets", -1);
@@ -2206,6 +2213,7 @@ static void common_moe_calibration_save(
         {"tps_offload_min_batch", entry.tps_offload_min_batch},
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
+        {"admit_exact_weight", entry.admit_exact_weight},
         {"predictor_admit", entry.predictor_admit},
         {"predictor_next_layer", entry.predictor_next_layer},
         {"predictor_prev_buckets", entry.predictor_prev_buckets},
@@ -6291,6 +6299,60 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Rank-weighted admission: how much an un-substitutable miss counts.
+    //
+    // With top-10 routing and a substitution floor of 4, ranks 0-3 are 40% of
+    // activations and can never be served by a stand-in - a miss on one costs a
+    // CPU matmul, every time. Ranks 4-9 miss for free. Admission could not tell
+    // the two apart: it counted demand and nothing else, so scarce VRAM was
+    // handed out without regard for whether a miss on that expert was
+    // expensive or free.
+    //
+    // This weighs the earned demand signal rather than replacing it - the
+    // distinction this file already draws when it rejected letting page-cache
+    // residency skip the admission bar. Rank is not a property a candidate
+    // happens to have; it is the router's own ordering, the same signal
+    // substitution is gated on.
+    int best_admit_exact_w = -1;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring rank-weighted admission (un-substitutable demand counts extra) ...\n", __func__);
+        common_moe_calibration_status_set("measuring rank-weighted admission");
+        common_moe_stage_begin("rank-weighted admission", 3);
+        double best_aw_tps = -1.0;
+        for (const int w : { 0, 2, 4 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_env(string_format("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT=%d", w));
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   un-substitutable demand weight %d -> %s\n", __func__, w,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("rank-weighted admission",
+                    w == 0 ? std::string("off (rank-blind)") : string_format("%dx", w),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_aw_tps) {
+                best_aw_tps        = tps;
+                best_admit_exact_w = w;
+            }
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.admit_exact_weight = best_admit_exact_w;
+        checkpoint("rank-weighted admission");
+        if (best_admit_exact_w >= 0) {
+            LOG_INF("%s: rank-weighted admission: %s at %.2f tok/s\n", __func__,
+                    best_admit_exact_w == 0 ? "off" : string_format("%dx", best_admit_exact_w).c_str(),
+                    best_aw_tps);
+            common_moe_calibration_status_note("rank-weighted admission",
+                    best_admit_exact_w == 0 ? std::string("off") : string_format("%dx", best_admit_exact_w),
+                    string_format("SELECTED - %.2f tok/s", best_aw_tps), true, true);
+        }
+    }
+
     // The live-trained prerouter. moe-cache already carries a full online
     // predictor - a logistic regression over the hidden state, trained by SGD
     // on every real routing decision (positives: the experts the router chose;
@@ -6912,6 +6974,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
+    entry.admit_exact_weight     = best_admit_exact_w;
     entry.predictor_admit        = best_pred_admit;
     entry.predictor_evict_w      = best_pred_evict_w;
     entry.predictor_sub_w        = best_pred_sub_w;
