@@ -4498,7 +4498,26 @@ void common_moe_calibrate(common_params & params) {
         // The constant sweep shares ONE server: 1 launch + 15 live measurements +
         // 5 settle calls. Still 21 units of the budget's time accounting, but only
         // one model load, which is ~80% of what a launched candidate costs.
-        est += 21; // tuning-constant sweep: 1 launch, 5 knobs x 3 values, 5 settles
+        // The tuning-constant sweep only runs when explicitly asked for - its
+        // effects are inside this machine's noise floor - so it must not be in
+        // the plan by default. Counting it anyway shrinks every stage's share
+        // of the budget by about a fifth, and a stage that hits its share early
+        // stops and reports its remaining candidates as failures, which is the
+        // conflation this file fixed elsewhere today.
+        {
+            const char * e = getenv("GGML_MOE_CALIBRATE_TUNE_CONSTANTS");
+            if (e && atoi(e) != 0) {
+                est += 21; // 1 launch, 5 knobs x 3 values, 5 settles
+            }
+        }
+        est += 3;  // KV precision: f16, q8_0, and the draft-attached re-check
+        est += 3;  // rank-weighted admission: 0, 2x, 4x
+        est += 3;  // verify substitution: generation floor, rank 2, every rank
+        est += 3;  // budget partition: the arbiter's feasible splits
+        est += 2;  // prerouter input shapes: this layer, next layer
+        est += 2;  // trained prerouter: off, on
+        est += 3;  // prerouter influence: inert, the role, the falsifier
+        est += 2;  // final validation: the combination, with and without the prerouter
         est += 2; // answer bar: substitution-off reference, twice
         const uint32_t ngl_hi_est = (uint32_t) probe.n_layer + 1;
         const uint32_t ngl_lo_est = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
@@ -4832,6 +4851,77 @@ void common_moe_calibrate(common_params & params) {
     int    depth_runner_up = -1; // the second-best depth, re-measured once substitution is chosen
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
+    // This has to run before the KV stage, not after it. That stage now
+    // measures with the draft attached - its no-draft numbers were not
+    // comparable with anything downstream - so it inherits whatever -ub the
+    // prompt stage chose, and -ub was chosen with no draft in the picture.
+    // Measured at 64k: -ub 2048 plus the draft plus q8_0 KV leaves the expert
+    // cache nothing, and the KV stage reported 2.56 tok/s - which is the
+    // no-cache rate (2.75 measured separately), not a KV verdict. The guard
+    // has to resolve the -ub/draft conflict first so everything after it
+    // measures a configuration that will actually be served.
+
+    // The micro-batch was chosen before any draft existed - check it survives one.
+    //
+    // -ub is measured on prompt processing, and that stage runs with no draft
+    // attached. The draft's compute buffers scale with the micro-batch, so a
+    // value that is comfortable without one can be impossible with it. Measured
+    // on Qwen3.8-Flash-Next at 64k: -ub 2048 won its stage at 47.5 prompt
+    // tok/s, and then every candidate from here on died with "failed to create
+    // MTP context", 676 MiB short - the draft depth search, substitution, the
+    // quality bar, the cache ladder, the prerouter. Nothing was wrong with any
+    // of them.
+    //
+    // This has to run BEFORE the depth search rather than after it: the first
+    // version keyed off mtp_configured, which is derived from best_n_max, which
+    // the depth search produces - so it only ran once the stage it was meant to
+    // protect had already failed.
+    //
+    // Earlier runs never saw any of this, because fit silently shrank the
+    // context until the combination fitted - the same mechanism that made a run
+    // asking for 64k measure 4k throughout.
+    if (params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty() &&
+        g_moe_calib_ubatch.load() > 0 && !common_moe_calibrate_budget_spent()) {
+        const std::string dft_path = params.speculative.draft.mparams.path;
+        const int probe_n_max = std::max(1, params.speculative.draft.n_max);
+        const int chosen_ub = g_moe_calib_ubatch.load();
+        auto try_with_draft = [&]() {
+            const double r = common_moe_bench_candidate_server(
+                    self_exe, path_model, dft_path, best_n, probe_n_max,
+                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
+                    active_ngl, active_min_rank);
+            common_moe_calibration_status_candidate_done();
+            return r;
+        };
+        double check = try_with_draft();
+        for (const int smaller : { 2048, 512 }) {
+            if (check != COMMON_MOE_TPS_LAUNCH_FAILED || smaller >= g_moe_calib_ubatch.load()) {
+                continue;
+            }
+            LOG_WRN("%s: -ub %d does not fit once the draft is attached at this context - stepping down "
+                    "to %d\n", __func__, g_moe_calib_ubatch.load(), smaller);
+            common_moe_calibration_status_note("prompt micro-batch",
+                    string_format("-ub %d", g_moe_calib_ubatch.load()),
+                    "does not fit with the draft attached", false, false);
+            g_moe_calib_ubatch.store(smaller);
+            entry.n_ubatch = smaller;
+            check = try_with_draft();
+        }
+        if (check == COMMON_MOE_TPS_LAUNCH_FAILED) {
+            LOG_WRN("%s: no micro-batch on the ladder fits with the draft attached - leaving it unset so "
+                    "the server's own default applies\n", __func__);
+            g_moe_calib_ubatch.store(-1);
+            entry.n_ubatch = -1;
+        } else if (g_moe_calib_ubatch.load() != chosen_ub) {
+            LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft\n",
+                    __func__, g_moe_calib_ubatch.load());
+            common_moe_calibration_status_note("prompt micro-batch",
+                    string_format("-ub %d", g_moe_calib_ubatch.load()),
+                    "REVISED - the larger value could not hold the draft", true, true);
+        }
+        checkpoint("micro-batch revalidated with the draft");
+    }
+
 
     // KV precision - the consumer nobody had ever bid against.
     //
@@ -4948,66 +5038,6 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
-    // The micro-batch was chosen before any draft existed - check it survives one.
-    //
-    // -ub is measured on prompt processing, and that stage runs with no draft
-    // attached. The draft's compute buffers scale with the micro-batch, so a
-    // value that is comfortable without one can be impossible with it. Measured
-    // on Qwen3.8-Flash-Next at 64k: -ub 2048 won its stage at 47.5 prompt
-    // tok/s, and then every candidate from here on died with "failed to create
-    // MTP context", 676 MiB short - the draft depth search, substitution, the
-    // quality bar, the cache ladder, the prerouter. Nothing was wrong with any
-    // of them.
-    //
-    // This has to run BEFORE the depth search rather than after it: the first
-    // version keyed off mtp_configured, which is derived from best_n_max, which
-    // the depth search produces - so it only ran once the stage it was meant to
-    // protect had already failed.
-    //
-    // Earlier runs never saw any of this, because fit silently shrank the
-    // context until the combination fitted - the same mechanism that made a run
-    // asking for 64k measure 4k throughout.
-    if (params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty() &&
-        g_moe_calib_ubatch.load() > 0 && !common_moe_calibrate_budget_spent()) {
-        const std::string dft_path = params.speculative.draft.mparams.path;
-        const int probe_n_max = std::max(1, params.speculative.draft.n_max);
-        const int chosen_ub = g_moe_calib_ubatch.load();
-        auto try_with_draft = [&]() {
-            const double r = common_moe_bench_candidate_server(
-                    self_exe, path_model, dft_path, best_n, probe_n_max,
-                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
-                    active_ngl, active_min_rank);
-            common_moe_calibration_status_candidate_done();
-            return r;
-        };
-        double check = try_with_draft();
-        for (const int smaller : { 2048, 512 }) {
-            if (check != COMMON_MOE_TPS_LAUNCH_FAILED || smaller >= g_moe_calib_ubatch.load()) {
-                continue;
-            }
-            LOG_WRN("%s: -ub %d does not fit once the draft is attached at this context - stepping down "
-                    "to %d\n", __func__, g_moe_calib_ubatch.load(), smaller);
-            common_moe_calibration_status_note("prompt micro-batch",
-                    string_format("-ub %d", g_moe_calib_ubatch.load()),
-                    "does not fit with the draft attached", false, false);
-            g_moe_calib_ubatch.store(smaller);
-            entry.n_ubatch = smaller;
-            check = try_with_draft();
-        }
-        if (check == COMMON_MOE_TPS_LAUNCH_FAILED) {
-            LOG_WRN("%s: no micro-batch on the ladder fits with the draft attached - leaving it unset so "
-                    "the server's own default applies\n", __func__);
-            g_moe_calib_ubatch.store(-1);
-            entry.n_ubatch = -1;
-        } else if (g_moe_calib_ubatch.load() != chosen_ub) {
-            LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft\n",
-                    __func__, g_moe_calib_ubatch.load());
-            common_moe_calibration_status_note("prompt micro-batch",
-                    string_format("-ub %d", g_moe_calib_ubatch.load()),
-                    "REVISED - the larger value could not hold the draft", true, true);
-        }
-        checkpoint("micro-batch revalidated with the draft");
-    }
     if (params.speculative.has_dft() && entry.spec_n_max >= 0) {
         best_n_max = entry.spec_n_max;
         LOG_WRN("%s: resuming - speculative depth %d already measured, skipping the envelope search "
