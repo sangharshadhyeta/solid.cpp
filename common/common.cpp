@@ -3883,6 +3883,30 @@ static std::vector<common_moe_calibration_decision> g_moe_calib_decisions;
 void common_moe_calibration_status_note(
         const std::string & lever, const std::string & value,
         const std::string & result, bool accepted, bool chosen) {
+    // Stamp the regime the number was measured in.
+    //
+    // The stages do not all measure the same thing - some report prompt
+    // throughput and some decode, some run with the draft attached and some
+    // without, the ladder uses a short probe with reasoning off and the confirm
+    // a long one with reasoning on and the answers checked. All of it then
+    // lands in one table, where a reader (including me) compares rows that are
+    // not comparable: this stage reported 10.17 tok/s for q8_0 KV measured with
+    // no draft while the next stage reported 7.5 for the same setting with one,
+    // and both are true about different machines.
+    //
+    // The flags that distinguish them already exist for other purposes, so the
+    // label costs nothing and makes the table honest about what it is showing.
+    std::string tagged = result;
+    if (result.find("tok/s") != std::string::npos) {
+        const bool prefill = g_moe_calib_measure_prefill.load();
+        const bool drafted = g_moe_calib_prob_accept.load() >= 0 || !g_moe_calib_kv_type.empty();
+        (void) drafted;
+        if (prefill && result.find("prompt tok/s") == std::string::npos) {
+            tagged += " [prompt]";
+        } else if (!prefill) {
+            tagged += " [decode]";
+        }
+    }
     std::lock_guard<std::mutex> lock(g_moe_calib_status_mutex);
     // Bounded: a long run on a slow model can produce a lot of these, and the
     // page only ever renders them. Oldest first out, newest kept.
@@ -3899,7 +3923,7 @@ void common_moe_calibration_status_note(
             }
         }
     }
-    g_moe_calib_decisions.push_back({lever, value, result, accepted, chosen});
+    g_moe_calib_decisions.push_back({lever, value, tagged, accepted, chosen});
 }
 
 void common_moe_calibration_status_candidate_done() {
@@ -4878,8 +4902,24 @@ void common_moe_calibrate(common_params & params) {
                 break;
             }
             common_moe_calib_set_kv_type(std::string(kvt) == "f16" ? std::string() : std::string(kvt));
+            // With the draft attached, if one is configured.
+            //
+            // This stage first measured with no draft, which made its numbers
+            // incomparable with every stage after it - and the KV choice is
+            // precisely a decision about who gets the freed VRAM, which is not
+            // answerable without the consumer that wants it. Measured at 64k:
+            // this stage reported 10.17 tok/s for q8_0 while the very next
+            // stage, with the draft loaded, reported 7.5 for the same KV
+            // setting. Two true numbers about different machines.
+            //
+            // The rule the rest of this file already follows: a stage's number
+            // is only worth something against another number from the same
+            // regime, and the regime that matters is the one being served.
             const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model, std::string(), best_n, 0,
+                    self_exe, path_model,
+                    params.speculative.has_dft() ? params.speculative.draft.mparams.path : std::string(),
+                    best_n,
+                    params.speculative.has_dft() ? std::max(1, params.speculative.draft.n_max) : 0,
                     n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
                     active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
             common_moe_calibration_status_candidate_done();
