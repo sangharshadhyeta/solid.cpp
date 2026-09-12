@@ -6791,7 +6791,7 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: validating the winning combination (nothing above ran the full set together) ...\n", __func__);
         common_moe_calibration_status_set("validating the combination");
-        common_moe_stage_begin("final validation", 1);
+        common_moe_stage_begin("final validation", 2);
         // Apply the entry the way a real launch would, so this measures what
         // serving will actually run rather than a hand-built approximation.
         common_moe_apply_quality_knobs(entry, path_model);
@@ -6800,6 +6800,57 @@ void common_moe_calibrate(common_params & params) {
                 best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
                 active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
         common_moe_calibration_status_candidate_done();
+
+        // The same combination without the prerouter.
+        //
+        // The prerouter's own stage compares on against off with every other
+        // knob at whatever the preceding stage left it on - which is the only
+        // comparison available at that point in the run, and is not the
+        // comparison that matters. What matters is whether the configuration
+        // actually being saved is faster with the predictor than without it,
+        // and nothing measured that: the on/off stage ran before substitution,
+        // the ring, the tuning constants and neuron subsetting were decided.
+        //
+        // Measured on gemma-4, the stage reported +21% (50.16 -> 60.93) while
+        // the full combination validated at 58.94 - three numbers that cannot
+        // be compared to each other. This is the one that can.
+        double final_tps_no_pred = -1.0;
+        if (entry.train_predictor > 0) {
+            common_moe_calib_set_base_env(std::string());
+            common_moe_calib_set_env("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=0");
+            final_tps_no_pred = common_moe_bench_candidate_server(
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calib_set_env(std::string());
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s: the winning combination WITHOUT the prerouter: %s\n", __func__,
+                    final_tps_no_pred > 0 ? string_format("%.2f tok/s", final_tps_no_pred).c_str() : "failed");
+            common_moe_calibration_status_note("final validation", "same combination, prerouter off",
+                    final_tps_no_pred > 0 ? string_format("%.2f tok/s", final_tps_no_pred) : std::string("failed"),
+                    final_tps_no_pred > 0, false);
+            // Proven, not promised: if the predictor does not earn its place in
+            // the configuration being saved, it is not saved as on.
+            if (final_tps > 0 && final_tps_no_pred > final_tps) {
+                LOG_WRN("%s: the prerouter's own stage preferred it, but the full combination is faster "
+                        "without it (%.2f vs %.2f tok/s) - recording it off. A stage-level win measured "
+                        "against different neighbours is not a win here\n",
+                        __func__, final_tps_no_pred, final_tps);
+                entry.train_predictor   = 0;
+                entry.predictor_evict_w = 0.0;
+                entry.predictor_sub_w   = 0.0;
+                entry.tok_per_sec       = final_tps_no_pred;
+                common_moe_calibration_status_note("trained prerouter", "off",
+                        string_format("OVERRULED by final validation - %.2f vs %.2f tok/s",
+                                      final_tps_no_pred, final_tps), true, true);
+            } else if (final_tps > 0 && final_tps_no_pred > 0) {
+                LOG_INF("%s: the prerouter holds up on the full combination: %.2f with, %.2f without\n",
+                        __func__, final_tps, final_tps_no_pred);
+                common_moe_calibration_status_note("trained prerouter", "on",
+                        string_format("CONFIRMED on the full combination - %.2f vs %.2f tok/s",
+                                      final_tps, final_tps_no_pred), true, true);
+            }
+        }
         common_moe_stage_end();
         if (final_tps > 0) {
             LOG_INF("%s: the winning combination runs: %.2f tok/s\n", __func__, final_tps);
