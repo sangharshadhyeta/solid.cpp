@@ -3943,11 +3943,50 @@ void common_moe_calibrate(common_params & params) {
     // half-configured.
     common_moe_calibration_entry entry;
     entry.concurrency = concurrency;
+
+    // Resume, rather than start over.
+    //
+    // Every stage checkpoints what it measured, so an interrupted run already
+    // keeps its results - but nothing READ them back, so the next run
+    // re-measured everything the last one had already paid for. On this model
+    // a single interrupted run had spent twenty minutes on the speculative
+    // envelope alone before it was stopped.
+    //
+    // Seeding `entry` from the cached one turns every stage's own "already
+    // measured?" test into the resume check, with no per-stage bookkeeping:
+    // a field that is still -1 was never measured, and its stage runs.
+    //
+    // Guarded on gates_version, because an entry measured under different
+    // quality gates is not a measurement of the same thing - that is the same
+    // rule the apply side already enforces. GGML_MOE_CALIBRATE_FRESH=1 forces
+    // a full re-measure.
+    bool resumed_any = false;
+    {
+        const char * fresh = getenv("GGML_MOE_CALIBRATE_FRESH");
+        if (!(fresh && atoi(fresh) != 0)) {
+            common_moe_calibration_entry prev;
+            if (common_moe_calibration_lookup(path_model, params, prev) &&
+                prev.gates_version == COMMON_MOE_CALIBRATION_GATES_VERSION &&
+                prev.concurrency == concurrency) {
+                const int keep_concurrency = entry.concurrency;
+                entry = prev;
+                entry.concurrency   = keep_concurrency;
+                entry.gates_version = COMMON_MOE_CALIBRATION_GATES_VERSION;
+                resumed_any = true;
+                LOG_WRN("%s: resuming from the cached entry measured %s - stages it already decided are "
+                        "skipped. Set GGML_MOE_CALIBRATE_FRESH=1 to re-measure everything\n",
+                        __func__, prev.calibrated_at.c_str());
+            }
+        }
+    }
+    (void) resumed_any;
     // Seed the fields a partial entry would otherwise report as a measurement.
     // n_cpu_moe defaults to 0, which reads as "no layers on the CPU" rather than
     // "not calibrated", so a server loading a checkpoint mid-run applied a
     // placement nothing had chosen. -1 is the value the apply side skips.
-    entry.n_cpu_moe     = -1;
+    if (!resumed_any) {
+        entry.n_cpu_moe = -1;
+    }
     entry.gates_version = COMMON_MOE_CALIBRATION_GATES_VERSION;
     auto checkpoint = [&](const char * stage) {
         time_t ck_now = time(nullptr);
@@ -4293,7 +4332,11 @@ void common_moe_calibrate(common_params & params) {
     // Candidates stop at 400: at the cache's 4096-row limit and ~10 experts per
     // token, a larger chunk cannot be served by the cache anyway.
     int best_offload_min_batch = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (entry.op_offload_min_batch > 0) {
+        best_offload_min_batch = entry.op_offload_min_batch;
+        LOG_WRN("%s: resuming - offload threshold %d already measured, skipping that stage\n",
+                __func__, best_offload_min_batch);
+    } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the offload threshold (GGML_OP_OFFLOAD_MIN_BATCH) on prompt processing ...\n", __func__);
         common_moe_calibration_status_set("measuring the MoE offload threshold");
         common_moe_stage_begin("offload threshold", 5);
@@ -4354,7 +4397,12 @@ void common_moe_calibrate(common_params & params) {
     // knob has nothing to act on.
     int best_ubatch   = -1;
     int best_prefetch = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (entry.n_ubatch > 0) {
+        best_ubatch   = entry.n_ubatch;
+        best_prefetch = entry.sched_prefetch_experts;
+        LOG_WRN("%s: resuming - prompt micro-batch -ub %d and expert prefetch already measured, "
+                "skipping that stage\n", __func__, best_ubatch);
+    } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the prompt micro-batch size (-ub) on a long prompt ...\n", __func__);
         common_moe_calibration_status_set("measuring the prompt micro-batch size");
         g_moe_calib_measure_prefill.store(true);
@@ -4421,7 +4469,11 @@ void common_moe_calibrate(common_params & params) {
     int    depth_runner_up = -1; // the second-best depth, re-measured once substitution is chosen
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
-    if (params.speculative.has_dft()) {
+    if (params.speculative.has_dft() && entry.spec_n_max >= 0) {
+        best_n_max = entry.spec_n_max;
+        LOG_WRN("%s: resuming - speculative depth %d already measured, skipping the envelope search "
+                "and the golden-section refinement\n", __func__, best_n_max);
+    } else if (params.speculative.has_dft()) {
         {
             // Find the envelope: double n_max until throughput drops below
             // half the n_max=1 baseline (the real n_max=8 collapse we
