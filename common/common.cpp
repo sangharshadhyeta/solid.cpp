@@ -3952,6 +3952,7 @@ void common_moe_calibrate(common_params & params) {
         calib_free_vram_bytes = std::max(calib_free_vram_bytes, std::min(dfree, dtotal));
     }
 
+
     LOG_INF("%s: probing safe MoE CPU-offload floor for this GPU+model+context combination ...\n", __func__);
     common_moe_calibration_status_set("probing safe MoE CPU-offload floor");
     // Probe with the SAME margin common_maybe_raise_moe_for_ctx will demand at
@@ -5893,6 +5894,65 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Measure the remainder, rather than assume the card is empty.
+    //
+    // calib_free_vram_bytes above is the free VRAM with NOTHING loaded, and the
+    // expert-cache ladder was derived from it - which is why an 8192 MiB rung
+    // was ever a candidate on a 12 GiB card. It cannot coexist with the model,
+    // a 64k KV cache, the compute buffers and the draft; measured by hand, the
+    // real remainder at 64k/f16 is 1405 MiB, and 2393 MiB at q8_0 KV. So the
+    // ladder was spending most of its candidates on rungs that could not exist,
+    // and the ones that "won" won by a margin inside the noise of rungs that
+    // were never allocated in the first place (see the slab-shortfall
+    // accounting in moe-cache.cu - a pool asked for a size and silently took a
+    // fraction of it).
+    //
+    // The fix is to measure it: hold one candidate open with the cache off,
+    // read the device memory the parent can see while the child has the model
+    // loaded, and treat what is left as the budget everything else divides.
+    // That is a real number for the configuration being calibrated rather than
+    // a property of an idle card.
+    auto measure_remainder = [&](const char * why) -> size_t {
+        if (common_moe_calibrate_budget_spent()) {
+            return 0;
+        }
+        LOG_INF("%s: measuring the VRAM remainder %s (one candidate, expert cache off) ...\n", __func__, why);
+        const double r = common_moe_bench_candidate_server(
+                self_exe, path_model,
+                params.speculative.has_dft() ? params.speculative.draft.mparams.path : std::string(),
+                probe.n_layer, params.speculative.has_dft() ? std::max(1, params.speculative.draft.n_max) : 0,
+                n_threads_default, next_port(), ctx, n_predict, concurrency,
+                0 /* expert cache off - this measures the floor, not the cache */, -1,
+                99, -1, nullptr, 1234,
+                std::numeric_limits<double>::quiet_NaN(), false, false, std::string(), -1,
+                std::string(), -1.0, -1, std::string(), true /* keep alive */);
+        size_t left = 0;
+        if (r > 0 || g_moe_live_port > 0) {
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                size_t dfree = 0, dtotal = 0;
+                ggml_backend_dev_memory(dev, &dfree, &dtotal);
+                left = std::max(left, std::min(dfree, dtotal));
+            }
+        }
+        common_moe_live_stop();
+        if (left > 0) {
+            LOG_WRN("%s: the expert cache and everything that divides it have %zu MiB to work with, not the "
+                    "%zu MiB an idle card reports\n", __func__, left >> 20, calib_free_vram_bytes >> 20);
+            common_moe_calibration_status_note("VRAM remainder", string_format("%zu MiB", left >> 20),
+                    string_format("measured with the model loaded (idle card reports %zu MiB)",
+                                  calib_free_vram_bytes >> 20), true, true);
+        } else {
+            LOG_WRN("%s: could not measure the remainder - falling back to the idle-card figure, which "
+                    "overstates it\n", __func__);
+        }
+        return left;
+    };
+
+
     // Expert-cache size: same question as -ncmoe, same answer - measure this
     // model's own knee rather than assume one. Our own sweep found the
     // relationship is not "more is better": Nemotron flattened at 4 GiB (of a
@@ -5918,15 +5978,29 @@ void common_moe_calibrate(common_params & params) {
     // candidate within 3% of the best, so off wins a tie - and off is also
     // the only configuration whose greedy output is exactly reproducible.
     std::vector<int> cache_candidates_mb = { 0 };
+    size_t remainder_bytes = 0;
     {
-        // Free, not total: the cache is only ever offered what is left. Sampled
-        // at the top of this function, before any candidate server took the card.
-        const int cap_mb = (int) (calib_free_vram_bytes >> 20);
+        // The ladder is capped by the MEASURED remainder, not by what an idle
+        // card reports.
+        //
+        // calib_free_vram_bytes is sampled before anything is loaded, so on a
+        // 12 GiB card it offered rungs up to 8192 MiB - a size that cannot
+        // coexist with the model, a 64k KV cache, the compute buffers and the
+        // draft. Measured by hand at 64k: 1405 MiB is actually left at f16 KV,
+        // 2393 MiB at q8_0. So most of the ladder was spending candidates on
+        // rungs that could not exist, and the winner was decided among rungs
+        // that were never fully allocated - the pool allocator halves its slot
+        // count until cudaMalloc succeeds, so an 8192 MiB rung silently became
+        // whatever fit (see the slab-shortfall accounting in moe-cache.cu).
+        remainder_bytes = measure_remainder("the expert cache has to fit inside");
+        const int cap_mb = (int) ((remainder_bytes > 0 ? remainder_bytes : calib_free_vram_bytes) >> 20);
         for (int mb = 512; mb <= cap_mb; mb *= 2) {
             cache_candidates_mb.push_back(mb);
         }
-        LOG_INF("%s: expert-cache size candidates derived from %d MiB of free device memory: %zu rung(s) up to %d MiB\n",
-                __func__, cap_mb, cache_candidates_mb.size() - 1,
+        LOG_INF("%s: expert-cache size candidates derived from %d MiB %s: %zu rung(s) up to %d MiB\n",
+                __func__, cap_mb,
+                remainder_bytes > 0 ? "measured free with the model loaded" : "free on an idle card (unmeasured)",
+                cache_candidates_mb.size() - 1,
                 cache_candidates_mb.size() > 1 ? cache_candidates_mb.back() : 0);
     }
     // Test every candidate rather than stopping at the first non-improving
