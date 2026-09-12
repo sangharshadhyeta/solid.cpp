@@ -4913,11 +4913,69 @@ void common_moe_calibrate(common_params & params) {
             g_moe_calib_ubatch.store(-1);
             entry.n_ubatch = -1;
         } else if (g_moe_calib_ubatch.load() != chosen_ub) {
-            LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft\n",
-                    __func__, g_moe_calib_ubatch.load());
-            common_moe_calibration_status_note("prompt micro-batch",
-                    string_format("-ub %d", g_moe_calib_ubatch.load()),
-                    "REVISED - the larger value could not hold the draft", true, true);
+            // The micro-batch and the draft cannot both have the VRAM, and
+            // stepping -ub down is only ONE of the two ways to resolve that.
+            // The other is to keep the micro-batch and drop the draft, and
+            // nothing here was measuring it - the guard simply assumed the
+            // draft was the thing worth keeping.
+            //
+            // On this hardware that assumption is wrong in both directions
+            // that matter. -ub 2048 is worth about 40% of prompt throughput
+            // (47.5 against 34.6 prompt tok/s), and the draft has measured
+            // NEGATIVE at this context in every run today - 7.56 against 8.39
+            // tok/s for no draft at all, with the draft accepting 0.97 of what
+            // it proposed. So the guard was giving up a large, reproducible
+            // prefill win to protect a feature that costs throughput.
+            //
+            // So measure it. One extra candidate: the full micro-batch with no
+            // draft, against the reduced micro-batch with one. If the first
+            // wins, speculative decoding is recorded off here and -ub keeps its
+            // value - which is a real verdict about this machine, not a
+            // preference about which feature is more interesting.
+            const int reduced_ub = g_moe_calib_ubatch.load();
+            const double with_draft = check;
+            double no_draft = -1.0;
+            if (!common_moe_calibrate_budget_spent()) {
+                g_moe_calib_ubatch.store(chosen_ub);
+                no_draft = common_moe_bench_candidate_server(
+                        self_exe, path_model, std::string(), best_n, 0,
+                        n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
+                        active_ngl, active_min_rank);
+                common_moe_calibration_status_candidate_done();
+                LOG_INF("%s:   -ub %d with no draft -> %s (against -ub %d with the draft at %.2f)\n",
+                        __func__, chosen_ub,
+                        no_draft > 0 ? string_format("%.2f tok/s", no_draft).c_str() : "failed",
+                        reduced_ub, with_draft);
+            }
+            if (no_draft > 0 && with_draft > 0 && no_draft > with_draft) {
+                LOG_WRN("%s: the full micro-batch without a draft beats the reduced one with it (%.2f vs "
+                        "%.2f tok/s) - keeping -ub %d and recording speculative decoding off. The draft "
+                        "cannot have the VRAM the micro-batch needs and return more than it costs\n",
+                        __func__, no_draft, with_draft, chosen_ub);
+                g_moe_calib_ubatch.store(chosen_ub);
+                entry.n_ubatch   = chosen_ub;
+                entry.spec_n_max = 0;
+                best_n_max       = 0;
+                common_moe_calibration_status_note("prompt micro-batch",
+                        string_format("-ub %d", chosen_ub),
+                        string_format("KEPT - %.2f tok/s with no draft beats %.2f with one",
+                                      no_draft, with_draft), true, true);
+                common_moe_calibration_status_note("speculative decoding", "off",
+                        string_format("SELECTED - it cannot hold -ub %d, and dropping -ub to %d costs more "
+                                      "than the draft returns", chosen_ub, reduced_ub), true, true);
+            } else {
+                g_moe_calib_ubatch.store(reduced_ub);
+                entry.n_ubatch = reduced_ub;
+                LOG_INF("%s: prompt micro-batch revised to -ub %d to fit alongside the draft%s\n",
+                        __func__, reduced_ub,
+                        no_draft > 0 ? string_format(" (the full micro-batch without a draft measured %.2f, "
+                                                     "which does not beat %.2f)", no_draft, with_draft).c_str()
+                                     : "");
+                common_moe_calibration_status_note("prompt micro-batch",
+                        string_format("-ub %d", reduced_ub),
+                        "REVISED - the larger value could not hold the draft, and the draft earns its place",
+                        true, true);
+            }
         }
         checkpoint("micro-batch revalidated with the draft");
     }
