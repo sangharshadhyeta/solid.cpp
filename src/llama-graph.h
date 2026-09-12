@@ -1085,6 +1085,12 @@ struct llm_graph_context {
 
     // Predict the next layer's experts from the current hidden state and hand
     // the result to moe-cache, so its fills overlap this layer's compute.
+    // Hand the expert-cache predictor an architecture-specific feature block
+    // for the token being routed. See ggml_moe_cache::set_aux_features.
+    void build_moe_aux_features(ggml_tensor * feats) const;
+
+    static void moe_aux_features_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata);
+
     void build_moe_lookahead(
             ggml_tensor * cur,
             ggml_tensor * next_gate_inp,

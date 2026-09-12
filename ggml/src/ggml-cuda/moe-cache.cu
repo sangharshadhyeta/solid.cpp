@@ -494,6 +494,21 @@ struct moe_cache_device {
     // one place. Same layout as moe_cache_train_request::acts, context dims
     // appended, so one scoring function serves every caller.
     std::unordered_map<const void *, std::vector<float>> predictor_last_acts;
+    // Next-layer mode (see moe_cache_train_next_layer). The feature vector
+    // built at the previous MoE layer, waiting to be paired with the experts
+    // the NEXT layer turns out to select. That pairing is what makes this a
+    // prerouter rather than a router echo: trained same-layer, the model is
+    // asked which experts this layer wants at a moment the real router already
+    // knows exactly; trained next-layer, it answers a question nothing else
+    // has answered yet, which is the only version prefetch can spend.
+    std::vector<float> predictor_pending_feats;
+    // Architecture-supplied features for the layer about to route, set through
+    // ggml_moe_cache.set_aux_features. Global rather than per-device because
+    // the caller is the model graph, which has no device notion; copied into
+    // each request under the session lock like everything else here.
+    std::vector<float> predictor_aux_feats;
+    const void *       predictor_pending_base = nullptr;
+    int                predictor_pending_layer = -1;
     // Set once per tensor, from that tensor's first training example's own
     // acts.size() (raw activation width + MOE_CACHE_TRAIN_CONTEXT_DIMS).
     // Genuinely PER-TENSOR, not a single model-wide scalar: ffn_gate_exps/
@@ -8991,6 +9006,45 @@ static bool moe_cache_train_frozen() {
     return frozen;
 }
 
+// Train the predictor on the NEXT layer's selection instead of this one's.
+//
+// Same-layer training asks "which experts does this layer want" of an input
+// the real router is about to answer exactly - so the learned score is only
+// ever useful for ranking experts OUTSIDE the current selection. Next-layer
+// training asks a question nothing else has answered yet, which is what
+// prefetch actually needs and what the published prerouters do.
+//
+// Off by default: it is a different model with a different target, and this
+// file's rule is that the difference gets measured rather than assumed.
+static bool moe_cache_train_next_layer() {
+    static const bool on = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER");
+        return env && atoi(env) != 0;
+    }();
+    return on;
+}
+
+// Width of the hashed previous-selection feature block appended to the input.
+//
+// The two signals this fork has measured for cross-layer prediction were
+// measured SEPARATELY: the hidden state through the next layer's gate reaches
+// 59.3% at depth 1, and the expert-id successor table reached 33.8% (raw
+// counts, top-1 - see the fair re-test alongside it). Nothing has tried them
+// together, and they are not the same information: one is what the input
+// looks like, the other is what the previous layer decided about it. Hashing
+// the previous selection into a small fixed block lets one model condition on
+// both without the input growing by n_expert.
+//
+// 0 disables the block entirely, which is the default until it is measured.
+static int moe_cache_train_prev_buckets() {
+    static const int v = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS");
+        const int n = env ? atoi(env) : 0;
+        return n > 0 ? std::min(n, 256) : 0;
+    }();
+    return v;
+}
+
 static float moe_cache_train_lr() {
     static const float v = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_LR");
@@ -9516,6 +9570,42 @@ static void moe_cache_train_service(moe_cache_device & device) {
 // can and cannot influence. Copies exactly one token (the first in this
 // batch) into the bounded train_queue - see that field's comment for why
 // bounded-and-dropping, not queued, is correct here, same as warm_queue.
+// Staging for ggml_moe_cache.set_aux_features. The model graph calls this
+// from a graph callback while the layer that will use it is still being
+// computed, so it has to be cheap and lock-light: a fixed-capacity buffer and
+// a length, guarded by its own small mutex rather than the session lock (which
+// decode contends for).
+static std::mutex        g_aux_feats_mu;
+static std::vector<float> g_aux_feats;
+
+static void moe_cache_set_aux_features(const float * feats, int n_feats) {
+    // Bounded: this lands in every training input, and an architecture that
+    // handed over a whole embedding would make the predictor's weight matrix
+    // n_expert x that. A slice is a hint, not the tensor.
+    // 0 means "ignore what the model offers", so the block's contribution can
+    // be measured against its absence rather than assumed useful.
+    static const int cap = [] {
+        const char * env = getenv("GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP");
+        if (!env) {
+            return 32;
+        }
+        const int n = atoi(env);
+        return n <= 0 ? 0 : std::min(n, 256);
+    }();
+    if (cap == 0) {
+        std::lock_guard<std::mutex> lock(g_aux_feats_mu);
+        g_aux_feats.clear();
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_aux_feats_mu);
+    if (!feats || n_feats <= 0) {
+        g_aux_feats.clear();
+        return;
+    }
+    const int n = std::min(n_feats, cap);
+    g_aux_feats.assign(feats, feats + n);
+}
+
 static void moe_cache_train(
         void * opaque, const int32_t * ids, int n_ids_per_token, int n_tokens,
         const float * acts, size_t act_stride, int64_t hidden_dim) {
@@ -9554,12 +9644,77 @@ static void moe_cache_train(
         req.acts.push_back(rx);
         req.acts.push_back(ry);
     }
+    // Architecture features for this layer, if the model supplied any.
+    {
+        std::lock_guard<std::mutex> lock(g_aux_feats_mu);
+        req.acts.insert(req.acts.end(), g_aux_feats.begin(), g_aux_feats.end());
+    }
+
+    // Hashed previous-selection block. Appended AFTER the atlas dims so the
+    // layout is append-only and a state file written without it still loads
+    // (the dimension check rejects it, and an untrained vector is a safe
+    // fallback - see moe_cache_train_service). Counts rather than bits: an
+    // expert selected by several of the previous layer's tokens is stronger
+    // evidence than one selected by a single token.
+    const int prev_buckets = moe_cache_train_prev_buckets();
+    if (prev_buckets > 0) {
+        const size_t base = req.acts.size();
+        req.acts.resize(base + (size_t) prev_buckets, 0.0f);
+        for (int32_t e : device.last_top_ids) {
+            if (e >= 0) {
+                req.acts[base + ((size_t) e % (size_t) prev_buckets)] += 1.0f;
+            }
+        }
+    }
+
     req.ids.assign(ids, ids + n_ids_per_token);
-    // Publish this token's input for the non-training consumers. Copied from
-    // the request rather than recomputed, so every consumer scores against
-    // exactly the activations training saw - the alternative is two sources
-    // that drift apart silently.
-    device.predictor_last_acts[node->host_base] = req.acts;
+
+    if (moe_cache_train_next_layer()) {
+        // Pair the PREVIOUS layer's features with THIS layer's selection, and
+        // only across a real layer boundary. One logical layer dispatches
+        // several expert tensors off a single routing decision (gate_up_exps
+        // then down_exps), so without the boundary check most "transitions"
+        // would be a layer paired with itself - measured at 45 of 64 exported
+        // cross-layer edges on Gemma, i.e. most of the signal was that
+        // artifact. Same check, same reason, as the successor table above.
+        const bool real_transition =
+            device.predictor_pending_base != nullptr &&
+            node->layer >= 0 && device.predictor_pending_layer >= 0 &&
+            node->layer != device.predictor_pending_layer &&
+            device.predictor_pending_feats.size() == req.acts.size();
+
+        std::vector<float> this_feats = req.acts;   // becomes the next pairing's input
+        if (real_transition) {
+            // Train W[this tensor] on the previous layer's input. The weights
+            // stay keyed by the tensor being PREDICTED, so scoring an expert
+            // of this tensor reads the same weights either mode - only what
+            // they were fitted against changes.
+            req.acts = device.predictor_pending_feats;
+        } else {
+            // Nothing to pair with yet: hold this layer's features and skip
+            // the update rather than train on a self-pairing, which would
+            // teach the model the router's own output as if it were a
+            // prediction.
+            device.predictor_pending_feats = std::move(this_feats);
+            device.predictor_pending_base  = node->host_base;
+            device.predictor_pending_layer = node->layer;
+            (void) act_stride;
+            (void) n_tokens;
+            return;
+        }
+        // Published for the consumers BEFORE the pending slot advances: this
+        // is the vector the next layer will be scored against.
+        device.predictor_last_acts[node->host_base] = req.acts;
+        device.predictor_pending_feats = std::move(this_feats);
+        device.predictor_pending_base  = node->host_base;
+        device.predictor_pending_layer = node->layer;
+    } else {
+        // Publish this token's input for the non-training consumers. Copied
+        // from the request rather than recomputed, so every consumer scores
+        // against exactly the activations training saw - the alternative is
+        // two sources that drift apart silently.
+        device.predictor_last_acts[node->host_base] = req.acts;
+    }
     (void) act_stride;
     (void) n_tokens;
     device.train_queue.push_back(std::move(req));
@@ -13416,6 +13571,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.begin = moe_cache_begin;
     ggml_moe_cache.plan = moe_cache_plan;
     ggml_moe_cache.train = moe_cache_train;
+    ggml_moe_cache.set_aux_features = moe_cache_set_aux_features;
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;

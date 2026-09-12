@@ -1967,6 +1967,37 @@ void llm_graph_context::build_moe_lookahead(
     ggml_build_forward_expand(gf, hint);
 }
 
+// Copies a bounded prefix of the first token's row into the expert-cache
+// predictor's input. Fires in graph order, so the block is in place before the
+// layers that will route against it are reached.
+void llm_graph_context::moe_aux_features_cb(ggml_tensor * dst, const ggml_tensor * a, int ith, int nth, void * userdata) {
+    GGML_UNUSED(dst);
+    GGML_UNUSED(nth);
+    GGML_UNUSED(userdata);
+    if (ith != 0 || !ggml_moe_cache.set_aux_features || !a || a->type != GGML_TYPE_F32 || !a->data) {
+        return;
+    }
+    // Token 0 only, matching how the predictor samples its activations - one
+    // example per dispatch, cheap rather than complete, on a hot path.
+    const int64_t n = a->ne[0];
+    ggml_moe_cache.set_aux_features((const float *) a->data, (int) std::min<int64_t>(n, 256));
+}
+
+// The model supplies a tensor whose first row identifies the token in a way the
+// hidden state cannot yet reflect. On Qwen3.8-Flash-Next that is the per-layer
+// n-gram embedding (PLE): gathered once before the layer loop and injected into
+// every layer's residual, so it is a component of the NEXT layer's input that is
+// exactly known now - unlike the hidden state, which is stale by one layer's
+// residual and is what caps router lookahead at 59.3%.
+void llm_graph_context::build_moe_aux_features(ggml_tensor * feats) const {
+    if (!ggml_moe_cache.set_aux_features || !feats) {
+        return;
+    }
+    ggml_tensor * hint = ggml_map_custom1(ctx0, feats,
+            llm_graph_context::moe_aux_features_cb, 1, nullptr);
+    ggml_build_forward_expand(gf, hint);
+}
+
 void llm_graph_context::build_moe_prefill_prefetch(
         ggml_tensor * this_gate_up_exps,
         ggml_tensor * this_down_exps,

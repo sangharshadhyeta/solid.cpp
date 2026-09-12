@@ -406,6 +406,14 @@ llama_model_qwen4exp::graph::graph(const llama_model & model, const llm_graph_pa
         ple_emb = build_inp_ple(mctx_hyb);
         // make sure ple_emb and build_inp_embd are in the same graph split
         ggml_build_forward_expand(gf, ple_emb);
+        // Hand the expert-cache predictor the n-gram identity of the token
+        // being decoded. The PLE is gathered once here, before the layer loop,
+        // and a slice of it is injected into every layer's residual - so it is
+        // a component of every later layer's input that is exactly known at
+        // this point. The predictor's other input, the hidden state at the MoE
+        // op, is stale by one layer's residual for cross-layer prediction, and
+        // that staleness is what caps router lookahead at 59.3%.
+        build_moe_aux_features(ple_emb);
     }
 
     // the wide residual starts as hc identical copies of the embedding
