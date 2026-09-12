@@ -8408,7 +8408,19 @@ void common_moe_calibrate(common_params & params) {
     entry.spec_p_min      = best_p_min;
     entry.spec_draft_cpu_moe = best_draft_cpu_moe;
     entry.op_offload_min_batch = best_offload_min_batch;
-    entry.n_ubatch             = best_ubatch;
+    // NOT best_ubatch. The draft-fit check above is the only thing that knows
+    // whether the chosen micro-batch survives once the draft is attached, and
+    // when it steps -ub down (or unsets it) it updates g_moe_calib_ubatch and
+    // entry.n_ubatch - not this stale local. Overwriting from best_ubatch here
+    // put the REJECTED value in the saved entry.
+    //
+    // Measured on Qwen3.8-Flash-Next at 64k: the run found -ub 2048 does not fit
+    // with the draft, stepped to 512, confirmed 512 serves, logged "keeping -ub
+    // 512 so it fits" - and then wrote n_ubatch 2048. Launching normally on that
+    // entry re-applies 2048 and OOMs allocating the MTP context, so calibration
+    // shipped a configuration it had itself measured as not fitting.
+    const int final_ubatch = g_moe_calib_ubatch.load();
+    entry.n_ubatch             = final_ubatch != 0 ? final_ubatch : best_ubatch;
     entry.sched_prefetch_experts = best_prefetch;
     entry.moe_cache_ring_pct     = best_ring_pct;
     entry.neuron_reduce_k        = best_neuron_k;
