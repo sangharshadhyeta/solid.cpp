@@ -958,6 +958,17 @@ struct moe_cache_device {
     bool saw_repeat = false;
     bool budget_ready = false;
     size_t budget_limit = 0;
+    // What the pools asked the allocator for, and what they actually got.
+    //
+    // moe_cache_allocate_pool halves its slot count until cudaMalloc succeeds,
+    // and on success simply proceeds - so a pool handed a share by the arbiter
+    // can take half of it, or an eighth, with nothing logged and nothing
+    // recorded. Every partition computed above it is then fiction: the split
+    // says one thing and the slabs hold another. These two make the difference
+    // visible, so a run can tell "the arbiter gave this pool 2 GiB" apart from
+    // "the pool actually holds 256 MiB of it".
+    size_t slab_requested_bytes = 0;
+    size_t slab_granted_bytes   = 0;
     // Set to the epoch (never a real re-check) so the very first call in
     // moe_cache_prepare_budget() always re-evaluates regardless of clock
     // start time.
@@ -5664,6 +5675,7 @@ static bool moe_cache_allocate_pool(
     ggml_cuda_set_device(device.physical);
     char * slab = nullptr;
     cudaError_t error = cudaSuccess;
+    const size_t slot_count_asked = slot_count;
     while (slot_count >= MOE_CACHE_MIN_POOL_SLOTS) {
         if (moe_cache_fail(session, "slab")) {
             error = cudaErrorMemoryAllocation;
@@ -5675,6 +5687,22 @@ static bool moe_cache_allocate_pool(
         }
         (void)cudaGetLastError();
         slot_count /= 2;
+    }
+    // Say so when the halving fired. This loop is the one place a carefully
+    // computed budget can quietly become a quarter of itself: it retries at
+    // half the slots until cudaMalloc succeeds and then proceeds as if nothing
+    // happened, so every number upstream - the cache-size ladder's winner, the
+    // arbiter's split, the fit margin - describes an allocation that was never
+    // made. Measured consequence elsewhere in this file: a reduced pool
+    // starved the primary out of existence and the hit rate fell 31.3% ->
+    // 23.1%, with nothing in the log to say why.
+    device.slab_requested_bytes += slot_count_asked * slot_stride;
+    if (error == cudaSuccess && slot_count < slot_count_asked) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d expert pool for %zu KiB experts got %zu of the %zu slots it "
+                "asked for (%zu of %zu MiB) - cudaMalloc refused the full size, so whatever budget "
+                "produced that number is describing memory this pool does not have\n",
+                device.physical, shape.expert_size >> 10, slot_count, slot_count_asked,
+                (slot_count * slot_stride) >> 20, (slot_count_asked * slot_stride) >> 20);
     }
     if (error != cudaSuccess || !slab || slot_count < MOE_CACHE_MIN_POOL_SLOTS) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d skipped %zu KiB expert pool: allocation failed\n",
@@ -5726,6 +5754,7 @@ static bool moe_cache_allocate_pool(
         for (int index = (int)slot_count - 1; index >= 0; index--) {
             pool->free_slots.push_back(index);
         }
+        device.slab_granted_bytes += (size_t) slot_count * slot_stride;
         device.pools.push_back(std::move(pool));
     } catch (...) {
         cudaFree(slab);
@@ -6912,6 +6941,13 @@ static void moe_cache_session_destroy(void * opaque) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d atlas stand-ins: %lld chosen by similarity, "
                         "%lld declined for want of a near neighbour\n",
                         d.physical, d.substitute_atlas_hits, d.substitute_atlas_declined);
+            }
+            if (d.slab_requested_bytes > d.slab_granted_bytes) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d pools asked for %zu MiB and hold %zu MiB - "
+                        "cudaMalloc refused the difference, so any budget or partition above this is "
+                        "describing %zu MiB it never got\n", d.physical,
+                        d.slab_requested_bytes >> 20, d.slab_granted_bytes >> 20,
+                        (d.slab_requested_bytes - d.slab_granted_bytes) >> 20);
             }
             if (d.ring_hits || d.ring_rotations || d.ring_seeds) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d prediction ring: hits=%lld rotations=%lld seeds=%lld "
