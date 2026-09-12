@@ -6033,6 +6033,17 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         return nullptr;
     }
 
+    // cublasCreate allocates device memory of its own, and it is otherwise
+    // deferred to the first matmul - i.e. to the first request, long after
+    // every VRAM consumer that sizes itself against cudaMemGetInfo has
+    // already claimed what it saw as free. On a card where the expert cache
+    // takes the remaining VRAM that ordering turns a startup fit problem
+    // into an abort on request one ("cublasCreate_v2 ... resource allocation
+    // failed"). Claim the handle here so the memory is accounted for before
+    // anything measures free VRAM, and so a genuine shortage surfaces at
+    // load time where the fit logic can still react to it.
+    ctx->cublas_handle(device);
+
     ggml_backend_t cuda_backend = new ggml_backend {
         /* .guid    = */ ggml_backend_cuda_guid(),
         /* .iface   = */ ggml_backend_cuda_interface,

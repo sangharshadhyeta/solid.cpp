@@ -2344,6 +2344,15 @@ static common_moe_bench_result common_moe_bench_one_request_full(int port, const
         // runs. Residual run-to-run wobble is measured, not assumed: see the
         // reference self-fidelity noise floor in the substitution ladder.
         {"seed", seed},
+        // The model card's thinking-mode sampling in full. min_p in particular was
+        // being left at llama.cpp's 0.05 rather than the documented 0.0 - an extra
+        // tail cut on top of top_p, under which every probe this session was
+        // measured. The server-side launch flags set the same values; sending them
+        // per request too means a probe is unaffected by what the candidate was
+        // launched with.
+        {"min_p", 0.0},
+        {"presence_penalty", 0.0},
+        {"repeat_penalty", 1.0},
     };
     if (!cache_prompt) {
         req["cache_prompt"] = false; // time a real prefill, not a prefix-cache hit
@@ -2529,6 +2538,16 @@ static constexpr double COMMON_MOE_TPS_REJECTED = -2.0;
 // top_k 20, min_p 0). This was 64, Unsloth's figure; the model card is the
 // primary source for the model it describes.
 #define COMMON_MOE_PROBE_TOP_K  "20"
+// min_p and the penalties, which the model card also specifies and which were
+// being left at llama.cpp's own defaults - min_p 0.05 against the documented 0.0.
+// An extra tail cut on top of top_p 0.95 is exactly the kind of thing that can
+// leave a reasoning model with nothing acceptable to emit after it finishes
+// thinking, and it meant every candidate was measured under sampling the model's
+// authors did not describe. Thinking-mode values; the instruct-mode row differs
+// (temp 0.7, top_p 0.80, presence_penalty 1.5) and is not what these probes use.
+#define COMMON_MOE_PROBE_MIN_P  "0.0"
+#define COMMON_MOE_PROBE_PRESENCE "0.0"
+#define COMMON_MOE_PROBE_REPEAT "1.0"
 static std::atomic<long long> g_moe_candidate_ms_sum{0};
 static std::atomic<int>       g_moe_candidate_count{0};
 static std::atomic<bool>      g_moe_budget_is_derived{false};
@@ -2835,7 +2854,9 @@ static double common_moe_bench_candidate_server(
     snprintf(cmd, sizeof(cmd),
         "%s%s'%s' -m '%s' -ngl %d -ncmoe %u --moe-cache %s -c %u %s%s%s%s%s"
         "--temp " COMMON_MOE_PROBE_TEMP " --top-p " COMMON_MOE_PROBE_TOP_P
-        " --top-k " COMMON_MOE_PROBE_TOP_K " --no-token-freq-log "
+        " --top-k " COMMON_MOE_PROBE_TOP_K " --min-p " COMMON_MOE_PROBE_MIN_P
+        " --presence-penalty " COMMON_MOE_PROBE_PRESENCE
+        " --repeat-penalty " COMMON_MOE_PROBE_REPEAT " --no-token-freq-log "
         "--port %d --no-webui > '%s' 2>&1 & echo $!",
         env_prefix.c_str(), subst_env.c_str(), self_exe.c_str(), path_model.c_str(), n_gpu_layers, n_cpu_moe, cache_arg, ctx_for_launch,
         mtp_args.c_str(), threads_args.c_str(), parallel_args.c_str(), fit_args.c_str(), reasoning_args, port, log_path);
@@ -7027,6 +7048,32 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     common_enforce_moe_cache_parallel_limit(params, cparams);
     common_moe_apply_mtp_aware_max_batch_hint(params);
     common_warn_p_min_disabled(params);
+
+    // ...and so does the output reservation. A caller that pre-sizes
+    // n_outputs_max (the server does, in load_model) computes it from the
+    // speculative width it can see at that point, which is still the default
+    // - the calibrated n_max only lands in the autoplace call above. Every
+    // draft token needs an output slot, so a cached n_max larger than the
+    // default leaves the reservation exactly (n_max_cal - n_max_default)
+    // short and the first decode trips
+    // GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) in llama-context.
+    // Re-derive against the final width here, where it is known. Grow only:
+    // a caller that deliberately reserved more keeps its own number.
+    if (params.n_outputs_max > 0) {
+        const auto lim = common_speculative_get_output_limits(
+                params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
+        const int32_t total   = std::max(params.n_outputs_max,         std::max(1, lim.total));
+        const int32_t per_seq = std::max(params.n_outputs_max_per_seq, std::max(1, lim.per_seq));
+        if (total != params.n_outputs_max || per_seq != params.n_outputs_max_per_seq) {
+            LOG_WRN("%s: raised the output reservation to %d (%d per sequence) to cover the "
+                    "calibrated speculative width of %d\n",
+                    __func__, total, per_seq, common_speculative_n_max(&params.speculative));
+        }
+        params.n_outputs_max         = total;
+        params.n_outputs_max_per_seq = per_seq;
+        cparams.n_outputs_max         = (uint32_t) total;
+        cparams.n_outputs_max_per_seq = (uint32_t) per_seq;
+    }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
     if (model == NULL) {
