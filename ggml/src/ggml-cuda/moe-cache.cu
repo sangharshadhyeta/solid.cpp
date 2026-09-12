@@ -176,6 +176,29 @@ struct moe_cache_slot {
     // over a merely older one. 0 means unknown, which sorts as weakest -
     // a caller that does not say how sure it is gets no protection.
     float spec_conf = 0.0f;
+    // Which mechanisms predicted this expert: bit 0 the router-lookahead
+    // matmul, bit 1 the live-trained prerouter.
+    //
+    // Confidence alone still had the two COMPETING - the stronger number won
+    // the slot and the other's prediction was discarded. But they sample
+    // different things (the next layer's gate applied early versus a model
+    // trained on outcomes with the architecture's n-gram features), so the
+    // interesting case is not which is more confident, it is when both want
+    // the same expert. This file already makes that argument for cross-depth
+    // agreement in spec_evict_mode::agree - two independent samples landing on
+    // the same expert "should be much rarer and much more often right than
+    // either depth alone" - and the same reasoning holds across mechanisms.
+    //
+    // So agreement is not a tiebreak, it is its own signal: an expert both
+    // mechanisms want outranks anything either wants alone, however confident
+    // that one is.
+    uint8_t spec_src = 0;
+};
+
+// Bit values for moe_cache_slot::spec_src.
+enum : uint8_t {
+    MOE_CACHE_SPEC_SRC_LOOKAHEAD = 1u << 0,
+    MOE_CACHE_SPEC_SRC_PREROUTER = 1u << 1,
 };
 
 struct moe_cache_pool {
@@ -1144,6 +1167,26 @@ struct moe_cache_device {
     // because everything already in the ring was more confident than it.
     long long ring_displaced_weaker = 0;
     long long ring_declined_weaker  = 0;
+    // Predictions the other mechanism had already made - corroborated rather
+    // than competed with. A high count here means the two agree often, which
+    // is the case where this arrangement pays; a near-zero count means they
+    // are looking at genuinely different things and the ring is shared rather
+    // than reinforced.
+    long long ring_corroborated     = 0;
+    // Per-mechanism precision, on the SAME basis: predictions each mechanism
+    // put into the ring, and how many of those the router then actually asked
+    // for. Indexed by the spec_src bit pattern (1 lookahead, 2 prerouter,
+    // 3 both).
+    //
+    // Nothing measured this before. Lookahead has a published 59.3% / 48.0% /
+    // 41.1% at depth 1/2/3 from an offline check, and the prerouter's accuracy
+    // was only ever printed behind a debug env var and against the SAME layer
+    // it was predicting - so the two could not be compared, and the question
+    // "which of these is more often right" had no answer in this file. It is
+    // also the number the agreement confidence should be derived from rather
+    // than guessed at.
+    long long spec_admitted[4] = {0, 0, 0, 0};
+    long long spec_hit[4]      = {0, 0, 0, 0};
     long long substitute_rank_hits  = 0;
     long long substitute_fused_hits = 0;
     long long ring_hits = 0;
@@ -2763,7 +2806,9 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     slot.state = moe_cache_slot_state::free;
     slot.segment = moe_cache_segment::probation;
     if (slot.spec) {
-        slot.spec = false;
+        slot.spec      = false;
+        slot.spec_src  = 0;
+        slot.spec_conf = 0.0f;
         if (pool.ring_count > 0) {
             pool.ring_count--;
         }
@@ -6977,10 +7022,23 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
-            if (d.ring_displaced_weaker || d.ring_declined_weaker) {
-                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d ring contention: %lld predictions displaced a "
-                        "less confident one, %lld were refused because the ring held better ones\n",
-                        d.physical, d.ring_displaced_weaker, d.ring_declined_weaker);
+            if (d.spec_admitted[1] || d.spec_admitted[2] || d.spec_admitted[3]) {
+                static const char * who[4] = { "-", "lookahead", "prerouter", "both agreeing" };
+                for (int i = 1; i < 4; i++) {
+                    if (d.spec_admitted[i] <= 0) {
+                        continue;
+                    }
+                    fprintf(stderr, "[moe-cache] SUMMARY CUDA%d predictions by %-13s %lld admitted, "
+                            "%lld asked for by the router (%.1f%%)\n", d.physical, who[i],
+                            d.spec_admitted[i], d.spec_hit[i],
+                            100.0 * (double) d.spec_hit[i] / (double) d.spec_admitted[i]);
+                }
+            }
+            if (d.ring_displaced_weaker || d.ring_declined_weaker || d.ring_corroborated) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d ring: %lld corroborated by the other predictor, "
+                        "%lld displaced a less confident prediction, %lld refused because the ring held "
+                        "better ones\n", d.physical, d.ring_corroborated,
+                        d.ring_displaced_weaker, d.ring_declined_weaker);
             }
             if (d.substitute_rank_hits || d.substitute_fused_hits) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d fused stand-ins: %lld from this token's own "
@@ -8534,6 +8592,8 @@ static bool moe_cache_atlas_admit_ring_enabled() {
 static int moe_cache_ring_target(const moe_cache_pool & pool);
 static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target,
                                float incoming_conf = 0.0f);
+static bool moe_cache_spec_corroborate(moe_cache_device & device, moe_cache_pool & pool,
+                                       const moe_cache_key & key, uint8_t src);
 
 static bool moe_cache_atlas_admit(
         moe_cache_device & device, moe_cache_pool & pool, int pool_index,
@@ -8597,6 +8657,13 @@ static bool moe_cache_atlas_admit(
             // measured for on the router-lookahead path.
             const int ring_target = moe_cache_ring_target(pool);
             if (ring_target > 0) {
+                // Agreement before competition. If the lookahead already
+                // predicted this expert, this prediction's job is to confirm
+                // it, not to win a slot away from it - the slot is promoted to
+                // the agreement confidence and there is nothing left to admit.
+                if (moe_cache_spec_corroborate(device, pool, key, MOE_CACHE_SPEC_SRC_PREROUTER)) {
+                    continue;
+                }
                 // The predictor's own score for this expert, so the ring can
                 // compare this prediction against the ones already in it
                 // rather than just against their age.
@@ -8604,6 +8671,8 @@ static bool moe_cache_atlas_admit(
                 slot_index = moe_cache_ring_take(device, pool, ring_target, conf);
                 if (slot_index >= 0) {
                     pool.slots[slot_index].spec_conf = conf;
+                    pool.slots[slot_index].spec_src  = MOE_CACHE_SPEC_SRC_PREROUTER;
+                    device.spec_admitted[MOE_CACHE_SPEC_SRC_PREROUTER]++;
                 }
             }
         }
@@ -10969,7 +11038,18 @@ static int moe_cache_plan(
                     // A prediction the router then asked for. It leaves the ring
                     // here; the real hit is what promotes it, below, the same as
                     // any resident - the prediction itself earned nothing.
-                    slot.spec = false;
+                    //
+                    // Credit the mechanism that called it, before spec_src is
+                    // cleared. This is the only place a prediction is known to
+                    // have been RIGHT, so it is the only place the two
+                    // mechanisms can be scored against each other on the same
+                    // basis.
+                    if (slot.spec_src < 4) {
+                        device.spec_hit[slot.spec_src]++;
+                    }
+                    slot.spec      = false;
+                    slot.spec_src  = 0;
+                    slot.spec_conf = 0.0f;
                     if (pool.ring_count > 0) {
                         pool.ring_count--;
                     }
@@ -13251,6 +13331,53 @@ static int moe_cache_ring_target(const moe_cache_pool & pool) {
     return pct > 0 ? std::max(1, pool.n_slots * pct / 100) : 0;
 }
 
+// Confidence awarded to an expert both mechanisms independently predicted.
+//
+// Above any single mechanism's own precision (the prerouter's learned
+// probability, or lookahead's measured 59.3% at depth 1), because that is the
+// claim: corroboration from a different kind of evidence is stronger than
+// either kind alone. Not 1.0 - agreement is not certainty, and a real hit must
+// still be able to outrank it.
+static float moe_cache_spec_agree_conf() {
+    return (float) MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_SPEC_AGREE_CONF", 0.90);
+}
+
+// If `key` is already a prediction in this pool from a DIFFERENT mechanism,
+// promote that slot to the agreement confidence and return true - the caller
+// then has nothing to admit, because the expert is already on its way in and
+// is now better protected than either mechanism could have made it alone.
+//
+// This is what turns two predictors competing for one ring into two predictors
+// corroborating each other: the second one to arrive does not need a slot, it
+// needs its agreement recorded.
+static bool moe_cache_spec_corroborate(moe_cache_device & device, moe_cache_pool & pool,
+                                       const moe_cache_key & key, uint8_t src) {
+    const auto it = pool.map.find(key);
+    if (it == pool.map.end()) {
+        return false;
+    }
+    moe_cache_slot & slot = pool.slots[it->second];
+    if (!slot.spec) {
+        return false;   // already a real resident - nothing to corroborate
+    }
+    if (slot.spec_src == 0 || (slot.spec_src & src) != 0) {
+        return false;   // unknown source, or the same mechanism predicting twice
+    }
+    if (slot.spec_src < 4 && device.spec_admitted[slot.spec_src] > 0) {
+        device.spec_admitted[slot.spec_src]--;   // it is no longer a single-source prediction
+    }
+    slot.spec_src |= src;
+    if (slot.spec_src < 4) {
+        device.spec_admitted[slot.spec_src]++;
+    }
+    const float agree = moe_cache_spec_agree_conf();
+    if (slot.spec_conf < agree) {
+        slot.spec_conf = agree;
+    }
+    device.ring_corroborated++;
+    return true;
+}
+
 static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target,
                                float incoming_conf) {
     // Carve the ring out of probation ONCE: at most ring_target evictions over the
@@ -13455,6 +13582,13 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     slot_index = pool.free_slots.back();
                     pool.free_slots.pop_back();
                 } else if (ring_target > 0) {
+                    // Agreement before competition, from this side too: if the
+                    // prerouter already wanted this expert, confirm it rather
+                    // than take a slot from it.
+                    if (moe_cache_spec_corroborate(device, pool, moe_cache_key{host_base, expert},
+                                                   MOE_CACHE_SPEC_SRC_LOOKAHEAD)) {
+                        continue;
+                    }
                     // Router-lookahead's confidence is its measured per-depth
                     // precision: 59.3% at depth 1, 48.0% at 2, 41.1% at 3.
                     // Those are real numbers for this mechanism, so a depth-1
@@ -13465,6 +13599,8 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                     slot_index = moe_cache_ring_take(device, pool, ring_target, la_conf);
                     if (slot_index >= 0) {
                         pool.slots[slot_index].spec_conf = la_conf;
+                        pool.slots[slot_index].spec_src  = MOE_CACHE_SPEC_SRC_LOOKAHEAD;
+                        device.spec_admitted[MOE_CACHE_SPEC_SRC_LOOKAHEAD]++;
                     }
                     if (slot_index < 0) {
                         if (!moe_cache_lookahead_disk_prefetch_enabled()) {
