@@ -130,3 +130,28 @@ LLAMA_API uint32_t        llama_model_target_layer_ids_n(const struct llama_mode
 // if out is nullptr, returns the number of tokens without writing to out
 // caller must allocate enough memory for out before calling
 LLAMA_API uint32_t llama_model_get_tok_embd(const struct llama_model * model, float * out);
+
+// Compute the PLE (per-layer n-gram embedding) feature slice for the LAST token
+// of `toks`, using the preceding entries as its n-gram context.
+//
+// This is a pure lookup: the row indices are an integer hash of the token and
+// its predecessors, and the rows themselves are read straight out of the
+// per-layer embedding tensor. No forward pass, no graph, no KV cache - which is
+// the point. It lets a caller obtain the n-gram identity of a token it has not
+// run yet.
+//
+// The use it exists for is speculative verification. A verify pass's expert
+// demand is the union of the drafted tokens' routing, and that demand is the
+// largest single cost a draft imposes on the target - but the drafted tokens'
+// identities are known the moment the draft proposes them, well before the
+// target runs. Handing their PLE to the expert cache's predictor there gives it
+// the whole draft's lead time instead of the one layer a graph-time hook can
+// offer, which is the difference between a prediction that can be acted on and
+// one that arrives with the work it was meant to avoid.
+//
+// Writes min(n_out, ple_head_dim) floats and returns how many, or 0 if this
+// model has no PLE, the tensor is not host-readable, or the arguments are bad.
+LLAMA_API int llama_ple_aux_features(
+        const struct llama_model * model,
+        const llama_token * toks, int n_toks,
+        float * out, int n_out);

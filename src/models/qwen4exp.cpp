@@ -1560,3 +1560,72 @@ ggml_tensor * llama_model_qwen4exp::graph::build_ple(
 
     return ggml_add(ctx0, hidden, ggml_add(ctx0, gated, conv_out));
 }
+
+// See llama_ple_aux_features in llama-ext.h. Lives here because the hash it has
+// to reproduce is this architecture's, and lives beside
+// llm_graph_input_ple::set_input for the same reason - if that hash ever
+// changes, both are in view of each other.
+int llama_ple_aux_features(
+        const struct llama_model * model,
+        const llama_token * toks, int n_toks,
+        float * out, int n_out) {
+    if (!model || !toks || n_toks <= 0 || !out || n_out <= 0) {
+        return 0;
+    }
+    const auto & hp = model->hparams;
+    if (hp.ple_n_heads == 0 || hp.ple_ngram_size < 2 || !model->per_layer_tok_embd) {
+        return 0;
+    }
+    const ggml_tensor * t = model->per_layer_tok_embd;
+    // Host-readable only. The table is 51B parameters on this model, so it is
+    // mmapped on the CPU in every configuration that fits a 12 GiB card - but a
+    // machine that can hold it on the GPU would land here with a device
+    // pointer, and reading that as host memory is a segfault rather than a
+    // wrong answer. Declining is correct: the caller treats 0 as "no features",
+    // which is the same neutral input it uses before the first token.
+    if (!t->data || !ggml_backend_buffer_is_host(t->buffer)) {
+        return 0;
+    }
+
+    const int64_t n_gram = hp.ple_ngram_size;
+    const int64_t n_prev = n_gram - 1;
+    const int64_t eos    = hp.ple_eos_token_id;
+
+    // The n-gram context of the last token: itself, then its predecessors,
+    // with an EOS (or a missing predecessor) cutting everything at or before
+    // it. Identical rule to set_input's, which is the whole point of putting
+    // them next to each other.
+    std::vector<int64_t> ctx(n_gram);
+    ctx[0] = toks[n_toks - 1];
+    bool cut = false;
+    for (int64_t s = 1; s < n_gram; ++s) {
+        const int64_t back = n_toks - 1 - s;
+        const llama_token tk = (cut || back < 0) ? LLAMA_TOKEN_NULL : toks[back];
+        cut = cut || tk < 0 || tk == eos;
+        ctx[s] = cut ? eos : tk;
+    }
+
+    // Head 0 only - the 2-gram head. The features are a hint for a linear
+    // predictor, not a reconstruction of the layer input, and one head's row is
+    // the cheapest slice that still identifies the n-gram.
+    uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+    mixed ^= (uint64_t) ctx[1] * hp.ple_layer_multipliers[1];
+    const int64_t row = (int64_t) (mixed % hp.ple_head_vocab_sizes[0] + hp.ple_head_offsets[0]);
+    if (row < 0 || row >= t->ne[1]) {
+        return 0;
+    }
+
+    const int64_t n_take = std::min<int64_t>(n_out, std::min<int64_t>(hp.ple_head_dim, t->ne[0]));
+    const auto * tt = ggml_get_type_traits(t->type);
+    if (!tt || !tt->to_float) {
+        return 0;   // an unquantised type would need a plain copy; none ships this way
+    }
+    // Dequantise the whole row into scratch, then take the prefix: to_float
+    // works in whole quantisation blocks, so a partial row is not addressable.
+    std::vector<float> rowbuf((size_t) t->ne[0]);
+    tt->to_float((const char *) t->data + (size_t) row * t->nb[1], rowbuf.data(), t->ne[0]);
+    for (int64_t i = 0; i < n_take; i++) {
+        out[i] = rowbuf[(size_t) i];
+    }
+    return (int) n_take;
+}
