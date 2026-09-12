@@ -2726,6 +2726,16 @@ static std::string common_moe_calib_get_kv_type() {
 static std::atomic<bool>      g_moe_calib_prefill_xlong{false};
 // GGML_SCHED_PREFETCH_EXPERTS every candidate launches with from here on.
 static std::atomic<bool>      g_moe_calib_prefetch{false};
+// The draft acceptance mode every candidate runs with once it has been chosen.
+//
+// --spec-prob-accept was measured ~2000 lines after the depth envelope, so the
+// envelope picked n_max under exact-match acceptance and a +10-18% lever was
+// switched on afterwards - measured 12.63 vs 11.43 tok/s on Qwen3.8-Flash-Next
+// and 77.18 vs 65.36 on gemma-4, the largest single lever in that run. Which
+// depth is best depends on how tokens are accepted, so deciding acceptance
+// after depth searches the wrong curve, and at 64k it produced "the draft
+// loses to no draft" from a configuration the draft would never be served in.
+static std::atomic<int>       g_moe_calib_prob_accept{-1};
 // GGML_CUDA_MOE_CACHE_RING_PCT every candidate launches with from here on (-1 = unset).
 static std::atomic<int>       g_moe_calib_ring_pct{-1};
 // Arbitrary extra environment every candidate launches with from here on, for the
@@ -4243,6 +4253,7 @@ void common_moe_calibrate(common_params & params) {
     g_moe_calib_ubatch.store(-1);
     g_moe_calib_prefill_xlong.store(false);
     g_moe_calib_prefetch.store(false);
+    g_moe_calib_prob_accept.store(-1);
     g_moe_calib_ring_pct.store(-1);
     common_moe_calib_set_env(std::string());
 
@@ -4352,15 +4363,18 @@ void common_moe_calibrate(common_params & params) {
     // pre-decision default, matching the parameter's own default.
     int active_ngl = 99;
     auto bench_one_sample = [&](uint32_t n_cpu_moe, int n_max, const std::string & mtp_path, int n_threads) -> double {
+        const int pa = g_moe_calib_prob_accept.load();
         double tps = common_moe_bench_candidate_server(
                 self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
-                -1, -1, active_ngl, active_min_rank);
+                -1, -1, active_ngl, active_min_rank, nullptr, 1234,
+                std::numeric_limits<double>::quiet_NaN(), false, false, std::string(), pa);
         // Retry only an infrastructure failure - a quality rejection is deterministic.
         if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED && tps != COMMON_MOE_TPS_LAUNCH_FAILED) {
             LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
-                    -1, -1, active_ngl, active_min_rank);
+                    -1, -1, active_ngl, active_min_rank, nullptr, 1234,
+                    std::numeric_limits<double>::quiet_NaN(), false, false, std::string(), pa);
         }
         return tps;
     };
@@ -4932,6 +4946,53 @@ void common_moe_calibrate(common_params & params) {
             // throughput cliff, not a gentle decline, so "less than half"
             // is a safe, real signal for "past the edge" rather than
             // ordinary run-to-run noise).
+            // Acceptance mode first, then depth.
+            //
+            // --spec-prob-accept changes how many drafted tokens survive
+            // verification, so it changes which depth is worth paying for -
+            // a mode that accepts more makes a wider draft pay off and a
+            // narrower one leave value behind. Measured after the depth
+            // search, as it used to be, the envelope searched the curve for
+            // the wrong acceptance mode and a +10-18% lever was switched on
+            // afterwards: 12.63 vs 11.43 tok/s on this model, 77.18 vs 65.36
+            // on gemma-4, where it was the largest single lever in the run.
+            // At 64k that ordering produced "the draft loses to no draft"
+            // from a configuration the draft would never be served in.
+            //
+            // Decided here at one fixed reference depth, then held for the
+            // whole envelope. One extra candidate, and every depth after it is
+            // measured in the regime it will actually run in. The later stage
+            // still re-checks it at the chosen depth, because the interaction
+            // runs both ways.
+            if (!common_moe_calibrate_budget_spent()) {
+                const int ref_depth = std::max(1, params.speculative.draft.n_max);
+                double pa_tps[2] = { -1.0, -1.0 };
+                for (int pa = 0; pa <= 1; pa++) {
+                    if (common_moe_calibrate_budget_spent()) {
+                        break;
+                    }
+                    g_moe_calib_prob_accept.store(pa);
+                    pa_tps[pa] = bench_with_retry(best_n, ref_depth,
+                                                  params.speculative.draft.mparams.path, n_threads_default);
+                    LOG_INF("%s:   draft acceptance %s at depth %d -> %s%s\n", __func__,
+                            pa ? "probabilistic" : "exact-match", ref_depth,
+                            pa_tps[pa] > 0 ? string_format("%.2f tok/s", pa_tps[pa]).c_str() : "failed",
+                            pa_tps[pa] > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                    common_moe_calibration_status_note("draft acceptance",
+                            pa ? "probabilistic" : "exact-match",
+                            pa_tps[pa] > 0 ? string_format("%.2f tok/s (before the depth search)", pa_tps[pa])
+                                           : std::string("failed"), pa_tps[pa] > 0);
+                }
+                const int pa_pick = (pa_tps[1] > 0 && pa_tps[1] > pa_tps[0]) ? 1 : (pa_tps[0] > 0 ? 0 : -1);
+                g_moe_calib_prob_accept.store(pa_pick);
+                if (pa_pick >= 0) {
+                    entry.spec_prob_accept = pa_pick;
+                    LOG_INF("%s: draft acceptance: %s - the depth search below runs in that mode\n",
+                            __func__, pa_pick ? "probabilistic" : "exact-match");
+                    checkpoint("draft acceptance");
+                }
+            }
+
             LOG_INF("%s: finding spec-draft-n-max envelope (doubling until collapse) via real llama-server subprocesses ...\n", __func__);
             common_moe_calibration_status_set("searching speculative-decoding depth (spec-draft-n-max)");
             common_moe_stage_begin("draft depth", 14);
