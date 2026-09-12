@@ -5503,6 +5503,9 @@ void common_moe_calibrate(common_params & params) {
                     __func__, best_ngl, best_ngl_tps, best_tps);
             common_moe_calibration_status_set(string_format("re-searching -ncmoe at -ngl=%u", best_ngl));
             best_tps = best_ngl_tps;
+            common_moe_calibration_status_note("GPU residency", string_format("ngl=%u", best_ngl),
+                    string_format("SELECTED - %.2f tok/s, beats full residency's %.2f",
+                                  best_ngl_tps, ngl_incumbent), true, true);
 
             llama_model_params mparams_ngl = mparams;
             mparams_ngl.n_gpu_layers = (int) best_ngl;
@@ -5549,8 +5552,33 @@ void common_moe_calibrate(common_params & params) {
                 }
             }
         } else {
-            LOG_INF("%s: full GPU residency still wins (%.2f vs %.2f tok/s on the same probe) - "
-                    "-ngl left at default\n", __func__, ngl_incumbent, best_ngl_tps);
+            // Report the best ALTERNATIVE, not best_ngl_tps. When full residency
+            // is itself the winning candidate, best_ngl_tps is the incumbent's
+            // own score, so this printed the same number twice - "14.25 vs
+            // 14.25 tok/s" - which reads as a tie nobody can act on rather than
+            // as "nothing beat leaving it alone".
+            double best_alt_tps = -1.0;
+            int    best_alt_ngl = -1;
+            for (const auto & kv : ngl_trace) {
+                if ((uint32_t) kv.first != ngl_hi && kv.second > best_alt_tps) {
+                    best_alt_tps = kv.second;
+                    best_alt_ngl = kv.first;
+                }
+            }
+            if (best_alt_ngl >= 0) {
+                LOG_INF("%s: full GPU residency wins (%.2f tok/s) - the best alternative was ngl=%d at "
+                        "%.2f tok/s, so -ngl is left at default\n",
+                        __func__, ngl_incumbent, best_alt_ngl, best_alt_tps);
+                common_moe_calibration_status_note("GPU residency", "full (default -ngl)",
+                        string_format("SELECTED - %.2f tok/s, best alternative ngl=%d at %.2f",
+                                      ngl_incumbent, best_alt_ngl, best_alt_tps), true, true);
+            } else {
+                LOG_INF("%s: full GPU residency wins (%.2f tok/s) - no alternative -ngl measured usable\n",
+                        __func__, ngl_incumbent);
+                common_moe_calibration_status_note("GPU residency", "full (default -ngl)",
+                        string_format("SELECTED - %.2f tok/s, no usable alternative", ngl_incumbent),
+                        true, true);
+            }
             best_ngl = ngl_hi;
         }
         // Carry it forward, so the thread / cache-size / fit-margin stages
@@ -5663,6 +5691,14 @@ void common_moe_calibrate(common_params & params) {
     // mistake for "smaller is fine"). Picking the smallest point within 3%
     // of the *global* max, after seeing the whole curve, is robust to that
     // dip in a way a running best-so-far comparison is not.
+    // One rung, measured the same way the sweep measures it - used by the sweep
+    // below and again by the tie-break that confirms a near-tie.
+    auto bench_cache_mb = [&](int mb) {
+        return common_moe_bench_candidate_server(
+                self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                best_threads, next_port(), ctx, n_predict, concurrency, mb, -1,
+                active_ngl, active_min_rank);
+    };
     std::vector<std::pair<int, double>> cache_results;
     for (size_t i = 0; i < cache_candidates_mb.size(); i++) {
         const int mb = cache_candidates_mb[i];
@@ -5691,12 +5727,86 @@ void common_moe_calibrate(common_params & params) {
         best_cache_tps = std::max(best_cache_tps, r.second);
     }
     if (best_cache_tps > 0) {
+        // The band has to be wider than the noise, or the noise chooses.
+        //
+        // This was 3%, which is far tighter than this hardware's measured
+        // run-to-run spread: fitt=448 read 12.45 then 10.35 tok/s in one run,
+        // and ncmoe=21 read 68.39 and 61.47 an hour apart. Measured on
+        // Qwen3.8-Flash-Next, 2048 MiB scored 11.14 against 8192 MiB's 11.52
+        // and missed the 3% band by 0.03 tok/s - 0.26% - so a cache four times
+        // the size won on a difference an order of magnitude below the noise
+        // floor, taking VRAM from everything else for nothing.
+        //
+        // Widening alone would be the wrong fix: it would hand the decision to
+        // a single cheap probe of a much smaller cache. So the wider band only
+        // nominates, and the nomination has to survive a re-measure against the
+        // best rung - the same confirm-before-believing the depth search
+        // already does with its "measured again" pass.
+        static const double band = [] {
+            const char * e = getenv("GGML_MOE_CALIBRATE_CACHE_BAND_PCT");
+            const double v = e ? atof(e) : 10.0;
+            return v > 0.0 && v < 50.0 ? v : 10.0;
+        }();
+        int    nominee_mb  = -1;
+        double nominee_tps = -1.0;
         for (const auto & r : cache_results) {
-            if (r.second >= best_cache_tps * 0.97) {
-                best_cache_mb = r.first; // smallest candidate within 3% of the global max
+            if (r.second >= best_cache_tps * (1.0 - band / 100.0)) {
+                nominee_mb  = r.first;
+                nominee_tps = r.second;
                 break;
             }
         }
+        int    best_mb_raw = -1;
+        for (const auto & r : cache_results) {
+            if (r.second >= best_cache_tps) {
+                best_mb_raw = r.first;
+                break;
+            }
+        }
+        best_cache_mb = nominee_mb;
+        if (nominee_mb > 0 && best_mb_raw > 0 && nominee_mb != best_mb_raw &&
+            !common_moe_calibrate_budget_spent()) {
+            LOG_INF("%s: expert-cache %d MiB (%.2f tok/s) is within %.0f%% of %d MiB (%.2f tok/s) and costs "
+                    "%d MiB less - re-measuring both before taking the smaller one\n",
+                    __func__, nominee_mb, nominee_tps, band, best_mb_raw, best_cache_tps,
+                    best_mb_raw - nominee_mb);
+            const double nom2  = bench_cache_mb(nominee_mb);
+            const double best2 = common_moe_calibrate_budget_spent() ? -1.0 : bench_cache_mb(best_mb_raw);
+            if (nom2 > 0 && best2 > 0) {
+                const double nom_mean  = (nominee_tps + nom2) / 2.0;
+                const double best_mean = (best_cache_tps + best2) / 2.0;
+                LOG_INF("%s:   %d MiB mean %.2f tok/s, %d MiB mean %.2f tok/s\n",
+                        __func__, nominee_mb, nom_mean, best_mb_raw, best_mean);
+                // Still only has to be close, not better - the whole point is
+                // that the smaller cache is worth real VRAM elsewhere.
+                best_cache_mb  = nom_mean >= best_mean * (1.0 - band / 100.0) ? nominee_mb : best_mb_raw;
+                best_cache_tps = best_cache_mb == nominee_mb ? nom_mean : best_mean;
+            }
+        }
+    }
+    // Say what was chosen. This stage measured every rung and then reported
+    // none of them as the answer - the only stage that did not - so the log and
+    // the decisions table both showed a ladder with no winner at the bottom,
+    // and the chosen size could only be inferred by re-applying the knee rule
+    // by hand.
+    if (best_cache_mb > 0) {
+        double chosen_tps = -1.0;
+        for (const auto & r : cache_results) {
+            if (r.first == best_cache_mb) {
+                chosen_tps = r.second;
+                break;
+            }
+        }
+        LOG_INF("%s: expert-cache size: %d MiB at %.2f tok/s (smallest within 3%% of the best rung's "
+                "%.2f tok/s - a bigger cache that is not measurably faster is VRAM taken from everything "
+                "else)\n", __func__, best_cache_mb, chosen_tps, best_cache_tps);
+        common_moe_calibration_status_note("expert-cache size",
+                string_format("%d MiB", best_cache_mb),
+                string_format("SELECTED - %.2f tok/s", chosen_tps), true, true);
+    } else {
+        LOG_WRN("%s: expert-cache size: no rung measured usable - leaving it on auto\n", __func__);
+        common_moe_calibration_status_note("expert-cache size", "auto",
+                "no rung measured usable", false, true);
     }
 
     // Fit margin (-fitt). Searched LAST and deliberately re-searching
