@@ -4697,6 +4697,17 @@ void common_moe_calibrate(common_params & params) {
     // the only thing that exercises it - decode is one token and never crosses it.
     // Candidates stop at 400: at the cache's 4096-row limit and ~10 experts per
     // token, a larger chunk cannot be served by the cache anyway.
+    // The two prefill stages - offload threshold and micro-batch - between them
+    // cost seven of the run's most expensive candidates (each processes an
+    // extra-long prompt) to decide two knobs that then govern every DECODE
+    // stage after them. That is the exact inheritance bug this file has hit
+    // repeatedly, paid for at the highest price per candidate in the run. Both
+    // now take the value the server was launched with, or a measured default.
+    const bool sweep_prefill = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SWEEP_PREFILL");
+        return e && atoi(e) != 0;
+    }();
+
     int best_offload_min_batch = -1;
     if (entry.op_offload_min_batch > 0) {
         best_offload_min_batch = entry.op_offload_min_batch;
@@ -4713,6 +4724,21 @@ void common_moe_calibrate(common_params & params) {
                 string_format("%d tokens", best_offload_min_batch),
                 resumed_result(string_format("%d tokens", best_offload_min_batch),
                                entry.tps_offload_min_batch, entry.calibrated_at), true, true);
+    } else if (!sweep_prefill) {
+        // A prefill knob, decided on prefill numbers, then inherited by every
+        // decode stage after it - the shape of bug this file has hit most. 256
+        // has won or tied on every model measured here, and the five candidates
+        // it costs are five of the most expensive in the run (they all process
+        // an extra-long prompt). GGML_MOE_CALIBRATE_SWEEP_PREFILL=1 measures it.
+        best_offload_min_batch = 256;
+        g_moe_calib_offload_min_batch.store(best_offload_min_batch);
+        entry.op_offload_min_batch = best_offload_min_batch;
+        LOG_WRN("%s: offload threshold at 256 by default - a prefill knob whose five candidates are the "
+                "run's most expensive, and which has not moved across models here "
+                "(GGML_MOE_CALIBRATE_SWEEP_PREFILL=1 to measure it)\n", __func__);
+        common_moe_calibration_status_note("offload threshold", "256 tokens",
+                "DEFAULT - unchanged across every model measured here", true, true);
+        checkpoint("offload threshold");
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the offload threshold (GGML_OP_OFFLOAD_MIN_BATCH) on prompt processing ...\n", __func__);
         common_moe_calibration_status_set("measuring the MoE offload threshold");
@@ -4793,6 +4819,30 @@ void common_moe_calibrate(common_params & params) {
                     best_prefetch ? "on" : "off",
                     resumed_result(best_prefetch ? "on" : "off", -1.0, entry.calibrated_at), true, true);
         }
+    } else if (!sweep_prefill) {
+        // -ub is a warm-up lever, not a throughput lever: it sets how much of
+        // the prompt crosses the PCIe bus at once, and the stage that measured
+        // it reported prompt tok/s - a number none of the decode stages that
+        // then inherit it are about. Take what the server was launched with.
+        best_ubatch = (int) params.n_ubatch;
+        g_moe_calib_ubatch.store(best_ubatch);
+        entry.n_ubatch = best_ubatch;
+        // Prefetch was never actually decided by its own candidate either - the
+        // stage measured it, logged the verdict, then stored true regardless,
+        // because the decode stages after it rely on that path existing. A
+        // candidate whose result cannot change the outcome is not a measurement.
+        best_prefetch = 1;
+        g_moe_calib_prefetch.store(true);
+        entry.sched_prefetch_experts = 1;
+        LOG_WRN("%s: prompt micro-batch left at the launch value (-ub %d) and expert prefetch on - both "
+                "were decided on prefill numbers that the decode stages after them are not about "
+                "(GGML_MOE_CALIBRATE_SWEEP_PREFILL=1 to measure them)\n", __func__, best_ubatch);
+        common_moe_calibration_status_note("prompt micro-batch", string_format("-ub %d", best_ubatch),
+                "LAUNCH VALUE - a warm-up lever, measured on prefill, inherited by decode stages", true, true);
+        common_moe_calibration_status_note("expert prefetch", "on",
+                "DEFAULT - the decode stages rely on the path; its candidate could never change that",
+                true, true);
+        checkpoint("prompt micro-batch");
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the prompt micro-batch size (-ub) on a long prompt ...\n", __func__);
         common_moe_calibration_status_set("measuring the prompt micro-batch size");
@@ -5270,6 +5320,10 @@ void common_moe_calibrate(common_params & params) {
         checkpoint("micro-batch revalidated with the draft");
     }
 
+    const bool search_depth = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_DEPTH");
+        return e && atoi(e) != 0;
+    }();
     if (params.speculative.has_dft() && entry.spec_n_max >= 0) {
         best_n_max = entry.spec_n_max;
         LOG_WRN("%s: resuming - speculative depth %d already measured, skipping the envelope search "
@@ -5278,6 +5332,28 @@ void common_moe_calibrate(common_params & params) {
                 best_n_max > 0 ? string_format("n-max %d", best_n_max) : std::string("off"),
                 resumed_result(best_n_max > 0 ? string_format("n-max %d", best_n_max) : std::string("off"),
                                entry.tps_spec_n_max, entry.calibrated_at), true, true);
+    } else if (params.speculative.has_dft() && !search_depth) {
+        // The single most expensive stage in the run: a no-draft baseline, an
+        // acceptance A/B, an envelope that doubles 1..32, a golden-section
+        // refinement inside it and a re-check after substitution - every one a
+        // full server spawn, because depth and acceptance are launch arguments
+        // and cannot be POSTed to a running server the way every other knob
+        // here can. That is most of the run's wall clock for two values the
+        // launch command already carries.
+        best_n_max = std::max(1, params.speculative.draft.n_max);
+        entry.spec_n_max = best_n_max;
+        g_moe_calib_prob_accept.store(params.speculative.draft.prob_accept ? 1 : 0);
+        entry.spec_prob_accept = params.speculative.draft.prob_accept ? 1 : 0;
+        LOG_WRN("%s: speculative depth left at the launch value (n-max %d, %s acceptance) - depth and "
+                "acceptance are launch arguments, so every candidate is a full server spawn "
+                "(GGML_MOE_CALIBRATE_SEARCH_DEPTH=1 to search them)\n", __func__, best_n_max,
+                params.speculative.draft.prob_accept ? "probabilistic" : "exact-match");
+        common_moe_calibration_status_note("speculative depth", string_format("n-max %d", best_n_max),
+                "LAUNCH VALUE - the only knob here that needs a server restart per candidate", true, true);
+        common_moe_calibration_status_note("draft acceptance",
+                params.speculative.draft.prob_accept ? "probabilistic" : "exact-match",
+                "LAUNCH VALUE", true, true);
+        checkpoint("speculative depth");
     } else if (params.speculative.has_dft()) {
         {
             // Find the envelope: double n_max until throughput drops below
@@ -5666,7 +5742,30 @@ void common_moe_calibrate(common_params & params) {
     // Hoisted: the deferred no-draft comparison below needs the draft's best
     // CONFIGURED throughput, which is produced inside the share stage.
     double best_share_tps  = -1.0;
-    if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
+    // The design answers this one outright: the MTP head is the thing that IS
+    // resident in VRAM. It runs on every decode step, it is small (440 MiB on
+    // gemma-4, 1819 on qwen4exp), and it is the single weight the whole
+    // no-resident-layer design chose to keep on the card. Offloading its experts
+    // to the CPU to buy expert-cache bytes is that decision run backwards, and
+    // the two follow-on stages - draft-exact and draft cache share - only exist
+    // once it has been offloaded, so pinning it here removes four candidates.
+    // GGML_MOE_CALIBRATE_SEARCH_DRAFT=1 measures the placement instead.
+    const bool search_draft_place = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_DRAFT");
+        return e && atoi(e) != 0;
+    }();
+    if (best_n_max > 0 && !search_draft_place) {
+        best_draft_cpu_moe = 0;
+        entry.spec_draft_cpu_moe = 0;
+        g_moe_calib_draft_cpu_moe.store(false);
+        LOG_WRN("%s: draft experts on the GPU - the MTP head is what the design keeps resident, and "
+                "offloading it is that choice run backwards (GGML_MOE_CALIBRATE_SEARCH_DRAFT=1 to "
+                "measure the placement)\n", __func__);
+        common_moe_calibration_status_note("draft placement", "experts on GPU",
+                "DESIGN - the MTP head is the weight the card holds; it runs on every decode step",
+                true, true);
+        checkpoint("draft placement");
+    } else if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring draft expert placement (GPU vs CPU) at spec-draft-n-max=%d ...\n", __func__, best_n_max);
         common_moe_calibration_status_set("measuring draft expert placement");
         g_moe_calib_draft_cpu_moe.store(true);
@@ -6183,14 +6282,36 @@ void common_moe_calibrate(common_params & params) {
             LOG_INF("%s: measuring stand-in quality bar at rank %d (this is the wait-or-substitute "
                     "balance) ...\n", __func__, active_min_rank);
             common_moe_calibration_status_set("measuring stand-in quality bar");
+            // On the server the substitution ladder left open. The bar is read
+            // per substitution decision through the tunables registry (see
+            // moe_cache_substitute_quality_sigma), so a POST changes the very
+            // next token - five model loads become five requests. Falls back to
+            // a spawn per candidate only if no live server survived the ladder.
+            bool sigma_live = g_moe_live_port > 0;
             for (const double sigma : {2.0, 1.0, 0.0, -1.0, -2.0}) {
                 if (common_moe_calibrate_budget_spent()) {
                     break;
                 }
                 std::string cand_text;
-                const double tps = common_moe_bench_candidate_server(
-                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
-                        concurrency, -1, -1, active_ngl, active_min_rank, &cand_text, 1234, sigma);
+                double tps = -1.0;
+                if (sigma_live && g_moe_live_port > 0) {
+                    const std::string body = string_format(
+                            "{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA\": \"%.1f\"}", sigma);
+                    tps = common_moe_bench_candidate_server(
+                            self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                            g_moe_live_port, ctx, n_predict, concurrency, -1, -1, active_ngl,
+                            active_min_rank, &cand_text, 1234, sigma, false, false,
+                            std::string(), -1, std::string(), -1.0,
+                            g_moe_live_port, body, /* keep_alive */ true);
+                } else {
+                    tps = common_moe_bench_candidate_server(
+                            self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                            next_port(), ctx, n_predict, concurrency, -1, -1, active_ngl,
+                            active_min_rank, &cand_text, 1234, sigma, false, false,
+                            std::string(), -1, std::string(), -1.0,
+                            -1, std::string(), /* keep_alive */ true);
+                    sigma_live = g_moe_live_port > 0;
+                }
                 common_moe_calibration_status_candidate_done();
                 // Reported, not a veto - the same fix the substitution ladder needed,
                 // for the same reason. Fidelity is similarity to the substitution-free
@@ -6228,6 +6349,10 @@ void common_moe_calibrate(common_params & params) {
             // "</think>" for the next prompt. Speed was fine. Output was destroyed.
             // Nothing downstream can catch this, because the calibration that
             // chose it never ran with reasoning on.
+            // The confirm below runs at a different length with reasoning on -
+            // a different regime, so it gets its own server, exactly as the
+            // substitution ladder's confirm does.
+            common_moe_live_stop();
             if (!std::isnan(best_sigma) && !common_moe_calibrate_budget_spent()) {
                 const int sigma_confirm_predict = n_predict * 4;
                 common_moe_calibration_status_set(string_format(
@@ -6514,11 +6639,28 @@ void common_moe_calibrate(common_params & params) {
     const int n_threads_physical = common_cpu_get_num_physical_cores();
     const int n_threads_logical  = (int) std::thread::hardware_concurrency();
     std::vector<int> thread_candidates = { n_threads_default };
-    if (n_threads_physical > 0 && n_threads_physical != n_threads_default) {
-        thread_candidates.push_back(n_threads_physical);
-    }
-    if (n_threads_logical > 0 && n_threads_logical != n_threads_default && n_threads_logical != n_threads_physical) {
-        thread_candidates.push_back(n_threads_logical);
+    // An explicit -t is an instruction, not an opening bid. When the launch
+    // value already equals the physical core count - the answer this sweep has
+    // reached on every run here - the remaining candidate is SMT, which oversubscribes
+    // the cores the expert streaming already saturates.
+    // GGML_MOE_CALIBRATE_SWEEP_THREADS=1 sweeps it anyway.
+    const bool sweep_threads = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SWEEP_THREADS");
+        return e && atoi(e) != 0;
+    }();
+    if (!sweep_threads && n_threads_default == n_threads_physical) {
+        LOG_WRN("%s: thread count left at %d - the launch value already equals the physical core count, "
+                "so the only remaining candidate is SMT over cores the expert streaming already saturates "
+                "(GGML_MOE_CALIBRATE_SWEEP_THREADS=1 to sweep it)\n", __func__, n_threads_default);
+        common_moe_calibration_status_note("thread count", string_format("%d threads", n_threads_default),
+                "LAUNCH VALUE - equals the physical core count", true, true);
+    } else {
+        if (n_threads_physical > 0 && n_threads_physical != n_threads_default) {
+            thread_candidates.push_back(n_threads_physical);
+        }
+        if (n_threads_logical > 0 && n_threads_logical != n_threads_default && n_threads_logical != n_threads_physical) {
+            thread_candidates.push_back(n_threads_logical);
+        }
     }
 
     int    best_threads = n_threads_default;
