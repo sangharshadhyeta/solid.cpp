@@ -4567,13 +4567,44 @@ void common_moe_calibrate(common_params & params) {
     // spread is only knowable by paying for the very benchmarks this is
     // deciding whether to skip. Above it the search runs as before, since a
     // genuinely wide range can hide a real optimum.
-    if (ncmoe_span < ncmoe_search_min_span) {
+    // No complete expert layer resident in VRAM. Every layer's experts go to
+    // the CPU, and only the MTP head stays.
+    //
+    // This is a design decision rather than a measurement, and the arithmetic
+    // says why. A resident layer costs 1.15 GiB and buys all 512 of that
+    // layer's experts - hot and cold alike - while the same 1.15 GiB spent as
+    // cache holds about 509 experts chosen by demand, across all 48 layers.
+    // With 10 of 512 firing per token, the cache's selection is worth far more
+    // than the layer's completeness: measured hit rate is 29% at 14%
+    // residency, so routing is roughly twice as concentrated as uniform, and
+    // the cache is what exploits that.
+    //
+    // So the placement search is not a search. The experts stream, the hottest
+    // are held, and the VRAM that would have pinned one layer's worth of
+    // mostly-cold weights goes to the MTP head and the cache instead.
+    // GGML_MOE_CALIBRATE_SEARCH_NCMOE=1 restores the search for a card where
+    // a resident layer might actually pay.
+    const bool search_ncmoe = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_NCMOE");
+        return e && atoi(e) != 0;
+    }();
+    if (!search_ncmoe) {
+        LOG_WRN("%s: no expert layer resident - all %u layers' experts on the CPU, only the MTP head and "
+                "the hottest experts in VRAM. A resident layer costs 1.15 GiB for all 512 of its experts; "
+                "the same bytes as cache hold ~509 chosen by demand across every layer "
+                "(GGML_MOE_CALIBRATE_SEARCH_NCMOE=1 to search placements instead)\n",
+                __func__, probe.n_layer);
+        common_moe_calibration_status_note("expert placement",
+                string_format("ncmoe %u - none resident", probe.n_layer),
+                "DESIGN - the cache holds experts chosen by demand, not a layer's worth of mostly-cold ones",
+                true, true);
+    } else if (ncmoe_span < ncmoe_search_min_span) {
         LOG_INF("%s: MoE CPU-offload depth fixed at %u by the fit probe - only %u placement(s) fit this "
                 "context with the serving margin, not enough spread to be worth benchmarking; spending the "
                 "budget on the levers that move instead\n", __func__, safe_n, ncmoe_span + 1);
     }
 
-    if (ncmoe_span >= ncmoe_search_min_span) {
+    if (search_ncmoe && ncmoe_span >= ncmoe_search_min_span) {
         LOG_INF("%s: golden-section search for -ncmoe in [%u, %u] at n_threads=%d%s (real llama-server subprocess, "
                 "chat-templated prompts, per candidate) ...\n", __func__, safe_n, ncmoe_hi, n_threads_default,
                 concurrency > 1 ? string_format(", concurrency=%d (aggregate throughput)", concurrency).c_str() : "");
@@ -4597,7 +4628,12 @@ void common_moe_calibrate(common_params & params) {
     };
     uint32_t best_n;
     double best_tps;
-    if (ncmoe_span < ncmoe_search_min_span) {
+    if (!search_ncmoe) {
+        // Every layer's experts on the CPU - the design rule above. Measured
+        // once so later stages have a real baseline to compare against.
+        best_n   = probe.n_layer;
+        best_tps = measure_ncmoe((int) best_n);
+    } else if (ncmoe_span < ncmoe_search_min_span) {
         // Probe-decided (see the comment above): take the fit probe's own
         // floor and measure it ONCE, so later stages still have a real
         // baseline tok/s to compare against without paying for a search.
@@ -4866,6 +4902,36 @@ void common_moe_calibrate(common_params & params) {
     //
     // GGML_MOE_CALIBRATE_ALLOW_NO_DRAFT=1 restores the old behaviour for
     // anyone who wants the comparison made rather than assumed.
+    // Short by default. The exhaustive sweep is opt-in.
+    //
+    // Stages that prove an individual mechanism - is the prerouter worth it,
+    // does rank-weighted admission help, which stand-in picker wins - all share
+    // a bias: they start from the feature being OFF and need evidence to enable
+    // it. On a machine with a 12-20% run-to-run spread that disables real
+    // benefits by coin flip, and the effect compounds with every stage added.
+    //
+    // Measured on gemma-4 at the same context: the September 4 entry, from a
+    // calibration with a fraction of today's stages, ran 68.75 tok/s. Today's,
+    // with all of them, produced 58.94 - 14% slower, on the same model and the
+    // same card, because more stages meant more chances to switch something off
+    // for a reason that was really noise. A hand-assembled configuration with
+    // everything enabled then beat both.
+    //
+    // So those stages are off by default and the mechanisms simply stay on. What
+    // remains is what genuinely differs between models and hardware and has
+    // effects far larger than the noise: where the experts live, how much cache
+    // there is, how aggressively stand-ins may be used, and how deep the draft
+    // goes. GGML_MOE_CALIBRATE_FULL=1 runs everything.
+    const bool full_sweep = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_FULL");
+        return e && atoi(e) != 0;
+    }();
+    if (!full_sweep) {
+        LOG_WRN("%s: short calibration - measuring placement, cache size, substitution and draft depth, "
+                "and leaving every other mechanism on rather than spending a candidate proving each one "
+                "(GGML_MOE_CALIBRATE_FULL=1 for the exhaustive sweep)\n", __func__);
+    }
+
     const bool allow_no_draft = [] {
         const char * e = getenv("GGML_MOE_CALIBRATE_ALLOW_NO_DRAFT");
         return e && atoi(e) != 0;
@@ -4938,6 +5004,36 @@ void common_moe_calibrate(common_params & params) {
         //
         // So: quantize the large consumer whose output is checked, and leave
         // the small one whose worth is measured in how often it is right.
+        // q8_0 by default, not measured.
+        //
+        // At any context worth calibrating, this is the single largest VRAM
+        // lever and it has won every time it has been looked at: measured at
+        // 64k it frees 988 MiB, which is the difference between the 1819 MiB
+        // MTP head fitting and not fitting at all, and it measured faster in
+        // both directions it was tried (10.17 against 9.41, 9.17 against 8.36).
+        // f16 at 64k leaves 1405 MiB against a draft that needs 1819 - it
+        // simply does not fit the design.
+        //
+        // So it stops being a candidate and becomes what the design assumes.
+        // The comparison remains available for a model where the trade might
+        // differ; it is not worth two candidates in every run to re-derive an
+        // answer this consistent. GGML_MOE_CALIBRATE_KV_SWEEP=1 measures it.
+        double best_kv_tps = -1.0;
+        const bool sweep_kv = [] {
+            const char * e = getenv("GGML_MOE_CALIBRATE_KV_SWEEP");
+            return e && atoi(e) != 0;
+        }();
+        if (!sweep_kv) {
+            best_kv_type = "q8_0";
+            common_moe_calib_set_kv_type(best_kv_type);
+            entry.kv_type = best_kv_type;
+            LOG_WRN("%s: KV cache at q8_0 by default - it frees the VRAM the draft needs and has measured "
+                    "faster every time it was compared (set GGML_MOE_CALIBRATE_KV_SWEEP=1 to measure it "
+                    "against f16)\n", __func__);
+            common_moe_calibration_status_note("KV precision", "q8_0",
+                    "DEFAULT - frees ~988 MiB at 64k, which is what makes the draft fit", true, true);
+            checkpoint("KV precision");
+        } else {
         common_moe_stage_begin("KV precision", 2);
         // At the CONSERVATIVE micro-batch, not whatever the prompt stage chose.
         //
@@ -4950,7 +5046,6 @@ void common_moe_calibrate(common_params & params) {
         // next stage may overturn anyway.
         const int kv_saved_ub = g_moe_calib_ubatch.load();
         g_moe_calib_ubatch.store(512);
-        double best_kv_tps = -1.0;
         for (const char * kvt : { "f16", "q8_0" }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
@@ -5001,6 +5096,7 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calib_set_kv_type(best_kv_type);
         g_moe_calib_ubatch.store(kv_saved_ub);   // the -ub decision is the next stage's
         common_moe_stage_end();
+        }   // sweep_kv
         entry.kv_type = best_kv_type;
         checkpoint("KV precision");
         if (best_kv_tps > 0) {
@@ -6877,7 +6973,7 @@ void common_moe_calibrate(common_params & params) {
     // bar, because the whole claim is that a better-chosen stand-in costs less
     // correctness - a claim that has to be shown, not asserted.
     int best_sub_atlas = -1;
-    if (best_min_rank >= 0 && best_min_rank < 10 && !common_moe_calibrate_budget_spent()) {
+    if (best_min_rank >= 0 && best_min_rank < 10 && full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring how stand-ins are chosen (heat vs atlas similarity) ...\n", __func__);
         common_moe_calibration_status_set("measuring stand-in selection");
         common_moe_stage_begin("stand-in selection", 3);
@@ -7023,7 +7119,7 @@ void common_moe_calibrate(common_params & params) {
     // second turn on a prefix the first turn cached, which is what the probe loop
     // does naturally (it repeats its prompts).
     int best_prewarm_k = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring atlas prewarm on a restored prefix (it ships off, unmeasured) ...\n", __func__);
         common_moe_calibration_status_set("measuring atlas prewarm");
         common_moe_stage_begin("atlas prewarm", 3);
@@ -7086,7 +7182,7 @@ void common_moe_calibrate(common_params & params) {
     // stage before this one runs with the predictor off entirely, for the same
     // reason - uniform, not absent-then-present.
     std::string predictor_state_file;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         const std::string cache_dir = fs_get_cache_directory();
         const std::string base = path_model ? std::string(path_model) : std::string("model");
         const size_t slash = base.find_last_of("/\\");
@@ -7211,7 +7307,7 @@ void common_moe_calibrate(common_params & params) {
     // share: it is the remainder, with a floor no combination may cross,
     // because a cache whose primary pool cannot exist is worse than no cache.
     int best_reduced_share = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the budget partition (reduced pool's share of the expert cache) ...\n", __func__);
         common_moe_calibration_status_set("measuring the budget partition");
         // The arbiter enumerates; this stage only measures. Which splits are
@@ -7301,7 +7397,7 @@ void common_moe_calibrate(common_params & params) {
     // happens to have; it is the router's own ordering, the same signal
     // substitution is gated on.
     int best_admit_exact_w = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring rank-weighted admission (un-substitutable demand counts extra) ...\n", __func__);
         common_moe_calibration_status_set("measuring rank-weighted admission");
         common_moe_stage_begin("rank-weighted admission", 3);
@@ -7358,7 +7454,7 @@ void common_moe_calibrate(common_params & params) {
     // 0.97 acceptance, the draft still lost to no draft at all - not for
     // predicting badly, but for what its verify pass costs.
     int best_verify_rank = -2;
-    if (mtp_configured && !common_moe_calibrate_budget_spent()) {
+    if (mtp_configured && full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring how hard a verify pass may lean on stand-ins ...\n", __func__);
         common_moe_calibration_status_set("measuring the verify substitution floor");
         common_moe_stage_begin("verify substitution", 3);
@@ -7428,7 +7524,7 @@ void common_moe_calibrate(common_params & params) {
     // a rate too low never leaves its prior inside the window and a rate too
     // high tracks noise. Both look like "the predictor does not help".
     int best_train_predictor = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the live-trained prerouter (it ships off, unmeasured) ...\n", __func__);
         common_moe_calibration_status_set("measuring the trained prerouter");
         common_moe_stage_begin("trained prerouter", 2);
@@ -7492,7 +7588,7 @@ void common_moe_calibrate(common_params & params) {
     int    best_pred_admit   = -1;
     double best_pred_evict_w = -1.0;
     double best_pred_sub_w   = -1.0;
-    if (best_train_predictor > 0 && !common_moe_calibrate_budget_spent()) {
+    if (best_train_predictor > 0 && full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring what the prerouter may influence beyond admission ...\n", __func__);
         common_moe_calibration_status_set("measuring prerouter influence");
         common_moe_stage_begin("prerouter influence", 3);
@@ -7808,7 +7904,7 @@ void common_moe_calibrate(common_params & params) {
     // here it changes the arithmetic, so its winner is confirmed at full length
     // with the answer check before it is kept.
     int best_neuron_k = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    if (full_sweep && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring heat-aware neuron subsetting (it has been on at K=256, unmeasured) ...\n", __func__);
         common_moe_calibration_status_set("measuring neuron subsetting");
         common_moe_stage_begin("neuron subsetting", 5);
@@ -8125,7 +8221,7 @@ void common_moe_calibrate(common_params & params) {
     if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: validating the winning combination (nothing above ran the full set together) ...\n", __func__);
         common_moe_calibration_status_set("validating the combination");
-        common_moe_stage_begin("final validation", 2);
+        common_moe_stage_begin("final validation", 3);
         // Apply the entry the way a real launch would, so this measures what
         // serving will actually run rather than a hand-built approximation.
         common_moe_apply_quality_knobs(entry, path_model);
@@ -8184,6 +8280,70 @@ void common_moe_calibrate(common_params & params) {
                         string_format("CONFIRMED on the full combination - %.2f vs %.2f tok/s",
                                       final_tps, final_tps_no_pred), true, true);
             }
+        }
+        // Everything on, as the floor this run may not ship below.
+        //
+        // Each stage above starts from a feature being OFF and requires
+        // evidence to turn it on. On a machine with a 12-20% run-to-run spread
+        // that is a systematic bias toward off: a feature genuinely worth 8%
+        // fails to prove itself about half the time, and is disabled by the
+        // coin flip rather than by its effect. Run enough stages that way and
+        // the saved entry is a configuration with most of its mechanisms
+        // switched off, each for a defensible-looking reason.
+        //
+        // Measured directly: a hand-assembled configuration with every feature
+        // enabled outran what this calibration produced. That is the bias, not
+        // a coincidence - so the all-on configuration is measured here as a
+        // reference, and if the calibrated combination cannot beat it, the
+        // calibrated entry is not what gets saved. Proving each feature
+        // individually is how the run learns; it is not permitted to be how
+        // the run loses.
+        double all_on_tps = -1.0;
+        if (!common_moe_calibrate_budget_spent()) {
+            common_moe_calib_set_env(
+                    "GGML_SCHED_PREFETCH_EXPERTS=1 "
+                    "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 "
+                    "GGML_CUDA_MOE_CACHE_ADMIT_AFTER=1 "
+                    "GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS=4 "
+                    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=1 "
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT=1.0 "
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT=1.0 "
+                    "GGML_CUDA_MOE_CACHE_GROUP_ADMIT=1 GGML_CUDA_MOE_CACHE_COVERAGE_EVICT=1 "
+                    "GGML_CUDA_MOE_CACHE_ATLAS_WARM=1 GGML_CUDA_MOE_CACHE_ATLAS_ALIGN_PROTECT=1 "
+                    "LLAMA_PROMPT_CACHE_MOE_PREWARM=1 LLAMA_PROMPT_CACHE_MOE_PREWARM_K=4");
+            all_on_tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calib_set_env(std::string());
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s: every feature on -> %s\n", __func__,
+                    all_on_tps > 0 ? string_format("%.2f tok/s", all_on_tps).c_str() : "failed");
+            common_moe_calibration_status_note("final validation", "every feature on",
+                    all_on_tps > 0 ? string_format("%.2f tok/s", all_on_tps) : std::string("failed"),
+                    all_on_tps > 0, false);
+        }
+        if (all_on_tps > 0 && final_tps > 0 && all_on_tps > final_tps) {
+            LOG_WRN("%s: every feature on (%.2f tok/s) beats the combination this run assembled (%.2f) - "
+                    "saving the all-on configuration instead. Each stage starts from a feature being off "
+                    "and needs evidence to enable it, which on a machine with this much run-to-run spread "
+                    "disables things by coin flip; the run is allowed to learn that way but not to ship "
+                    "worse than the configuration it started from\n", __func__, all_on_tps, final_tps);
+            entry.sched_prefetch_experts = 1;
+            entry.moe_cache_ring_pct     = 10;
+            entry.admit_after            = 1;
+            entry.substitute_atlas       = 4;
+            entry.train_predictor        = 1;
+            entry.predictor_next_layer   = 1;
+            entry.predictor_evict_w      = 1.0;
+            entry.predictor_sub_w        = 1.0;
+            entry.group_admit            = 1;
+            entry.coverage_evict         = 1;
+            entry.atlas_prewarm_k        = 4;
+            entry.tok_per_sec            = all_on_tps;
+            common_moe_calibration_status_note("final validation", "every feature on",
+                    string_format("SELECTED - %.2f tok/s, ahead of the assembled combination's %.2f",
+                                  all_on_tps, final_tps), true, true);
         }
         common_moe_stage_end();
         if (final_tps > 0) {
