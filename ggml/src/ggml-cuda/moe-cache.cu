@@ -9058,6 +9058,87 @@ static bool moe_cache_train_predictor_enabled() {
 // plain demand count. 0 = today's behaviour (rank-blind). Measured, not
 // assumed - this moves who gets scarce VRAM, and the fill worker is already
 // permanently backlogged.
+// ---------------------------------------------------------------------------
+// Budget arbiter.
+//
+// Everything in this cache bids for one number - device.budget_limit - and
+// until now nothing saw the whole bid. The reduced pool capped itself at 1/8,
+// the draft took a percentage, the ring took a fraction of the primary's
+// slots, and the primary got whatever happened to be left, each decided at a
+// different moment by a different rule. Nobody could answer "what is the
+// split", so nothing could calibrate it.
+//
+// That is not a cosmetic gap. Measured on Qwen3.8-Flash-Next at 64k: an
+// 8192 MiB cache ran at 9.90 tok/s and a 2048 MiB cache at 11.40 - four times
+// smaller and 15% faster - because the extra bytes were taken from consumers
+// that needed them more. The same run chose neuron subsetting OFF (11.70 vs
+// 9.83 at K=128) even though subsetting exists to double effective capacity:
+// its pool competes with the primary for the same bytes, which is the failure
+// this file already records ("reserving a flat slice starved a whole primary
+// pool out of existence, hit rate 31.3% -> 23.1%").
+//
+// Each stage optimising its own allocation while holding the others fixed is
+// coordinate descent on a shared constraint: it converges to a local optimum,
+// and the order in which the stages run changes which one. The arbiter makes
+// the partition a single object so it can be searched as a vector instead.
+//
+// Shares are percentages of the post-reserve budget. The primary is never a
+// share - it is the remainder, and it has a floor no other consumer may cross,
+// because a cache whose primary pool cannot exist is worse than no cache at
+// all (measured above).
+struct moe_cache_budget_split {
+    size_t total   = 0;  // post-reserve bytes being divided
+    size_t reduced = 0;  // heat-aware neuron subsetting pool
+    size_t draft   = 0;  // the draft model's experts
+    size_t primary = 0;  // the remainder - never a declared share
+};
+
+// Floor on the primary pool, as a percentage of the divisible budget. No
+// combination of shares may push it below this.
+static int moe_cache_primary_floor_pct() {
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_PRIMARY_FLOOR_PCT", 50);
+}
+static int moe_cache_reduced_share_pct() {
+    // Default 12 ~= the 1/8 cap this replaces, so an uncalibrated run behaves
+    // as it did before the arbiter existed.
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT", 12);
+}
+
+static moe_cache_budget_split moe_cache_split_budget(const moe_cache_device & device) {
+    moe_cache_budget_split out;
+    out.total = device.budget_limit;
+    if (out.total == 0) {
+        return out;
+    }
+
+    int reduced_pct = moe_cache_neuron_reduce_enabled() ? moe_cache_reduced_share_pct() : 0;
+    int draft_pct   = 0;
+    {
+        const int pct = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", -1);
+        if (pct > 0) {
+            draft_pct = pct;
+        }
+    }
+    reduced_pct = std::max(0, std::min(100, reduced_pct));
+    draft_pct   = std::max(0, std::min(100, draft_pct));
+
+    // Enforce the primary floor by scaling the declared shares down together,
+    // so their relative proportions survive - shrinking one arbitrarily would
+    // silently re-decide a split somebody measured.
+    const int floor_pct = std::max(0, std::min(90, moe_cache_primary_floor_pct()));
+    const int max_share = 100 - floor_pct;
+    if (reduced_pct + draft_pct > max_share) {
+        const double scale = (double) max_share / (double) (reduced_pct + draft_pct);
+        reduced_pct = (int) (reduced_pct * scale);
+        draft_pct   = (int) (draft_pct   * scale);
+    }
+
+    out.reduced = out.total / 100 * (size_t) reduced_pct;
+    out.draft   = out.total / 100 * (size_t) draft_pct;
+    out.primary = out.total - out.reduced - out.draft;
+    return out;
+}
+
 static int moe_cache_admit_exact_weight() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_ADMIT_EXACT_WEIGHT", 0);
 }
