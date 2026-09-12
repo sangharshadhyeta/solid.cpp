@@ -4526,15 +4526,27 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
-    // Proven, not promised: the best depth has to beat no draft at all.
+    // Proven, not promised: the best depth has to beat no draft at all - but
+    // it has to be given its own measured configuration first.
+    //
+    // This verdict used to land here, and zeroing best_n_max here is circular:
+    // the three stages below (draft placement, exactness, cache share) are all
+    // gated on best_n_max > 0, so a draft was judged in the worst
+    // configuration it will ever have - its experts competing with the
+    // target's in an untuned cache, no share of its own, no placement - and
+    // the stages that would fix exactly that were skipped BECAUSE it lost.
+    // Measured on Qwen3.8-Flash-Next at 64k: the draft was accepting 0.87-0.88
+    // of what it proposed, which is a draft doing its job well, and still lost
+    // on throughput - a verification-cost problem, which is what placement and
+    // share address.
+    //
+    // So the comparison is deferred: remember the number to beat, configure
+    // the draft, then decide against the configured draft's real throughput.
+    const double no_draft_tps_to_beat = no_draft_tps;
     if (best_n_max > 0 && no_draft_tps > 0.0 && best_n_max_tps <= no_draft_tps) {
-        LOG_WRN("%s: the best draft depth (%d, %.2f tok/s) does not beat no draft at all (%.2f tok/s) on this "
-                "machine - recording speculative decoding as measured slower; later stages run without it\n",
+        LOG_INF("%s: the best draft depth (%d, %.2f tok/s) does not yet beat no draft at all (%.2f tok/s) - "
+                "configuring the draft first, then deciding\n",
                 __func__, best_n_max, best_n_max_tps, no_draft_tps);
-        common_moe_calibration_status_note("speculative decoding", "off",
-                string_format("SELECTED - %.2f tok/s beats the best draft depth's %.2f", no_draft_tps, best_n_max_tps),
-                true, true);
-        best_n_max = 0;
     }
 
     // Draft placement, at the chosen depth. The draft defaults to fully GPU-resident
@@ -4545,6 +4557,9 @@ void common_moe_calibrate(common_params & params) {
     int best_draft_cpu_moe = -1;
     int best_draft_exact   = -1; // -1 not calibrated, 1 exact only, 0 stand-ins allowed
     int best_share_pct     = -1; // draft's share of the expert-cache budget
+    // Hoisted: the deferred no-draft comparison below needs the draft's best
+    // CONFIGURED throughput, which is produced inside the share stage.
+    double best_share_tps  = -1.0;
     if (best_n_max > 0 && best_n_max_tps > 0.0 && !common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring draft expert placement (GPU vs CPU) at spec-draft-n-max=%d ...\n", __func__, best_n_max);
         common_moe_calibration_status_set("measuring draft expert placement");
@@ -4582,7 +4597,7 @@ void common_moe_calibrate(common_params & params) {
             // is by tensor count, which hands the draft ~2% for no measured reason
             // while it runs on every decode step. Measured only when its experts are
             // CPU-offloaded, because that is the only case where it holds any.
-            double best_share_tps = std::max(cpu_tps, sub_tps);
+            best_share_tps = std::max(cpu_tps, sub_tps);
             const std::string exact_env = best_draft_exact ? std::string() : std::string(" GGML_CUDA_MOE_CACHE_DRAFT_EXACT=0");
             for (const int pct : { 10, 25 }) {
                 if (common_moe_calibrate_budget_spent()) {
@@ -4609,6 +4624,33 @@ void common_moe_calibrate(common_params & params) {
                 common_moe_calibration_status_note("draft cache share", string_format("%d%%", best_share_pct),
                         string_format("SELECTED - %.2f tok/s", best_share_tps), true, true);
             }
+        }
+    }
+
+    // Now the deferred verdict, against the draft's best CONFIGURED throughput
+    // rather than its worst. best_share_tps/cpu_tps only exist when those
+    // stages ran, so fall back to the depth search's own number.
+    if (best_n_max > 0 && no_draft_tps_to_beat > 0.0) {
+        double configured_tps = best_n_max_tps;
+        if (best_share_pct > 0 && best_share_tps > configured_tps) {
+            configured_tps = best_share_tps;
+        }
+        if (configured_tps <= no_draft_tps_to_beat) {
+            LOG_WRN("%s: the draft at its best measured configuration (%.2f tok/s) still does not beat no draft "
+                    "at all (%.2f tok/s) on this machine - recording speculative decoding as measured slower; "
+                    "later stages run without it\n", __func__, configured_tps, no_draft_tps_to_beat);
+            common_moe_calibration_status_note("speculative decoding", "off",
+                    string_format("SELECTED - %.2f tok/s beats the configured draft's %.2f",
+                                  no_draft_tps_to_beat, configured_tps),
+                    true, true);
+            best_n_max = 0;
+        } else {
+            LOG_INF("%s: the draft beats no draft once configured (%.2f vs %.2f tok/s) - keeping speculative "
+                    "decoding\n", __func__, configured_tps, no_draft_tps_to_beat);
+            common_moe_calibration_status_note("speculative decoding", "on",
+                    string_format("SELECTED - configured draft %.2f tok/s beats no draft's %.2f",
+                                  configured_tps, no_draft_tps_to_beat),
+                    true, true);
         }
     }
 
@@ -6394,6 +6436,50 @@ void common_moe_calibrate(common_params & params) {
         }
     }
     entry.calibrated_at   = timebuf;
+
+    // Validate the COMBINATION, not just the parts.
+    //
+    // Every stage above picks a per-stage winner while the other knobs sit at
+    // whatever the previous stage left them on. Nothing has ever run the full
+    // set together, so the entry that gets saved is a configuration this
+    // machine has never actually executed - and that is not a theoretical
+    // worry: the full calibrated config crashed on its first served request
+    // (CUDA error in ggml_cuda_mul_mat_cublas_impl) while every stage that
+    // chose its values had passed.
+    //
+    // So: one final candidate with the entry exactly as it will be saved. It
+    // is a check, not a search - it changes nothing, it only records whether
+    // the combination runs and what it measures. A failure here is recorded
+    // and reported rather than silently saved, because a config that cannot
+    // serve is worse than one that is merely slower.
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: validating the winning combination (nothing above ran the full set together) ...\n", __func__);
+        common_moe_calibration_status_set("validating the combination");
+        common_moe_stage_begin("final validation", 1);
+        // Apply the entry the way a real launch would, so this measures what
+        // serving will actually run rather than a hand-built approximation.
+        common_moe_apply_quality_knobs(entry, path_model);
+        const double final_tps = common_moe_bench_candidate_server(
+                self_exe, path_model, sub_mtp_path, best_n, sub_n_max,
+                best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+        common_moe_calibration_status_candidate_done();
+        common_moe_stage_end();
+        if (final_tps > 0) {
+            LOG_INF("%s: the winning combination runs: %.2f tok/s\n", __func__, final_tps);
+            common_moe_calibration_status_note("final validation", "all calibrated values together",
+                    string_format("%.2f tok/s", final_tps), true, true);
+            entry.tok_per_sec = final_tps;
+        } else {
+            LOG_WRN("%s: the winning combination did NOT run cleanly, though every stage that chose its "
+                    "values did. Saving it anyway (so the measurements are not lost) but this entry has "
+                    "not been shown to serve - re-run calibration or pin the failing knob by hand\n",
+                    __func__);
+            common_moe_calibration_status_note("final validation", "all calibrated values together",
+                    "FAILED - the parts passed, the combination did not", false, true);
+        }
+    }
+
     common_moe_calibration_save(path_model, params, entry);
 
     const char * tps_label = concurrency > 1 ? "aggregate tok/s" : "tok/s";
