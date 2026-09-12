@@ -1120,6 +1120,12 @@ struct moe_cache_device {
     // expert, and misses where nothing resident was near enough (strict mode only).
     long long substitute_atlas_hits = 0;
     long long substitute_atlas_declined = 0;
+    // Which signal answered, for the fused picker: the router's own ranking for
+    // this token, or the scored scan over every resident expert. Two numbers
+    // rather than one, because "substitutions happened" does not say whether
+    // the strong evidence or the weak evidence produced them.
+    long long substitute_rank_hits  = 0;
+    long long substitute_fused_hits = 0;
     long long ring_hits = 0;
     long long ring_rotations = 0;
     long long ring_seeds = 0;
@@ -6951,6 +6957,11 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            if (d.substitute_rank_hits || d.substitute_fused_hits) {
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d fused stand-ins: %lld from this token's own "
+                        "router ranking, %lld from the scored scan over residents\n",
+                        d.physical, d.substitute_rank_hits, d.substitute_fused_hits);
+            }
             if (d.substitute_atlas_hits || d.substitute_atlas_declined) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d atlas stand-ins: %lld chosen by similarity, "
                         "%lld declined for want of a near neighbour\n",
@@ -10265,6 +10276,176 @@ static int moe_cache_substitute_pick_rank(
     return -1;
 }
 
+// One picker that uses every signal, instead of three that each use one.
+//
+// The three methods this replaces are not three ways of answering the same
+// question - they draw from different candidate sets and rank by different
+// evidence, and that is exactly why choosing between them wastes two of them:
+//
+//   rank   this token's own top-k co-picks, rank-ordered. The strongest
+//          evidence available - the router wanted this expert for THIS input,
+//          not in general - and the cheapest, since the ids are already here.
+//          Measured best of the three on the router's own score for the
+//          stand-in chosen (0.03856, ahead of the full-probs oracle's
+//          0.03790). Its weakness is coverage: at most top_k-1 candidates, and
+//          it declines when none of them are resident.
+//   atlas  every resident expert of the tensor, scored by cosine similarity to
+//          the MISSING expert in atlas space. The only signal that measures
+//          resemblance rather than popularity.
+//   coact  every resident expert, scored by how often it has fired in the same
+//          routing decision as the expert it replaces.
+//
+// So: take rank first when it answers, because nothing beats the router
+// wanting this expert for this token. When it declines, score the wide set by
+// atlas similarity and co-activation TOGETHER rather than picking one, with
+// heat as the final tiebreak. Co-activation is normalized by how often the
+// candidate fires at all, because a raw count says nothing on its own - a
+// partner seen twice looks identical to one seen 500 times, which is the same
+// correction expert_fire_count exists for.
+//
+// Weights are calibrated, and 0 for either one reduces this exactly to the
+// other, so the old behaviours remain reachable as points in this space rather
+// than as separate code paths.
+static double moe_cache_substitute_w_atlas() {
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_SUB_W_ATLAS", 1.0);
+}
+static double moe_cache_substitute_w_coact() {
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_SUB_W_COACT", 1.0);
+}
+
+static int moe_cache_substitute_pick_fused(
+        moe_cache_device & device, moe_cache_pool & pool, const void * host_base,
+        int32_t missed, int64_t n_expert, const int32_t * ids, int self_index, int top_k) {
+    // 1. This token's own picks, rank-ordered. Free, and the best evidence
+    //    there is - no scan, no scoring, the router already ranked these.
+    if (ids && top_k > 1 && self_index >= 0) {
+        const int slot = moe_cache_substitute_pick_rank(pool, host_base, ids, self_index, top_k, n_expert);
+        if (slot >= 0) {
+            device.substitute_rank_hits++;
+            return slot;
+        }
+    }
+
+    // 2. The wide set, scored by both remaining signals at once.
+    const std::vector<uint64_t> * words = moe_cache_mask_words(pool, host_base);
+    if (!words) {
+        return -1;
+    }
+    const double w_atlas = moe_cache_substitute_w_atlas();
+    const double w_coact = moe_cache_substitute_w_coact();
+    if (w_atlas <= 0.0 && w_coact <= 0.0) {
+        return -1;   // both signals disabled: decline rather than guess by popularity
+    }
+
+    const moe_cache_key mkey{host_base, missed};
+    // The atlas row for this tensor, indexed once per call like pick_atlas
+    // does - expert -> cell, so the resident scan stays O(1) per candidate.
+    const moe_cache_atlas_row * row = nullptr;
+    {
+        const auto arow = device.atlas_by_tensor.find(host_base);
+        if (arow != device.atlas_by_tensor.end() && arow->second) {
+            row = &*arow->second;
+        }
+    }
+    const moe_cache_atlas_cell * want = nullptr;
+    double want_norm = 0.0;
+    if (row) {
+        for (const auto & [expert, cell] : *row) {
+            if (expert == missed) {
+                want = &cell;
+                break;
+            }
+        }
+        if (want && !want->dims.empty()) {
+            for (float v : want->dims) {
+                want_norm += (double) v * (double) v;
+            }
+            want_norm = std::sqrt(want_norm);
+        }
+    }
+    auto cell_of = [&row](int32_t e) -> const moe_cache_atlas_cell * {
+        if (!row) {
+            return nullptr;
+        }
+        for (const auto & [expert, cell] : *row) {
+            if (expert == e) {
+                return &cell;
+            }
+        }
+        return nullptr;
+    };
+
+    const int scan_cap = moe_cache_substitute_scan();
+    int      best_slot = -1;
+    double   best_score = 0.0;
+    uint16_t best_heat  = 0;
+    int      examined = 0;
+
+    for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
+        uint64_t bits = (*words)[w];
+        while (bits && examined < scan_cap) {
+            const int cand = (int) (w << 6) + __builtin_ctzll(bits);
+            bits &= bits - 1;
+            if (cand == missed || cand >= (int) n_expert) {
+                continue;
+            }
+            examined++;
+            const moe_cache_key ckey{host_base, cand};
+            const auto found = pool.map.find(ckey);
+            if (found == pool.map.end()) {
+                continue;
+            }
+            const moe_cache_slot & slot = pool.slots[found->second];
+            if (slot.state != moe_cache_slot_state::valid) {
+                continue;
+            }
+
+            double score = 0.0;
+
+            if (w_atlas > 0.0 && want && want_norm > 0.0) {
+                const moe_cache_atlas_cell * have = cell_of(cand);
+                if (have && have->dims.size() == want->dims.size()) {
+                    double dot = 0.0, norm = 0.0;
+                    for (size_t i = 0; i < have->dims.size(); i++) {
+                        dot  += (double) want->dims[i] * (double) have->dims[i];
+                        norm += (double) have->dims[i] * (double) have->dims[i];
+                    }
+                    norm = std::sqrt(norm);
+                    if (norm > 0.0) {
+                        // cosine is in [-1,1]; only resemblance counts, so the
+                        // negative half contributes nothing rather than
+                        // subtracting from the co-activation evidence.
+                        const double sim = dot / (want_norm * norm);
+                        if (sim > 0.0) {
+                            score += w_atlas * sim;
+                        }
+                    }
+                }
+            }
+
+            if (w_coact > 0.0) {
+                const auto cit = device.co_activation.find(moe_cache_edge_undirected(mkey, ckey));
+                if (cit != device.co_activation.end() && cit->second > 0) {
+                    // P(fired together | candidate fired), not a raw count.
+                    const auto fit = device.expert_fire_count.find(ckey);
+                    const double fired = fit == device.expert_fire_count.end() ? 0.0 : (double) fit->second;
+                    score += w_coact * ((double) cit->second / (fired + 1.0));
+                }
+            }
+
+            if (score > best_score || (score == best_score && score > 0.0 && slot.heat > best_heat)) {
+                best_score = score;
+                best_heat   = slot.heat;
+                best_slot   = found->second;
+            }
+        }
+    }
+    if (best_slot >= 0) {
+        device.substitute_fused_hits++;
+    }
+    return best_slot;
+}
+
 // Pruning for the live session-tracking maps (co_activation,
 // co_activation_cross_layer, neuron_heat) - all insert-only, no eviction,
 // growing with every newly-observed expert pair or (tensor,expert) combo
@@ -10849,9 +11030,23 @@ static int moe_cache_plan(
             // a candidate is in general. It declines when nothing resident is near
             // enough, so the fallback below is a real fallback, not a formality.
             // Live-tunable and calibrated - see the substitution-mode stage.
+            // mode 4 is the fused picker: it uses the router's ranking for this
+            // token AND atlas resemblance AND co-activation, instead of the
+            // caller choosing one of them. See
+            // moe_cache_substitute_pick_fused for why choosing wastes two -
+            // the three draw from different candidate sets and rank by
+            // different evidence, so they are complements, not alternatives.
             const int mode = MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 0);
             int sub = -1;
-            if (mode != 0) {
+            if (mode == 4) {
+                sub = moe_cache_substitute_pick_fused(device, pool, node->host_base, expert,
+                                                      node->n_expert, ids, index, rank_top_k);
+                if (sub >= 0) {
+                    device.substitute_atlas_hits++;
+                } else {
+                    device.substitute_atlas_declined++;
+                }
+            } else if (mode != 0) {
                 sub = moe_cache_substitute_pick_atlas(device, pool, node->host_base, expert, node->n_expert);
                 if (sub >= 0) {
                     device.substitute_atlas_hits++;
@@ -10859,7 +11054,7 @@ static int moe_cache_plan(
                     device.substitute_atlas_declined++;   // strict: no near neighbour, pay exact compute
                 }
             }
-            if (sub < 0 && mode != 2) {
+            if (sub < 0 && mode != 2 && mode != 4) {
                 // Two pickers, not four.
                 //
                 // moe_cache_substitute_pick - the original pairwise
