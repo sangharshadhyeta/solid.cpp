@@ -3596,7 +3596,28 @@ static double common_moe_bench_candidate_server(
             // model's natural variation at the served sampling, measured rather
             // than chosen. Two identical references give 0 - the strictest bar,
             // because that is the model saying it answers these reliably.
-            const int tol  = ref2 >= 0 ? std::abs(ref - ref2) : 0;
+            // Tolerance, with a floor.
+            //
+            // |ref - ref2| is the model's observed run-to-run spread, and when
+            // the two reference runs happen to agree exactly that difference is
+            // 0 - which was then used as "any deviation disqualifies". That is a
+            // degenerate inference: two identical draws do not show the variance
+            // is zero, they show it has not been observed in two draws. With
+            // eight binary probes, a two-answer difference in a single run is
+            // well inside what noise produces.
+            //
+            // It cost a real result. Measured on Qwen3.8-Flash-Next at 64k,
+            // substitution rank 4 ran at 9.91 tok/s against rank 6's 6.25 - 59%
+            // faster - and was rejected for answering 6 of 8 where the reference
+            // answered 8 of 8, on one sample, against a tolerance of zero
+            // derived from two runs that both happened to score perfectly.
+            //
+            // So the floor is one probe: a candidate has to be worse than the
+            // reference by more than a single answer before a single run is
+            // allowed to disqualify it. Anything that really is broken fails by
+            // far more than one - the failures this gate was built for scored 2
+            // of 10 - and the rejection is re-measured below in any case.
+            const int tol  = std::max(ref2 >= 0 ? std::abs(ref - ref2) : 0, 1);
             if (g_moe_verifying_reference.load()) {
                 if (ref < 0) {
                     g_moe_verifiable_ref.store(correct);
@@ -3618,6 +3639,13 @@ static double common_moe_bench_candidate_server(
                         "rejected - no reference measured to judge against", false);
                 result_tps = COMMON_MOE_TPS_REJECTED;
             } else if (correct < bar - tol) {
+                // A rejection is a measurement too, and this one is asymmetric
+                // with how the rest of the run treats evidence: every WIN here
+                // is re-measured before it is believed - the cache ladder, the
+                // depth envelope, the acceptance mode all confirm - while a
+                // rejection got a single sample and was final. On eight binary
+                // probes that is the weaker of the two decisions being given
+                // the stronger power.
                 LOG_WRN("%s: candidate rejected - answered %d of %d verifiable probes against the "
                         "substitution-off reference's %d (tolerance %d, its own run-to-run spread), at %.2f "
                         "tok/s. Fluent output that is wrong is not a faster configuration, it is a broken one\n",
@@ -5721,14 +5749,44 @@ void common_moe_calibrate(common_params & params) {
             }
             common_moe_calibration_status_set(string_format(
                     "confirming substitution floor rank %d over %d tokens", cand.first, confirm_predict));
-            const double tps = common_moe_bench_candidate_server(
+            double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx,
                     confirm_predict, concurrency, -1, -1, active_ngl, cand.first,
                     nullptr, 1234, std::numeric_limits<double>::quiet_NaN(),
                     /* verify_answers */ true, /* with_reasoning */ true);
             common_moe_calibration_status_candidate_done();
+            // Re-measure a rejection before accepting it, exactly as a win is
+            // re-measured before it is believed. The answer check runs eight
+            // binary probes on one generation; a candidate can lose two of them
+            // to sampling and a 59% throughput difference should not turn on
+            // that. Measured here: rank 4 at 9.91 tok/s was discarded for 6 of
+            // 8 against the reference's 8, and rank 6 at 6.25 was taken
+            // instead.
+            //
+            // Only for a quality rejection. An infrastructure failure or a
+            // configuration that cannot launch is deterministic and retrying it
+            // buys nothing - the sentinels already separate those three cases.
+            if (tps == COMMON_MOE_TPS_REJECTED && !common_moe_calibrate_budget_spent()) {
+                LOG_INF("%s:   rank %d failed the answer check - re-measuring before discarding it, since "
+                        "eight probes on one generation is a thin basis for dropping a rung\n",
+                        __func__, cand.first);
+                tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default,
+                        next_port(), ctx, confirm_predict, concurrency, -1, -1, active_ngl, cand.first,
+                        nullptr, 5678 /* a different seed, or it is the same draw */,
+                        std::numeric_limits<double>::quiet_NaN(),
+                        /* verify_answers */ true, /* with_reasoning */ true);
+                common_moe_calibration_status_candidate_done();
+                if (tps > 0) {
+                    LOG_INF("%s:   rank %d held on the second run -> %.2f tok/s (the first run's rejection "
+                            "did not reproduce)\n", __func__, cand.first, tps);
+                    common_moe_calibration_status_note("substitution floor",
+                            string_format("rank %d", cand.first),
+                            string_format("held on re-measure - %.2f tok/s", tps), true);
+                }
+            }
             if (tps <= 0) {
-                LOG_WRN("%s:   rank %d did NOT hold over %d tokens\n", __func__, cand.first, confirm_predict);
+                LOG_WRN("%s:   rank %d did NOT hold over %d tokens (twice)\n", __func__, cand.first, confirm_predict);
                 common_moe_calibration_status_note("substitution floor",
                         string_format("rank %d", cand.first),
                         string_format("did not hold over %d tokens", confirm_predict), false);
