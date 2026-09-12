@@ -1214,10 +1214,44 @@ private:
                 uint32_t hp_ngl = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
-                try {
-                    auto dmd = common_get_device_memory_data(
+
+                // Kept alive for as long as cparams_dft.ctx_other points into it.
+                common_probe_context probe_tgt;
+
+                auto measure_dft = [&]() {
+                    return common_get_device_memory_data(
                         params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
                         devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                };
+
+                try {
+                    common_device_memory_data_vec dmd;
+                    try {
+                        dmd = measure_dft();
+                    } catch (const std::exception &) {
+                        // A draft head that ships without its own embeddings /
+                        // LM head (qwen4exp MTP, eagle3, dflash) borrows them
+                        // from its target and cannot build a context without
+                        // one - and the target context does not exist yet,
+                        // since this measurement is what sizes the fit that
+                        // creates it. Stand up a no_alloc target purely to be
+                        // that ctx_other and retry. Without this the draft's
+                        // model, context and compute all silently drop out of
+                        // fit_params_target, and the fit search then decides
+                        // against understated numbers: it approves placements
+                        // that do not actually fit, and falls back to the
+                        // minimum context size when remeasurement disagrees.
+                        auto mparams_tgt = common_model_params_to_llama(params_base);
+                        auto cparams_tgt = common_context_params_to_llama(params_base);
+                        common_make_probe_context(params_base.model.path.c_str(),
+                                &mparams_tgt, &cparams_tgt, probe_tgt, GGML_LOG_LEVEL_ERROR);
+                        if (probe_tgt.ctx == nullptr) {
+                            throw; // nothing more to try - report the original failure
+                        }
+                        cparams_dft.ctx_other = probe_tgt.ctx;
+                        dmd = measure_dft();
+                        SRV_DBG("%s", "[spec] measured the draft against a no_alloc target context\n");
+                    }
 
                     GGML_ASSERT(!params_base.fit_params_target.empty());
                     size_t total = 0;
