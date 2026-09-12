@@ -5065,9 +5065,18 @@ void common_moe_calibrate(common_params & params) {
             // regime, and the regime that matters is the one being served.
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model,
-                    params.speculative.has_dft() ? params.speculative.draft.mparams.path : std::string(),
+                    // has_dft() only means a draft was named on the command
+                    // line. best_n_max == 0 means a stage has since MEASURED
+                    // that no draft beats every depth, and a stage that keeps
+                    // attaching one after that is measuring a configuration
+                    // this run has already rejected - which is how f16 KV came
+                    // back as "failed" immediately after the micro-batch guard
+                    // recorded speculative decoding off.
+                    (params.speculative.has_dft() && best_n_max != 0)
+                        ? params.speculative.draft.mparams.path : std::string(),
                     best_n,
-                    params.speculative.has_dft() ? std::max(1, params.speculative.draft.n_max) : 0,
+                    (params.speculative.has_dft() && best_n_max != 0)
+                        ? std::max(1, params.speculative.draft.n_max) : 0,
                     n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
                     active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
             common_moe_calibration_status_candidate_done();
@@ -6377,8 +6386,11 @@ void common_moe_calibrate(common_params & params) {
         LOG_INF("%s: measuring the VRAM remainder %s (one candidate, expert cache off) ...\n", __func__, why);
         const double r = common_moe_bench_candidate_server(
                 self_exe, path_model,
-                params.speculative.has_dft() ? params.speculative.draft.mparams.path : std::string(),
-                probe.n_layer, params.speculative.has_dft() ? std::max(1, params.speculative.draft.n_max) : 0,
+                (params.speculative.has_dft() && best_n_max != 0)
+                    ? params.speculative.draft.mparams.path : std::string(),
+                probe.n_layer,
+                (params.speculative.has_dft() && best_n_max != 0)
+                    ? std::max(1, params.speculative.draft.n_max) : 0,
                 n_threads_default, next_port(), ctx, n_predict, concurrency,
                 0 /* expert cache off - this measures the floor, not the cache */, -1,
                 99, -1, nullptr, 1234,
