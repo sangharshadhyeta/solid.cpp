@@ -4847,10 +4847,192 @@ void common_moe_calibrate(common_params & params) {
     // rather than assuming what that share is. Ordering the depth search after
     // substitution meant the substitution floor was chosen for a no-draft
     // configuration the server would never run.
+    // Speculative decoding is a design constraint here, not a knob.
+    //
+    // The architecture of this fork is: no expert layer resident in VRAM, the
+    // MTP head resident, and the hottest experts held in the cache and served
+    // on demand. The draft is part of that design - it is what generates,
+    // while the target verifies and the cache decides what is worth keeping -
+    // so the calibration's job is to make it work as well as possible, not to
+    // ask whether to have it.
+    //
+    // That is a change from what this file did earlier today, which was free to
+    // record speculative decoding off whenever a measurement preferred the
+    // alternative. It did so twice, and both times on a comparison taken in a
+    // configuration where the draft could not work: the arms ran at f16 KV,
+    // where 64k leaves 1405 MiB against the draft's 1819, so the "draft" arm
+    // was really a dead cache (2.64 tok/s against a measured no-cache rate of
+    // 2.75). A design decision is not the right thing to infer from that.
+    //
+    // GGML_MOE_CALIBRATE_ALLOW_NO_DRAFT=1 restores the old behaviour for
+    // anyone who wants the comparison made rather than assumed.
+    const bool allow_no_draft = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_ALLOW_NO_DRAFT");
+        return e && atoi(e) != 0;
+    }();
     int    best_n_max     = -1; // -1 not calibrated; 0 measured: no draft beat every depth
     int    depth_runner_up = -1; // the second-best depth, re-measured once substitution is chosen
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
+
+
+    // KV precision - the consumer nobody had ever bid against.
+    //
+    // Every other stage fights over the VRAM left AFTER the KV cache, and the
+    // KV cache was never a variable: calibration passed type_k through and
+    // never varied it. On this model that is the binding difference between
+    // the context we measure at and the one we serve at. With 2 KV heads and
+    // 256-wide K and V, an attention layer holds 2048 bytes per token, so the
+    // step from 4k to 64k costs roughly 1.4 GiB - and 1.4 GiB is the margin
+    // every failure today has been on the wrong side of: the micro-batch OOM
+    // was 676 MiB short, the expert cache had to halve, and the draft stopped
+    // paying for the VRAM it displaced.
+    //
+    // Halving KV precision gives most of that back. Whether it is worth taking
+    // is a quality question, not a throughput one, so it is measured through
+    // the same answer gate that polices the substitution ladder rather than
+    // ranked on tok/s alone. Placed before the draft-depth search because that
+    // is where the shortage first bites - a depth that cannot fit at f16 may
+    // fit at q8_0, and every stage after inherits the larger budget.
+    std::string best_kv_type;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring KV cache precision (it has never been varied, and at this context it "
+                "holds the margin everything else is short of) ...\n", __func__);
+        common_moe_calibration_status_set("measuring KV cache precision");
+        // q8_0 and f16 only. q4_0 is not a candidate.
+        //
+        // KV precision is a quality knob with a throughput side effect, and
+        // the two do not deserve equal weight here: this is a reasoning model,
+        // the KV cache holds the whole chain of thought, and 4-bit K and V
+        // degrade it in a way the answer gate is not guaranteed to catch - a
+        // reply can stay fluent and verifiable while the reasoning behind it
+        // drifts. q8_0 is the floor, and q4_0 is excluded by policy rather
+        // than measured and rejected, because a win it produced would be a win
+        // we should not take.
+        //
+        // f16 stays in only as the reference point, so the log records what
+        // q8_0 actually costs and what it buys. Measured at 64k on this model:
+        // f16 leaves 1405 MiB for everything else and cannot fit the draft at
+        // all; q8_0 leaves 2393 MiB and fits it with room to spare. That is
+        // the difference between serving 64k with speculative decoding and
+        // choosing between them.
+        // q8_0 for the target, f16 for the draft. The asymmetry is the point.
+        //
+        // common_base_params_to_speculative gives the draft its own
+        // cache_type_k/v, so -ctk/-ctv here quantize the target only - which is
+        // what we want, for opposite reasons on each side.
+        //
+        // The target is where the bytes are: 48 layers against the draft's
+        // single NextN block, so q8_0 on the target frees ~1 GiB at 64k while
+        // q8_0 on the draft would free almost nothing. And the target's
+        // degradation is the kind the answer gate can see - it checks what the
+        // model answers.
+        //
+        // The draft's cannot be seen that way. Acceptance is the draft's
+        // entire value, and it is measured in AGREEMENT with the target, not
+        // in output anyone reads: at 0.97 the draft pays for itself, at 0.43 it
+        // costs more than it returns (both measured today at 64k). A quantized
+        // KV degrades precisely that agreement, since the head predicts from
+        // state it then has to agree with - and it would buy a rounding error
+        // of VRAM for the risk.
+        //
+        // So: quantize the large consumer whose output is checked, and leave
+        // the small one whose worth is measured in how often it is right.
+        common_moe_stage_begin("KV precision", 2);
+        // At the CONSERVATIVE micro-batch, not whatever the prompt stage chose.
+        //
+        // KV precision is a question about the budget: how much is left for
+        // everything else. Measuring it at a micro-batch large enough to starve
+        // the expert cache answers a different question - the stage reported
+        // 2.56 tok/s that way, which is the no-cache rate, not a KV verdict.
+        // The conservative micro-batch leaves the most room, so what this
+        // measures is the KV choice rather than the consequences of an -ub the
+        // next stage may overturn anyway.
+        const int kv_saved_ub = g_moe_calib_ubatch.load();
+        g_moe_calib_ubatch.store(512);
+        double best_kv_tps = -1.0;
+        for (const char * kvt : { "f16", "q8_0" }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_kv_type(std::string(kvt) == "f16" ? std::string() : std::string(kvt));
+            // With the draft attached, if one is configured.
+            //
+            // This stage first measured with no draft, which made its numbers
+            // incomparable with every stage after it - and the KV choice is
+            // precisely a decision about who gets the freed VRAM, which is not
+            // answerable without the consumer that wants it. Measured at 64k:
+            // this stage reported 10.17 tok/s for q8_0 while the very next
+            // stage, with the draft loaded, reported 7.5 for the same KV
+            // setting. Two true numbers about different machines.
+            //
+            // The rule the rest of this file already follows: a stage's number
+            // is only worth something against another number from the same
+            // regime, and the regime that matters is the one being served.
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model,
+                    // has_dft() only means a draft was named on the command
+                    // line. best_n_max == 0 means a stage has since MEASURED
+                    // that no draft beats every depth, and a stage that keeps
+                    // attaching one after that is measuring a configuration
+                    // this run has already rejected - which is how f16 KV came
+                    // back as "failed" immediately after the micro-batch guard
+                    // recorded speculative decoding off.
+                    (params.speculative.has_dft() && best_n_max != 0)
+                        ? params.speculative.draft.mparams.path : std::string(),
+                    best_n,
+                    (params.speculative.has_dft() && best_n_max != 0)
+                        ? std::max(1, params.speculative.draft.n_max) : 0,
+                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   KV %s -> %s\n", __func__, kvt,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str()
+                            : (tps == COMMON_MOE_TPS_REJECTED ? "rejected on answer quality" : "failed"));
+            common_moe_calibration_status_note("KV precision", kvt,
+                    tps > 0 ? string_format("%.2f tok/s", tps)
+                            : (tps == COMMON_MOE_TPS_REJECTED ? std::string("rejected on answer quality")
+                                                              : std::string("failed")), tps > 0);
+            if (tps > best_kv_tps) {
+                best_kv_tps  = tps;
+                best_kv_type = std::string(kvt) == "f16" ? std::string() : std::string(kvt);
+            }
+        }
+        common_moe_calib_set_kv_type(best_kv_type);
+        g_moe_calib_ubatch.store(kv_saved_ub);   // the -ub decision is the next stage's
+        common_moe_stage_end();
+        entry.kv_type = best_kv_type;
+        checkpoint("KV precision");
+        if (best_kv_tps > 0) {
+            LOG_INF("%s: KV precision: %s at %.2f tok/s\n", __func__,
+                    best_kv_type.empty() ? "f16" : best_kv_type.c_str(), best_kv_tps);
+            common_moe_calibration_status_note("KV precision",
+                    best_kv_type.empty() ? std::string("f16") : best_kv_type,
+                    string_format("SELECTED - %.2f tok/s", best_kv_tps), true, true);
+        }
+    }
+
+    // After the KV stage, not before it. Both orders are wrong for opposite
+    // reasons, and this is the one that is wrong less.
+    //
+    // Before: the KV stage inherited an -ub chosen with no draft in the
+    // picture, attached the draft anyway, and measured a starved cache -
+    // 2.56 tok/s, which is the no-cache rate rather than a KV verdict.
+    //
+    // After, without care: the guard decides whether -ub and the draft can
+    // coexist using f16 KV, which at 64k leaves 1405 MiB against the draft's
+    // 1819 - so the draft is judged in the one configuration where it cannot
+    // work, and the stage that frees the gigabyte it needs runs afterwards.
+    // Measured: the draft arm came back at 2.64 tok/s, again the no-cache
+    // rate, and speculative decoding was recorded off on that basis.
+    //
+    // The circularity is only apparent. KV is a budget question and the
+    // micro-batch is a prefill one, so KV can be settled at the CONSERVATIVE
+    // micro-batch - the one that leaves the most room - and the -ub/draft
+    // conflict then resolved against a budget that already includes whatever
+    // KV freed. Which is this order, with the KV stage passing -ub 512 rather
+    // than whatever the prompt stage chose.
+
     // This has to run before the KV stage, not after it. That stage now
     // measures with the draft attached - its no-draft numbers were not
     // comparable with anything downstream - so it inherits whatever -ub the
@@ -4947,7 +5129,19 @@ void common_moe_calibrate(common_params & params) {
                         no_draft > 0 ? string_format("%.2f tok/s", no_draft).c_str() : "failed",
                         reduced_ub, with_draft);
             }
-            if (no_draft > 0 && with_draft > 0 && no_draft > with_draft) {
+            if (!allow_no_draft && no_draft > 0 && with_draft > 0 && no_draft > with_draft) {
+                LOG_INF("%s: -ub %d without a draft measured faster (%.2f vs %.2f tok/s), but the draft is "
+                        "part of this design rather than a candidate - keeping -ub %d so it fits. The "
+                        "micro-batch buys prefill once per request; the draft buys a token multiplier on "
+                        "every step, and what to do with the VRAM it leaves is the cache's question\n",
+                        __func__, chosen_ub, no_draft, with_draft, reduced_ub);
+                g_moe_calib_ubatch.store(reduced_ub);
+                entry.n_ubatch = reduced_ub;
+                common_moe_calibration_status_note("prompt micro-batch",
+                        string_format("-ub %d", reduced_ub),
+                        string_format("REVISED - the draft is a design constraint; -ub %d without it "
+                                      "measured %.2f but is not an option", chosen_ub, no_draft), true, true);
+            } else if (no_draft > 0 && with_draft > 0 && no_draft > with_draft) {
                 LOG_WRN("%s: the full micro-batch without a draft beats the reduced one with it (%.2f vs "
                         "%.2f tok/s) - keeping -ub %d and recording speculative decoding off. The draft "
                         "cannot have the VRAM the micro-batch needs and return more than it costs\n",
@@ -4978,131 +5172,6 @@ void common_moe_calibrate(common_params & params) {
             }
         }
         checkpoint("micro-batch revalidated with the draft");
-    }
-
-
-    // KV precision - the consumer nobody had ever bid against.
-    //
-    // Every other stage fights over the VRAM left AFTER the KV cache, and the
-    // KV cache was never a variable: calibration passed type_k through and
-    // never varied it. On this model that is the binding difference between
-    // the context we measure at and the one we serve at. With 2 KV heads and
-    // 256-wide K and V, an attention layer holds 2048 bytes per token, so the
-    // step from 4k to 64k costs roughly 1.4 GiB - and 1.4 GiB is the margin
-    // every failure today has been on the wrong side of: the micro-batch OOM
-    // was 676 MiB short, the expert cache had to halve, and the draft stopped
-    // paying for the VRAM it displaced.
-    //
-    // Halving KV precision gives most of that back. Whether it is worth taking
-    // is a quality question, not a throughput one, so it is measured through
-    // the same answer gate that polices the substitution ladder rather than
-    // ranked on tok/s alone. Placed before the draft-depth search because that
-    // is where the shortage first bites - a depth that cannot fit at f16 may
-    // fit at q8_0, and every stage after inherits the larger budget.
-    std::string best_kv_type;
-    if (!common_moe_calibrate_budget_spent()) {
-        LOG_INF("%s: measuring KV cache precision (it has never been varied, and at this context it "
-                "holds the margin everything else is short of) ...\n", __func__);
-        common_moe_calibration_status_set("measuring KV cache precision");
-        // q8_0 and f16 only. q4_0 is not a candidate.
-        //
-        // KV precision is a quality knob with a throughput side effect, and
-        // the two do not deserve equal weight here: this is a reasoning model,
-        // the KV cache holds the whole chain of thought, and 4-bit K and V
-        // degrade it in a way the answer gate is not guaranteed to catch - a
-        // reply can stay fluent and verifiable while the reasoning behind it
-        // drifts. q8_0 is the floor, and q4_0 is excluded by policy rather
-        // than measured and rejected, because a win it produced would be a win
-        // we should not take.
-        //
-        // f16 stays in only as the reference point, so the log records what
-        // q8_0 actually costs and what it buys. Measured at 64k on this model:
-        // f16 leaves 1405 MiB for everything else and cannot fit the draft at
-        // all; q8_0 leaves 2393 MiB and fits it with room to spare. That is
-        // the difference between serving 64k with speculative decoding and
-        // choosing between them.
-        // q8_0 for the target, f16 for the draft. The asymmetry is the point.
-        //
-        // common_base_params_to_speculative gives the draft its own
-        // cache_type_k/v, so -ctk/-ctv here quantize the target only - which is
-        // what we want, for opposite reasons on each side.
-        //
-        // The target is where the bytes are: 48 layers against the draft's
-        // single NextN block, so q8_0 on the target frees ~1 GiB at 64k while
-        // q8_0 on the draft would free almost nothing. And the target's
-        // degradation is the kind the answer gate can see - it checks what the
-        // model answers.
-        //
-        // The draft's cannot be seen that way. Acceptance is the draft's
-        // entire value, and it is measured in AGREEMENT with the target, not
-        // in output anyone reads: at 0.97 the draft pays for itself, at 0.43 it
-        // costs more than it returns (both measured today at 64k). A quantized
-        // KV degrades precisely that agreement, since the head predicts from
-        // state it then has to agree with - and it would buy a rounding error
-        // of VRAM for the risk.
-        //
-        // So: quantize the large consumer whose output is checked, and leave
-        // the small one whose worth is measured in how often it is right.
-        common_moe_stage_begin("KV precision", 2);
-        double best_kv_tps = -1.0;
-        for (const char * kvt : { "f16", "q8_0" }) {
-            if (common_moe_calibrate_budget_spent()) {
-                break;
-            }
-            common_moe_calib_set_kv_type(std::string(kvt) == "f16" ? std::string() : std::string(kvt));
-            // With the draft attached, if one is configured.
-            //
-            // This stage first measured with no draft, which made its numbers
-            // incomparable with every stage after it - and the KV choice is
-            // precisely a decision about who gets the freed VRAM, which is not
-            // answerable without the consumer that wants it. Measured at 64k:
-            // this stage reported 10.17 tok/s for q8_0 while the very next
-            // stage, with the draft loaded, reported 7.5 for the same KV
-            // setting. Two true numbers about different machines.
-            //
-            // The rule the rest of this file already follows: a stage's number
-            // is only worth something against another number from the same
-            // regime, and the regime that matters is the one being served.
-            const double tps = common_moe_bench_candidate_server(
-                    self_exe, path_model,
-                    // has_dft() only means a draft was named on the command
-                    // line. best_n_max == 0 means a stage has since MEASURED
-                    // that no draft beats every depth, and a stage that keeps
-                    // attaching one after that is measuring a configuration
-                    // this run has already rejected - which is how f16 KV came
-                    // back as "failed" immediately after the micro-batch guard
-                    // recorded speculative decoding off.
-                    (params.speculative.has_dft() && best_n_max != 0)
-                        ? params.speculative.draft.mparams.path : std::string(),
-                    best_n,
-                    (params.speculative.has_dft() && best_n_max != 0)
-                        ? std::max(1, params.speculative.draft.n_max) : 0,
-                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
-                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
-            common_moe_calibration_status_candidate_done();
-            LOG_INF("%s:   KV %s -> %s\n", __func__, kvt,
-                    tps > 0 ? string_format("%.2f tok/s", tps).c_str()
-                            : (tps == COMMON_MOE_TPS_REJECTED ? "rejected on answer quality" : "failed"));
-            common_moe_calibration_status_note("KV precision", kvt,
-                    tps > 0 ? string_format("%.2f tok/s", tps)
-                            : (tps == COMMON_MOE_TPS_REJECTED ? std::string("rejected on answer quality")
-                                                              : std::string("failed")), tps > 0);
-            if (tps > best_kv_tps) {
-                best_kv_tps  = tps;
-                best_kv_type = std::string(kvt) == "f16" ? std::string() : std::string(kvt);
-            }
-        }
-        common_moe_calib_set_kv_type(best_kv_type);
-        common_moe_stage_end();
-        entry.kv_type = best_kv_type;
-        checkpoint("KV precision");
-        if (best_kv_tps > 0) {
-            LOG_INF("%s: KV precision: %s at %.2f tok/s\n", __func__,
-                    best_kv_type.empty() ? "f16" : best_kv_type.c_str(), best_kv_tps);
-            common_moe_calibration_status_note("KV precision",
-                    best_kv_type.empty() ? std::string("f16") : best_kv_type,
-                    string_format("SELECTED - %.2f tok/s", best_kv_tps), true, true);
-        }
     }
 
     if (params.speculative.has_dft() && entry.spec_n_max >= 0) {
