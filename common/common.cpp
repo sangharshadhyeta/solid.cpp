@@ -4694,12 +4694,37 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calibration_status_candidate_done();
             LOG_INF("%s:   expert prefetch on -> %s (off: %.1f prompt tok/s)\n", __func__,
                     pp > 0 ? string_format("%.1f prompt tok/s", pp).c_str() : "failed", best_pp);
+            // Provisional, and left ON for the stages that follow.
+            //
+            // This measures prompt throughput, which is the only thing
+            // scheduler prefetch acts on - but the decision it writes applies
+            // to every candidate for the rest of the run, including the
+            // decode-measured stages that depend on the prefetch path
+            // existing. Measured here: prefetch scored 42.3 prompt tok/s
+            // against 48.5 off, so it was disabled - and the substitution
+            // ladder, the ring, the prerouter and the partition were then all
+            // measured with a mechanism they rely on switched off, on the
+            // strength of a prefill number none of them are about.
+            //
+            // So the verdict is recorded and the mechanism is left enabled.
+            // Prefetch costs prefetch_n_slots (3) max-sized expert tensors of
+            // device memory, which is single-digit MiB on this model - cheap
+            // enough that leaving it on through the search is the safer error
+            // than turning it off, and the final validation re-measures the
+            // saved combination either way.
             best_prefetch = pp > best_pp ? 1 : 0;
             entry.sched_prefetch_experts = best_prefetch;
             checkpoint("expert prefetch");
-            g_moe_calib_prefetch.store(best_prefetch == 1);
+            if (best_prefetch == 0) {
+                LOG_WRN("%s: expert prefetch measured slower on prompt processing, but it is left ON for "
+                        "the rest of the search - the decode stages after this one rely on that path, and "
+                        "a prefill number is not a verdict about them\n", __func__);
+            }
+            g_moe_calib_prefetch.store(true);
             common_moe_calibration_status_note("expert prefetch", best_prefetch ? "on" : "off",
-                    string_format("SELECTED - %.1f prompt tok/s", best_prefetch ? pp : best_pp), true, true);
+                    string_format("%s - %.1f prompt tok/s (kept on through the search either way)",
+                                  best_prefetch ? "SELECTED" : "measured slower on prefill",
+                                  best_prefetch ? pp : best_pp), true, true);
         }
         g_moe_calib_measure_prefill.store(false);
         g_moe_calib_prefill_xlong.store(false);
@@ -4742,9 +4767,26 @@ void common_moe_calibrate(common_params & params) {
         LOG_INF("%s: measuring KV cache precision (it has never been varied, and at this context it "
                 "holds the margin everything else is short of) ...\n", __func__);
         common_moe_calibration_status_set("measuring KV cache precision");
-        common_moe_stage_begin("KV precision", 3);
+        // q8_0 and f16 only. q4_0 is not a candidate.
+        //
+        // KV precision is a quality knob with a throughput side effect, and
+        // the two do not deserve equal weight here: this is a reasoning model,
+        // the KV cache holds the whole chain of thought, and 4-bit K and V
+        // degrade it in a way the answer gate is not guaranteed to catch - a
+        // reply can stay fluent and verifiable while the reasoning behind it
+        // drifts. q8_0 is the floor, and q4_0 is excluded by policy rather
+        // than measured and rejected, because a win it produced would be a win
+        // we should not take.
+        //
+        // f16 stays in only as the reference point, so the log records what
+        // q8_0 actually costs and what it buys. Measured at 64k on this model:
+        // f16 leaves 1405 MiB for everything else and cannot fit the draft at
+        // all; q8_0 leaves 2393 MiB and fits it with room to spare. That is
+        // the difference between serving 64k with speculative decoding and
+        // choosing between them.
+        common_moe_stage_begin("KV precision", 2);
         double best_kv_tps = -1.0;
-        for (const char * kvt : { "f16", "q8_0", "q4_0" }) {
+        for (const char * kvt : { "f16", "q8_0" }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
