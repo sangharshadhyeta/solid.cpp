@@ -3061,10 +3061,39 @@ static double common_moe_bench_candidate_server(
     // same effective configuration several times over (confirmed: -ncmoe
     // 22/16/10 all silently became 27 and returned near-identical tok/s).
     std::string fit_args;
+    // A candidate must serve at the context it was asked for, or not at all.
+    //
+    // Candidates ran with fit ENABLED, so each one's own fit logic was free to
+    // trade the requested context down until the rest of its configuration
+    // fitted - and it did, silently. Measured directly: a calibration launched
+    // with -c 65536 produced candidate after candidate reporting
+    // "n_ctx_slot = 4096" and "context size of 4096 ... falling back to the
+    // minimum context size of 4096". Every value in that run was chosen at 4k.
+    //
+    // That is not a small discrepancy, because VRAM is the binding constraint
+    // and context is most of what consumes it. At 4k there is room to spare, so
+    // the sweeps picked moe-cache 2048 and -ub 2048 - and both of them OOM at
+    // 65536 with the draft attached (676 MiB short). The run optimised a
+    // configuration this machine cannot serve, and nothing in it could tell,
+    // because a candidate that quietly shrank its context still returned a
+    // perfectly good tok/s number for a configuration nobody asked about.
+    //
+    // With fit off, the parent's explicit -ngl / -ncmoe / --moe-cache / -c are
+    // what the candidate runs. One that cannot hold them fails to launch, which
+    // is the honest answer: that combination does not fit. The launch-failure
+    // sentinel already keeps such a candidate from being retried or mistaken
+    // for a quality rejection.
+    // The one exception is the fit-margin stage itself, which passes a
+    // fit_target_mb because the margin is the quantity it is measuring - and
+    // -fitt means nothing with fit disabled. That stage keeps fit on and is
+    // explicitly measuring what fit does with the context; every other stage
+    // wants the context it asked for.
     if (fit_target_mb > 0) {
         char buf[64];
         snprintf(buf, sizeof(buf), "-fitt %d ", fit_target_mb);
         fit_args = buf;
+    } else {
+        fit_args = "-fit off ";
     }
     // Substitution aggressiveness is an env var, not a flag, so it is passed
     // as a shell assignment on the candidate's own command line - the
@@ -3252,6 +3281,26 @@ static double common_moe_bench_candidate_server(
         // A process that exited before serving will exit again on the same
         // command line - say so, so the caller does not spend a second launch
         // proving it.
+        //
+        // With candidates now pinned to the requested context, the commonest
+        // reason for this is the honest one: that combination does not fit on
+        // this card at this context. Name it, because "failed" reads as a bug
+        // and this is a measurement - the configuration was tried and could
+        // not be held.
+        if (child_exited) {
+            std::ifstream lf(log_path);
+            if (lf) {
+                std::string line;
+                while (std::getline(lf, line)) {
+                    if (line.find("cudaMalloc failed: out of memory") != std::string::npos ||
+                        line.find("unable to allocate") != std::string::npos) {
+                        LOG_WRN("%s: this configuration does not fit at the requested context - "
+                                "not a failure to retry, an answer\n", __func__);
+                        break;
+                    }
+                }
+            }
+        }
         return child_exited ? COMMON_MOE_TPS_LAUNCH_FAILED : -1.0;
     }
 
