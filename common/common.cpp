@@ -1995,9 +1995,20 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         set_env_int("LLAMA_PROMPT_CACHE_MOE_PREWARM_K", cal.atlas_prewarm_k);
         LOG_WRN("%s: using calibrated atlas prewarm, top_k %d per tensor\n", __func__, cal.atlas_prewarm_k);
     }
+    // Mode 3 is not an atlas mode - it is the per-token-rank picker, which
+    // needs the atlas picker off and the rank picker on. Writing the mode
+    // number straight into SUBSTITUTE_ATLAS would set it to 3, which the cache
+    // reads as "atlas on, some unknown variant", and the rank picker - the one
+    // the stage actually chose - would never run.
     if (cal.substitute_atlas > 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS")) {
-        set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", cal.substitute_atlas);
-        LOG_WRN("%s: choosing stand-ins by atlas similarity (mode %d)\n", __func__, cal.substitute_atlas);
+        if (cal.substitute_atlas == 3) {
+            set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 0);
+            set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK", 1);
+            LOG_WRN("%s: choosing stand-ins by this token's router rank (calibrated)\n", __func__);
+        } else {
+            set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", cal.substitute_atlas);
+            LOG_WRN("%s: choosing stand-ins by atlas similarity (mode %d)\n", __func__, cal.substitute_atlas);
+        }
     }
     if (cal.draft_share_pct > 0 && !getenv("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_DRAFT_SHARE_PCT", cal.draft_share_pct);
@@ -6343,12 +6354,32 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_set("measuring stand-in selection");
         common_moe_stage_begin("stand-in selection", 3);
         double best_sub_tps = -1.0;
-        for (const int mode : { 0, 1, 2 }) {
+        // Four methods, not three. Mode 3 is the per-token-rank picker, which
+        // has measured evidence it is the best of them and had never been
+        // measured here: on the router's own score for the stand-in chosen it
+        // scored 0.03856 against pairwise co-activation's 0.02130 (+81%) and
+        // the full-probs oracle's 0.03790. It was reachable only through
+        // GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK, which nothing set - the
+        // same way the prerouter sat behind TRAIN_PREDICTOR=0 for its whole
+        // life. It declines more often than the co-activation scan, and a
+        // declined stand-in costs time while a wrong one costs quality, so
+        // whether the trade pays is exactly a question for measurement.
+        for (const int mode : { 0, 1, 2, 3 }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
-            const char * label = mode == 0 ? "by heat" : (mode == 1 ? "atlas, heat fallback" : "atlas only");
-            const std::string body = string_format("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS\": \"%d\"}", mode);
+            const char * label = mode == 0 ? "by heat"
+                               : mode == 1 ? "atlas, heat fallback"
+                               : mode == 2 ? "atlas only"
+                                           : "by this token's router rank";
+            // Mode 3 turns the atlas picker off and the rank picker on; the
+            // others leave the rank picker off, so exactly one method is
+            // measured per candidate.
+            const std::string body = mode == 3
+                ? std::string("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS\": \"0\", "
+                              "\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK\": \"1\"}")
+                : string_format("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS\": \"%d\", "
+                                "\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK\": \"0\"}", mode);
             double tps = (mode == 0) ? open_live(n_predict) : measure_live(body, n_predict);
             if (mode == 0 && g_moe_live_port > 0) {
                 // the launch itself ran at the default; re-measure through the knob
