@@ -814,6 +814,101 @@ against admission alone (+2.75pp, 4 of 4); and hit rate itself turned out to be 
 rate, is the objective here.</p>
 </section>
 
+<section id="measuring-honestly">
+<div class="eyebrow">The calibration was optimising a machine that does not exist</div>
+<h2>Every number was measured at 4k while the run asked for 64k</h2>
+<p class="section-lede">Calibration launches real servers and benchmarks them, which is the whole
+point. Its candidates ran with <code>--fit</code> enabled, so each one's own fit logic was free to trade
+the requested context down until the rest of its configuration fitted &mdash; and it did, silently.</p>
+
+<p>A run launched with <code>-c 65536</code> produced candidate after candidate reporting
+<code>n_ctx_slot = 4096</code>. Every value that run chose was chosen at 4k. That is not a small
+discrepancy, because VRAM is the binding constraint and context consumes most of it: at 4k there is room
+to spare, so the sweeps picked a 2048 MiB expert cache and <code>-ub 2048</code> &mdash; and both of them
+<strong>OOM at 65536</strong> with the draft attached, 676 MiB short. The run optimised a configuration
+the machine cannot serve, and nothing in it could tell, because a candidate that quietly shrank its
+context still returned a perfectly good tok/s for a configuration nobody had asked about.</p>
+
+<table>
+<colgroup><col style="width:34%"><col style="width:33%"><col style="width:33%"></colgroup>
+<thead><tr><th>What the ladder offered</th><th>Chosen at 4k</th><th>Actually holds at 64k</th></tr></thead>
+<tbody>
+<tr><td>prompt micro-batch</td><td><code>-ub 2048</code></td><td><strong>512</strong> &mdash; 2048 costs 666 MiB</td></tr>
+<tr><td>expert cache</td><td>2048 MiB</td><td><strong>1024 MiB</strong></td></tr>
+<tr><td>speculative depth</td><td>4</td><td><strong>2 or less</strong> &mdash; 4 and 8 do not load</td></tr>
+<tr><td>VRAM left for everything else</td><td>4273 MiB</td><td><strong>1405 MiB</strong> (f16 KV)</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">Candidates are now pinned to the requested context. One that cannot hold it
+fails to launch, which is the honest answer &mdash; <em>that combination does not fit</em> &mdash; and an
+OOM in a candidate log is reported as a fit result rather than a failure, because it is a measurement.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Then the ordering bugs it had been hiding</h3>
+
+<p>Pinning the context immediately exposed three decisions that were being made against the wrong
+neighbours &mdash; each one a stage optimising a knob whose value depends on a stage that runs later.</p>
+
+<table>
+<colgroup><col style="width:30%"><col style="width:70%"></colgroup>
+<thead><tr><th>Decision</th><th>Why it was wrong, and what it cost</th></tr></thead>
+<tbody>
+<tr><td><strong>The draft was eliminated before it was configured</strong></td><td>&ldquo;Does the best depth beat no draft&rdquo; ran immediately after the depth search &mdash; but draft placement, exactness and cache share are all gated on that verdict. So the draft was judged in the worst configuration it will ever have, and the stages that would fix exactly that were skipped <em>because it lost</em>. It was accepting 0.87&ndash;0.88 of what it proposed at the time.</td></tr>
+<tr><td><strong>A prefill number disabled prefetch for every decode stage</strong></td><td>Expert prefetch measured 42.3 prompt tok/s against 48.5 off, so it was switched off &mdash; for the substitution ladder, the ring, the prerouter and the partition, all of which rely on that path and none of which are about prompt throughput. Re-measured the next run: 45.9 against 40.0. The verdict was noise deciding a mechanism.</td></tr>
+<tr><td><strong>Acceptance mode was chosen 2000 lines after the depth it determines</strong></td><td><code>--spec-prob-accept</code> changes how many drafted tokens survive verification, so it changes which depth is worth paying for. Measured after the depth search, the envelope searched the curve for the wrong mode &mdash; and it is not a small lever: 77.18 against 65.36 tok/s on gemma-4, the largest single one in that run.</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<p><strong>The pattern, and the rule that came out of it:</strong> a knob measured on a narrow metric can
+invalidate every stage beneath it, and nothing detects that. So the search is now ordered by what each
+knob <em>does</em> rather than by convenience: knobs that change the <strong>fixed cost</strong> (context,
+KV precision, micro-batch, placement, draft width) are settled first and the remainder is then
+<strong>measured</strong> with the model loaded; knobs that <strong>divide that remainder</strong> (cache
+size, the reduced pool, the draft's share, the ring) are searched against the real number; and knobs that
+<strong>spend no bytes</strong> (admission, substitution, eviction, the prerouter's influence) come last,
+where they cannot invalidate anything above them. The expert-cache ladder used to derive its ceiling from
+an idle card &mdash; which is how an 8192 MiB rung became a candidate on a 12 GiB card, and how it
+<em>won</em> by 0.26% over 2048 while the pool allocator silently halved it to whatever fitted.</p>
+</div>
+</section>
+
+<section id="kv-precision">
+<div class="eyebrow">The consumer nobody had ever bid against</div>
+<h2>Quantising the KV cache is what buys 64k <em>and</em> speculative decoding</h2>
+<p class="section-lede">Every other mechanism here fights over the VRAM left after the KV cache. The KV
+cache itself was never a variable &mdash; calibration passed its type through and never varied it &mdash;
+and on this model it holds the exact margin everything else was short of.</p>
+
+<table>
+<colgroup><col style="width:40%"><col style="width:30%"><col style="width:30%"></colgroup>
+<thead><tr><th>Qwen3.8-Flash-Next at 64k</th><th>f16 KV</th><th>q8_0 KV</th></tr></thead>
+<tbody>
+<tr><td>VRAM left after model + context + buffers</td><td>1405 MiB</td><td><strong>2393 MiB</strong></td></tr>
+<tr><td>Can the 1819 MiB MTP draft load?</td><td><strong>no</strong></td><td><strong>yes</strong>, with 1117 MiB spare</td></tr>
+<tr><td>Decode throughput</td><td>8.36 tok/s</td><td><strong>9.17 tok/s</strong></td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">So it is not a quality-for-speed trade at all: the gigabyte it frees goes to
+the expert cache and pays for itself, <strong>+9.7%</strong>, on top of being the difference between
+serving 64k with a draft and choosing between them.</p>
+
+<p><strong>q4_0 is excluded by policy rather than measured and rejected.</strong> This is a reasoning
+model, the KV cache holds the whole chain of thought, and 4-bit K and V degrade it in a way the answer
+gate is not guaranteed to catch &mdash; a reply can stay fluent and verifiable while the reasoning behind
+it has drifted. A win q4_0 produced would be a win we should not take.</p>
+
+<p>And the draft's own KV stays <strong>f16</strong>, deliberately. The asymmetry is the point: the target
+is 48 layers against the draft's single NextN block, so q8_0 on the target frees a gigabyte while q8_0 on
+the draft would free a rounding error &mdash; and the target's degradation is the kind the answer gate can
+see, because it checks what the model answers. The draft's cannot be seen that way. Acceptance is the
+draft's entire value and it is measured in <em>agreement</em> with the target, not in output anyone reads:
+0.97 acceptance pays for itself, 0.43 costs more than it returns. A quantised KV degrades exactly that
+agreement, since the head predicts from state it then has to agree with. Quantise the large consumer whose
+output is checked; leave the small one whose worth is measured in how often it is right.</p>
+</section>
+
 <section id="prerouter">
 <div class="eyebrow">A predictor that trains itself while it serves</div>
 <h2>The prerouter: learning which experts are coming, one layer ahead</h2>
@@ -885,6 +980,57 @@ middle path, where a prediction displaces only an older prediction and never a r
 on/off arms had to carry the same ring as each other &mdash; the ring moves throughput on its own, so an A/B
 where only the &ldquo;on&rdquo; arm has one measures the ring, not the predictor.</p>
 </div>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Two predictors, and the one that can be late is not the one that admits</h3>
+
+<p>There are two mechanisms predicting into the same ring, and they were competing for its slots
+first-come-first-served &mdash; the rotation was FIFO, so it went to whichever fired more <em>often</em>
+rather than whichever was more often <em>right</em>. They do not fire alike:</p>
+
+<table>
+<colgroup><col style="width:20%"><col style="width:40%"><col style="width:40%"></colgroup>
+<thead><tr><th></th><th>router lookahead</th><th>the trained prerouter</th></tr></thead>
+<tbody>
+<tr><td>where it runs</td><td>a graph node, while the current layer computes</td><td>enqueued, serviced on the cache worker</td></tr>
+<tr><td>reliability</td><td><strong>every time</strong></td><td>queue is one deep and <strong>drops rather than falls behind</strong></td></tr>
+<tr><td>lead time</td><td>exactly one layer of compute</td><td>whenever the worker gets to it, or never</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">So lookahead is punctual and certain; the prerouter is late and lossy. That is
+not a defect in either &mdash; it is what each can be, given where it runs. And it explains a result that
+otherwise reads as contradictory: the prerouter <strong>lost</strong> at admission and <strong>won</strong>
+at eviction protection, on both models.</p>
+
+<table>
+<colgroup><col style="width:40%"><col style="width:30%"><col style="width:30%"></colgroup>
+<thead><tr><th>What the prerouter was allowed to do</th><th>gemma-4</th><th>qwen3.8-flash-next</th></tr></thead>
+<tbody>
+<tr><td>trained but inert</td><td>&mdash;</td><td>9.44 tok/s</td></tr>
+<tr><td>admission only</td><td>56.59 tok/s</td><td>9.45 &mdash; <em>adds nothing</em></td></tr>
+<tr><td><strong>eviction protection</strong></td><td><strong>71.41 tok/s</strong></td><td>9.86</td></tr>
+<tr><td>eviction + substitution</td><td>52.81 tok/s</td><td><strong>10.69</strong></td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem"><strong>Admission has to be on time</strong> &mdash; a fetch landing after the
+layer ran is pure waste. <strong>Retention does not</strong>: a slightly stale &ldquo;this will be
+wanted&rdquo; is still exactly what you need to decide what <em>not</em> to throw away. The droppable
+mechanism lost the punctual job and won the one that tolerates being late. So the roles are assigned
+rather than searched &mdash; lookahead admits, the prerouter retains &mdash; and the calibration stage now
+measures the role's <em>strength</em>, keeping an inert floor and an &ldquo;admission too&rdquo; arm so the
+assignment stays falsifiable.</p>
+
+<p>Substitution is deliberately <em>not</em> assigned, because the two models genuinely disagree, and
+explicably so: a stand-in is a resemblance question, and on a model that mostly fits there is little to
+gain while a wrong stand-in costs quality &mdash; whereas on one where 48 expert layers live on CPU nearly
+every miss needs a stand-in and the extra signal earns its place.</p>
+
+<p>And where both mechanisms want the same expert, that is now its own signal rather than a collision. The
+second one to arrive does not need a slot; it needs its agreement recorded &mdash; the slot is promoted
+above what either mechanism could claim alone. This file already made that argument for cross-depth
+agreement: two independent samples landing on the same expert &ldquo;should be much rarer and much more
+often right than either depth alone&rdquo;.</p>
 
 <div class="callout">
 <p><strong>Stated plainly: this is not yet an end-to-end win.</strong> Every figure above is the calibration
