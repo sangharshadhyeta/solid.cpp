@@ -2297,42 +2297,56 @@ static double moe_cache_weighted_heat(const moe_cache_device & device, const moe
     if (out_base) {
         *out_base = base;
     }
-    if (!moe_cache_atlas_align_protect_enabled()) {
-        return base;
-    }
-    const float align = moe_cache_atlas_align_score(device, slot.key);
-    if (align <= 0.0f) {
-        return base;
-    }
-    const double strength = (double) moe_cache_atlas_align_protect_strength_effective(device);
-    // cap_ref, when supplied, is already a base score (heat*tier_weight) -
-    // value-units-comparable as-is. The heat_scale_ema fallback is raw heat,
-    // not value units, so it still needs this slot's own tier weight to
-    // land in the same units base is in.
+    // Two sources say "this one is about to be wanted" - the atlas, from where
+    // the request sits in topic space, and the prerouter, from the hidden
+    // state. They were computed as two separate additive terms, and that was
+    // wrong twice.
+    //
+    // First, the predictor's term was unreachable unless the atlas one was
+    // enabled AND the slot had a positive align score: both early returns
+    // below used to sit above it, so two unrelated conditions gated the
+    // consumer that actually won its stage (71.41 tok/s against 56.59 for
+    // admission and 52.81 for the substitution tiebreak on gemma-4).
+    //
+    // Second, each term was capped at `cap` independently, so together they
+    // could add 2x the cap the comments promised - and a cap that the
+    // combination escapes is not a cap. A slot both mechanisms liked could be
+    // pinned against real demand, which is the exact failure the cap exists to
+    // prevent.
+    //
+    // So: compute both, sum the evidence, cap the sum once. Either can be off
+    // (weight or enable at 0) without affecting the other.
     const double cap = cap_ref >= 0.0
         ? moe_cache_atlas_align_protect_cap_fraction() * cap_ref
         : moe_cache_atlas_align_protect_cap_fraction() * pool.heat_scale_ema *
               moe_cache_cost_tier_weight(device, slot.key);
-    const double bias = std::min((double) align * strength * (double) MOE_CACHE_HEAT_STEP, cap);
-    double out = base + std::max(0.0, bias);
 
-    // Predictor protection: do not evict what the prerouter says is about to
-    // be wanted. Deliberately the same shape as the atlas bias above - an
-    // additive, CAPPED bonus on heat, never a veto - so a confident predictor
-    // can delay an eviction but can never pin a slot against real demand.
-    // Weight defaults to 0 (no effect) until a calibration stage measures it:
-    // this is the mechanism that admits on guesses, and guesses cost real
-    // slots (the ring at 5% took the hit rate from 28.8% to 6.4%).
-    const double pw = moe_cache_predictor_evict_weight();
-    if (pw > 0.0) {
-        const double p = moe_cache_predictor_score(device, slot.key);
-        // p is a probability in (0,1); 0.5 is "no opinion" for an untrained
-        // weight vector, so only the half above it protects anything.
-        if (p > 0.5) {
-            out += std::min((p - 0.5) * 2.0 * pw * (double) MOE_CACHE_HEAT_STEP, cap);
+    double bias = 0.0;
+
+    if (moe_cache_atlas_align_protect_enabled()) {
+        const float align = moe_cache_atlas_align_score(device, slot.key);
+        if (align > 0.0f) {
+            const double strength = (double) moe_cache_atlas_align_protect_strength_effective(device);
+            bias += (double) align * strength * (double) MOE_CACHE_HEAT_STEP;
         }
     }
-    return out;
+
+    const double pw = moe_cache_predictor_evict_weight();
+    if (pw > 0.0) {
+        // p is a probability in (0,1); 0.5 is "no opinion" for an untrained
+        // weight vector, so only the half above it protects anything.
+        const double p = moe_cache_predictor_score(device, slot.key);
+        if (p > 0.5) {
+            bias += (p - 0.5) * 2.0 * pw * (double) MOE_CACHE_HEAT_STEP;
+        }
+    }
+
+    if (bias <= 0.0) {
+        return base;
+    }
+    // One cap over the combined evidence - additive, never a veto, so a
+    // confident mechanism can delay an eviction and never pin a slot.
+    return base + std::min(bias, cap);
 }
 
 // protected_ is capped at half the pool - the structural fix for the
@@ -9937,62 +9951,6 @@ static void moe_cache_train(
     device.train_queue.push_back(std::move(req));
 }
 
-// Pick a resident stand-in for `missed`, or -1. Walks this tensor's resident
-// bitmask (one hash for the tensor, then bit tests over ~4 words - the whole
-// reason the mask exists) and scores each candidate by how often it has fired
-// in the SAME routing decision as the expert it would replace. Co-activation
-// rather than atlas position or router score, because those two rank experts
-// context-free and both lost their eviction A/Bs to plain recency; co-firing
-// is the only signal here that says "these two do the same job for this
-// input". Ties break toward the hotter slot, which is the cheaper one to keep.
-//
-// Caller must hold the session lock, as everything reading pool state does.
-static int moe_cache_substitute_pick(
-        moe_cache_device & device, moe_cache_pool & pool,
-        const void * host_base, int32_t missed, int64_t n_expert) {
-    const std::vector<uint64_t> * words = moe_cache_mask_words(pool, host_base);
-    if (!words) {
-        return -1;
-    }
-    const moe_cache_key mkey{host_base, missed};
-    const uint32_t min_coact = moe_cache_substitute_min_coact();
-    const int scan_cap = moe_cache_substitute_scan();
-    int best_slot = -1;
-    uint32_t best_count = 0;
-    uint16_t best_heat = 0;
-    int examined = 0;
-    for (size_t w = 0; w < words->size() && examined < scan_cap; w++) {
-        uint64_t bits = (*words)[w];
-        while (bits && examined < scan_cap) {
-            const int cand = (int) (w << 6) + __builtin_ctzll(bits);
-            bits &= bits - 1;
-            if (cand == missed || cand >= (int) n_expert) {
-                continue;
-            }
-            examined++;
-            const auto cit = device.co_activation.find(
-                    moe_cache_edge_undirected(mkey, moe_cache_key{host_base, cand}));
-            if (cit == device.co_activation.end() || cit->second < min_coact) {
-                continue;
-            }
-            const auto found = pool.map.find(moe_cache_key{host_base, cand});
-            if (found == pool.map.end()) {
-                continue; // mask and map disagree - trust the map, it is the truth
-            }
-            const moe_cache_slot & slot = pool.slots[found->second];
-            if (slot.state != moe_cache_slot_state::valid) {
-                continue;
-            }
-            if (cit->second > best_count ||
-                (cit->second == best_count && slot.heat > best_heat)) {
-                best_count = cit->second;
-                best_heat  = slot.heat;
-                best_slot  = found->second;
-            }
-        }
-    }
-    return best_slot;
-}
 
 // Pick the hottest resident stand-in for `missed`, breaking ties by
 // co-activation count (how often it has fired alongside the expert it would
@@ -10880,20 +10838,12 @@ static int moe_cache_plan(
             // currently-resident expert for this tensor, tiebroken by
             // cross-request co-activation, with no min_coact floor to
             // decline against - see moe_cache_substitute_pick_hot's own
-            // comment. The narrower per-token-rank method and the older
-            // co-activation-primary method both stay available for
-            // comparison via GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK=1 /
-            // GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT=1 respectively - strict
-            // rank wins if both are set, since it is the more conservative
-            // of the two opt-outs.
-            static const bool use_strict_rank = [] {
-                const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK");
-                return env && atoi(env) != 0;
-            }();
-            static const bool use_coact = [] {
-                const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_COACT");
-                return env && atoi(env) != 0;
-            }();
+            // comment. The narrower per-token-rank method is the alternative,
+            // and it is now calibrated rather than left behind an env var:
+            // live-tunable, so the stand-in stage can measure it on one
+            // server instead of a reload per value.
+            const bool use_strict_rank =
+                MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK", 0) != 0;
             // Atlas-similarity first when asked for: it is the only picker that
             // ranks by resemblance to the MISSING expert rather than by how wanted
             // a candidate is in general. It declines when nothing resident is near
@@ -10910,11 +10860,28 @@ static int moe_cache_plan(
                 }
             }
             if (sub < 0 && mode != 2) {
+                // Two pickers, not four.
+                //
+                // moe_cache_substitute_pick - the original pairwise
+                // co-activation scan - is retired: moe_cache_substitute_pick_hot
+                // below already ranks by co-activation and uses heat only to
+                // break ties, which is the same signal with a better tiebreak,
+                // and the measurement that produced pick_rank scored the
+                // pairwise scan at 0.02130 against pick_rank's 0.03856 on the
+                // router's own score for the stand-in chosen. Keeping a third
+                // path that is worse than both and reachable only through an
+                // env var nobody sets is how a mechanism ends up never
+                // measured.
+                //
+                // pick_rank stays and is now calibrated rather than hidden: it
+                // measured +81% over the pairwise scan and beat the full-probs
+                // oracle (0.03856 vs 0.03790), and it was still sitting behind
+                // GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK with no stage
+                // measuring it - the same way the prerouter sat behind
+                // TRAIN_PREDICTOR=0 for its whole life.
                 sub = use_strict_rank
                     ? moe_cache_substitute_pick_rank(pool, node->host_base, ids, index,
                                                      rank_top_k, node->n_expert)
-                    : use_coact
-                    ? moe_cache_substitute_pick(device, pool, node->host_base, expert, node->n_expert)
                     : moe_cache_substitute_pick_hot(device, pool, node->host_base, expert, node->n_expert);
             }
             if (sub >= 0) {
