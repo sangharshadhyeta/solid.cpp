@@ -2001,7 +2001,11 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
     // reads as "atlas on, some unknown variant", and the rank picker - the one
     // the stage actually chose - would never run.
     if (cal.substitute_atlas > 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS")) {
-        if (cal.substitute_atlas == 3) {
+        if (cal.substitute_atlas == 4) {
+            set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 4);
+            LOG_WRN("%s: choosing stand-ins by the fused picker - this token's router ranking first, "
+                    "then atlas resemblance and co-activation together (calibrated)\n", __func__);
+        } else if (cal.substitute_atlas == 3) {
             set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 0);
             set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK", 1);
             LOG_WRN("%s: choosing stand-ins by this token's router rank (calibrated)\n", __func__);
@@ -6364,14 +6368,19 @@ void common_moe_calibrate(common_params & params) {
         // life. It declines more often than the co-activation scan, and a
         // declined stand-in costs time while a wrong one costs quality, so
         // whether the trade pays is exactly a question for measurement.
-        for (const int mode : { 0, 1, 2, 3 }) {
+        // Mode 4 is the fused picker - all three signals at once rather than
+        // the best of them. The other four stay as measurable points so the
+        // fusion has to earn its place against each individual signal rather
+        // than being assumed better for being more elaborate.
+        for (const int mode : { 0, 1, 2, 3, 4 }) {
             if (common_moe_calibrate_budget_spent()) {
                 break;
             }
             const char * label = mode == 0 ? "by heat"
                                : mode == 1 ? "atlas, heat fallback"
                                : mode == 2 ? "atlas only"
-                                           : "by this token's router rank";
+                               : mode == 3 ? "by this token's router rank"
+                                           : "fused: rank, then atlas + co-activation";
             // Mode 3 turns the atlas picker off and the rank picker on; the
             // others leave the rank picker off, so exactly one method is
             // measured per candidate.
@@ -6380,6 +6389,7 @@ void common_moe_calibrate(common_params & params) {
                               "\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK\": \"1\"}")
                 : string_format("{\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS\": \"%d\", "
                                 "\"GGML_CUDA_MOE_CACHE_SUBSTITUTE_STRICT_RANK\": \"0\"}", mode);
+            // mode 4 carries the fusion weights; the picker reads them live.
             double tps = (mode == 0) ? open_live(n_predict) : measure_live(body, n_predict);
             if (mode == 0 && g_moe_live_port > 0) {
                 // the launch itself ran at the default; re-measure through the knob
