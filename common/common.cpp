@@ -6310,7 +6310,32 @@ void common_moe_calibrate(common_params & params) {
     }
 
     uint32_t best_ngl = (uint32_t) probe.n_layer + 1; // "all" - mirrors llama_model::n_gpu_layers()'s own +1
-    {
+    // -ngl only ever had something to trade because a layer's experts were
+    // resident. With every layer's experts on the CPU (the design above), the
+    // only things -ngl still governs are attention, the norms and the output
+    // head - a few hundred MiB that every token passes through twice. Moving
+    // those to the CPU to buy expert-cache VRAM is the trade run backwards:
+    // it makes the hot path slower to enlarge a cache that is already sized by
+    // whatever the card has left. Measured on gemma-4 under this design the
+    // cache grew 4197 -> 11277 MiB on its own, so there was no VRAM for a
+    // lowered -ngl to free that the cache had not already taken.
+    //
+    // The search also costs more than its own candidates: when it "wins" it
+    // re-runs the whole -ncmoe search underneath the new residency.
+    // GGML_MOE_CALIBRATE_SEARCH_NGL=1 restores it for a card where attention
+    // is big enough relative to VRAM for the trade to go the other way.
+    const bool search_ngl = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_NGL");
+        return e && atoi(e) != 0;
+    }();
+    if (!search_ngl) {
+        LOG_WRN("%s: -ngl left at full residency - with every layer's experts on the CPU, -ngl governs "
+                "only attention and the norms, and the expert cache already grows into whatever VRAM is "
+                "left (GGML_MOE_CALIBRATE_SEARCH_NGL=1 to search layer residency instead)\n", __func__);
+        common_moe_calibration_status_note("GPU residency", "full (default -ngl)",
+                "DESIGN - experts stream from the CPU; the GPU holds attention, the MTP head and the cache",
+                true, true);
+    } else {
         const uint32_t ngl_hi = best_ngl;
         const uint32_t ngl_lo = probe.n_layer > 3 ? probe.n_layer - probe.n_layer / 3 : 0;
         LOG_INF("%s: golden-section search for -ngl in [%u, %u] at ncmoe=%u (trading GPU-resident layers "
@@ -6612,9 +6637,28 @@ void common_moe_calibrate(common_params & params) {
     // 0 = cache off, measured first. The pick below takes the smallest
     // candidate within 3% of the best, so off wins a tie - and off is also
     // the only configuration whose greedy output is exactly reproducible.
-    std::vector<int> cache_candidates_mb = { 0 };
+    //
+    // ... which was true while a resident expert layer competed with the cache
+    // for the same VRAM. Under the fixed design nothing else is bidding: the
+    // experts all stream from the CPU, so "auto" means the cache takes the
+    // whole remainder after the model, the KV cache and the MTP head. Every
+    // rung this ladder can nominate is therefore SMALLER than what auto would
+    // have claimed, and the ladder's own tie-break prefers the smallest rung
+    // inside the noise band - so it systematically hands VRAM back for nothing.
+    // Measured on gemma-4: auto grew the cache to 11277 MiB and served 96%+ of
+    // expert requests from VRAM at 52% residency; the calibrated 2048 MiB
+    // entry, chosen by this ladder, did not come close.
+    // GGML_MOE_CALIBRATE_CACHE_SWEEP=1 restores the ladder.
+    const bool sweep_cache = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_CACHE_SWEEP");
+        return e && atoi(e) != 0;
+    }();
+    std::vector<int> cache_candidates_mb;
+    if (sweep_cache) {
+        cache_candidates_mb.push_back(0);
+    }
     size_t remainder_bytes = 0;
-    {
+    if (sweep_cache) {
         // The ladder is capped by the MEASURED remainder, not by what an idle
         // card reports.
         //
@@ -6762,10 +6806,17 @@ void common_moe_calibrate(common_params & params) {
         common_moe_calibration_status_note("expert-cache size",
                 string_format("%d MiB", best_cache_mb),
                 string_format("SELECTED - %.2f tok/s", chosen_tps), true, true);
-    } else {
+    } else if (sweep_cache) {
         LOG_WRN("%s: expert-cache size: no rung measured usable - leaving it on auto\n", __func__);
         common_moe_calibration_status_note("expert-cache size", "auto",
                 "no rung measured usable", false, true);
+    } else {
+        LOG_WRN("%s: expert cache on auto - nothing else bids for that VRAM once every layer's experts "
+                "are on the CPU, so auto takes the whole remainder and any fixed rung would only be "
+                "smaller (GGML_MOE_CALIBRATE_CACHE_SWEEP=1 to sweep sizes)\n", __func__);
+        common_moe_calibration_status_note("expert-cache size", "auto",
+                "DESIGN - the cache takes whatever VRAM is left; a fixed rung can only be smaller",
+                true, true);
     }
 
     // Fit margin (-fitt). Searched LAST and deliberately re-searching
@@ -6792,6 +6843,17 @@ void common_moe_calibrate(common_params & params) {
     // fit logic raise it to whatever that margin actually permits, which is
     // the quantity being measured.
     int    best_fit_mb  = -1;
+    // ... and that is exactly why it stops being searched under the fixed
+    // design. Every number above is a PLACEMENT result: the margin paid because
+    // tightening it let more expert layers stay on the GPU. With -ncmoe pinned
+    // to every layer there is no placement left to unlock - the margin's only
+    // remaining effect is to shrink the headroom the expert cache grows into,
+    // while moving the server closer to the launch failures this walk exists to
+    // stay clear of. GGML_MOE_CALIBRATE_SEARCH_FIT=1 restores the search.
+    const bool search_fit = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_FIT");
+        return e && atoi(e) != 0;
+    }();
     // Baseline MUST be the best throughput already measured at the DEFAULT
     // margin under the SAME cache size and thread count these candidates
     // run with - i.e. the cache-knee winner, not best_threads_tps. Getting
@@ -6812,6 +6874,14 @@ void common_moe_calibrate(common_params & params) {
     {
         const int default_fit_mb = (int) (params.fit_params_target[0] / (1024 * 1024));
         static const int fit_candidates_mb[] = {640, 448, 320, 256};
+        if (!search_fit) {
+            LOG_WRN("%s: fit margin left at the default %d MiB - with no expert layer resident there is "
+                    "no placement for a tighter margin to unlock, only headroom taken from the expert "
+                    "cache (GGML_MOE_CALIBRATE_SEARCH_FIT=1 to search it)\n", __func__, default_fit_mb);
+            common_moe_calibration_status_note("fit margin",
+                    string_format("%d MiB (default)", default_fit_mb),
+                    "DESIGN - the margin only bought placements, and placement is fixed", true, true);
+        } else {
         common_moe_calibration_status_set("searching fit margin (-fitt)");
         LOG_INF("%s: searching fit margin (-fitt) below the default of %d MiB at ncmoe>=%u ...\n",
                 __func__, default_fit_mb, safe_n);
@@ -6876,6 +6946,7 @@ void common_moe_calibrate(common_params & params) {
                 best_fit_mb = runner_up;
             }
             best_fit_tps = fit_trace.at(best_fit_mb);
+        }
         }
         entry.fit_target_mb = best_fit_mb;
         checkpoint("fit margin");
