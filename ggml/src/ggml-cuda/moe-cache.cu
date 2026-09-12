@@ -813,18 +813,23 @@ struct moe_cache_device {
     int  last_top_layer = -1;
     bool last_top_expert_valid = false;
 
-    // Track 1 step 6 (docs/plan.md): does the cross-layer co-activation
-    // table actually PREDICT the next layer's pick? Router-lookahead's own
-    // measured precision is 59.3% / 48.0% / 41.1% at depth 1/2/3, and it
-    // pays a real n_embd x n_expert matmul per layer to get it; a table
-    // lookup is nearly free, so the question is whether it is competitive.
-    // successor_best is an O(1) index (from-expert -> its highest-count
-    // successor so far) maintained alongside the edge counts, so scoring a
-    // prediction never scans the full edge map. All of this is gated - see
-    // moe_cache_measure_pred_enabled - and costs nothing when off.
-    std::unordered_map<moe_cache_key, std::pair<moe_cache_key, uint32_t>, moe_cache_key_hash> successor_best;
-    long long xlayer_pred_total = 0;
-    long long xlayer_pred_hit   = 0;
+    // RETIRED: the cross-layer successor table as a PREDICTOR.
+    //
+    // The question was whether a nearly-free table lookup could stand in for
+    // router-lookahead's n_embd x n_expert matmul (59.3% / 48.0% / 41.1% at
+    // depth 1/2/3). It was refuted three times, each stronger than the last:
+    // raw-count argmax scored 33.8% top-1; a fair re-test was built with the
+    // normalization this file applies to the sibling table and with recall@k
+    // instead of top-1; and finally the signal was fused directly into the
+    // trained predictor as a hashed block of the previous layer's selection -
+    // the strongest form of the test, since it lets one model use both the
+    // hidden state AND the expert ids. It lost on both models measured:
+    // gemma-4 66.57 against 70.00 tok/s, Qwen3.8-Flash-Next 10.16 against
+    // 12.37.
+    //
+    // What survives is co_activation_cross_layer itself, which is still the
+    // input to atlas evolution, and partner_best below, which group admission
+    // reads. Only the prediction scaffolding is gone.
 
     // Fair re-test of the same table. The 33.8% above refutes one specific
     // estimator - argmax of RAW counts, scored top-1 against the next layer's
@@ -850,19 +855,6 @@ struct moe_cache_device {
     //     rather than just "some percent"
     // None of this is a prediction path yet: measure first, and let the
     // result decide whether a table can stand in for the lookahead matmul.
-    struct successor_entry { moe_cache_key to; uint32_t n; };
-    static constexpr size_t MOE_CACHE_SUCCESSOR_FANOUT = 32;
-    std::unordered_map<moe_cache_key, std::vector<successor_entry>, moe_cache_key_hash> successor_topk;
-    std::vector<int32_t> last_top_ids;   // previous layer's full selection
-    const void *         last_top_base = nullptr;
-    long long xlayer_recall_num  = 0;    // |predicted n actual|, one anchor
-    long long xlayer_recall_den  = 0;    // k asked for
-    long long xlayer_multi_num   = 0;    // same, union over every previous-layer expert
-    long long xlayer_multi_den   = 0;
-    long long xlayer_chance_num  = 0;    // expected overlap under uniform routing
-    long long xlayer_chance_den  = 0;
-    long long xlayer_norm_hit    = 0;    // normalized top-1, directly vs the raw-count 33.8%
-    long long xlayer_norm_total  = 0;
 
     // Step 7a measurement: a different question from step 6. Not "which
     // expert comes next across layers" (refuted, 33.8%) but "given one
@@ -6921,16 +6913,6 @@ static void moe_cache_session_destroy(void * opaque) {
                         "%lld declined for want of a near neighbour\n",
                         d.physical, d.substitute_atlas_hits, d.substitute_atlas_declined);
             }
-            if (d.xlayer_recall_den > 0 || d.xlayer_pred_total > 0) {
-                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d cross-layer prediction: raw top-1 %.1f%% | "
-                        "normalized top-1 %.1f%% | recall@k one-anchor %.1f%% all-anchors %.1f%% | "
-                        "chance %.1f%%\n", d.physical,
-                        d.xlayer_pred_total ? 100.0 * (double) d.xlayer_pred_hit / (double) d.xlayer_pred_total : 0.0,
-                        d.xlayer_norm_total ? 100.0 * (double) d.xlayer_norm_hit / (double) d.xlayer_norm_total : 0.0,
-                        d.xlayer_recall_den ? 100.0 * (double) d.xlayer_recall_num / (double) d.xlayer_recall_den : 0.0,
-                        d.xlayer_multi_den  ? 100.0 * (double) d.xlayer_multi_num / (double) d.xlayer_multi_den : 0.0,
-                        d.xlayer_chance_den ? 100.0 * (double) d.xlayer_chance_num / (double) d.xlayer_chance_den : 0.0);
-            }
             if (d.ring_hits || d.ring_rotations || d.ring_seeds) {
                 fprintf(stderr, "[moe-cache] SUMMARY CUDA%d prediction ring: hits=%lld rotations=%lld seeds=%lld "
                         "(lookahead hits=%lld wasted=%lld)\n", d.physical, d.ring_hits, d.ring_rotations,
@@ -9252,27 +9234,6 @@ static bool moe_cache_train_next_layer() {
     return on;
 }
 
-// Width of the hashed previous-selection feature block appended to the input.
-//
-// The two signals this fork has measured for cross-layer prediction were
-// measured SEPARATELY: the hidden state through the next layer's gate reaches
-// 59.3% at depth 1, and the expert-id successor table reached 33.8% (raw
-// counts, top-1 - see the fair re-test alongside it). Nothing has tried them
-// together, and they are not the same information: one is what the input
-// looks like, the other is what the previous layer decided about it. Hashing
-// the previous selection into a small fixed block lets one model condition on
-// both without the input growing by n_expert.
-//
-// 0 disables the block entirely, which is the default until it is measured.
-static int moe_cache_train_prev_buckets() {
-    static const int v = [] {
-        const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS");
-        const int n = env ? atoi(env) : 0;
-        return n > 0 ? std::min(n, 256) : 0;
-    }();
-    return v;
-}
-
 static float moe_cache_train_lr() {
     static const float v = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_TRAIN_LR");
@@ -9878,22 +9839,14 @@ static void moe_cache_train(
         req.acts.insert(req.acts.end(), g_aux_feats.begin(), g_aux_feats.end());
     }
 
-    // Hashed previous-selection block. Appended AFTER the atlas dims so the
-    // layout is append-only and a state file written without it still loads
-    // (the dimension check rejects it, and an untrained vector is a safe
-    // fallback - see moe_cache_train_service). Counts rather than bits: an
-    // expert selected by several of the previous layer's tokens is stronger
-    // evidence than one selected by a single token.
-    const int prev_buckets = moe_cache_train_prev_buckets();
-    if (prev_buckets > 0) {
-        const size_t base = req.acts.size();
-        req.acts.resize(base + (size_t) prev_buckets, 0.0f);
-        for (int32_t e : device.last_top_ids) {
-            if (e >= 0) {
-                req.acts[base + ((size_t) e % (size_t) prev_buckets)] += 1.0f;
-            }
-        }
-    }
+    // RETIRED: the hashed previous-selection block.
+    //
+    // This fused the expert-id successor signal into the predictor's input, so
+    // one model could condition on both what the input looks like AND what the
+    // previous layer decided about it - the strongest form of the test that
+    // signal has had. It lost on both models measured: gemma-4 66.57 against
+    // 70.00 tok/s, Qwen3.8-Flash-Next 10.16 against 12.37. The hidden state
+    // already carries what this added, and the block cost input width for it.
 
     req.ids.assign(ids, ids + n_ids_per_token);
 
@@ -11288,195 +11241,13 @@ static int moe_cache_plan(
             device.last_top_expert_valid &&
             node->layer >= 0 && device.last_top_layer >= 0 &&
             node->layer != device.last_top_layer;
-        if (real_transition) {
-            // Step 6 scoring, BEFORE this observation updates the table -
-            // otherwise the prediction would be graded against evidence it
-            // just supplied, which would inflate it.
-            if (moe_cache_measure_pred_enabled()) {
-                const auto pred = device.successor_best.find(device.last_top_expert);
-                if (pred != device.successor_best.end()) {
-                    device.xlayer_pred_total++;
-                    if (pred->second.first == top_key) {
-                        device.xlayer_pred_hit++;
-                    }
-                    if (device.xlayer_pred_total % 2000 == 0) {
-                        fprintf(stderr,
-                                "[xlayer-pred] depth-1 precision %.1f%% (%lld/%lld) over %zu tracked edges\n",
-                                100.0 * (double) device.xlayer_pred_hit / (double) device.xlayer_pred_total,
-                                device.xlayer_pred_hit, device.xlayer_pred_total,
-                                device.co_activation_cross_layer.size());
-                    }
-                }
-            }
-            // The fair re-test, scored BEFORE the table learns this
-            // observation, for the same reason the raw estimator above is.
-            if (moe_cache_measure_pred_enabled()) {
-                const int k = n_ids;
-                // actual set for this layer
-                std::unordered_set<int32_t> actual;
-                for (int a = 0; a < n_ids; a++) {
-                    if (ids[a] >= 0 && ids[a] < node->n_expert) {
-                        actual.insert(ids[a]);
-                    }
-                }
-                if (!actual.empty() && k > 0) {
-                    // Normalized score: count(a->b) / fire_count(b). Raw count
-                    // ranks by how popular b is in general; this ranks by how
-                    // much a raises b above its own base rate.
-                    auto scored_from = [&](const moe_cache_key & anchor,
-                                           std::vector<std::pair<double,int32_t>> & out) {
-                        const auto it = device.successor_topk.find(anchor);
-                        if (it == device.successor_topk.end()) {
-                            return;
-                        }
-                        for (const auto & e : it->second) {
-                            if (e.to.tensor != node->host_base) {
-                                continue; // only this layer's tensor is predictable here
-                            }
-                            const auto fit = device.expert_fire_count.find(e.to);
-                            const double fired = fit == device.expert_fire_count.end() ? 0.0 : (double) fit->second;
-                            out.emplace_back((double) e.n / (fired + 1.0), e.to.expert);
-                        }
-                    };
-                    auto recall_of = [&](std::vector<std::pair<double,int32_t>> & cand) {
-                        if (cand.empty()) {
-                            return -1;
-                        }
-                        std::sort(cand.begin(), cand.end(),
-                                  [](const auto & x, const auto & y) { return x.first > y.first; });
-                        std::unordered_set<int32_t> taken;
-                        int hit = 0;
-                        for (const auto & c : cand) {
-                            if ((int) taken.size() >= k) {
-                                break;
-                            }
-                            if (!taken.insert(c.second).second) {
-                                continue;
-                            }
-                            if (actual.count(c.second)) {
-                                hit++;
-                            }
-                        }
-                        return hit;
-                    };
-
-                    std::vector<std::pair<double,int32_t>> one;
-                    scored_from(device.last_top_expert, one);
-                    // normalized top-1, the like-for-like comparison against 33.8%
-                    if (!one.empty()) {
-                        auto best = *std::max_element(one.begin(), one.end(),
-                                [](const auto & x, const auto & y) { return x.first < y.first; });
-                        device.xlayer_norm_total++;
-                        if (actual.count(best.second)) {
-                            device.xlayer_norm_hit++;
-                        }
-                    }
-                    const int hit_one = recall_of(one);
-                    if (hit_one >= 0) {
-                        device.xlayer_recall_num += hit_one;
-                        device.xlayer_recall_den += k;
-                    }
-
-                    // Widen the context: union the successors of EVERY expert
-                    // the previous layer selected, not just its top pick.
-                    std::vector<std::pair<double,int32_t>> many;
-                    for (int32_t prev : device.last_top_ids) {
-                        scored_from(moe_cache_key{device.last_top_base, prev}, many);
-                    }
-                    const int hit_many = recall_of(many);
-                    if (hit_many >= 0) {
-                        device.xlayer_multi_num += hit_many;
-                        device.xlayer_multi_den += k;
-                    }
-
-                    // Chance: picking k of n_expert blindly overlaps a set of
-                    // |actual| by k*|actual|/n_expert in expectation.
-                    device.xlayer_chance_num += (long long) k * (long long) actual.size();
-                    device.xlayer_chance_den += node->n_expert;
-
-                    if (device.xlayer_recall_den > 0 && device.xlayer_recall_den % 20000 < (long long) k) {
-                        fprintf(stderr,
-                                "[xlayer-pred] normalized top-1 %.1f%% | recall@k one-anchor %.1f%% "
-                                "all-anchors %.1f%% | chance %.1f%% (%lld decisions, %zu edges)\n",
-                                device.xlayer_norm_total ? 100.0 * (double) device.xlayer_norm_hit / (double) device.xlayer_norm_total : 0.0,
-                                100.0 * (double) device.xlayer_recall_num / (double) device.xlayer_recall_den,
-                                device.xlayer_multi_den ? 100.0 * (double) device.xlayer_multi_num / (double) device.xlayer_multi_den : 0.0,
-                                device.xlayer_chance_den ? 100.0 * (double) device.xlayer_chance_num / (double) device.xlayer_chance_den : 0.0,
-                                device.xlayer_recall_den / (k ? k : 1),
-                                device.successor_topk.size());
-                    }
-                }
-            }
-
-            const auto edge = moe_cache_edge_directed(device.last_top_expert, top_key);
-            const uint32_t n = ++device.co_activation_cross_layer[edge];
-
-            // Learn this transition into the bounded top-k successor table.
-            // Every expert the previous layer chose is an anchor, so the
-            // all-anchors estimator above has something to read.
-            if (moe_cache_measure_pred_enabled()) {
-                for (int a = 0; a < n_ids; a++) {
-                    if (ids[a] < 0 || ids[a] >= node->n_expert) {
-                        continue;
-                    }
-                    const moe_cache_key to{node->host_base, ids[a]};
-                    for (int32_t prev : device.last_top_ids) {
-                        auto & vec = device.successor_topk[moe_cache_key{device.last_top_base, prev}];
-                        bool found = false;
-                        for (auto & e : vec) {
-                            if (e.to == to) {
-                                e.n++;
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found) {
-                            continue;
-                        }
-                        if (vec.size() < moe_cache_device::MOE_CACHE_SUCCESSOR_FANOUT) {
-                            vec.push_back({to, 1});
-                        } else {
-                            // replace the weakest, so the table tracks what
-                            // keeps happening rather than what happened first
-                            auto weakest = std::min_element(vec.begin(), vec.end(),
-                                    [](const auto & x, const auto & y) { return x.n < y.n; });
-                            if (weakest != vec.end() && weakest->n <= 1) {
-                                *weakest = {to, 1};
-                            }
-                        }
-                    }
-                }
-            }
-            if (moe_cache_measure_pred_enabled()) {
-                // O(1) index upkeep: only this edge's count changed, so it
-                // can only have become the new best for its own from-expert.
-                auto & best = device.successor_best[device.last_top_expert];
-                if (n > best.second) {
-                    best.first  = top_key;
-                    best.second = n;
-                }
-            }
-        }
         // Advance regardless: the next call's "previous layer" should be
         // this one even when this call itself recorded nothing, otherwise
         // a same-layer pair in the middle would also swallow the following
         // genuine transition.
         device.last_top_expert = top_key;
         device.last_top_layer = node->layer;
-        device.last_top_expert_valid = true;
-        // The wider anchor set for the all-anchors estimator, carried on the
-        // same boundary so it can never disagree with last_top_expert about
-        // which layer "previous" means. Only kept while measuring.
-        if (moe_cache_measure_pred_enabled()) {
-            device.last_top_base = node->host_base;
-            device.last_top_ids.clear();
-            for (int a = 0; a < n_ids; a++) {
-                if (ids[a] >= 0 && ids[a] < node->n_expert) {
-                    device.last_top_ids.push_back(ids[a]);
-                }
-            }
-        }
-    }
+        device.last_top_expert_valid = true;    }
 
     // Track 1 step 3: Atlas-driven warming. Rate-limited to once every
     // atlas_warm_interval() plan() calls (device.nodes, unconditionally
