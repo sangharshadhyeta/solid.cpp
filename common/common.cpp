@@ -1672,6 +1672,14 @@ struct common_moe_calibration_entry {
     double      predictor_sub_w   = -1.0;
     // What the predictor is trained to answer and what it gets to see.
     // -1 = not calibrated.
+    // What each resumable stage actually measured, so a resumed run can show
+    // the number rather than just the word "resumed". Without these a resumed
+    // row renders "RESUMED" where every other row renders "SELECTED - N tok/s",
+    // which tells the reader a stage was skipped but not what it decided or
+    // what that decision was worth.
+    double      tps_offload_min_batch = -1.0;
+    double      tps_ubatch            = -1.0;
+    double      tps_spec_n_max        = -1.0;
     int         predictor_next_layer = -1;  // predict the NEXT layer's picks
     int         predictor_prev_buckets = -1; // hashed previous-selection block width
     int         lookahead_depth  = -1;
@@ -2110,6 +2118,9 @@ static bool common_moe_calibration_lookup(
         out.train_predictor        = e.value("train_predictor", -1);
         out.predictor_evict_w      = e.value("predictor_evict_w", -1.0);
         out.predictor_sub_w        = e.value("predictor_sub_w", -1.0);
+        out.tps_offload_min_batch  = e.value("tps_offload_min_batch", -1.0);
+        out.tps_ubatch             = e.value("tps_ubatch", -1.0);
+        out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
         out.predictor_next_layer   = e.value("predictor_next_layer", -1);
         out.predictor_prev_buckets = e.value("predictor_prev_buckets", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
@@ -2186,6 +2197,9 @@ static void common_moe_calibration_save(
         {"train_predictor", entry.train_predictor},
         {"predictor_evict_w", entry.predictor_evict_w},
         {"predictor_sub_w", entry.predictor_sub_w},
+        {"tps_offload_min_batch", entry.tps_offload_min_batch},
+        {"tps_ubatch", entry.tps_ubatch},
+        {"tps_spec_n_max", entry.tps_spec_n_max},
         {"predictor_next_layer", entry.predictor_next_layer},
         {"predictor_prev_buckets", entry.predictor_prev_buckets},
         {"lookahead_depth", entry.lookahead_depth},
@@ -4013,6 +4027,18 @@ void common_moe_calibrate(common_params & params) {
     // quality gates is not a measurement of the same thing - that is the same
     // rule the apply side already enforces. GGML_MOE_CALIBRATE_FRESH=1 forces
     // a full re-measure.
+    // "RESUMED - 64 tokens at 21.1 prompt tok/s (2026-09-12 01:34)" reads as a
+    // measurement; "RESUMED" alone reads as a gap in the table.
+    auto resumed_result = [](const std::string & what, double tps, const std::string & when) {
+        std::string out = "RESUMED - " + what;
+        if (tps > 0.0) {
+            out += string_format(" at %.2f tok/s", tps);
+        }
+        if (!when.empty()) {
+            out += " (measured " + when + ")";
+        }
+        return out;
+    };
     bool resumed_any = false;
     {
         const char * fresh = getenv("GGML_MOE_CALIBRATE_FRESH");
@@ -4394,7 +4420,8 @@ void common_moe_calibrate(common_params & params) {
         // rather than "measured earlier".
         common_moe_calibration_status_note("offload threshold",
                 string_format("%d tokens", best_offload_min_batch),
-                "RESUMED - measured by an earlier run", true, true);
+                resumed_result(string_format("%d tokens", best_offload_min_batch),
+                               entry.tps_offload_min_batch, entry.calibrated_at), true, true);
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the offload threshold (GGML_OP_OFFLOAD_MIN_BATCH) on prompt processing ...\n", __func__);
         common_moe_calibration_status_set("measuring the MoE offload threshold");
@@ -4443,6 +4470,7 @@ void common_moe_calibrate(common_params & params) {
         g_moe_calib_measure_prefill.store(false);
         g_moe_calib_offload_min_batch.store(best_offload_min_batch);
         entry.op_offload_min_batch = best_offload_min_batch;
+        entry.tps_offload_min_batch = best_pp;   // what the winner actually measured
         checkpoint("offload threshold");
         if (best_offload_min_batch > 0) {
             LOG_INF("%s: offload threshold: %d at %.1f prompt tok/s\n", __func__, best_offload_min_batch, best_pp);
@@ -4463,11 +4491,12 @@ void common_moe_calibrate(common_params & params) {
                 "skipping that stage\n", __func__, best_ubatch);
         common_moe_calibration_status_note("prompt micro-batch",
                 string_format("-ub %d", best_ubatch),
-                "RESUMED - measured by an earlier run", true, true);
+                resumed_result(string_format("-ub %d", best_ubatch),
+                               entry.tps_ubatch, entry.calibrated_at), true, true);
         if (best_prefetch >= 0) {
             common_moe_calibration_status_note("expert prefetch",
                     best_prefetch ? "on" : "off",
-                    "RESUMED - measured by an earlier run", true, true);
+                    resumed_result(best_prefetch ? "on" : "off", -1.0, entry.calibrated_at), true, true);
         }
     } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the prompt micro-batch size (-ub) on a long prompt ...\n", __func__);
@@ -4495,6 +4524,7 @@ void common_moe_calibrate(common_params & params) {
         }
         g_moe_calib_ubatch.store(best_ubatch);
         entry.n_ubatch = best_ubatch;
+        entry.tps_ubatch = best_pp;
         checkpoint("prompt micro-batch");
         if (best_ubatch > 0) {
             LOG_INF("%s: prompt micro-batch: -ub %d at %.1f prompt tok/s\n", __func__, best_ubatch, best_pp);
@@ -4542,7 +4572,8 @@ void common_moe_calibrate(common_params & params) {
                 "and the golden-section refinement\n", __func__, best_n_max);
         common_moe_calibration_status_note("speculative depth",
                 best_n_max > 0 ? string_format("n-max %d", best_n_max) : std::string("off"),
-                "RESUMED - measured by an earlier run", true, true);
+                resumed_result(best_n_max > 0 ? string_format("n-max %d", best_n_max) : std::string("off"),
+                               entry.tps_spec_n_max, entry.calibrated_at), true, true);
     } else if (params.speculative.has_dft()) {
         {
             // Find the envelope: double n_max until throughput drops below
@@ -4717,6 +4748,7 @@ void common_moe_calibrate(common_params & params) {
                 }
                 LOG_INF("%s: spec-draft-n-max=%d wins (%.2f tok/s)\n", __func__, best_n_max, nmax_trace.at(best_n_max));
                 entry.spec_n_max = best_n_max;
+                entry.tps_spec_n_max = nmax_trace.at(best_n_max);
                 checkpoint("draft depth");
                 common_moe_stage_end();
                 // The whole speculative-decoding stage wrote no row, so a model
