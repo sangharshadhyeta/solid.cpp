@@ -6768,25 +6768,35 @@ static void common_moe_apply_prefill_knobs(const common_moe_calibration_entry & 
     }
 }
 
+// The calibrated quality knobs, applied from exactly one place and on every
+// launch. None of them depends on placement, context size, or whether --fit
+// ran: the substitution floor is a router-quality boundary and neuron-reduce
+// is a magnitude threshold on expert weights.
+//
+// This has now escaped twice. First they lived inside the placement branch, so
+// pinning -ngl dropped them; then they moved up into
+// common_maybe_raise_moe_for_ctx, which only runs when --fit is on, so
+// `-fit off` (or an explicit -ncmoe placement, which is how one reaches a
+// large context on a card this size) dropped them just as silently. The
+// failure is invisible from the outside and identical every time: without the
+// floor, moe_cache_substitute_min_rank falls back to its pace-driven default
+// of 10, no rank_bucket in a top-k router ever reaches it, and the gate never
+// runs - substitutions 0, declined 0, with a cache that is otherwise filling
+// and hitting normally.
+//
+// So it is deliberately NOT guarded by anything. Add new calibrated settings
+// that do not depend on placement here, not in a caller.
+static void common_moe_apply_calibrated_quality(const char * path_model, common_params & params) {
+    common_moe_calibration_entry cal_q;
+    if (common_moe_calibration_lookup(path_model, params, cal_q)) {
+        common_moe_apply_quality_knobs(cal_q);
+        common_moe_apply_prefill_knobs(cal_q, params);
+    }
+}
+
 static bool common_maybe_raise_moe_for_ctx(
         const char * path_model, common_params & params,
         llama_model_params & mparams, const llama_context_params & cparams) {
-    // Quality knobs first, and independently of whether the placement below is
-    // usable. Neither depends on layer residency: the substitution floor is a
-    // router-quality boundary and neuron-reduce is a magnitude threshold on
-    // expert weights, so both survive an -ngl the entry was not measured at.
-    // They used to live inside the placement branch, which meant pinning -ngl
-    // (or any placement mismatch) silently dropped them - the same class of
-    // gap as the one recorded in that branch's own comment, where a measured
-    // substitute_min_rank was cached and then never applied at serving.
-    {
-        common_moe_calibration_entry cal_q;
-        if (common_moe_calibration_lookup(path_model, params, cal_q)) {
-            common_moe_apply_quality_knobs(cal_q);
-            common_moe_apply_prefill_knobs(cal_q, params);
-        }
-    }
-
     // Only meaningful for an explicit request. n_ctx == 0 ("auto") means the
     // user expressed no preference, so there is no context to protect and the
     // existing post-fit autoplace path already handles it.
@@ -6998,6 +7008,11 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     pimpl(new impl{}) {
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
+
+    // Unconditional, and before the --fit branch below: these do not depend on
+    // fit, placement or context, and every previous home for them turned out to
+    // be behind a guard that some ordinary launch failed to satisfy.
+    common_moe_apply_calibrated_quality(params.model.path.c_str(), params);
 
     if (params.fit_params) {
         // must run before common_fit_params() - see the function's own comment
