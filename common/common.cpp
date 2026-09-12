@@ -3148,9 +3148,26 @@ static double common_moe_bench_candidate_server(
         //
         // kill(pid, 0) answers the question that actually matters - is there
         // still a process there - and does not care who reaps it.
+        // kill(pid, 0) is the ONLY valid liveness test here, because the
+        // candidate is not our child: `cmd` backgrounds llama-server through a
+        // shell and echoes its pid, so the shell is reaped immediately and the
+        // server is a grandchild. waitpid on it therefore returns -1/ECHILD on
+        // every single poll - which is why the original `== pid` test never
+        // fired and a candidate that died in five seconds sat out the whole
+        // 600s backstop.
+        //
+        // Treating that ECHILD as "exited" is the trap, and it is worse than
+        // the bug it looks like it fixes: ECHILD is the NORMAL state for this
+        // pid, so every candidate gets declared dead on its first poll while
+        // it is still loading, and the process is then leaked holding the
+        // whole GPU. Measured directly: one leaked candidate held 11.6 GiB of
+        // a 12 GiB card and every launch after it died on cudaMalloc.
+        //
+        // waitpid is kept only for the case where the pid really is a child
+        // (it costs nothing and is correct there); ESRCH from kill is what
+        // actually decides.
         int status = 0;
-        const pid_t w = waitpid(pid, &status, WNOHANG);
-        if (w == pid || (w < 0 && errno == ECHILD)) {
+        if (waitpid(pid, &status, WNOHANG) == pid) {
             child_exited = true;
             break;
         }
