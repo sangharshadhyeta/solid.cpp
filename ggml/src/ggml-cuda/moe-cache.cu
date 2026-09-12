@@ -486,6 +486,14 @@ struct moe_cache_device {
     // thing that can be wrong before this mechanism has proven the basic
     // shape works at all.
     std::unordered_map<const void *, std::vector<float>> predictor_weights;
+    // The most recent hidden state seen for each tensor, kept so consumers
+    // other than training can score against it. Training owns the weights and
+    // reads its activations from the queued request; eviction and substitution
+    // run at different moments in the same decode step and have no request of
+    // their own, so without this the learned signal is reachable from exactly
+    // one place. Same layout as moe_cache_train_request::acts, context dims
+    // appended, so one scoring function serves every caller.
+    std::unordered_map<const void *, std::vector<float>> predictor_last_acts;
     // Set once per tensor, from that tensor's first training example's own
     // acts.size() (raw activation width + MOE_CACHE_TRAIN_CONTEXT_DIMS).
     // Genuinely PER-TENSOR, not a single model-wide scalar: ffn_gate_exps/
@@ -2233,6 +2241,11 @@ static void moe_cache_lookahead_report(const moe_cache_device & device) {
     }
 }
 
+// Defined with the rest of the predictor, far below; eviction is one of its
+// consumers and sits above it.
+static double moe_cache_predictor_score(const moe_cache_device & device, const moe_cache_key & key);
+static double moe_cache_predictor_evict_weight();
+
 static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_pool & pool,
         const moe_cache_slot & slot, double * out_base = nullptr, double cap_ref = -1.0) {
     const double base = (double) slot.heat * moe_cache_cost_tier_weight(device, slot.key);
@@ -2256,7 +2269,25 @@ static double moe_cache_weighted_heat(const moe_cache_device & device, const moe
         : moe_cache_atlas_align_protect_cap_fraction() * pool.heat_scale_ema *
               moe_cache_cost_tier_weight(device, slot.key);
     const double bias = std::min((double) align * strength * (double) MOE_CACHE_HEAT_STEP, cap);
-    return base + std::max(0.0, bias);
+    double out = base + std::max(0.0, bias);
+
+    // Predictor protection: do not evict what the prerouter says is about to
+    // be wanted. Deliberately the same shape as the atlas bias above - an
+    // additive, CAPPED bonus on heat, never a veto - so a confident predictor
+    // can delay an eviction but can never pin a slot against real demand.
+    // Weight defaults to 0 (no effect) until a calibration stage measures it:
+    // this is the mechanism that admits on guesses, and guesses cost real
+    // slots (the ring at 5% took the hit rate from 28.8% to 6.4%).
+    const double pw = moe_cache_predictor_evict_weight();
+    if (pw > 0.0) {
+        const double p = moe_cache_predictor_score(device, slot.key);
+        // p is a probability in (0,1); 0.5 is "no opinion" for an untrained
+        // weight vector, so only the half above it protects anything.
+        if (p > 0.5) {
+            out += std::min((p - 0.5) * 2.0 * pw * (double) MOE_CACHE_HEAT_STEP, cap);
+        }
+    }
+    return out;
 }
 
 // protected_ is capped at half the pool - the structural fix for the
@@ -9044,6 +9075,62 @@ static double moe_cache_predictor_admit_confidence(const moe_cache_device & devi
 // and leaving it in the set would let the SAME admission also count as
 // "against" later when it eventually gets evicted (everything resident
 // eventually is), double-counting one outcome as both good and bad.
+// The learned score for one expert, against the most recent hidden state seen
+// for its tensor. This is the whole point of training a prerouter: the signal
+// is not admission-specific, it is an estimate of "is this expert about to be
+// wanted", and admission, eviction and substitution are three different
+// questions asked of that same estimate.
+//
+//   admission   - warm what is about to be wanted (already wired)
+//   eviction    - do not throw away what is about to be wanted
+//   substitution- when standing in, prefer what is about to be wanted anyway
+//
+// Returns 0 when nothing is known (no weights, no activations, dimension
+// mismatch), which every caller treats as "no opinion" rather than "no" - an
+// untrained predictor must not be able to push a decision around.
+static double moe_cache_predictor_score(const moe_cache_device & device, const moe_cache_key & key) {
+    const auto wit = device.predictor_weights.find(key.tensor);
+    if (wit == device.predictor_weights.end() || key.expert < 0) {
+        return 0.0;
+    }
+    const auto ait = device.predictor_last_acts.find(key.tensor);
+    if (ait == device.predictor_last_acts.end()) {
+        return 0.0;
+    }
+    const auto dit = device.predictor_hidden_dim.find(key.tensor);
+    if (dit == device.predictor_hidden_dim.end()) {
+        return 0.0;
+    }
+    const int64_t hidden_dim = dit->second;
+    if (hidden_dim <= 0 || (int64_t) ait->second.size() != hidden_dim) {
+        return 0.0;
+    }
+    const size_t off = (size_t) key.expert * (size_t) hidden_dim;
+    if (off + (size_t) hidden_dim > wit->second.size()) {
+        return 0.0;
+    }
+    const float * w = wit->second.data() + off;
+    const float * h = ait->second.data();
+    double score = 0.0;
+    for (int64_t d = 0; d < hidden_dim; d++) {
+        score += (double) w[d] * (double) h[d];
+    }
+    // Squashed to (0,1) so callers can mix it with their own scales without
+    // an unbounded term swamping them.
+    return 1.0 / (1.0 + std::exp(-std::max(-30.0, std::min(30.0, score))));
+}
+
+// How much the predictor may protect a resident expert from eviction, as a
+// multiplier on its heat. 0 disables it entirely (the default until measured).
+static double moe_cache_predictor_evict_weight() {
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", 0.0);
+}
+
+// How much the predictor may influence the choice of stand-in. 0 disables it.
+static double moe_cache_predictor_substitute_weight() {
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT", 0.0);
+}
+
 static void moe_cache_predictor_note_hit(moe_cache_device & device, const moe_cache_key & key) {
     if (!moe_cache_train_predictor_enabled() || device.predictor_admitted.empty()) {
         return;
@@ -9446,6 +9533,11 @@ static void moe_cache_train(
         req.acts.push_back(ry);
     }
     req.ids.assign(ids, ids + n_ids_per_token);
+    // Publish this token's input for the non-training consumers. Copied from
+    // the request rather than recomputed, so every consumer scores against
+    // exactly the activations training saw - the alternative is two sources
+    // that drift apart silently.
+    device.predictor_last_acts[node->host_base] = req.acts;
     (void) act_stride;
     (void) n_tokens;
     device.train_queue.push_back(std::move(req));
@@ -9652,6 +9744,7 @@ static int moe_cache_substitute_pick_hot(
     int best_slot = -1;
     uint16_t best_heat = 0;
     uint32_t best_count = 0;
+    double   best_pred = -1.0;
     int examined = 0;
     uint64_t coact_sum = 0;
     double   coact_sq  = 0.0;
@@ -9688,7 +9781,32 @@ static int moe_cache_substitute_pick_hot(
             // Co-activation is the signal that actually answers "have these
             // two ever done the same job", so it decides, and popularity only
             // separates equals.
-            if (count > best_count || (count == best_count && slot.heat > best_heat)) {
+            // Predictor as the tiebreak among EQUALS only, never above
+            // co-activation. Substitution is a resemblance question - "have
+            // these two ever done the same job" - and the prerouter answers a
+            // different one, "is this about to be wanted". Letting the latter
+            // outrank the former would repeat exactly the heat-first mistake
+            // described above, which measured fidelity 0.33 against the
+            // substitution-free reference while still reading as fluent text.
+            // So it only separates candidates co-activation cannot, where the
+            // alternative tiebreak is raw popularity - and there, "about to be
+            // wanted" is the better of two weak signals. Off (weight 0) until
+            // a stage measures it.
+            const double sw = moe_cache_predictor_substitute_weight();
+            bool better;
+            if (count != best_count) {
+                better = count > best_count;
+            } else if (sw > 0.0) {
+                const double cand_p = moe_cache_predictor_score(device, moe_cache_key{host_base, cand});
+                better = cand_p > best_pred + 1e-9 ||
+                         (std::abs(cand_p - best_pred) <= 1e-9 && slot.heat > best_heat);
+                if (better) {
+                    best_pred = cand_p;
+                }
+            } else {
+                better = slot.heat > best_heat;
+            }
+            if (better) {
                 best_heat  = slot.heat;
                 best_count = count;
                 best_slot  = found->second;

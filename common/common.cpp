@@ -1665,6 +1665,10 @@ struct common_moe_calibration_entry {
     // GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR since it was written - the same
     // opt-in trap the substitution floor was in. -1 = not calibrated.
     int         train_predictor  = -1;
+    // What the trained prerouter is allowed to influence beyond admission.
+    // -1 = not calibrated; 0 = no influence.
+    double      predictor_evict_w = -1.0;
+    double      predictor_sub_w   = -1.0;
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1852,6 +1856,14 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         setenv(name, std::to_string(v).c_str(), 1);
 #endif
     };
+    auto set_env_double = [](const char * name, double v) {
+        const std::string s = string_format("%.6g", v);
+#if defined(_WIN32)
+        _putenv_s(name, s.c_str());
+#else
+        setenv(name, s.c_str(), 1);
+#endif
+    };
     // Neuron subsetting. 0 is a measured answer ("off won"), and the feature
     // defaults to ON, so it has to be switched off explicitly - the old form only
     // ever turned it on, which meant a measured-off result could not be expressed.
@@ -1905,6 +1917,15 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR", cal.train_predictor);
         LOG_WRN("%s: live-trained prerouter %s (calibrated)\n", __func__,
                 cal.train_predictor ? "on" : "off");
+    }
+
+    if (cal.predictor_evict_w >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT")) {
+        set_env_double("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", cal.predictor_evict_w);
+        LOG_WRN("%s: prerouter eviction protection at weight %.2f (calibrated)\n", __func__, cal.predictor_evict_w);
+    }
+    if (cal.predictor_sub_w >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT")) {
+        set_env_double("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT", cal.predictor_sub_w);
+        LOG_WRN("%s: prerouter substitution tiebreak at weight %.2f (calibrated)\n", __func__, cal.predictor_sub_w);
     }
 
     if (cal.atlas_prewarm_k > 0 && !getenv("LLAMA_PROMPT_CACHE_MOE_PREWARM")) {
@@ -2044,6 +2065,8 @@ static bool common_moe_calibration_lookup(
         out.substitute_atlas       = e.value("substitute_atlas", -1);
         out.atlas_prewarm_k        = e.value("atlas_prewarm_k", -1);
         out.train_predictor        = e.value("train_predictor", -1);
+        out.predictor_evict_w      = e.value("predictor_evict_w", -1.0);
+        out.predictor_sub_w        = e.value("predictor_sub_w", -1.0);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -2116,6 +2139,8 @@ static void common_moe_calibration_save(
         {"substitute_atlas", entry.substitute_atlas},
         {"atlas_prewarm_k", entry.atlas_prewarm_k},
         {"train_predictor", entry.train_predictor},
+        {"predictor_evict_w", entry.predictor_evict_w},
+        {"predictor_sub_w", entry.predictor_sub_w},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -5722,6 +5747,66 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // What the trained prerouter is allowed to influence beyond admission.
+    // The learned score answers "is this expert about to be wanted", and that
+    // is useful to more than one consumer: eviction should not discard what is
+    // about to be wanted, and substitution - when it has no better way to
+    // separate two equally-plausible stand-ins - may as well prefer one that
+    // is wanted anyway. Both ship at weight 0 and are measured here.
+    //
+    // Only worth spending budget on when the predictor itself won: with it
+    // off there is no score to weight, and every candidate here would measure
+    // the same thing twice.
+    double best_pred_evict_w = -1.0;
+    double best_pred_sub_w   = -1.0;
+    if (best_train_predictor > 0 && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring what the prerouter may influence beyond admission ...\n", __func__);
+        common_moe_calibration_status_set("measuring prerouter influence");
+        common_moe_stage_begin("prerouter influence", 3);
+        double best_infl_tps = -1.0;
+        struct infl_cand { const char * label; double evict_w; double sub_w; };
+        const infl_cand cands[] = {
+            { "admission only",          0.0, 0.0 },
+            { "+ eviction protection",   1.0, 0.0 },
+            { "+ substitution tiebreak", 1.0, 1.0 },
+        };
+        for (const auto & c : cands) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_env(string_format(
+                    "GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 "
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT=%.3f "
+                    "GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT=%.3f", c.evict_w, c.sub_w));
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   prerouter %s -> %s\n", __func__, c.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("prerouter influence", c.label,
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            if (tps > best_infl_tps) {
+                best_infl_tps    = tps;
+                best_pred_evict_w = c.evict_w;
+                best_pred_sub_w   = c.sub_w;
+            }
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.predictor_evict_w = best_pred_evict_w;
+        entry.predictor_sub_w   = best_pred_sub_w;
+        checkpoint("prerouter influence");
+        if (best_pred_evict_w >= 0.0) {
+            LOG_INF("%s: prerouter influence: evict %.2f sub %.2f at %.2f tok/s\n", __func__,
+                    best_pred_evict_w, best_pred_sub_w, best_infl_tps);
+            common_moe_calibration_status_note("prerouter influence",
+                    string_format("evict %.2f sub %.2f", best_pred_evict_w, best_pred_sub_w),
+                    string_format("SELECTED - %.2f tok/s", best_infl_tps), true, true);
+        }
+    }
+
     // Prediction ring: how much of each pool the router lookahead may use. At full
     // occupancy a prediction otherwise has nowhere to go; too large a ring takes
     // slots from experts that were really demanded. Measured on decode, as served
@@ -6205,6 +6290,8 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
+    entry.predictor_evict_w      = best_pred_evict_w;
+    entry.predictor_sub_w        = best_pred_sub_w;
     // -1 ("not calibrated / use default") when full GPU residency won its own
     // search above - only recorded as an explicit override when giving up
     // some GPU-resident layers actually measured faster.
