@@ -814,6 +814,89 @@ against admission alone (+2.75pp, 4 of 4); and hit rate itself turned out to be 
 rate, is the objective here.</p>
 </section>
 
+<section id="prerouter">
+<div class="eyebrow">A predictor that trains itself while it serves</div>
+<h2>The prerouter: learning which experts are coming, one layer ahead</h2>
+<p class="section-lede">The expert cache decides what to keep. A prerouter decides what is about to be
+<em>wanted</em> &mdash; a small logistic model over the hidden state, trained by SGD on every real routing
+decision the model makes, with labels that cost nothing because the router produces them a layer later.</p>
+
+<p>It was already in the tree, and it had never once been switched on. <code>TRAIN_PREDICTOR</code> defaulted
+to 0 and appeared nowhere in the calibration path, so every run this fork had ever done served with it off
+&mdash; the same opt-in trap that had already hidden the substitution floor. Making it a measured stage is what
+produced every number below, and three of them changed the design.</p>
+
+<table>
+<colgroup><col style="width:46%"><col style="width:27%"><col style="width:27%"></colgroup>
+<thead><tr><th>What was compared (gemma-4 26B, probe regime)</th><th>Without</th><th>With</th></tr></thead>
+<tbody>
+<tr><td><strong>The predictor at all</strong> &mdash; trained on calibration's own traffic, then frozen</td><td>50.16 tok/s</td><td><strong>60.93 tok/s</strong></td></tr>
+<tr><td><strong>Predicting the next layer</strong> rather than the layer already routing</td><td>59.20 tok/s</td><td><strong>70.00 tok/s</strong></td></tr>
+<tr><td><strong>The n-gram (PLE) embedding</strong> as an input feature</td><td>49.88 tok/s</td><td><strong>70.00 tok/s</strong></td></tr>
+<tr><td>A hashed block of the previous layer's selection, fused with the hidden state</td><td>70.00 tok/s</td><td>66.57 tok/s &mdash; rejected</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem"><strong>Trained same-layer, it is not a prerouter at all.</strong> It learns which
+experts <em>this</em> layer wants from an input the real router is about to answer exactly &mdash; so the score
+can only ever rank experts outside the current selection. Pairing the previous layer's features with this
+layer's decision asks a question nothing else has answered yet, and that is the only version prefetch can
+spend. The pairing crosses a real layer boundary only: one logical layer dispatches several expert tensors off
+a single routing decision, and without that check most &ldquo;transitions&rdquo; are a layer paired with itself
+&mdash; measured at 45 of 64 exported cross-layer edges.</p>
+
+<p><strong>The architecture's own n-gram table turned out to be the most valuable input in the run.</strong>
+Qwen3.8-Flash-Next gathers its per-layer n-gram embedding once, before the layer loop, and injects a slice into
+every layer's residual &mdash; so it is a component of the next layer's input that is known exactly, now, while
+the hidden state is stale by one layer's residual. That staleness is precisely what caps router lookahead at
+59.3%. Removing the n-gram block costs more than any other lever measured here: 70.00 &rarr; 49.88 tok/s.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">One score, three consumers &mdash; and only one of them won</h3>
+
+<p>The learned score answers &ldquo;is this expert about to be wanted&rdquo;, which is not an admission-specific
+question. Admission, eviction and substitution are three different things to ask of the same estimate, so all
+three were measured.</p>
+
+<table>
+<colgroup><col style="width:46%"><col style="width:27%"><col style="width:27%"></colgroup>
+<thead><tr><th>Consumer</th><th>Needs a free slot?</th><th>Measured</th></tr></thead>
+<tbody>
+<tr><td>Admission &mdash; fetch it before it is asked for</td><td>yes</td><td>56.59 tok/s &mdash; <em>hurts</em></td></tr>
+<tr><td><strong>Eviction protection</strong> &mdash; do not discard what is about to be wanted</td><td>no</td><td><strong>71.41 tok/s</strong></td></tr>
+<tr><td>Substitution tiebreak &mdash; among equals, prefer what is wanted anyway</td><td>no</td><td>52.81 tok/s &mdash; <em>hurts</em></td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">On a model whose working set is largely resident, the prerouter pays off as a
+<strong>retention policy, not a prefetcher</strong> &mdash; there is little to fetch but plenty worth not
+losing. That result is consistent with the prediction ring measuring best at 0% in the same run: the ring
+exists to give admissions somewhere to land, and admission is the consumer that lost. Whether this inverts on a
+model that does not fit &mdash; where a miss costs a real NVMe fetch &mdash; is the open question, and is being
+measured on Qwen3.8-Flash-Next now.</p>
+
+<div class="callout">
+<p><strong>The measurement was nearly worthless, twice, and both times for the same reason.</strong> The
+predictor admits through a suggestion-only path whose own comment records that
+<code>pool.free_slots</code> &ldquo;empties permanently within the first few tokens of any real run&rdquo; &mdash;
+so every prediction was being discarded for want of a slot, and the stage would have reported that the
+predictor does not help about a mechanism that was never allowed to act. Giving that path eviction rights is
+<em>not</em> the fix: that was built, measured worse (&minus;6.55pp), and reverted. The prediction ring is the
+middle path, where a prediction displaces only an older prediction and never a resident expert. Separately, the
+on/off arms had to carry the same ring as each other &mdash; the ring moves throughput on its own, so an A/B
+where only the &ldquo;on&rdquo; arm has one measures the ring, not the predictor.</p>
+</div>
+
+<div class="callout">
+<p><strong>Stated plainly: this is not yet an end-to-end win.</strong> Every figure above is the calibration
+probe regime, and this hardware shows &plusmn;10% run-to-run variance on identical configurations (<code>ncmoe=21</code>
+measured 68.39 and 61.47 tok/s an hour apart). The three comparisons point the same way, which is what makes
+them worth reporting &mdash; but the full calibrated combination validates at <strong>58.94 tok/s</strong>, and
+no like-for-like run of that same combination <em>without</em> the predictor has been measured yet. Until that
+exists, the honest claim is that the mechanism works and the direction is consistent, not that throughput
+improved.</p>
+</div>
+</section>
+
 <section id="sparse-activation">
 <div class="eyebrow">Below the expert: individual neurons</div>
 <h2>Sparse activation: not every neuron in a hot expert earns its VRAM</h2>
