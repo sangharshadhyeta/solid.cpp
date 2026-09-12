@@ -12,7 +12,8 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
-#include "../../src/llama-ext.h" // llama_model_n_expert - not part of the public API surface
+#include "../../src/llama-ext.h" // llama_model_n_expert, llama_ple_aux_features - not part of the public API surface
+#include "ggml-backend-moe-cache.h" // set_aux_features: the drafted tokens' PLE, handed over before verification
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -3389,6 +3390,51 @@ private:
         // generate the actual drafts (if any)
         {
             common_speculative_draft(spec.get());
+        }
+
+        // Hand the drafted tokens' n-gram identity to the expert cache, before
+        // the target verifies them.
+        //
+        // This is the only point in the loop where the tokens the target is
+        // about to process are known and the target has not started. A verify
+        // pass's expert demand is the union of those tokens' routing, and that
+        // union is the largest cost a draft imposes - measured at 64k, a draft
+        // accepting 0.97 of what it proposed still lost to no draft at all, on
+        // what its verify pass costs rather than on prediction quality.
+        //
+        // The predictor's usual input is the hidden state at the MoE op, which
+        // gives it one layer of lead. Here it gets the whole draft's worth,
+        // because the PLE is a pure lookup on token ids: no forward pass, no
+        // graph, no KV cache. That is the difference between a prediction that
+        // can be acted on and one that arrives with the work it was meant to
+        // avoid.
+        if (ggml_moe_cache.set_aux_features) {
+            iterate(drafting, [&](server_slot & slot) {
+                if (slot.spec_draft.empty()) {
+                    return;
+                }
+                // The last drafted token with its predecessors as context: the
+                // deepest position the target will verify, so the furthest
+                // ahead this can usefully see. Earlier positions are closer to
+                // what the graph-time hook already provides.
+                llama_tokens ctx_toks;
+                const int n_prev = 8;   // more than any ngram_size this arch uses
+                const auto & pt = slot.prompt.tokens;
+                const int have = (int) pt.size();
+                for (int i = std::max(0, have - n_prev); i < have; i++) {
+                    ctx_toks.push_back(pt[i]);
+                }
+                for (const llama_token t : slot.spec_draft) {
+                    ctx_toks.push_back(t);
+                }
+                float feats[32];
+                const int n = llama_ple_aux_features(llama_get_model(slot.ctx_tgt),
+                                                     ctx_toks.data(), (int) ctx_toks.size(),
+                                                     feats, (int) (sizeof(feats)/sizeof(feats[0])));
+                if (n > 0) {
+                    ggml_moe_cache.set_aux_features(feats, n);
+                }
+            });
         }
 
         // make checkpoints if needed
