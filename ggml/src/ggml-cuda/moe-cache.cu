@@ -1205,6 +1205,27 @@ struct moe_cache_device {
     // are looking at genuinely different things and the ring is shared rather
     // than reinforced.
     long long ring_corroborated     = 0;
+    // How much wider a batch's expert demand is than a single token's.
+    //
+    // This is the question of whether speculative decoding actually saves the
+    // target any work on a model whose experts do not fit. On a dense model,
+    // verifying N drafted tokens in one batch costs about what one token costs
+    // - the weights are loaded once and applied N+1 times, which is the whole
+    // win. On a sparse MoE model whose experts stream, each token routes
+    // somewhere different, so the batch's demand is the UNION over N+1 tokens
+    // and the pass can touch several times the experts a single token would.
+    // Then the usual amortisation inverts: more tokens per batch means more
+    // distinct experts, and every non-resident one costs.
+    //
+    // plan_tokens/plan_distinct accumulate the batch width and the distinct
+    // expert count actually demanded, so the ratio against top_k says whether
+    // consecutive tokens route alike (the union stays small, verification is
+    // nearly free) or independently (the union grows with width, and that is
+    // where the draft's throughput is going).
+    long long plan_tokens   = 0;
+    long long plan_ids      = 0;
+    long long plan_distinct = 0;
+    long long plan_calls    = 0;
     // Per-mechanism precision, on the SAME basis: predictions each mechanism
     // put into the ring, and how many of those the router then actually asked
     // for. Indexed by the spec_src bit pattern (1 lookahead, 2 prerouter,
@@ -7054,6 +7075,21 @@ static void moe_cache_session_destroy(void * opaque) {
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+            if (d.plan_calls > 0 && d.plan_tokens > 0) {
+                const double tok_per_call  = (double) d.plan_tokens / (double) d.plan_calls;
+                const double ids_per_tok   = (double) d.plan_ids / (double) d.plan_tokens;
+                const double dist_per_call = (double) d.plan_distinct / (double) d.plan_calls;
+                // If consecutive tokens routed identically, distinct would equal
+                // top_k however wide the batch. If they route independently it
+                // approaches top_k * batch width. Where it lands between those
+                // is exactly how much work speculative decoding saves - or
+                // costs - on a model whose experts do not fit.
+                fprintf(stderr, "[moe-cache] SUMMARY CUDA%d batch width: %.2f tokens/dispatch, top_k %.1f, "
+                        "%.1f distinct experts demanded (%.2fx one token's worth - 1.00 means the tokens "
+                        "route alike and verification is nearly free, %.2f would mean no overlap at all)\n",
+                        d.physical, tok_per_call, ids_per_tok, dist_per_call,
+                        ids_per_tok > 0.0 ? dist_per_call / ids_per_tok : 0.0, tok_per_call);
+            }
             if (d.spec_admitted[1] || d.spec_admitted[2] || d.spec_admitted[3]) {
                 static const char * who[4] = { "-", "lookahead", "prerouter", "both agreeing" };
                 for (int i = 1; i < 4; i++) {
@@ -8160,6 +8196,34 @@ static bool moe_cache_neuron_heat_enabled() {
 // GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK, if the user sets it, still wins
 // outright - same "never override an explicit choice" rule as everywhere
 // else in this file.
+// The substitution floor for a VERIFY pass, which can afford to be lower than
+// the floor for ordinary generation.
+//
+// This is the "reading versus writing" distinction made concrete. When the
+// target processes a batch of N+1 positions to check N drafted tokens, its job
+// at those positions is a COMPARISON, not a token: accept the draft's token or
+// reject it. Every token that comes out of an accepted position is the draft's
+// own token, exact, computed by the draft with its own weights - the target's
+// substituted experts never appear in it. What a stand-in can change at a
+// verified position is whether the comparison came out accept or reject.
+//
+// So the cost of substituting during verify is measured in acceptance, not in
+// output fidelity, and acceptance is something this file already measures
+// continuously. Whereas substituting during ordinary generation puts an
+// approximate expert directly into a token the user reads, which is why that
+// floor is conservative and gated on the router's own confidence ordering.
+//
+// That asymmetry matters because the verify pass is exactly where the expert
+// demand is widest: it is the pass that touches N+1 tokens' worth of routing
+// at once, and on a model whose experts do not fit, that width is where the
+// draft's throughput goes. Allowing it to lean harder on resident stand-ins is
+// the one lever that reduces the work without reducing what is verified.
+//
+// -1 means "use the ordinary floor", i.e. exactly today's behaviour.
+static int moe_cache_substitute_min_rank_verify() {
+    return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK_VERIFY", -1);
+}
+
 static int moe_cache_substitute_min_rank(moe_cache_device & device) {
     // -1 means "no pin, use the pace-driven floor below"; a live override lands here.
     const int pinned = moe_cache_tunable_int_scoped("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK", -1);
@@ -10903,6 +10967,31 @@ static int moe_cache_plan(
             fflush(stderr);
         }
     }
+    // Batch width vs distinct expert demand, always counted - this is the
+    // number that says whether verifying N drafted tokens costs the target one
+    // token's worth of expert traffic or N tokens' worth. Bounded work: one
+    // pass over n_ids (at most GGML_MOE_CACHE_MAX_BATCH_ROWS) against a small
+    // stack bitmap, no allocation.
+    if (n_ids > 0 && node->n_expert > 0 && node->n_expert <= 4096) {
+        uint64_t seen[64] = {0};   // 4096 bits
+        int distinct = 0;
+        for (int i = 0; i < n_ids; i++) {
+            const int32_t e = ids[i];
+            if (e < 0 || e >= (int32_t) node->n_expert) {
+                continue;
+            }
+            const int w = e >> 6, b = e & 63;
+            if (!(seen[w] & (1ull << b))) {
+                seen[w] |= 1ull << b;
+                distinct++;
+            }
+        }
+        device.plan_tokens   += node->n_tokens > 0 ? node->n_tokens : 1;
+        device.plan_ids      += n_ids;
+        device.plan_distinct += distinct;
+        device.plan_calls++;
+    }
+
     const int rank_top_k = (node->n_tokens > 0 && n_ids >= node->n_tokens)
         ? (int) (n_ids / node->n_tokens) : 0;
 
@@ -11218,8 +11307,19 @@ static int moe_cache_plan(
         // available via GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK for anyone
         // who wants the router's most-confident picks to always pay exact
         // compute regardless of residency.
+        // A batch wider than one token in decode IS a verify pass: ordinary
+        // decode presents one token at a time, and only speculative
+        // verification presents several. Prefill is excluded because the
+        // cache's own width cap keeps it out of this path entirely.
+        const int min_rank_here = [&]() {
+            const int v = moe_cache_substitute_min_rank_verify();
+            if (v >= 0 && node->n_tokens > 1) {
+                return v;
+            }
+            return moe_cache_substitute_min_rank(device);
+        }();
         if (moe_cache_substitute_enabled() && !moe_cache_scope_exact() && slot_indices[index] < 0 &&
-            rank_bucket >= moe_cache_substitute_min_rank(device) &&
+            rank_bucket >= min_rank_here &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
             // Hot-loaded-first by default (2026-09-04): picks the hottest
             // currently-resident expert for this tensor, tiebroken by
