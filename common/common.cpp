@@ -7101,12 +7101,21 @@ void common_moe_calibrate(common_params & params) {
         common_moe_stage_begin("prerouter influence", 5);
         double best_infl_tps = -1.0;
         struct infl_cand { const char * label; int admit; double evict_w; double sub_w; };
+        // The roles are assigned now, not searched: lookahead owns admission
+        // because it is punctual, the prerouter owns retention because a late
+        // prediction still tells you what not to discard. Two models agreed
+        // and the timing argument explains why (see spec_src in moe-cache.cu).
+        //
+        // So this measures the role's STRENGTH, plus two arms that can still
+        // falsify it: "inert" as the floor, and "admission too" in case a
+        // model exists where the prerouter's queue is never contended and it
+        // can be punctual after all.
         const infl_cand cands[] = {
-            { "nothing (trained, inert)", 0, 0.0, 0.0 },
-            { "admission only",           1, 0.0, 0.0 },
-            { "eviction protection",      0, 1.0, 0.0 },
-            { "eviction + substitution",  0, 1.0, 1.0 },
-            { "admission + eviction",     1, 1.0, 0.0 },
+            { "inert (floor)",                  0, 0.0, 0.0 },
+            { "eviction protection",            0, 1.0, 0.0 },
+            { "eviction, stronger",             0, 2.0, 0.0 },
+            { "eviction + substitution",        0, 1.0, 1.0 },
+            { "eviction + admission (falsify)", 1, 1.0, 0.0 },
         };
         for (const auto & c : cands) {
             if (common_moe_calibrate_budget_spent()) {
