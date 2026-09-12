@@ -4983,7 +4983,74 @@ void common_moe_calibrate(common_params & params) {
                             pa_tps[pa] > 0 ? string_format("%.2f tok/s (before the depth search)", pa_tps[pa])
                                            : std::string("failed"), pa_tps[pa] > 0);
                 }
-                const int pa_pick = (pa_tps[1] > 0 && pa_tps[1] > pa_tps[0]) ? 1 : (pa_tps[0] > 0 ? 0 : -1);
+                // Confirm before believing, and break a tie on acceptance.
+                //
+                // This knob shapes the whole depth search below it, so a
+                // verdict reached on a noise-sized margin is leverage applied
+                // to a coin flip. Measured at depth 3: exact-match 8.15 tok/s
+                // at 0.78 acceptance, probabilistic 7.88 at 0.94 - a 3.4% gap
+                // on a machine that has shown 10-20% between identical
+                // configurations all day.
+                //
+                // And 3.4% cannot be a real cost, because probabilistic
+                // acceptance does not do more work. The whole difference on
+                // the drafting side is one push_back of a probability the
+                // sampler has already computed (see result_probs in
+                // speculative.cpp); on the verify side it accepts on that
+                // probability instead of on exact match. More tolerant
+                // acceptance means more tokens survive each verify round and
+                // therefore FEWER rounds - it should be faster, not slower.
+                //
+                // So: re-measure when the gap is inside the noise, and if it
+                // stays inside it, take the mode that accepts more. Acceptance
+                // is the mechanism's actual output and it is measured over
+                // hundreds of tokens; throughput at this margin is not
+                // measuring anything.
+                int pa_pick = (pa_tps[1] > 0 && pa_tps[1] > pa_tps[0]) ? 1 : (pa_tps[0] > 0 ? 0 : -1);
+                if (pa_tps[0] > 0 && pa_tps[1] > 0) {
+                    const double hi  = std::max(pa_tps[0], pa_tps[1]);
+                    const double lo  = std::min(pa_tps[0], pa_tps[1]);
+                    const double gap = (hi - lo) / hi;
+                    if (gap < 0.10 && !common_moe_calibrate_budget_spent()) {
+                        LOG_INF("%s:   the two acceptance modes are %.1f%% apart, which is inside this "
+                                "machine's run-to-run spread - re-measuring both\n", __func__, 100.0 * gap);
+                        double acc[2] = { -1.0, -1.0 };
+                        double tps2[2] = { -1.0, -1.0 };
+                        for (int pa = 0; pa <= 1; pa++) {
+                            if (common_moe_calibrate_budget_spent()) {
+                                break;
+                            }
+                            g_moe_calib_prob_accept.store(pa);
+                            tps2[pa] = bench_with_retry(best_n, ref_depth,
+                                                        params.speculative.draft.mparams.path, n_threads_default);
+                            acc[pa] = g_moe_last_draft_n > 0.0
+                                ? g_moe_last_draft_n_accepted / g_moe_last_draft_n : -1.0;
+                            common_moe_calibration_status_candidate_done();
+                            LOG_INF("%s:   %s measured again -> %s (first %.2f)%s\n", __func__,
+                                    pa ? "probabilistic" : "exact-match",
+                                    tps2[pa] > 0 ? string_format("%.2f tok/s", tps2[pa]).c_str() : "failed",
+                                    pa_tps[pa], common_moe_last_acceptance_str().c_str());
+                        }
+                        if (tps2[0] > 0 && tps2[1] > 0) {
+                            const double m0 = (pa_tps[0] + tps2[0]) / 2.0;
+                            const double m1 = (pa_tps[1] + tps2[1]) / 2.0;
+                            const double mhi = std::max(m0, m1);
+                            if (mhi > 0.0 && (mhi - std::min(m0, m1)) / mhi < 0.10) {
+                                // Still a tie on throughput: decide on acceptance.
+                                pa_pick = (acc[1] >= 0.0 && acc[0] >= 0.0 && acc[1] > acc[0]) ? 1 : pa_pick;
+                                LOG_INF("%s: the two modes are within noise on throughput (%.2f vs %.2f "
+                                        "mean) - taking %s, which accepted %.2f against %.2f\n",
+                                        __func__, m0, m1, pa_pick ? "probabilistic" : "exact-match",
+                                        pa_pick ? acc[1] : acc[0], pa_pick ? acc[0] : acc[1]);
+                            } else {
+                                pa_pick = m1 > m0 ? 1 : 0;
+                                LOG_INF("%s: %s wins on the mean of two samples (%.2f vs %.2f)\n", __func__,
+                                        pa_pick ? "probabilistic" : "exact-match",
+                                        std::max(m0, m1), std::min(m0, m1));
+                            }
+                        }
+                    }
+                }
                 g_moe_calib_prob_accept.store(pa_pick);
                 if (pa_pick >= 0) {
                     entry.spec_prob_accept = pa_pick;
