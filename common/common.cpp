@@ -22,6 +22,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <cerrno>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -2707,6 +2708,13 @@ static std::string common_moe_calib_get_env() {
 // which is what exhausted the time budget and left the later stages - thread
 // count, cache size, fit margin - skipped in milliseconds.
 static constexpr double COMMON_MOE_TPS_REJECTED = -2.0;
+// The candidate's process died before it could serve - a model-load OOM, a bad
+// placement, a config this machine cannot hold. Deterministic: the same command
+// line will fail the same way, so retrying it buys nothing and costs a full
+// launch. Distinct from -1.0 ("did not happen", worth one retry) and from
+// REJECTED ("ran, output unusable"). Kept < 0 like the others so every
+// "tps > 0" ranking test is unaffected.
+static constexpr double COMMON_MOE_TPS_LAUNCH_FAILED = -3.0;
 
 // Sampling the calibration probes run under, and the values to quote when
 // anyone asks "how should this model be run".
@@ -3127,9 +3135,26 @@ static double common_moe_bench_candidate_server(
                 break;
             }
         }
-        // still loading, or gone? waitpid(WNOHANG) distinguishes the two.
+        // Still loading, or gone? Ask two ways, because one of them lies.
+        //
+        // waitpid(WNOHANG) only reports the exit if THIS process is the one
+        // that reaps it. When something else has already reaped the child it
+        // returns -1/ECHILD, which the == pid test reads as "still loading" -
+        // so a candidate that died in five seconds sat out the whole 600s
+        // backstop, twice over with the retry. Observed directly: a candidate
+        // OOMed on model load at 12:44:37 and was not declared dead until
+        // 12:54:24, and the message said "never became healthy" rather than
+        // "exited before serving", which is what pinned it on this test.
+        //
+        // kill(pid, 0) answers the question that actually matters - is there
+        // still a process there - and does not care who reaps it.
         int status = 0;
-        if (waitpid(pid, &status, WNOHANG) == pid) {
+        const pid_t w = waitpid(pid, &status, WNOHANG);
+        if (w == pid || (w < 0 && errno == ECHILD)) {
+            child_exited = true;
+            break;
+        }
+        if (kill(pid, 0) != 0 && errno == ESRCH) {
             child_exited = true;
             break;
         }
@@ -3142,7 +3167,10 @@ static double common_moe_bench_candidate_server(
         if (!child_exited) {
             cleanup();
         }
-        return -1.0;
+        // A process that exited before serving will exit again on the same
+        // command line - say so, so the caller does not spend a second launch
+        // proving it.
+        return child_exited ? COMMON_MOE_TPS_LAUNCH_FAILED : -1.0;
     }
 
     // /v1/chat/completions, not /completion: the raw completion endpoint
@@ -4054,7 +4082,7 @@ void common_moe_calibrate(common_params & params) {
                 self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
                 -1, -1, active_ngl, active_min_rank);
         // Retry only an infrastructure failure - a quality rejection is deterministic.
-        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
+        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED && tps != COMMON_MOE_TPS_LAUNCH_FAILED) {
             LOG_WRN("%s:   candidate sample failed, retrying ...\n", __func__);
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path, n_cpu_moe, n_max, n_threads, next_port(), ctx, n_predict, concurrency,
@@ -4455,6 +4483,27 @@ void common_moe_calibrate(common_params & params) {
                 }
                 n_failures = 0;
                 last_good = n; // the golden search may still land between this rung and the peak
+
+                // Stop doubling once the draft stops being believed, not only
+                // once the process dies. Acceptance is the direct measure of
+                // whether a wider draft is producing anything verification
+                // will keep, and it collapses well before the depth becomes
+                // unloadable: measured on Qwen3.8-Flash-Next at 64k, 0.91 /
+                // 0.83 / 0.87 at n-max 1/2/4 and then 0.40 at 8 - after which
+                // 16 and 32 were tried anyway and both died on a model-load
+                // OOM. Each of those cost a full launch plus the health
+                // backstop, for rungs the acceptance number had already ruled
+                // out. Half the tokens rejected means the next rung, which
+                // doubles the width again, cannot plausibly recover.
+                const double acc = g_moe_last_draft_n > 0.0
+                    ? g_moe_last_draft_n_accepted / g_moe_last_draft_n : -1.0;
+                if (acc >= 0.0 && acc < 0.5) {
+                    LOG_INF("%s: draft acceptance fell to %.2f at n-max %d - stopping the envelope search "
+                            "rather than doubling into widths the draft is no longer believed at\n",
+                            __func__, acc, n);
+                    break;
+                }
+
                 if (tps > best_so_far) {
                     best_so_far = tps;
                     n_below     = 0;
@@ -5225,7 +5274,7 @@ void common_moe_calibrate(common_params & params) {
                         self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                         concurrency, -1, -1, n, active_min_rank);
                 // Retry only an infrastructure failure - a quality rejection is deterministic.
-                if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
+                if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED && tps != COMMON_MOE_TPS_LAUNCH_FAILED) {
                     tps = common_moe_bench_candidate_server(
                             self_exe, path_model, sub_mtp_path, best_n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, n, active_min_rank);
@@ -5291,7 +5340,7 @@ void common_moe_calibrate(common_params & params) {
                             self_exe, path_model, sub_mtp_path, (uint32_t) n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                             concurrency, -1, -1, (int) best_ngl, active_min_rank);
                     // Retry only an infrastructure failure - a quality rejection is deterministic.
-                    if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
+                    if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED && tps != COMMON_MOE_TPS_LAUNCH_FAILED) {
                         tps = common_moe_bench_candidate_server(
                                 self_exe, path_model, sub_mtp_path, (uint32_t) n, sub_n_max, n_threads_default, next_port(), ctx, n_predict,
                                 concurrency, -1, -1, (int) best_ngl, active_min_rank);
@@ -5439,7 +5488,7 @@ void common_moe_calibrate(common_params & params) {
                 self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                 best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
         // Retry only an infrastructure failure - a quality rejection is deterministic.
-        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED) {
+        if (tps < 0 && tps != COMMON_MOE_TPS_REJECTED && tps != COMMON_MOE_TPS_LAUNCH_FAILED) {
             tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                     best_threads, next_port(), ctx, n_predict, concurrency, mb, -1, active_ngl, active_min_rank);
