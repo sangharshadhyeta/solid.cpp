@@ -1684,6 +1684,9 @@ struct common_moe_calibration_entry {
     // it holds ~1.4 GiB more than at 4k on this model, which is exactly the
     // margin every other stage has been failing by. Empty = not calibrated.
     std::string kv_type;
+    // The fused stand-in picker's signal weights. -1 = not calibrated.
+    double      sub_w_atlas       = -1.0;
+    double      sub_w_coact       = -1.0;
     int         reduced_share_pct    = -1;  // the arbiter's split: reduced pool's share of the budget
     int         admit_exact_weight   = -1;  // extra admission weight for un-substitutable demand
     int         predictor_admit      = -1;  // may it warm experts (needs a slot)
@@ -2000,6 +2003,12 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
     // number straight into SUBSTITUTE_ATLAS would set it to 3, which the cache
     // reads as "atlas on, some unknown variant", and the rank picker - the one
     // the stage actually chose - would never run.
+    if (cal.sub_w_atlas >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_SUB_W_ATLAS")) {
+        set_env_double("GGML_CUDA_MOE_CACHE_SUB_W_ATLAS", cal.sub_w_atlas);
+        set_env_double("GGML_CUDA_MOE_CACHE_SUB_W_COACT", cal.sub_w_coact);
+        LOG_WRN("%s: stand-in fusion weights atlas %.2f / co-activation %.2f (calibrated)\n",
+                __func__, cal.sub_w_atlas, cal.sub_w_coact);
+    }
     if (cal.substitute_atlas > 0 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS")) {
         if (cal.substitute_atlas == 4) {
             set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS", 4);
@@ -2148,6 +2157,8 @@ static bool common_moe_calibration_lookup(
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
         out.kv_type                = e.value("kv_type", std::string());
+        out.sub_w_atlas            = e.value("sub_w_atlas", -1.0);
+        out.sub_w_coact            = e.value("sub_w_coact", -1.0);
         out.reduced_share_pct      = e.value("reduced_share_pct", -1);
         out.admit_exact_weight     = e.value("admit_exact_weight", -1);
         out.predictor_admit        = e.value("predictor_admit", -1);
@@ -2230,6 +2241,8 @@ static void common_moe_calibration_save(
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
         {"kv_type", entry.kv_type},
+        {"sub_w_atlas", entry.sub_w_atlas},
+        {"sub_w_coact", entry.sub_w_coact},
         {"reduced_share_pct", entry.reduced_share_pct},
         {"admit_exact_weight", entry.admit_exact_weight},
         {"predictor_admit", entry.predictor_admit},
@@ -6465,6 +6478,61 @@ void common_moe_calibrate(common_params & params) {
             }
             common_moe_calib_set_env(std::string());
         }
+        // If the fusion won, measure the weights it won with rather than
+        // shipping the 1.0/1.0 they were written with. Two knobs added with
+        // guessed defaults and no stage measuring them is the same debt this
+        // file has spent the day paying off elsewhere - the prerouter at
+        // TRAIN_PREDICTOR=0, the substitution floor behind a fit guard,
+        // pick_rank behind an env var nothing set.
+        //
+        // The ratio is what matters, not the magnitude: scores are only ever
+        // compared against other candidates', so (1,1) and (2,2) rank
+        // identically. One axis swept with the other pinned covers everything
+        // that changes the ordering, and a weight at 0 reduces the fusion to
+        // the single-signal picker the modes above already measured - which
+        // makes those points the cross-check.
+        if (best_sub_atlas == 4 && !common_moe_calibrate_budget_spent()) {
+            double best_w_tps   = -1.0;
+            double best_w_atlas = 1.0, best_w_coact = 1.0;
+            for (const auto & w : { std::make_pair(1.0, 1.0), std::make_pair(1.0, 0.25),
+                                    std::make_pair(1.0, 4.0), std::make_pair(0.25, 1.0),
+                                    std::make_pair(4.0, 1.0) }) {
+                if (common_moe_calibrate_budget_spent()) {
+                    break;
+                }
+                common_moe_calib_set_env(string_format(
+                        "GGML_CUDA_MOE_CACHE_SUBSTITUTE_ATLAS=4 "
+                        "GGML_CUDA_MOE_CACHE_SUB_W_ATLAS=%.2f GGML_CUDA_MOE_CACHE_SUB_W_COACT=%.2f",
+                        w.first, w.second));
+                const double tps = common_moe_bench_candidate_server(
+                        self_exe, path_model, sub_mtp_path, best_n, sub_n_max, best_threads,
+                        next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                        active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+                common_moe_calibration_status_candidate_done();
+                LOG_INF("%s:   fusion weights atlas %.2f / coact %.2f -> %s\n", __func__,
+                        w.first, w.second,
+                        tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+                common_moe_calibration_status_note("stand-in fusion weights",
+                        string_format("atlas %.2f / coact %.2f", w.first, w.second),
+                        tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+                if (tps > best_w_tps) {
+                    best_w_tps   = tps;
+                    best_w_atlas = w.first;
+                    best_w_coact = w.second;
+                }
+            }
+            common_moe_calib_set_env(std::string());
+            if (best_w_tps > 0) {
+                entry.sub_w_atlas = best_w_atlas;
+                entry.sub_w_coact = best_w_coact;
+                LOG_INF("%s: stand-in fusion weights: atlas %.2f / coact %.2f at %.2f tok/s\n",
+                        __func__, best_w_atlas, best_w_coact, best_w_tps);
+                common_moe_calibration_status_note("stand-in fusion weights",
+                        string_format("atlas %.2f / coact %.2f", best_w_atlas, best_w_coact),
+                        string_format("SELECTED - %.2f tok/s", best_w_tps), true, true);
+            }
+        }
+
         entry.substitute_atlas = best_sub_atlas;
         checkpoint("stand-in selection");
         if (best_sub_atlas >= 0) {
