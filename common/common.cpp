@@ -4965,7 +4965,16 @@ void common_moe_calibrate(common_params & params) {
             // still re-checks it at the chosen depth, because the interaction
             // runs both ways.
             if (!common_moe_calibrate_budget_spent()) {
-                const int ref_depth = std::max(1, params.speculative.draft.n_max);
+                // Depth 1 first, then the configured depth.
+                //
+                // Depth 1 is the cleanest place to isolate the acceptance mode -
+                // one drafted token, so nothing about the width confounds it -
+                // and the cheapest. But the mode matters MORE at width, because
+                // there are more tokens for tolerance to save, so testing only
+                // at depth 1 could call a difference invisible that is real at
+                // 3 or 4. Both, and the aggregate decides.
+                const int cfg_depth = std::max(1, params.speculative.draft.n_max);
+                const int ref_depth = 1;
                 double pa_tps[2] = { -1.0, -1.0 };
                 for (int pa = 0; pa <= 1; pa++) {
                     if (common_moe_calibrate_budget_spent()) {
@@ -4983,6 +4992,39 @@ void common_moe_calibrate(common_params & params) {
                             pa_tps[pa] > 0 ? string_format("%.2f tok/s (before the depth search)", pa_tps[pa])
                                            : std::string("failed"), pa_tps[pa] > 0);
                 }
+                // The same comparison at the configured width, where tolerance
+                // has more tokens to act on. Skipped when the configured depth
+                // IS 1, since that is the measurement just taken.
+                double pa_wide[2] = { -1.0, -1.0 };
+                if (cfg_depth > ref_depth) {
+                    for (int pa = 0; pa <= 1; pa++) {
+                        if (common_moe_calibrate_budget_spent()) {
+                            break;
+                        }
+                        g_moe_calib_prob_accept.store(pa);
+                        pa_wide[pa] = bench_with_retry(best_n, cfg_depth,
+                                                       params.speculative.draft.mparams.path, n_threads_default);
+                        common_moe_calibration_status_candidate_done();
+                        LOG_INF("%s:   draft acceptance %s at depth %d -> %s%s\n", __func__,
+                                pa ? "probabilistic" : "exact-match", cfg_depth,
+                                pa_wide[pa] > 0 ? string_format("%.2f tok/s", pa_wide[pa]).c_str() : "failed",
+                                pa_wide[pa] > 0 ? common_moe_last_acceptance_str().c_str() : "");
+                        common_moe_calibration_status_note("draft acceptance",
+                                string_format("%s at depth %d", pa ? "probabilistic" : "exact-match", cfg_depth),
+                                pa_wide[pa] > 0 ? string_format("%.2f tok/s", pa_wide[pa]) : std::string("failed"),
+                                pa_wide[pa] > 0);
+                    }
+                    // Aggregate the two widths: a mode has to be better across
+                    // them, not just at whichever one it happened to win.
+                    for (int pa = 0; pa <= 1; pa++) {
+                        if (pa_tps[pa] > 0 && pa_wide[pa] > 0) {
+                            pa_tps[pa] = (pa_tps[pa] + pa_wide[pa]) / 2.0;
+                        } else if (pa_wide[pa] > 0) {
+                            pa_tps[pa] = pa_wide[pa];
+                        }
+                    }
+                }
+
                 // Confirm before believing, and break a tie on acceptance.
                 //
                 // This knob shapes the whole depth search below it, so a
