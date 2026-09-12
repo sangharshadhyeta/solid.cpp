@@ -338,6 +338,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "border-bottom:1px solid #232326}"
                 "#dec td{padding:.3rem .5rem .3rem 0;border-bottom:1px solid #1b1b1e;color:#c8c8cc}"
                 "#dec td.r{color:#4ed6a5}"
+                // The middle column carries the value being tried ("-ub 2048",
+                // "next layer + prev picks") - the column a reader scans to compare
+                // candidates. Left to auto it collapsed to the width of the shortest
+                // label and wrapped the longer ones.
+                "#dec th:nth-child(1),#dec td:nth-child(1){width:20%}"
+                "#dec th:nth-child(2),#dec td:nth-child(2){width:36%;white-space:nowrap}"
                 "#dec tr.no td{color:#8a8a8f}"
                 "#dec tr.sel td{color:#e9fbf4;background:#12241d;font-weight:600}"
                 "#dec tr.sel td:first-child::before{content:'\\2713 ';color:#4ed6a5}"
@@ -349,6 +355,12 @@ int llama_server(common_params & params, int argc, char ** argv) {
                 "#dec td{padding:.3rem .5rem .3rem 0;border-bottom:1px solid #1b1b1e;color:#c8c8cc}"
                 "#dec tr.no td{color:#8a8a8f}"
                 "#dec td.r{color:#4ed6a5}"
+                // The middle column carries the value being tried ("-ub 2048",
+                // "next layer + prev picks") - the column a reader scans to compare
+                // candidates. Left to auto it collapsed to the width of the shortest
+                // label and wrapped the longer ones.
+                "#dec th:nth-child(1),#dec td:nth-child(1){width:20%}"
+                "#dec th:nth-child(2),#dec td:nth-child(2){width:36%;white-space:nowrap}"
                 "#dec tr.no td.r{color:#d67a7a}"
                 "#dec-wrap{display:none}"
                 "</style></head><body><main>"
