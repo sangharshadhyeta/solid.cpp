@@ -1078,6 +1078,13 @@ std::vector<common_moe_cache_co_activation_entry> common_moe_cache_get_co_activa
 struct common_sampler;
 
 // note: defines the model, context, samplers, ets. lifetimes
+// Measure the draft / MTP context's device memory without applying it.
+// Fills out_per_device (indexed against params.devices, or all devices when
+// that is empty) and returns the total. 0 if there is no draft or it could not
+// be measured. Callers decide how to apply it: the server adds it to
+// fit_params_target, calibration adds it once to its probe margin.
+size_t common_measure_draft_memory(const common_params & params, std::vector<size_t> & out_per_device);
+
 struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();

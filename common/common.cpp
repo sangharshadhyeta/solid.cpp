@@ -1412,6 +1412,101 @@ static bool common_moe_fits_with_n(
     }
 }
 
+// Measure the draft / MTP context's device memory and fold it into
+// params.fit_params_target, so every fit or calibration probe that runs after
+// this point accounts for VRAM the draft is going to take.
+//
+// Two consumers need this and used to disagree. The server measured the draft
+// in load_model and added it to the target; --moe-calibrate runs earlier, in
+// server.cpp, and never did - so calibration benchmarked placements with the
+// draft's VRAM still notionally free (2105 MiB of it on Qwen3.8-Flash-Next),
+// picked a placement that only fits without the draft, and the serving-side fit
+// guard then overrode it. That override is recorded in this file's own comments
+// as an unexplained conservatism; this is where it came from.
+//
+// Measures only - it deliberately does not apply the result, because the two
+// consumers apply it differently and one process does both. --moe-calibrate
+// does not exit when it finishes; it goes on to serve in the same process, so
+// a helper that folded the bytes into fit_params_target would have them added
+// once here and a second time by the server's own load_model. Calibration also
+// wants them added ONCE to a margin that is already 3x the fit target, not
+// tripled along with it.
+//
+// Fills out_per_device with bytes indexed against the caller's device list and
+// returns the total. 0 / empty if there is no draft or it could not be
+// measured; failure is not fatal, an unmeasured draft is the status quo.
+size_t common_measure_draft_memory(const common_params & params, std::vector<size_t> & out_per_device) {
+    out_per_device.clear();
+    if (!params.speculative.has_dft()) {
+        return 0;
+    }
+
+    common_params params_dft = common_base_params_to_speculative(params);
+
+    auto mparams_dft = common_model_params_to_llama(params_dft);
+    auto cparams_dft = common_context_params_to_llama(params_dft);
+
+    const bool spec_mtp = std::find(params.speculative.types.begin(),
+                                    params.speculative.types.end(),
+                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.speculative.types.end();
+    if (spec_mtp) {
+        cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+    }
+    cparams_dft.n_rs_seq = 0;
+
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_nct = 0, hp_nex = 0;
+
+    // A draft head that borrows embeddings / LM head from its target cannot
+    // build a context without one - see common_make_probe_context.
+    common_probe_context probe_tgt;
+    common_device_memory_data_vec dmd;
+    try {
+        try {
+            dmd = common_get_device_memory_data(params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                                                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+        } catch (const std::exception &) {
+            // these take a non-const ref; this helper must not mutate the caller's params
+            common_params params_tgt = params;
+            auto mparams_tgt = common_model_params_to_llama(params_tgt);
+            auto cparams_tgt = common_context_params_to_llama(params_tgt);
+            common_make_probe_context(params_tgt.model.path.c_str(), &mparams_tgt, &cparams_tgt,
+                                      probe_tgt, GGML_LOG_LEVEL_ERROR);
+            if (probe_tgt.ctx == nullptr) {
+                throw;
+            }
+            cparams_dft.ctx_other = probe_tgt.ctx;
+            dmd = common_get_device_memory_data(params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
+                                                devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+        }
+    } catch (const std::exception & e) {
+        LOG_WRN("%s: could not measure the draft's device memory (%s) - probes after this point will "
+                "treat its VRAM as free\n", __func__, e.what());
+        return 0;
+    }
+
+    std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
+    if (tgt_devices.empty()) {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            tgt_devices.push_back(ggml_backend_dev_get(i));
+        }
+    }
+    out_per_device.assign(tgt_devices.size(), 0);
+
+    size_t total = 0;
+    for (size_t j = 0; j < devs.size(); ++j) {
+        const size_t bytes = dmd[j].model + dmd[j].context + dmd[j].compute;
+        for (size_t i = 0; i < tgt_devices.size(); i++) {
+            if (tgt_devices[i] == devs[j]) {
+                out_per_device[i] += bytes;
+                total += bytes;
+                break;
+            }
+        }
+    }
+    return total;
+}
+
 struct common_moe_fit_probe_result {
     bool     is_moe        = false;
     bool     already_fits  = false;
@@ -3593,7 +3688,22 @@ void common_moe_calibrate(common_params & params) {
     // 44 CPU layer(s) is below the safe minimum for this context - keeping the
     // fit search's more conservative answer", serving 47. Every candidate in
     // that budget was unusable by construction.
-    const int64_t fit_margin = 3 * (int64_t) params.fit_params_target[0];
+    // Before deriving the margin: the draft's VRAM is real and this probe is
+    // otherwise blind to it (calibration runs in server.cpp well before the
+    // server's own load_model measures the draft). Folding it into the target
+    // here makes the margin below cover the draft too, so the placements this
+    // run benchmarks are placements that still fit once the draft is loaded.
+    std::vector<size_t> draft_per_device;
+    const size_t draft_bytes = common_measure_draft_memory(params, draft_per_device);
+    if (draft_bytes > 0) {
+        LOG_INF("%s: reserving %.2f MiB for the draft before probing\n",
+                __func__, draft_bytes / (1024.0 * 1024.0));
+    }
+
+    // 3x the fit target is the serving margin (see below), and the draft is an
+    // actual allocation on top of it - added once, not tripled with the margin.
+    const int64_t fit_margin = 3 * (int64_t) params.fit_params_target[0] +
+                               (int64_t) (draft_per_device.empty() ? 0 : draft_per_device[0]);
     common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams, fit_margin);
     if (!probe.is_moe) {
         LOG_WRN("%s: model has no MoE experts - nothing for --moe-calibrate to do\n", __func__);
@@ -3645,6 +3755,35 @@ void common_moe_calibrate(common_params & params) {
             if (try_par == 1) {
                 break;
             }
+        }
+        // An explicit -c is a pin, not a hint. The halving below exists for the
+        // n_ctx == 0 ("the model's own trained context") case, where nobody
+        // asked for that size and silently calibrating smaller is better than
+        // refusing outright. When the context WAS asked for, halving it
+        // produces an entry for a context the user will never serve at, while
+        // the log says "Pass -c explicitly to pin a different one" - advice
+        // this loop then ignored, because it overrode the explicit -c too.
+        //
+        // The probe is also the wrong thing to defer to here. It demands the
+        // full serving margin (3x the per-device fit target, so 3 GiB at the
+        // default) on top of the model and KV, while the runtime treats the
+        // expert cache as elastic and shrinks it to whatever is left - which
+        // is why a context this probe rejects can and does serve. Measured on
+        // Qwen3.8-Flash-Next: the probe refused 65536, and 65536 then served
+        // at n_ctx_slot = 65536 with every expert on the CPU.
+        //
+        // So honour the pin and calibrate at the deepest offload, which is the
+        // only placement such a context could use anyway. Say plainly that the
+        // margin was not met, so a genuine shortage is still visible.
+        if (!found && cparams.n_ctx > 0 && probe.n_layer > 0) {
+            LOG_WRN("%s: the requested %u-token context does not leave the full serving margin, but -c "
+                    "pinned it - calibrating at %u with every expert on the CPU rather than silently "
+                    "calibrating for a context you did not ask for. Pass -c 0 to let the probe choose "
+                    "a size that meets the margin\n", __func__, requested, requested);
+            cparams.n_ctx = requested;
+            params.n_ctx  = (int32_t) requested;
+            safe_n        = probe.n_layer;
+            found         = true;
         }
         for (uint32_t try_ctx = requested / 2; try_ctx >= 512 && !found; try_ctx /= 2) {
             cparams.n_ctx = try_ctx;
