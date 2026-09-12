@@ -2051,6 +2051,16 @@ static std::string common_moe_calibration_cache_path() {
 
 static bool common_moe_calibration_lookup(
         const char * path_model, const common_params & params, common_moe_calibration_entry & out) {
+    // A calibration candidate never reads the cache. See the long note at the
+    // candidate launcher (common_moe_bench_candidate_server): the parent passes
+    // every knob it is measuring explicitly, and where it deliberately passes
+    // nothing - because it measured that no value fits - the child must keep its
+    // own default rather than adopt a previous run's answer. Guarded here rather
+    // than at one caller because the cached entry also carries placement, fit
+    // margin and the quality knobs, each applied from its own site.
+    if (getenv("LLAMA_MOE_CALIBRATION_CHILD")) {
+        return false;
+    }
     std::ifstream f(common_moe_calibration_cache_path());
     static const bool trace_lookup = getenv("LLAMA_MOE_CALIB_TRACE") != nullptr;
     if (trace_lookup) {
@@ -3199,7 +3209,29 @@ static double common_moe_bench_candidate_server(
     // Candidates are launched without --moe-calibrate (they must not calibrate
     // recursively), so the runtime tuning endpoint is enabled by its own variable -
     // without it every live POST was silently rejected and the knob never changed.
-    std::string env_prefix = std::string("LLAMA_MOE_TUNING_ENDPOINT=1 ") + extra_env;
+    // A calibration candidate must not read the cached calibration entry.
+    //
+    // Every knob a candidate runs with is chosen by the parent and passed
+    // explicitly; the cache holds a PREVIOUS run's answers for this same model.
+    // Where the parent deliberately passes nothing - because it measured that
+    // no value fits - the child saw its own default, matched the "user did not
+    // ask for this" test in common_moe_apply_prefill_knobs, and substituted the
+    // stale cached value instead.
+    //
+    // Measured on Qwen3.8-Flash-Next at 64k: the parent found that -ub 2048 does
+    // not fit once the draft is attached, stepped to 512, found that did not fit
+    // either, and left the micro-batch unset. Every candidate after that point
+    // then launched with the cached -ub 2048, OOMed allocating the MTP context's
+    // compute buffers (676 MiB on a full card), and was recorded as "does not fit
+    // at the requested context" - 30 consecutive candidates, the whole
+    // substitution ladder, the quality bar, admission, the ring, the cascade and
+    // the final validation, all of them measuring a configuration the parent had
+    // already rejected.
+    //
+    // This is the same bug shape this file keeps hitting - a value decided in one
+    // place and inherited somewhere it was never meant to apply - reaching the
+    // candidates through the cache rather than through a stage.
+    std::string env_prefix = std::string("LLAMA_MOE_CALIBRATION_CHILD=1 LLAMA_MOE_TUNING_ENDPOINT=1 ") + extra_env;
     if (g_moe_calib_offload_min_batch.load() > 0) {
         env_prefix = string_format("GGML_OP_OFFLOAD_MIN_BATCH=%d ", g_moe_calib_offload_min_batch.load()) + env_prefix;
     }
