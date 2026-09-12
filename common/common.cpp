@@ -6506,8 +6506,21 @@ static bool common_maybe_autoplace_moe_cpu(
             // (the offload threshold is applied once, with the other prompt-processing
             //  settings, in common_moe_apply_prefill_knobs - before the fit pass)
             if (cached.spec_draft_cpu_moe == 1 && params.speculative.has_dft() &&
-                params.speculative.draft.tensor_buft_overrides.empty()) {
-                params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+                params.speculative.draft.tensor_buft_overrides.size() <= 1) {
+                // The list must END with the {nullptr, nullptr} sentinel, and arg
+                // parsing has already appended one (common/arg.cpp) by the time this
+                // runs - so pushing here left a real entry after the sentinel and
+                // none at the end. common_model_params_to_llama asserts on exactly
+                // that, and the server aborted on startup: "Tensor buffer overrides
+                // not terminated with empty pattern". Insert before the sentinel,
+                // or add one if this list has none yet.
+                auto & ov = params.speculative.draft.tensor_buft_overrides;
+                if (!ov.empty() && ov.back().pattern == nullptr) {
+                    ov.insert(ov.end() - 1, llm_ffn_exps_cpu_override());
+                } else {
+                    ov.push_back(llm_ffn_exps_cpu_override());
+                    ov.push_back({nullptr, nullptr});
+                }
             }
             // Same rule again: only for someone who already has a draft
             // configured, and only when they left acceptance at its default.
