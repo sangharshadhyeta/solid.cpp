@@ -1685,6 +1685,8 @@ struct common_moe_calibration_entry {
     // margin every other stage has been failing by. Empty = not calibrated.
     std::string kv_type;
     // The fused stand-in picker's signal weights. -1 = not calibrated.
+    // The verify pass's own substitution floor. -1 = use the ordinary floor.
+    int         sub_min_rank_verify = -2;   // -2 = not calibrated, -1 = "same as generation"
     double      sub_w_atlas       = -1.0;
     double      sub_w_coact       = -1.0;
     int         reduced_share_pct    = -1;  // the arbiter's split: reduced pool's share of the budget
@@ -2003,6 +2005,12 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
     // number straight into SUBSTITUTE_ATLAS would set it to 3, which the cache
     // reads as "atlas on, some unknown variant", and the rank picker - the one
     // the stage actually chose - would never run.
+    if (cal.sub_min_rank_verify > -2 && !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK_VERIFY")) {
+        set_env_int("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK_VERIFY", cal.sub_min_rank_verify);
+        LOG_WRN("%s: verify passes substitute from rank %d%s (calibrated)\n", __func__,
+                cal.sub_min_rank_verify,
+                cal.sub_min_rank_verify < 0 ? " (same floor as generation)" : "");
+    }
     if (cal.sub_w_atlas >= 0.0 && !getenv("GGML_CUDA_MOE_CACHE_SUB_W_ATLAS")) {
         set_env_double("GGML_CUDA_MOE_CACHE_SUB_W_ATLAS", cal.sub_w_atlas);
         set_env_double("GGML_CUDA_MOE_CACHE_SUB_W_COACT", cal.sub_w_coact);
@@ -2157,6 +2165,7 @@ static bool common_moe_calibration_lookup(
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
         out.kv_type                = e.value("kv_type", std::string());
+        out.sub_min_rank_verify    = e.value("sub_min_rank_verify", -2);
         out.sub_w_atlas            = e.value("sub_w_atlas", -1.0);
         out.sub_w_coact            = e.value("sub_w_coact", -1.0);
         out.reduced_share_pct      = e.value("reduced_share_pct", -1);
@@ -2241,6 +2250,7 @@ static void common_moe_calibration_save(
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
         {"kv_type", entry.kv_type},
+        {"sub_min_rank_verify", entry.sub_min_rank_verify},
         {"sub_w_atlas", entry.sub_w_atlas},
         {"sub_w_coact", entry.sub_w_coact},
         {"reduced_share_pct", entry.reduced_share_pct},
@@ -7057,6 +7067,74 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // The verify pass's own substitution floor.
+    //
+    // Only meaningful with a draft attached, because only a verify pass
+    // presents more than one token to a decode-time dispatch. It is measured
+    // separately from the generation floor because the two are paid for in
+    // different currencies: a stand-in during generation lands in a token the
+    // user reads, while a stand-in during verification can only move the
+    // accept/reject boundary - every token out of an accepted position is the
+    // draft's own, exact. So this floor can go lower than the one above it,
+    // and the answer gate still guards the result.
+    //
+    // The reason to want it lower is where the cost is: a verify batch demands
+    // the union of N+1 tokens' routing, which is the widest expert demand
+    // anything in this system makes, and on a model whose experts do not fit
+    // that width is where the draft's throughput goes. Measured at 64k with
+    // 0.97 acceptance, the draft still lost to no draft at all - not for
+    // predicting badly, but for what its verify pass costs.
+    int best_verify_rank = -2;
+    if (mtp_configured && !common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring how hard a verify pass may lean on stand-ins ...\n", __func__);
+        common_moe_calibration_status_set("measuring the verify substitution floor");
+        common_moe_stage_begin("verify substitution", 3);
+        double best_vr_tps = -1.0;
+        // -1 = same as generation (today's behaviour and the baseline); then
+        // progressively more tolerant, down to substituting every rank.
+        for (const int vr : { -1, 2, 0 }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_env(vr < 0 ? std::string()
+                    : string_format("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK_VERIFY=%d", vr));
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, sub_mtp_path, best_n, sub_n_max, best_threads,
+                    next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma,
+                    /* verify_answers */ true, /* with_reasoning */ true);
+            common_moe_calibration_status_candidate_done();
+            const std::string label = vr < 0 ? std::string("same floor as generation")
+                                             : string_format("from rank %d", vr);
+            LOG_INF("%s:   verify substitution %s -> %s%s\n", __func__, label.c_str(),
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str()
+                            : (tps == COMMON_MOE_TPS_REJECTED ? "rejected on answer quality" : "failed"),
+                    tps > 0 ? common_moe_last_acceptance_str().c_str() : "");
+            common_moe_calibration_status_note("verify substitution", label,
+                    tps > 0 ? string_format("%.2f tok/s%s", tps, common_moe_last_acceptance_str().c_str())
+                            : (tps == COMMON_MOE_TPS_REJECTED ? std::string("rejected on answer quality")
+                                                              : std::string("failed")), tps > 0);
+            if (tps > best_vr_tps) {
+                best_vr_tps      = tps;
+                best_verify_rank = vr;
+            }
+        }
+        common_moe_calib_set_env(std::string());
+        common_moe_stage_end();
+        entry.sub_min_rank_verify = best_verify_rank;
+        checkpoint("verify substitution");
+        if (best_vr_tps > 0) {
+            LOG_INF("%s: verify substitution: %s at %.2f tok/s\n", __func__,
+                    best_verify_rank < 0 ? "same floor as generation"
+                                         : string_format("from rank %d", best_verify_rank).c_str(),
+                    best_vr_tps);
+            common_moe_calibration_status_note("verify substitution",
+                    best_verify_rank < 0 ? std::string("same floor as generation")
+                                         : string_format("from rank %d", best_verify_rank),
+                    string_format("SELECTED - %.2f tok/s", best_vr_tps), true, true);
+        }
+    }
+
     // The live-trained prerouter. moe-cache already carries a full online
     // predictor - a logistic regression over the hidden state, trained by SGD
     // on every real routing decision (positives: the experts the router chose;
@@ -7688,6 +7766,7 @@ void common_moe_calibrate(common_params & params) {
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
     entry.kv_type                = best_kv_type;
+    entry.sub_min_rank_verify    = best_verify_rank;
     entry.reduced_share_pct      = best_reduced_share;
     entry.admit_exact_weight     = best_admit_exact_w;
     entry.predictor_admit        = best_pred_admit;
