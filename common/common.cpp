@@ -1680,11 +1680,14 @@ struct common_moe_calibration_entry {
     double      tps_offload_min_batch = -1.0;
     double      tps_ubatch            = -1.0;
     double      tps_spec_n_max        = -1.0;
+    // KV cache precision. The one consumer nobody had ever bid against: at 64k
+    // it holds ~1.4 GiB more than at 4k on this model, which is exactly the
+    // margin every other stage has been failing by. Empty = not calibrated.
+    std::string kv_type;
     int         reduced_share_pct    = -1;  // the arbiter's split: reduced pool's share of the budget
     int         admit_exact_weight   = -1;  // extra admission weight for un-substitutable demand
     int         predictor_admit      = -1;  // may it warm experts (needs a slot)
     int         predictor_next_layer = -1;  // predict the NEXT layer's picks
-    int         predictor_prev_buckets = -1; // hashed previous-selection block width
     int         lookahead_depth  = -1;
     // Stand-in quality bar, in standard deviations below the mean
     // co-activation of the residents examined. This is the continuous form of
@@ -1955,9 +1958,6 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
             if (cal.predictor_next_layer >= 0) {
                 set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER", cal.predictor_next_layer);
             }
-            if (cal.predictor_prev_buckets >= 0) {
-                set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS", cal.predictor_prev_buckets);
-            }
         }
         LOG_WRN("%s: live-trained prerouter %s (calibrated)\n", __func__,
                 cal.train_predictor ? "on" : "off");
@@ -1967,11 +1967,6 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER", cal.predictor_next_layer);
         LOG_WRN("%s: prerouter target: %s (calibrated)\n", __func__,
                 cal.predictor_next_layer ? "the next layer's picks" : "this layer's picks");
-    }
-    if (cal.predictor_prev_buckets >= 0 && !getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS")) {
-        set_env_int("GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS", cal.predictor_prev_buckets);
-        LOG_WRN("%s: prerouter previous-selection block: %d buckets (calibrated)\n", __func__,
-                cal.predictor_prev_buckets);
     }
     if (cal.reduced_share_pct >= 0 && !getenv("GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT")) {
         set_env_int("GGML_CUDA_MOE_CACHE_REDUCED_SHARE_PCT", cal.reduced_share_pct);
@@ -2137,11 +2132,11 @@ static bool common_moe_calibration_lookup(
         out.tps_offload_min_batch  = e.value("tps_offload_min_batch", -1.0);
         out.tps_ubatch             = e.value("tps_ubatch", -1.0);
         out.tps_spec_n_max         = e.value("tps_spec_n_max", -1.0);
+        out.kv_type                = e.value("kv_type", std::string());
         out.reduced_share_pct      = e.value("reduced_share_pct", -1);
         out.admit_exact_weight     = e.value("admit_exact_weight", -1);
         out.predictor_admit        = e.value("predictor_admit", -1);
         out.predictor_next_layer   = e.value("predictor_next_layer", -1);
-        out.predictor_prev_buckets = e.value("predictor_prev_buckets", -1);
         out.lookahead_depth        = e.value("lookahead_depth", -1);
         // Saved as NaN when no stand-in bar was measured, and nlohmann writes NaN
         // as null. value() only falls back to its default when the key is absent -
@@ -2219,11 +2214,11 @@ static void common_moe_calibration_save(
         {"tps_offload_min_batch", entry.tps_offload_min_batch},
         {"tps_ubatch", entry.tps_ubatch},
         {"tps_spec_n_max", entry.tps_spec_n_max},
+        {"kv_type", entry.kv_type},
         {"reduced_share_pct", entry.reduced_share_pct},
         {"admit_exact_weight", entry.admit_exact_weight},
         {"predictor_admit", entry.predictor_admit},
         {"predictor_next_layer", entry.predictor_next_layer},
-        {"predictor_prev_buckets", entry.predictor_prev_buckets},
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
@@ -2687,6 +2682,19 @@ static std::atomic<bool>      g_moe_calib_measure_prefill{false};
 // whether the prefill probe uses its extra-long prompt (the micro-batch stage:
 // a knob that only matters past one micro-batch cannot show on a short prompt).
 static std::atomic<int>       g_moe_calib_ubatch{-1};
+// The KV precision every candidate after the KV stage runs with. A string
+// because that is what the flag takes, guarded because candidates are launched
+// from the stage loop while this is being set.
+static std::mutex  g_moe_calib_kv_type_mu;
+static std::string g_moe_calib_kv_type;
+static void common_moe_calib_set_kv_type(const std::string & t) {
+    std::lock_guard<std::mutex> lock(g_moe_calib_kv_type_mu);
+    g_moe_calib_kv_type = t;
+}
+static std::string common_moe_calib_get_kv_type() {
+    std::lock_guard<std::mutex> lock(g_moe_calib_kv_type_mu);
+    return g_moe_calib_kv_type;
+}
 static std::atomic<bool>      g_moe_calib_prefill_xlong{false};
 // GGML_SCHED_PREFETCH_EXPERTS every candidate launches with from here on.
 static std::atomic<bool>      g_moe_calib_prefetch{false};
@@ -3015,6 +3023,12 @@ static double common_moe_bench_candidate_server(
     }
     if (g_moe_calib_ubatch.load() > 0) {
         threads_args += string_format("-ub %d ", g_moe_calib_ubatch.load());
+    }
+    {
+        const std::string kvt = common_moe_calib_get_kv_type();
+        if (!kvt.empty()) {
+            threads_args += string_format("-ctk %s -ctv %s ", kvt.c_str(), kvt.c_str());
+        }
     }
     // At concurrency > 1, --parallel must match so the candidate server can
     // actually hold n_concurrency slots, and -c needs enough headroom for
@@ -4689,6 +4703,66 @@ void common_moe_calibrate(common_params & params) {
     double best_n_max_tps = -1.0;
     double no_draft_tps   = -1.0;
 
+    // KV precision - the consumer nobody had ever bid against.
+    //
+    // Every other stage fights over the VRAM left AFTER the KV cache, and the
+    // KV cache was never a variable: calibration passed type_k through and
+    // never varied it. On this model that is the binding difference between
+    // the context we measure at and the one we serve at. With 2 KV heads and
+    // 256-wide K and V, an attention layer holds 2048 bytes per token, so the
+    // step from 4k to 64k costs roughly 1.4 GiB - and 1.4 GiB is the margin
+    // every failure today has been on the wrong side of: the micro-batch OOM
+    // was 676 MiB short, the expert cache had to halve, and the draft stopped
+    // paying for the VRAM it displaced.
+    //
+    // Halving KV precision gives most of that back. Whether it is worth taking
+    // is a quality question, not a throughput one, so it is measured through
+    // the same answer gate that polices the substitution ladder rather than
+    // ranked on tok/s alone. Placed before the draft-depth search because that
+    // is where the shortage first bites - a depth that cannot fit at f16 may
+    // fit at q8_0, and every stage after inherits the larger budget.
+    std::string best_kv_type;
+    if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: measuring KV cache precision (it has never been varied, and at this context it "
+                "holds the margin everything else is short of) ...\n", __func__);
+        common_moe_calibration_status_set("measuring KV cache precision");
+        common_moe_stage_begin("KV precision", 3);
+        double best_kv_tps = -1.0;
+        for (const char * kvt : { "f16", "q8_0", "q4_0" }) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            common_moe_calib_set_kv_type(std::string(kvt) == "f16" ? std::string() : std::string(kvt));
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, std::string(), best_n, 0,
+                    n_threads_default, next_port(), ctx, n_predict, concurrency, -1, -1,
+                    active_ngl, active_min_rank, nullptr, 1234, active_quality_sigma);
+            common_moe_calibration_status_candidate_done();
+            LOG_INF("%s:   KV %s -> %s\n", __func__, kvt,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str()
+                            : (tps == COMMON_MOE_TPS_REJECTED ? "rejected on answer quality" : "failed"));
+            common_moe_calibration_status_note("KV precision", kvt,
+                    tps > 0 ? string_format("%.2f tok/s", tps)
+                            : (tps == COMMON_MOE_TPS_REJECTED ? std::string("rejected on answer quality")
+                                                              : std::string("failed")), tps > 0);
+            if (tps > best_kv_tps) {
+                best_kv_tps  = tps;
+                best_kv_type = std::string(kvt) == "f16" ? std::string() : std::string(kvt);
+            }
+        }
+        common_moe_calib_set_kv_type(best_kv_type);
+        common_moe_stage_end();
+        entry.kv_type = best_kv_type;
+        checkpoint("KV precision");
+        if (best_kv_tps > 0) {
+            LOG_INF("%s: KV precision: %s at %.2f tok/s\n", __func__,
+                    best_kv_type.empty() ? "f16" : best_kv_type.c_str(), best_kv_tps);
+            common_moe_calibration_status_note("KV precision",
+                    best_kv_type.empty() ? std::string("f16") : best_kv_type,
+                    string_format("SELECTED - %.2f tok/s", best_kv_tps), true, true);
+        }
+    }
+
     // The micro-batch was chosen before any draft existed - check it survives one.
     //
     // -ub is measured on prompt processing, and that stage runs with no draft
@@ -6346,16 +6420,15 @@ void common_moe_calibrate(common_params & params) {
         //   - ngram       drop the architecture block the model supplies (the
         //                 PLE n-gram identity on qwen4exp), to measure what it
         //                 is worth rather than assume it.
-        struct train_shape { const char * label; int next_layer; int prev_buckets; int aux_cap; };
+        struct train_shape { const char * label; int next_layer; int aux_cap; };
         const train_shape shapes[] = {
-            { "this layer's picks",        0,  0, 32 },
-            { "next layer's picks",        1,  0, 32 },
-            { "next layer + prev picks",   1, 64, 32 },
-            { "next layer, no n-gram",     1, 64,  0 },
+            { "this layer's picks",        0, 32 },
+            { "next layer's picks",        1, 32 },
+            { "next layer, no n-gram",     1, 0 },
         };
         common_moe_stage_begin("prerouter training", (int)(sizeof(shapes)/sizeof(shapes[0])));
         double train_tps = -1.0;
-        int best_next_layer = -1, best_prev_buckets = -1, best_aux_cap = 32;
+        int best_next_layer = -1, best_aux_cap = 32;
         std::string best_state_file;
         for (size_t si = 0; si < sizeof(shapes)/sizeof(shapes[0]); si++) {
             if (common_moe_calibrate_budget_spent()) {
@@ -6374,10 +6447,9 @@ void common_moe_calibrate(common_params & params) {
             // allowed to place anything.
             common_moe_calib_set_env(string_format(
                     "%sGGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s "
-                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
-                    "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
+                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
                     "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 ",
-                    state_i.c_str(), sh.next_layer, sh.prev_buckets, sh.aux_cap));
+                    state_i.c_str(), sh.next_layer, sh.aux_cap));
             const double tps = common_moe_bench_candidate_server(
                     self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
                     best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
@@ -6390,13 +6462,11 @@ void common_moe_calibrate(common_params & params) {
             if (tps > train_tps) {
                 train_tps         = tps;
                 best_next_layer   = sh.next_layer;
-                best_prev_buckets = sh.prev_buckets;
                 best_aux_cap      = sh.aux_cap;
                 best_state_file   = state_i;
             }
         }
         entry.predictor_next_layer   = best_next_layer;
-        entry.predictor_prev_buckets = best_prev_buckets;
         checkpoint("prerouter input");
         if (!best_state_file.empty()) {
             predictor_state_file = best_state_file;
@@ -6420,9 +6490,8 @@ void common_moe_calibrate(common_params & params) {
             common_moe_calib_set_base_env(string_format(
                     "GGML_CUDA_MOE_CACHE_RING_PCT=10 GGML_CUDA_MOE_CACHE_ATLAS_ADMIT_RING=1 "
                     "GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE=%s GGML_CUDA_MOE_CACHE_TRAIN_FREEZE=1 "
-                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_TRAIN_PREV_BUCKETS=%d "
-                    "GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
-                    predictor_state_file.c_str(), best_next_layer, best_prev_buckets, best_aux_cap));
+                    "GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER=%d GGML_CUDA_MOE_CACHE_AUX_FEATURE_CAP=%d",
+                    predictor_state_file.c_str(), best_next_layer, best_aux_cap));
         }
     }
 
@@ -7192,6 +7261,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_atlas       = best_sub_atlas;
     entry.atlas_prewarm_k        = best_prewarm_k;
     entry.train_predictor        = best_train_predictor;
+    entry.kv_type                = best_kv_type;
     entry.reduced_share_pct      = best_reduced_share;
     entry.admit_exact_weight     = best_admit_exact_w;
     entry.predictor_admit        = best_pred_admit;
