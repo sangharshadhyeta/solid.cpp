@@ -6051,7 +6051,20 @@ static void moe_cache_try_reduce_convert(
         const size_t headroom = device.budget_limit > device.allocated_bytes
             ? device.budget_limit - device.allocated_bytes : 0;
         const size_t budget = std::min(moe_cache_neuron_reduce_budget_bytes(), headroom);
-        moe_cache_shape shape{reduced_expert_size, wtype, n_expert, 1, -1, false};
+        // Named fields, not a brace list. moe_cache_shape gained `draft` as its
+        // FIRST member after this line was written, and the positional list kept
+        // compiling: it produced draft=true, expert_size=<the wtype enum>,
+        // wtype=<n_expert>, n_expert=1, n_tensors=-1. moe_cache_allocate_pool
+        // rejects n_tensors <= 0 on its first line, so the reduced-width pool
+        // could never be created - neuron subsetting decided keys and placed none.
+        moe_cache_shape shape;
+        shape.draft       = moe_cache_scope_draft();
+        shape.expert_size = reduced_expert_size;
+        shape.wtype       = wtype;
+        shape.n_expert    = n_expert;
+        shape.n_tensors   = 1;
+        shape.pool        = -1;
+        shape.finished    = false;
         if (!moe_cache_allocate_pool(session, device, shape, budget)) {
             // Decided (see the decide() call below), never retried this
             // session - see the "convert-once" rationale above.
@@ -8077,7 +8090,22 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     const bool external_pressure =
         device.vram_external_baseline > free_if_we_released &&
         (device.vram_external_baseline - free_if_we_released) > floor_bytes;
-    if (!external_pressure) {
+    // And only when the card is actually short. "Someone else took memory" is
+    // not by itself a reason to give anything back: free_if_we_released counts
+    // everything outside this cache's slabs as external, which includes THIS
+    // process's own compute buffers, CUDA graph pools and the draft context's
+    // buffers as they grow with prompt length.
+    //
+    // Measured on gemma-4 serving alone: the server's own allocations grew
+    // ~600 MiB over its first requests (4213 -> 4819 MiB total), this read that
+    // as "another process took 596 MiB", and released 2708 + 130 + 4202 MiB of
+    // expert pools - with 7 GB of the card still free. Nothing else was on the
+    // GPU. Decode fell from 46-54 tok/s to 27-35, with requests down to 12.
+    //
+    // So the external deficit decides WHO to blame; raw free memory below the
+    // reserved headroom decides WHETHER anything is wrong at all.
+    const bool actually_short = free_memory < floor_bytes;
+    if (!external_pressure || !actually_short) {
         device.vram_pressure_ticks = 0;
         return false;
     }
@@ -8111,6 +8139,9 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
 
     cudaDeviceSynchronize();
     moe_cache_pool * pool = device.pools[victim].get();
+    const size_t victim_expert_size = pool->expert_size;
+    const int    victim_wtype       = pool->wtype;
+    const bool   victim_draft       = pool->draft;
     cudaFree(pool->slab);
     pool->slab = nullptr;
     pool->n_slots = 0;
@@ -8120,6 +8151,38 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     device.allocated_bytes = device.allocated_bytes > victim_bytes
             ? device.allocated_bytes - victim_bytes : 0;
     device.pools.erase(device.pools.begin() + victim);
+
+    // Everything that cached a pool INDEX now points one slot too far for every
+    // pool after the victim. Those indices are bounds-checked at use but not
+    // size-checked, so a stale one hands an expert to a pool whose slot stride
+    // was cut for a different expert size. Remap the long-lived holders: the
+    // reduced-width entries drop their pool if it was the victim (they are
+    // re-decided like any other undecided key) and shift down otherwise.
+    for (auto & kv : device.reduced_indices) {
+        int & pi = kv.second.pool_index;
+        if (pi == victim)      { pi = -1; }
+        else if (pi > victim)  { pi--; }
+    }
+    // Shapes: recompute every pool index from what now exists, and put the
+    // victim's shape back into the pending set. It was left finished, and
+    // moe_cache_build_pending only builds unfinished shapes - so the pool the
+    // message below promised would be "rebuilt to whatever fits on the next
+    // miss" was never rebuilt at all. Measured: the gemma-4 session above ran
+    // for an hour afterwards with ~7 GB free and no expert pools.
+    for (moe_cache_shape & sh : device.shapes) {
+        sh.pool = moe_cache_find_pool(device, sh.expert_size, sh.wtype, sh.draft);
+        if (sh.expert_size == victim_expert_size && sh.wtype == victim_wtype &&
+            sh.draft == victim_draft && sh.n_tensors > 0) {
+            sh.pool     = -1;
+            sh.finished = false;
+        }
+    }
+    // Accept the new level as the baseline. The deficit that triggered this is
+    // either still there (and now paid for) or gone; either way, measuring the
+    // next event from the old high-water mark would read the same deficit again
+    // two ticks later and release the next pool, and the next.
+    device.vram_external_baseline = free_memory + victim_bytes + device.allocated_bytes;
+    device.vram_pressure_ticks    = 0;
     (void) session;
     fprintf(stderr, "[moe-cache] another process took %zu MiB of this card (free would be %zu MiB with this "
             "cache emptied, was %zu MiB) - released a %zu MiB expert pool so it can be used; the pool is "

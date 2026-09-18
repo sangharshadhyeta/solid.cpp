@@ -7146,7 +7146,27 @@ void common_moe_calibrate(common_params & params) {
     // 32-token candidate can never beat a 128-token confirmed number.
     int    best_admit_after     = -1;
     double best_admit_after_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
-    if (!common_moe_calibrate_budget_spent()) {
+    // Three candidates that have never separated by more than the noise.
+    //
+    // Measured on Qwen3.8-Flash-Next at 64k: 1 -> 2.42, 2 -> 2.46, 4 -> 2.44
+    // tok/s. A 1.6% spread on a machine whose run-to-run spread is 12-20%, for
+    // three of the most expensive candidates in that run at 3.3 minutes each -
+    // ten minutes sampling noise and then fixing it for every stage after.
+    // Gemma-4 read 66.55 / 69.24 / 49.14, which looks decisive until you note
+    // the incumbent was 70.62 and nothing was selected either way.
+    //
+    // The shipped constant stays. GGML_MOE_CALIBRATE_SEARCH_ADMIT=1 searches it.
+    const bool search_admit = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_ADMIT");
+        return e && atoi(e) != 0;
+    }();
+    if (!search_admit) {
+        LOG_WRN("%s: admission threshold left at its shipped constant - the ladder has never separated by "
+                "more than this machine's run-to-run spread (1.6%% across the three rungs on qwen4exp at "
+                "64k) (GGML_MOE_CALIBRATE_SEARCH_ADMIT=1 to search it)\n", __func__);
+        common_moe_calibration_status_note("admission threshold", "default",
+                "DEFAULT - three rungs that have never separated by more than the noise", true, true);
+    } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: searching admission threshold (admit_after) ...\n", __func__);
         common_moe_calibration_status_set("searching admission threshold");
         for (const int candidate : {1, 2, 4}) {
@@ -7910,7 +7930,27 @@ void common_moe_calibrate(common_params & params) {
     // exact expert, so it changes no arithmetic - but the winner is still re-run
     // through the answer check against the substitution-off bar before it is kept.
     int best_ring_pct = -1;
-    if (!common_moe_calibrate_budget_spent()) {
+    // The ring has measured best at 0% - off - on every model run here, and the
+    // candidates that lost did not lose to the ring. On qwen4exp at 64k the three
+    // rungs read 2.48 / 1.49 / 1.69 tok/s while draft acceptance was IDENTICAL
+    // across all three (0.69, 52 of 75): the same generation, three different
+    // throughputs, which is the definition of a noise reading. Gemma-4 read
+    // 70.65 / 54.26 / 67.17 and again chose 0%.
+    //
+    // Off is also what the runtime already does, so the stage's usual outcome is
+    // to spend three candidates confirming the default.
+    // GGML_MOE_CALIBRATE_SEARCH_RING=1 measures it.
+    const bool search_ring = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_RING");
+        return e && atoi(e) != 0;
+    }();
+    if (!search_ring) {
+        LOG_WRN("%s: prediction ring left off - 0%% has won on every model measured here, and on qwen4exp "
+                "at 64k all three rungs produced identical draft acceptance with different throughput, "
+                "which is a noise reading (GGML_MOE_CALIBRATE_SEARCH_RING=1 to measure it)\n", __func__);
+        common_moe_calibration_status_note("prediction ring", "0% (off)",
+                "DEFAULT - 0% has won on every model; the rungs differ only by noise", true, true);
+    } else if (!common_moe_calibrate_budget_spent()) {
         LOG_INF("%s: measuring the prediction ring (GGML_CUDA_MOE_CACHE_RING_PCT) ...\n", __func__);
         common_moe_calibration_status_set("measuring the prediction ring");
         double best_ring_tps = -1.0;
