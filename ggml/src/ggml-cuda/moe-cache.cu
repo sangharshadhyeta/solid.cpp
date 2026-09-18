@@ -8055,8 +8055,22 @@ static bool moe_cache_partner_index_enabled() {
 // on - the next tick will catch them.
 static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cache_device & device) {
     static const bool enabled = [] {
+        // OFF by default. On this machine it has never once fired for another
+        // process - both times the "other process" was this server's own
+        // buffers growing into the cache's headroom - and both times the
+        // release did lasting damage: first the pools were never rebuilt, then
+        // (after that was fixed) one 2162 MiB release left NOTHING resident,
+        // decode 46-66 -> 13.7 tok/s.
+        //
+        // The release erases the pool from device.pools, which shifts every
+        // later pool's index, while fill jobs (moe_cache_job.pool), per-dispatch
+        // nodes (a raw moe_cache_pool * as well as pool_index), warm and train
+        // requests all hold indices or pointers into it. Only reduced_indices
+        // and the shapes are remapped. Until every holder is audited this is a
+        // use-after-free waiting for a busy card, so it stays opt-in. Size the
+        // headroom with GGML_CUDA_MOE_CACHE_RESERVE_MB instead.
         const char * e = getenv("GGML_CUDA_MOE_CACHE_YIELD_VRAM");
-        return !e || atoi(e) != 0; // on by default
+        return e && atoi(e) != 0;
     }();
     if (!enabled || device.pools.empty()) {
         return false;
@@ -8137,6 +8151,11 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
         return false;
     }
 
+    // Report before the baseline is reset below - printing afterwards always
+    // read "another process took 0 MiB", which hid what actually happened.
+    const size_t deficit_mb = (device.vram_external_baseline - free_if_we_released) >> 20;
+    const size_t baseline_mb = device.vram_external_baseline >> 20;
+
     cudaDeviceSynchronize();
     moe_cache_pool * pool = device.pools[victim].get();
     const size_t victim_expert_size = pool->expert_size;
@@ -8187,8 +8206,7 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     fprintf(stderr, "[moe-cache] another process took %zu MiB of this card (free would be %zu MiB with this "
             "cache emptied, was %zu MiB) - released a %zu MiB expert pool so it can be used; the pool is "
             "rebuilt to whatever fits on the next miss\n",
-            (device.vram_external_baseline - free_if_we_released) >> 20,
-            free_if_we_released >> 20, device.vram_external_baseline >> 20, victim_bytes >> 20);
+            deficit_mb, free_if_we_released >> 20, baseline_mb, victim_bytes >> 20);
     fflush(stderr);
     return true;
 }
