@@ -119,6 +119,7 @@ void server_queue::wait_until_no_sleep() {
 void server_queue::terminate() {
     std::unique_lock<std::mutex> lock(mutex_tasks);
     running = false;
+    terminated = true;
     condition_tasks.notify_all();
 }
 
@@ -391,7 +392,16 @@ server_task_result_ptr server_response_reader::next(const std::function<bool()> 
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
             // timeout, check stop condition
-            if (should_stop()) {
+            //
+            // ...and whether anything can still answer. Shutdown terminates the
+            // TASK queue, not the result queue, so a reader waiting on an
+            // in-flight completion used to wake every poll, see its client
+            // still connected, and wait again - forever. That wedged the whole
+            // exit: the HTTP pool's shutdown joined this worker, and main joined
+            // the HTTP thread. Reproduced on every SIGTERM that landed mid-
+            // request; only SIGKILL got out. Returning here takes the same path
+            // a disconnected client does.
+            if (should_stop() || queue_tasks.is_terminated()) {
                 return nullptr;
             }
         } else {

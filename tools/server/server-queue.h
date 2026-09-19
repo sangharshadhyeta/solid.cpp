@@ -2,6 +2,7 @@
 
 #include "server-task.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -14,6 +15,9 @@ struct server_queue {
 private:
     int id = 0;
     bool running  = false;
+    // Set by terminate() only. Not the same as !running: running is also false
+    // BEFORE start_loop, while the HTTP server already accepts requests.
+    std::atomic<bool> terminated{false};
     bool sleeping = false;
     bool req_stop_sleeping = false;
     int64_t time_last_task = 0;
@@ -58,6 +62,9 @@ public:
 
     // end the start_loop routine
     void terminate();
+
+    // True once terminate() has been called - no task will be processed again.
+    bool is_terminated() const { return terminated.load(); }
 
     /**
      * Main loop consists of these steps:
