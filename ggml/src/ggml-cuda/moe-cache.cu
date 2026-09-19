@@ -5237,6 +5237,9 @@ static int moe_cache_find_pool(
         const moe_cache_device & device, size_t expert_size, int wtype, bool draft) {
     for (int index = 0; index < (int)device.pools.size(); index++) {
         const moe_cache_pool & pool = *device.pools[index];
+        if (!pool.slab) {
+            continue;   // released by moe_cache_relieve_vram_pressure - a placeholder
+        }
         if (pool.expert_size == expert_size && pool.wtype == wtype && pool.draft == draft) {
             return index;
         }
@@ -8128,6 +8131,14 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     if (++device.vram_pressure_ticks < 2) {
         return false;
     }
+    // Never while a fill copy is in flight. The worker resolves its pool and a
+    // destination inside the slab under this lock, then copies with the lock
+    // released - freeing a slab now could put that copy into freed device
+    // memory. inflight is set under this same lock at dequeue and cleared after
+    // the copy, so checking it here closes the window; the next tick retries.
+    if (device.inflight) {
+        return false;
+    }
     device.vram_pressure_ticks = 0;
 
     int victim = -1;
@@ -8169,18 +8180,22 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     pool->map.clear();
     device.allocated_bytes = device.allocated_bytes > victim_bytes
             ? device.allocated_bytes - victim_bytes : 0;
-    device.pools.erase(device.pools.begin() + victim);
-
-    // Everything that cached a pool INDEX now points one slot too far for every
-    // pool after the victim. Those indices are bounds-checked at use but not
-    // size-checked, so a stale one hands an expert to a pool whose slot stride
-    // was cut for a different expert size. Remap the long-lived holders: the
-    // reduced-width entries drop their pool if it was the victim (they are
-    // re-decided like any other undecided key) and shift down otherwise.
+    // The pool object STAYS in device.pools, as an empty placeholder (slab null,
+    // no slots). The rest of this file is written for a pool list that only
+    // grows - "pools can only grow today", as the admit path says - and holds
+    // pool indices in fill jobs, warm and train requests and reduced entries,
+    // and a raw pool pointer in each dispatch node. Erasing here shifted every
+    // later index and destroyed the object a node could still point at; in
+    // practice one release left NOTHING resident (all 3840 cells empty). A
+    // placeholder keeps every index and pointer valid: each use already checks
+    // pool->slab or n_slots, finds nothing, and misses. find_pool skips
+    // placeholders, so the rebuild below appends a fresh pool.
+    //
+    // Reduced-width entries that lived in the victim are sent back to undecided.
     for (auto & kv : device.reduced_indices) {
-        int & pi = kv.second.pool_index;
-        if (pi == victim)      { pi = -1; }
-        else if (pi > victim)  { pi--; }
+        if (kv.second.pool_index == victim) {
+            kv.second.pool_index = -1;
+        }
     }
     // Shapes: recompute every pool index from what now exists, and put the
     // victim's shape back into the pending set. It was left finished, and
