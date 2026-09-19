@@ -31,6 +31,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <deque>
 #include <regex>
 #include <sys/wait.h>
 
@@ -2705,7 +2706,7 @@ static std::atomic<long long> g_moe_calibrate_deadline_ms{0};
 static std::atomic<int> g_moe_repro_floor{-1};
 
 // Inputs for deriving the time budget from this model's measured cost instead
-// of a flat constant. See common_moe_maybe_derive_budget.
+// of a flat constant. See common_moe_record_candidate_cost.
 static std::atomic<long long> g_moe_calibrate_start_ms{0};
 static std::atomic<int>       g_moe_planned_candidates{0};
 // How many verifiable-answer probes the first configuration measured got right.
@@ -2873,78 +2874,82 @@ static long long common_moe_steady_now_ms();
 // stage's deadline when the global budget grows. See common_moe_stage_begin.
 static std::atomic<long long> g_moe_stage_deadline_ms{0};
 
-static void common_moe_maybe_derive_budget() {
-    if (!g_moe_budget_is_derived.load(std::memory_order_relaxed)) {
-        return;
-    }
-    if (g_moe_candidate_count.load(std::memory_order_relaxed) != 2) {
-        return; // one sample is noise; derive once, on the second
-    }
-    const int planned = g_moe_planned_candidates.load(std::memory_order_relaxed);
-    const long long start_ms = g_moe_calibrate_start_ms.load(std::memory_order_relaxed);
-    if (planned <= 0 || start_ms == 0) {
-        return;
-    }
-    const double per_candidate_s =
-            (double) g_moe_candidate_ms_sum.load(std::memory_order_relaxed) / 2.0 / 1000.0;
-    // The cap is the last line of defence, not the budget: want_s below asks for
-    // what the planned candidates actually cost, and the cap only stops a runaway.
-    // It was 3600s while the stages planned ~78 candidates at ~49s - 3822s - so the
-    // cap, not the measurement, decided that the last stages never ran, and they
-    // were then recorded as "failed", which a cached entry cannot tell apart from
-    // "measured and no good". Raised to 2h now that the stages measure far more;
-    // a model whose candidates are cheap (gemma-4 fits in ~600s) is unaffected,
-    // because want_s is derived per model.
-    const double cap_s = [] {
-        const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_MAX_S");
-        const double v = e ? atof(e) : 7200.0;
-        return v > 0.0 ? v : 7200.0;
-    }();
-    // Slack for the stages that cost more than a plain candidate - the
-    // substitution confirm step runs at 4x the probe length.
-    double want_s = per_candidate_s * (double) planned * 1.25;
-    want_s = std::max(600.0, std::min(want_s, cap_s));
-    const long long deadline_ms = start_ms + (long long) (want_s * 1000.0);
-    if (deadline_ms <= g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed)) {
-        return;
-    }
-    const long long prev_deadline = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
-    g_moe_calibrate_deadline_ms.store(deadline_ms, std::memory_order_relaxed);
+// The budget prices itself, per stage, from what candidates actually cost.
+//
+// It used to be derived ONCE, from the first two candidates, times a hand-kept
+// planned-candidate count, then split among stages by their share of that
+// count. On Qwen3.8-Flash-Next at 64k all three inputs were wrong at once: the
+// first two candidates were cheap placement probes (23s), the substitution
+// ladder's cost 2-3 minutes each, and the planned count (118) still included
+// every stage the short calibration had since switched off. The ladder - the
+// stage that matters most - got a share sized for 23s candidates and never ran.
+//
+// Now: every candidate updates the price (the larger of the all-time mean and
+// the mean of the last three, so cheap early probes cannot set the price for
+// expensive late stages), and the stage in flight gets 2x its OWN planned
+// candidates at the current price - re-priced after each candidate, only ever
+// extended. The global deadline is a runaway guard (the cap), not a plan.
+// GGML_MOE_CALIBRATE_BUDGET_S still pins a fixed budget and disables all this.
+static std::mutex             g_moe_cost_mu;
+static std::deque<long long>  g_moe_recent_candidate_ms;
+static std::atomic<long long> g_moe_stage_start_ms{0};
+static std::atomic<int>       g_moe_stage_planned{0};
 
-    // The stage that is running right now took its share from the PROVISIONAL
-    // budget, and that share was frozen at stage start. Growing the global
-    // budget without revisiting it leaves that stage on a deadline derived
-    // from a number that no longer exists - measured directly: the draft-depth
-    // stage opened at ~36s against the 600s provisional budget, took ~107s,
-    // and the budget was re-derived to 4988s thirty seconds later. It still
-    // stopped at ~143s, and the candidates it had left to run (n-max 4 and 8)
-    // were recorded as "failed". n-max 4 was the winner in the run before.
-    //
-    // Scale the in-flight stage's remaining time by the same factor the global
-    // budget grew, so a stage that opened under a provisional number is not
-    // punished for having started early.
-    const long long stage_deadline = g_moe_stage_deadline_ms.load(std::memory_order_relaxed);
-    if (stage_deadline != 0 && prev_deadline > 0 && deadline_ms > prev_deadline) {
-        const long long now_ms = common_moe_steady_now_ms();
-        const long long prev_left = prev_deadline - now_ms;
-        const long long new_left  = deadline_ms - now_ms;
-        if (prev_left > 0 && new_left > prev_left) {
-            const long long stage_left = stage_deadline - now_ms;
-            if (stage_left > 0) {
-                const long long grown = (long long) ((double) stage_left *
-                        ((double) new_left / (double) prev_left));
-                g_moe_stage_deadline_ms.store(now_ms + grown, std::memory_order_relaxed);
-                LOG_DBG("%s: extended the in-flight stage's deadline from %llds to %llds to match the "
-                        "re-derived budget\n", __func__, stage_left / 1000, grown / 1000);
+static double common_moe_candidate_price_s() {
+    const int n = g_moe_candidate_count.load(std::memory_order_relaxed);
+    if (n <= 0) {
+        return 0.0;
+    }
+    const double mean_all = (double) g_moe_candidate_ms_sum.load(std::memory_order_relaxed) / n / 1000.0;
+    double mean_recent = 0.0;
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cost_mu);
+        if (!g_moe_recent_candidate_ms.empty()) {
+            long long sum = 0;
+            for (long long ms : g_moe_recent_candidate_ms) {
+                sum += ms;
             }
+            mean_recent = (double) sum / g_moe_recent_candidate_ms.size() / 1000.0;
         }
     }
-
-    LOG_WRN("%s: time budget derived from this model's measured cost: %.0fs "
-            "(%.0fs per candidate x %d planned candidates, capped at %.0fs - "
-            "set GGML_MOE_CALIBRATE_BUDGET_S to fix it, GGML_MOE_CALIBRATE_BUDGET_MAX_S to raise the cap)\n",
-            __func__, want_s, per_candidate_s, planned, cap_s);
+    return std::max(mean_all, mean_recent);
 }
+
+static long long common_moe_stage_want_deadline_ms() {
+    const long long start = g_moe_stage_start_ms.load(std::memory_order_relaxed);
+    const int planned     = g_moe_stage_planned.load(std::memory_order_relaxed);
+    const double price_s  = common_moe_candidate_price_s();
+    if (start == 0 || planned <= 0 || price_s <= 0.0) {
+        return 0;
+    }
+    const long long want = start + std::max(60000LL, (long long) (2.0 * planned * price_s * 1000.0));
+    const long long global = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
+    return global > 0 ? std::min(want, global) : want;
+}
+
+static void common_moe_record_candidate_cost(long long ms) {
+    g_moe_candidate_ms_sum.fetch_add(ms, std::memory_order_relaxed);
+    g_moe_candidate_count.fetch_add(1, std::memory_order_relaxed);
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cost_mu);
+        g_moe_recent_candidate_ms.push_back(ms);
+        while (g_moe_recent_candidate_ms.size() > 3) {
+            g_moe_recent_candidate_ms.pop_front();
+        }
+    }
+    if (!g_moe_budget_is_derived.load(std::memory_order_relaxed)) {
+        return; // pinned by GGML_MOE_CALIBRATE_BUDGET_S
+    }
+    // Re-price the stage in flight. Only ever extend it.
+    const long long cur  = g_moe_stage_deadline_ms.load(std::memory_order_relaxed);
+    const long long want = common_moe_stage_want_deadline_ms();
+    if (cur != 0 && want > cur) {
+        g_moe_stage_deadline_ms.store(want, std::memory_order_relaxed);
+        LOG_INF("%s: stage re-priced - candidates here cost %.0fs, deadline extended by %llds\n",
+                __func__, common_moe_candidate_price_s(), (want - cur) / 1000);
+    }
+}
+
 static std::atomic<bool>      g_moe_calibrate_budget_warned{false};
 
 static long long common_moe_steady_now_ms() {
@@ -2966,30 +2971,37 @@ static long long common_moe_steady_now_ms() {
 // budget_spent() as "stop and keep the best so far", so hitting a stage deadline
 // degrades to a shorter search rather than to nothing - and with the entry saved
 // after each stage, what it did measure survives.
-static std::atomic<int>       g_moe_stage_planned{0};
-
 static void common_moe_stage_begin(const char * name, int planned) {
     g_moe_stage_deadline_ms.store(0, std::memory_order_relaxed);
-    const long long global = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
-    if (global == 0 || planned <= 0) {
-        return;
-    }
-    const long long now = common_moe_steady_now_ms();
-    const long long left = global - now;
-    if (left <= 0) {
-        return;
-    }
-    const int planned_total = g_moe_planned_candidates.load(std::memory_order_relaxed);
-    const int done          = g_moe_candidate_count.load(std::memory_order_relaxed);
-    const int remaining     = std::max(planned, planned_total - done);
-    // 1.6x slack: a stage may run over its exact share (candidates vary in cost)
-    // without being able to claim the whole remainder.
-    const double share = 1.6 * (double) planned / (double) remaining;
-    const long long budget = (long long) ((double) left * std::min(1.0, share));
+    g_moe_stage_start_ms.store(common_moe_steady_now_ms(), std::memory_order_relaxed);
     g_moe_stage_planned.store(planned, std::memory_order_relaxed);
-    g_moe_stage_deadline_ms.store(now + std::max(60000LL, budget), std::memory_order_relaxed);
-    LOG_DBG("%s: stage '%s' may use %llds of the %llds left (%d of %d candidates still planned)\n",
-            __func__, name, (long long) std::max(60000LL, budget) / 1000, left / 1000, planned, remaining);
+    if (planned <= 0) {
+        return;
+    }
+    if (!g_moe_budget_is_derived.load(std::memory_order_relaxed)) {
+        // Pinned budget: the old proportional share of whatever is left.
+        const long long global = g_moe_calibrate_deadline_ms.load(std::memory_order_relaxed);
+        const long long now = common_moe_steady_now_ms();
+        const long long left = global - now;
+        if (global == 0 || left <= 0) {
+            return;
+        }
+        const int planned_total = g_moe_planned_candidates.load(std::memory_order_relaxed);
+        const int done          = g_moe_candidate_count.load(std::memory_order_relaxed);
+        const int remaining     = std::max(planned, planned_total - done);
+        const double share = 1.6 * (double) planned / (double) remaining;
+        const long long budget = (long long) ((double) left * std::min(1.0, share));
+        g_moe_stage_deadline_ms.store(now + std::max(60000LL, budget), std::memory_order_relaxed);
+        return;
+    }
+    // No candidate priced yet: no stage limit, only the runaway guard.
+    const long long want = common_moe_stage_want_deadline_ms();
+    g_moe_stage_deadline_ms.store(want, std::memory_order_relaxed);
+    if (want != 0) {
+        LOG_INF("%s: stage '%s' - %d candidate(s) at %.0fs each on this model, allowed %llds\n",
+                __func__, name, planned, common_moe_candidate_price_s(),
+                (want - common_moe_steady_now_ms()) / 1000);
+    }
 }
 
 static void common_moe_stage_end() {
@@ -3048,9 +3060,7 @@ static double common_moe_bench_candidate_server(
     struct candidate_timer {
         long long t0 = common_moe_steady_now_ms();
         ~candidate_timer() {
-            g_moe_candidate_ms_sum.fetch_add(common_moe_steady_now_ms() - t0, std::memory_order_relaxed);
-            g_moe_candidate_count.fetch_add(1, std::memory_order_relaxed);
-            common_moe_maybe_derive_budget();
+            common_moe_record_candidate_cost(common_moe_steady_now_ms() - t0);
         }
     } timer;
     std::string mtp_args;
@@ -4327,10 +4337,19 @@ void common_moe_calibrate(common_params & params) {
     // spent. Skipped candidates report as failures, which every search here
     // already handles by keeping the best point actually measured.
     const bool budget_pinned_by_user = getenv("GGML_MOE_CALIBRATE_BUDGET_S") != nullptr;
+    // Pinned by the user, or else the runaway guard: stages price themselves
+    // (see common_moe_record_candidate_cost), so the global number only has to
+    // stop a run that has gone wrong.
     const double calibration_budget_s = [] {
-        const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_S");
-        const double v = e ? atof(e) : 600.0; // provisional; re-derived once two candidates have been priced
-        return v > 0.0 ? v : 600.0;
+        if (const char * e = getenv("GGML_MOE_CALIBRATE_BUDGET_S")) {
+            const double v = atof(e);
+            if (v > 0.0) {
+                return v;
+            }
+        }
+        const char * m = getenv("GGML_MOE_CALIBRATE_BUDGET_MAX_S");
+        const double cap = m ? atof(m) : 7200.0;
+        return cap > 0.0 ? cap : 7200.0;
     }();
     g_moe_calibrate_budget_warned.store(false);
     const long long calibrate_start_ms = common_moe_steady_now_ms();
@@ -4382,11 +4401,15 @@ void common_moe_calibrate(common_params & params) {
 
     g_moe_candidate_ms_sum.store(0);
     g_moe_candidate_count.store(0);
+    {
+        std::lock_guard<std::mutex> lock(g_moe_cost_mu);
+        g_moe_recent_candidate_ms.clear();
+    }
     g_moe_planned_candidates.store(0);
     g_moe_budget_is_derived.store(!budget_pinned_by_user);
     LOG_INF("%s: time budget for this run: %.0fs (%s)\n", __func__, calibration_budget_s,
             budget_pinned_by_user ? "GGML_MOE_CALIBRATE_BUDGET_S"
-                                  : "provisional - re-derived once this model's candidate cost is measured");
+                                  : "runaway guard only - each stage is priced from its own measured candidates");
 
     const std::string self_exe = common_self_exe_path();
     if (self_exe.empty()) {
