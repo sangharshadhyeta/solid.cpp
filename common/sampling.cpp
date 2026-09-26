@@ -122,6 +122,10 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // probabilistic draft acceptance's random stream: from the sampling seed, so a
+    // request with a fixed seed is reproducible (a random seed stays random)
+    std::mt19937 accept_rng{params.seed == LLAMA_DEFAULT_SEED ? std::random_device{}() : params.seed};
+
     void reset() {
         prev.clear();
 
@@ -516,6 +520,7 @@ struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
         /* .prev    = */ gsmpl->prev,
         /* .cur     = */ gsmpl->cur,
         /* .cur_p   = */ gsmpl->cur_p,
+        /* .accept_rng = */ gsmpl->accept_rng,
     };
 }
 
@@ -537,6 +542,7 @@ void common_sampler_copy(const common_sampler * src, common_sampler * dst) {
     dst->cur_p      = src->cur_p;
     dst->cur_p.data = src->cur_p.data ? dst->cur.data() : nullptr; // re-point to dst's buffer
     dst->t_total_us = src->t_total_us;
+    dst->accept_rng = src->accept_rng;
 }
 
 void common_perf_print(const struct llama_context * ctx, const struct common_sampler * gsmpl) {
@@ -676,6 +682,17 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     return id;
 }
 
+// whether the grammar (if one applies now) admits this token next
+static bool draft_fits_grammar(struct common_sampler * gsmpl, llama_token id) {
+    if (!gsmpl->grmr || !grammar_should_apply(gsmpl)) {
+        return true;
+    }
+    llama_token_data       single       = { id, 1.0f, 0.0f };
+    llama_token_data_array single_array = { &single, 1, -1, false };
+    llama_sampler_apply(gsmpl->grmr, &single_array);
+    return single_array.data[0].logit != -INFINITY;
+}
+
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first, const std::vector<float> * draft_probs) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
     GGML_ASSERT(!draft_probs || draft_probs->size() == draft.size());
@@ -701,8 +718,16 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         // exact match failed - optionally give the draft token one more chance via
         // probabilistic acceptance (see the doc comment in sampling.h) before falling
-        // back to the target's own independently-sampled token
-        if (draft_probs) {
+        // back to the target's own independently-sampled token.
+        //
+        // Not under greedy sampling: the target distribution is then a point mass on
+        // its own token, so any other token has p_target = 0 - the softmax values left
+        // in cur_p are not what is being sampled from, and accepting by them made
+        // temperature-0 requests answer differently each time. And never a token the
+        // grammar rejects: with grammar_first = false the grammar is not in cur_p, and
+        // accepting such a token emptied the grammar stack ("Unexpected empty grammar
+        // stack after accepting piece").
+        if (draft_probs && gsmpl->params.temp > 0.0f && draft_fits_grammar(gsmpl, draft[i])) {
             const float p_draft = (*draft_probs)[i];
 
             if (p_draft > 0.0f) {
@@ -719,10 +744,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
                 const float alpha = std::min(1.0f, p_target / p_draft);
 
                 if (alpha > 0.0f) {
-                    static thread_local std::mt19937 rng{std::random_device{}()};
+                    // the request's own seed: a fixed seed gives the same answer twice
                     std::uniform_real_distribution<float> dist(0.0f, 1.0f);
 
-                    if (dist(rng) < alpha) {
+                    if (dist(gsmpl->accept_rng) < alpha) {
                         common_sampler_accept(gsmpl, draft[i], true);
                         result.push_back(draft[i]);
                         continue;
