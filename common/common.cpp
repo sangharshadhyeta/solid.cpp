@@ -3503,9 +3503,16 @@ static double common_moe_bench_candidate_server(
             "Write a Python function that implements binary search, then explain its time complexity.",
             "A train leaves at 3pm at 60 km/h; a second leaves the same station at 4pm at 90 km/h on the "
             "same track. When does the second catch the first? Work it out step by step.",
+            // Prose, where a draft is accepted ~38% of the time against 73-90% for code and
+            // reasoning: a depth picked on those two alone ran 8 deep and cost a mixed
+            // workload up to a third of its speed (gemma-4, 1 Oct 2026: depth 4 measured
+            // +32% on prose). Added to the mix, not instead of it.
+            "Explain in a few paragraphs how central banks respond to inflation, and why markets "
+            "react to what they announce.",
         };
-        const int n_solo_probes = mtp_path.empty() ? 1 : 2;
-        double sum_tps = 0.0;
+        const int n_solo_probes = mtp_path.empty() ? 1 : 3;
+        double sum_tps = 0.0;   // (kept for the single-probe path)
+        double sum_tok = 0.0, sum_ms = 0.0;   // the mix is scored by total tokens over total time
         int n_ok = 0;
         double worst_degeneracy = 0.0;
         // One untimed request first. A candidate server has just started, so its
@@ -3564,6 +3571,8 @@ static double common_moe_bench_candidate_server(
             const auto r = common_moe_bench_one_request_full(port, timed_prompt, n_predict, probe_seed);
             if (r.predicted_n > 0 && r.predicted_ms > 0) {
                 sum_tps += r.predicted_n / (r.predicted_ms / 1000.0);
+                sum_tok += r.predicted_n;
+                sum_ms  += r.predicted_ms;
                 worst_degeneracy = std::max(worst_degeneracy, r.degeneracy);
                 n_ok++;
                 if (r.draft_n > 0) {
@@ -3572,7 +3581,10 @@ static double common_moe_bench_candidate_server(
                 }
             }
         }
-        result_tps = n_ok > 0 ? sum_tps / n_ok : -1.0;
+        // Total tokens over total time, not the mean of the rates: a mean of rates lets the
+        // fast probe (code) hide the slow one (prose), which is the one that sets how long a
+        // real mixed workload takes. Identical for a single probe.
+        result_tps = n_ok > 0 ? (sum_ms > 0 ? sum_tok / (sum_ms / 1000.0) : sum_tps / n_ok) : -1.0;
         // Quality-only pass over the short prompts. Kept out of the timing
         // average deliberately: these generate few tokens when healthy, so
         // folding them into tok/s would measure prompt length, not decode
@@ -9186,13 +9198,13 @@ static bool common_maybe_autoplace_moe_cpu(
             // - this never turns MTP on for someone who didn't ask for it,
             // it only tunes n_max for someone who already did.
             if (cached.spec_n_max > 0 && params.speculative.has_dft() &&
-                params.speculative.draft.n_max == 3 /* default, see common_params_speculative_draft */) {
+                params.speculative.draft.n_max == common_params_speculative_draft::N_MAX_DEFAULT) {
                 params.speculative.draft.n_max = cached.spec_n_max;
             }
             // 0 is a measured answer: no draft beat every depth on this machine.
             // Same guard - only when the user left the depth at its default.
             if (cached.spec_n_max == 0 && params.speculative.has_dft() &&
-                params.speculative.draft.n_max == 3) {
+                params.speculative.draft.n_max == common_params_speculative_draft::N_MAX_DEFAULT) {
                 LOG_WRN("%s: calibration measured speculative decoding slower than none on this machine - "
                         "serving without it (pass --spec-draft-n-max to override; the draft model is still loaded)\n",
                         __func__);

@@ -323,7 +323,12 @@ struct common_params_model {
 
 // draft-model-based speculative decoding parameters
 struct common_params_speculative_draft {
-    int32_t n_max = 3; // maximum number of tokens to draft during speculative decoding
+    // 4 keeps a verify batch (4 drafted + 1) inside the GPU's 5-wide MoE fast path. Measured on
+    // gemma-4, 1 Oct 2026, same prompts and seeds: depth 4 +32%, depth 6 +12%, against depth 8
+    // on a mixed prompt set; a calibrated depth (which replaces this) was picked on code and
+    // reasoning only, where deeper drafts do win - the calibration probes include prose now.
+    static constexpr int32_t N_MAX_DEFAULT = 4;
+    int32_t n_max = N_MAX_DEFAULT; // maximum number of tokens to draft during speculative decoding
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
