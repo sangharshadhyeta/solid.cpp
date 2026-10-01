@@ -1583,12 +1583,19 @@ static common_moe_fit_probe_result common_moe_find_safe_layers(
 // Qwen3.8-Flash-Next, which served 1-2 correct answers in 10; every version-1
 // substitution setting is suspect for the same reason, so none is applied.
 static constexpr int COMMON_MOE_CALIBRATION_GATES_VERSION = 2;
+// The version of the shipped defaults an entry was written under (1 Oct 2026: depth 4, p_min 0.5,
+// probabilistic acceptance, neuron subsetting off). An entry from before it recorded the speculative
+// settings from whatever the launch carried - a flag left on a command line became a "calibrated"
+// value that outranked every later default (gemma-4's depth 8) - so its speculative fields are read
+// as unmeasured. Placement, threads, cache size and the substitution floor are unaffected.
+static constexpr int COMMON_MOE_DEFAULTS_VERSION = 2;
 
 struct common_moe_calibration_entry {
     int         n_cpu_moe       = 0;
     int         n_threads       = -1;
     int         n_threads_batch = -1;
     int         spec_n_max      = -1; // -1 = no MTP calibration recorded
+    int         defaults_version = 0;  // COMMON_MOE_DEFAULTS_VERSION when written; 0 = before it existed
     int         concurrency     = 1;  // > 1: tok_per_sec is aggregate throughput at this many concurrent requests, not solo
     double      tok_per_sec     = 0.0;
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
@@ -2156,6 +2163,12 @@ static bool common_moe_calibration_lookup(
         out.spec_prob_accept    = e.value("spec_prob_accept", -1);
         out.spec_types          = e.value("spec_types", std::string());
         out.spec_p_min          = e.value("spec_p_min", -1.0);
+        out.defaults_version    = e.value("defaults_version", 0);
+        if (out.defaults_version < COMMON_MOE_DEFAULTS_VERSION) {
+            out.spec_n_max = -1;          // launch values, not measurements: let the defaults apply
+            out.spec_p_min = -1.0;
+            out.spec_prob_accept = -1;
+        }
         out.spec_draft_cpu_moe  = e.value("spec_draft_cpu_moe", -1);
         out.op_offload_min_batch = e.value("op_offload_min_batch", -1);
         out.n_ubatch             = e.value("n_ubatch", -1);
@@ -2271,6 +2284,7 @@ static void common_moe_calibration_save(
         {"lookahead_depth", entry.lookahead_depth},
         {"substitute_quality_sigma", entry.substitute_quality_sigma},
         {"gates_version", COMMON_MOE_CALIBRATION_GATES_VERSION},
+        {"defaults_version", COMMON_MOE_DEFAULTS_VERSION},
         {"fit_target_mb",           entry.fit_target_mb},
         {"neuron_reduce_k",         entry.neuron_reduce_k},
         {"neuron_reduce_budget_mb", entry.neuron_reduce_budget_mb},
@@ -5407,10 +5421,10 @@ void common_moe_calibrate(common_params & params) {
         // and cannot be POSTed to a running server the way every other knob
         // here can. That is most of the run's wall clock for two values the
         // launch command already carries.
+        // The later stages run at the launch depth, but it is NOT written into the entry: it is
+        // not a measurement, and a cached launch flag would outrank every future default.
         best_n_max = std::max(1, params.speculative.draft.n_max);
-        entry.spec_n_max = best_n_max;
         g_moe_calib_prob_accept.store(params.speculative.draft.prob_accept ? 1 : 0);
-        entry.spec_prob_accept = params.speculative.draft.prob_accept ? 1 : 0;
         LOG_WRN("%s: speculative depth left at the launch value (n-max %d, %s acceptance) - depth and "
                 "acceptance are launch arguments, so every candidate is a full server spawn "
                 "(GGML_MOE_CALIBRATE_SEARCH_DEPTH=1 to search them)\n", __func__, best_n_max,

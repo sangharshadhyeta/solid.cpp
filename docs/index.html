@@ -1166,14 +1166,14 @@ how much VRAM is free at the cache's first fill) and drives hit rate, so hit rat
 <tr><td>Draft depth 6</td><td>32.5 / 36.6 / 35.0</td><td>+12% &plusmn;3 (22/24)</td><td>+15% &plusmn;6 (6/6)</td><td>2,721 / 0.843</td><td>win, smaller than 4</td></tr>
 <tr><td>Draft confidence gate <code>p_min</code> 0.5 (depth 8)</td><td>34.1 / 38.0 / 36.6</td><td>+13% &plusmn;3 (19/24)</td><td>+16% &plusmn;6 (6/6)</td><td>2,682 / 0.828</td><td><strong>win</strong> &mdash; now the default</td></tr>
 <tr><td>Probabilistic draft acceptance <strong>off</strong></td><td>25.1 / 29.3 / 31.0</td><td>-9% &plusmn;2 (4/24)</td><td>-4% &plusmn;3 (1/6)</td><td>2,682 / 0.845</td><td>keep it on (now the default)</td></tr>
-<tr><td>Lazy KV commit</td><td>29.9 / 34.6 / 30.5</td><td>-0% &plusmn;2 (12/24)</td><td>+6% &plusmn;3 (5/6)</td><td>3,123 / 0.882</td><td><strong>win</strong> &mdash; a larger cache every round (+8% to +21% slots, hit rate higher); now on, with headroom</td></tr>
+<tr><td>Lazy KV commit</td><td>29.9 / 34.6 / 30.5</td><td>-0% &plusmn;2 (12/24)</td><td>+6% &plusmn;3 (5/6)</td><td>3,123 / 0.882</td><td>a bigger cache (+8% to +21% slots, hit rate up about 3 points) but no measurable warm speed gain; on, with headroom</td></tr>
 <tr><td>Router lookahead, depth 2</td><td>27.8 / 30.5 / 32.2</td><td>-6% &plusmn;2 (5/24)</td><td>-3% &plusmn;5 (2/6)</td><td>2,644 / 0.805</td><td>loss: slower and a lower hit rate every round: stays off</td></tr>
 <tr><td>Lookahead boundary at 8 (shipped) against widened to the real verify width</td><td>29.8 / 31.8 / 30.8</td><td>-1% &plusmn;2 (12/24)</td><td>+7% &plusmn;6 (3/6)</td><td>2,721 / 0.863</td><td>8 is better on hit rate every round: kept</td></tr>
 <tr><td>Atlas warming</td><td>30.5 / 32.0 / 34.2</td><td>+1% &plusmn;2 (13/24)</td><td>+3% &plusmn;4 (3/6)</td><td>2,721 / 0.854</td><td>tie: stays off</td></tr>
 <tr><td>Admission after 4 touches</td><td>27.4 / 33.6 / 30.8</td><td>+0% &plusmn;2 (11/24)</td><td>+6% &plusmn;4 (4/6)</td><td>2,759 / 0.853</td><td>no gain in speed, hit rate a little lower: stays off</td></tr>
 <tr><td>Substitution <strong>off</strong></td><td>28.7 / 33.8 / 31.3</td><td>-1% &plusmn;2 (9/24)</td><td>+3% &plusmn;5 (3/6)</td><td>2,721 / 0.853</td><td>tie in speed at the calibrated floor</td></tr>
-<tr><td>Trained pre-router, weights frozen</td><td>29.2 / 35.0</td><td>-1% &plusmn;3 (6/16)</td><td>-1% &plusmn;5 (2/4)</td><td>2,702 / 0.847</td><td>no measurable gain here</td></tr>
-<tr><td>Trained pre-router, learning while it serves</td><td>30.2 / 28.9</td><td>-3% &plusmn;2 (6/16)</td><td>-1% &plusmn;3 (1/4)</td><td>2,644 / 0.834</td><td>no gain; slightly negative</td></tr>
+<tr><td>Trained pre-router, weights frozen</td><td>29.2 / 35.0 / 30.3</td><td>-1% &plusmn;2 (10/24)</td><td>+4% &plusmn;6 (3/6)</td><td>2,721 / 0.852</td><td>no measurable gain here</td></tr>
+<tr><td>Trained pre-router, learning while it serves</td><td>30.2 / 28.9 / 30.1</td><td>-3% &plusmn;2 (10/24)</td><td>+3% &plusmn;5 (2/6)</td><td>2,644 / 0.833</td><td>a mild loss warm (about 2 se); no gain on first requests</td></tr>
 <tr><td>Previous build, same settings (reference)</td><td>30.1 / 36.2 / 35.6</td><td>+7% &plusmn;3 (16/24)</td><td>+10% &plusmn;2 (6/6)</td><td>3,045 / 0.877</td><td>see the note below the table</td></tr>
 </tbody>
 </table></div>
