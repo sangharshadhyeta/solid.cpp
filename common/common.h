@@ -1099,6 +1099,11 @@ struct common_sampler;
 // fit_params_target, calibration adds it once to its probe margin.
 size_t common_measure_draft_memory(const common_params & params, std::vector<size_t> & out_per_device);
 
+// A draft file that is an MTP head (read from its own header, not its name) used with -md and no --spec-type
+// runs as a plain draft model unless told otherwise - 25% slower on gemma-4 (paired, 24 requests, 1 Oct 2026).
+// Sets draft-mtp in that case. Leaves an explicit type, and a draft that is not an MTP head, alone.
+void common_speculative_default_type_from_draft(common_params & params);
+
 struct common_init_result {
     common_init_result(common_params & params, bool model_only = false);
     ~common_init_result();

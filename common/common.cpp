@@ -1509,6 +1509,45 @@ size_t common_measure_draft_memory(const common_params & params, std::vector<siz
     return total;
 }
 
+// An MTP head is recognised by what is in its header: gemma-4's has its own architecture ("gemma4-assistant"),
+// and a head that shares its target's architecture (Qwen's "mtp-*-shared") declares <arch>.nextn_shared_target_tensors.
+// A full model that merely contains a trailing MTP block has neither.
+static bool common_draft_file_is_mtp_head(const std::string & path) {
+    struct gguf_init_params ip = { /*no_alloc=*/ true, /*ctx=*/ nullptr };
+    struct gguf_context * gctx = gguf_init_from_file(path.c_str(), ip);
+    if (!gctx) {
+        return false;
+    }
+    bool mtp = false;
+    const int64_t k_arch = gguf_find_key(gctx, "general.architecture");
+    if (k_arch >= 0 && gguf_get_kv_type(gctx, k_arch) == GGUF_TYPE_STRING) {
+        const std::string arch = gguf_get_val_str(gctx, k_arch);
+        const std::string suffix = "-assistant";
+        if (arch.size() > suffix.size() && arch.compare(arch.size() - suffix.size(), suffix.size(), suffix) == 0) {
+            mtp = true;
+        } else {
+            const int64_t k_shared = gguf_find_key(gctx, (arch + ".nextn_shared_target_tensors").c_str());
+            mtp = k_shared >= 0 && gguf_get_kv_type(gctx, k_shared) == GGUF_TYPE_BOOL && gguf_get_val_bool(gctx, k_shared);
+        }
+    }
+    gguf_free(gctx);
+    return mtp;
+}
+
+void common_speculative_default_type_from_draft(common_params & params) {
+    if (!params.speculative.has_dft() || params.speculative.draft.mparams.path.empty()) {
+        return;
+    }
+    // only when no type was asked for: the default is the single entry NONE
+    if (params.speculative.types != std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE}) {
+        return;
+    }
+    if (common_draft_file_is_mtp_head(params.speculative.draft.mparams.path)) {
+        params.speculative.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        LOG_INF("%s: the draft file is an MTP head - using --spec-type draft-mtp (pass --spec-type to choose another)\n", __func__);
+    }
+}
+
 // The draft's VRAM on the first device, for the serving-time placement probes. Calibration folds the draft into
 // its margin (see the --moe-calibrate probe); the serving paths did not, so a launch that reached them with no
 // calibration entry placed the target into the whole device and then could not load the draft (cudaMalloc out

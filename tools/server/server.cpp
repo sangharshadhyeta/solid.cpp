@@ -203,6 +203,9 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // an -md that names an MTP head, with no --spec-type: use it as one (it was run as a plain draft model: -25%)
+    common_speculative_default_type_from_draft(params);
+
     {
         std::string model_tag = std::filesystem::path(params.model.path).stem().string();
         if (model_tag.empty()) {
