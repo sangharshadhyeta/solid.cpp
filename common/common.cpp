@@ -9244,7 +9244,7 @@ static bool common_maybe_autoplace_moe_cpu(
             // And the confidence gate: only for a run with a draft model that left
             // --spec-draft-p-min at its default of 0.
             if (cached.spec_p_min >= 0.0 && params.speculative.has_dft() &&
-                params.speculative.draft.p_min == 0.0f) {
+                params.speculative.draft.p_min == common_params_speculative_draft::P_MIN_DEFAULT) {
                 params.speculative.draft.p_min = (float) cached.spec_p_min;
             }
             if (!cached.spec_types.empty() && params.speculative.has_dft() &&

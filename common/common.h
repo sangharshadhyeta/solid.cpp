@@ -332,7 +332,12 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
-    float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+    // The confidence gate: stop drafting once the draft's top probability falls below it.
+    // 0 never stops anything. 0.5 measured +18% and +13% (two rounds, gemma-4, same prompts and
+    // seeds, depth 8; 1 Oct 2026) - upstream's long-standing default was 0.75-0.8 and this fork
+    // had lowered it to 0. A calibrated value replaces it (it applies when this is still the default).
+    static constexpr float P_MIN_DEFAULT = 0.5f;
+    float p_min   = P_MIN_DEFAULT; // minimum speculative decoding probability (greedy)
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
