@@ -19,6 +19,8 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <map>
+#include <mutex>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1930,6 +1932,11 @@ void llm_graph_context::build_moe_lookahead(
     // ring at its default 0 so not one prediction could even be stored. 8 is the
     // decode/MTP-verify width (n_parallel x draft depth) this fork already uses as
     // the boundary for decode-only work elsewhere.
+    // Tried raising this to the server's real decode width (n_parallel x verify
+    // width, 18 for two slots at draft depth 8): hit rate 0.868 against 0.886
+    // with the fixed 8 (1 Oct 2026, same prompts and seeds). The lookahead
+    // predicts from the first token's row only - a poor guide for the other 8-17
+    // tokens of a verify batch - and its fills queue behind demand fills. 8 stays.
     if (n_tokens > 8) {
         return;
     }
@@ -1948,16 +1955,28 @@ void llm_graph_context::build_moe_lookahead(
     cb(next_top, depth == 1 ? "ffn_moe_lookahead" : "ffn_moe_lookahead2", il);
 
     // Bundles the target tensor pointer with this call's depth for
-    // moe_prefetch_cb - see the struct comment. Allocated once per (layer,
-    // depth) pair at graph build time (bounded: at most n_layers * 3) and
-    // deliberately never freed, the same lifetime the raw tensor-pointer
-    // userdata this replaces already had implicitly.
-    auto * ud = new llm_graph_context::moe_lookahead_userdata{};
-    ud->depth = depth;
+    // moe_prefetch_cb - see the struct comment. One per (predicted tensor,
+    // depth), shared by every graph that predicts it (bounded: at most
+    // n_layers * 3) and never freed. It used to be allocated on every graph
+    // build - every rebuild a batch shape forces - so it leaked for the life of
+    // the server while this comment said it was bounded.
+    llm_graph_context::moe_lookahead_userdata key{};
+    key.depth = depth;
     for (ggml_tensor * t : { next_exps, next_exps_b, next_exps_c }) {
-        if (t && t->data && ud->n_host_bases < 3) {
-            ud->host_bases[ud->n_host_bases++] = t->data;
+        if (t && t->data && key.n_host_bases < 3) {
+            key.host_bases[key.n_host_bases++] = t->data;
         }
+    }
+    llm_graph_context::moe_lookahead_userdata * ud = nullptr;
+    {
+        static std::mutex mu;
+        static std::map<std::pair<void *, int>, llm_graph_context::moe_lookahead_userdata *> made;
+        std::lock_guard<std::mutex> lock(mu);
+        auto & slot = made[{ key.n_host_bases ? key.host_bases[0] : nullptr, depth }];
+        if (!slot) {
+            slot = new llm_graph_context::moe_lookahead_userdata(key);
+        }
+        ud = slot;
     }
 
     // Fires in graph order - while this layer is still computing and before the
