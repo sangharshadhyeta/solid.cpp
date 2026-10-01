@@ -8347,6 +8347,63 @@ size_t ggml_backend_cuda_moe_cache_yield_vram(int device_index, size_t bytes_nee
     return freed;
 }
 
+// Residency snapshot for the router bias (see llm_graph_input_moe_cache_bias in src/llama-graph.cpp): for each expert tensor
+// `bases[i]` (the tensor's host data pointer, which is the cache key) belonging to layer `layer_of[i]`, add 1 to
+// out[layer * n_expert + e] when expert e of that tensor sits in a valid slot. A caller that registered k tensors for a layer
+// treats an expert as resident when its count is k. One pass over each pool's map, under the session lock; the
+// snapshot is advisory (fills land while the token runs), which is all a routing preference needs. Returns the number
+// of (tensor, expert) entries found resident, 0 when the cache is off or empty.
+size_t ggml_backend_cuda_moe_cache_resident_counts(const void * const * bases, const int32_t * layer_of, int n_bases,
+        int n_layers, int64_t n_expert, uint8_t * out) {
+    if (!bases || !layer_of || !out || n_bases <= 0 || n_layers <= 0 || n_expert <= 0) {
+        return 0;
+    }
+    std::unordered_map<const void *, int> layer_by_base;
+    layer_by_base.reserve((size_t) n_bases * 2);
+    for (int i = 0; i < n_bases; i++) {
+        if (bases[i] && layer_of[i] >= 0 && layer_of[i] < n_layers) {
+            layer_by_base[bases[i]] = layer_of[i];
+        }
+    }
+    std::vector<moe_cache_session *> sessions;
+    {
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        for (moe_cache_session * session : g_sessions) {
+            if (!session->stopping) {
+                sessions.push_back(session);
+            }
+        }
+    }
+    size_t found = 0;
+    for (moe_cache_session * session : sessions) {
+        std::lock_guard<std::mutex> lock(session->mu);
+        for (const auto & device_ptr : session->devices) {
+            for (const auto & pool_ptr : device_ptr->pools) {
+                const moe_cache_pool & pool = *pool_ptr;
+                if (!pool.slab || pool.n_slots <= 0) {
+                    continue;
+                }
+                for (const auto & kv : pool.map) {
+                    const auto it = layer_by_base.find(kv.first.tensor);
+                    if (it == layer_by_base.end() || kv.first.expert < 0 || kv.first.expert >= n_expert) {
+                        continue;
+                    }
+                    if (kv.second < 0 || kv.second >= pool.n_slots ||
+                        pool.slots[kv.second].state != moe_cache_slot_state::valid) {
+                        continue;
+                    }
+                    uint8_t & c = out[(size_t) it->second * (size_t) n_expert + (size_t) kv.first.expert];
+                    if (c < 255) {
+                        c++;
+                    }
+                    found++;
+                }
+            }
+        }
+    }
+    return found;
+}
+
 static bool moe_cache_substitute_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");

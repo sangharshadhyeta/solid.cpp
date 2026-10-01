@@ -64,6 +64,9 @@ GGML_BACKEND_API size_t ggml_backend_cuda_vmm_uncommitted_bytes(void);
 // The expert cache gives pools back until `bytes_needed` are free on the device; returns the bytes released.
 GGML_BACKEND_API size_t ggml_backend_cuda_moe_cache_yield_vram(int device, size_t bytes_needed);
 
+// Residency snapshot of the expert cache for the router bias: see moe-cache.cu.
+GGML_BACKEND_API size_t ggml_backend_cuda_moe_cache_resident_counts(const void * const * bases, const int32_t * layer_of,
+        int n_bases, int n_layers, int64_t n_expert, uint8_t * out);
 // Mark the next buffer allocation on this thread as eligible for lazy commit.
 // Only meaningful for allocations whose use lags their reservation (the KV
 // cache); weights are read in full at load and must never be lazy.

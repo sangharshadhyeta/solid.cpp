@@ -186,6 +186,38 @@ public:
     const float    f_attn_temp_offset;
 };
 
+// Router preference for experts that are resident in the expert cache (Cache-Conditional Experts, arXiv 2412.00099):
+// the selection scores of a resident expert are multiplied by (1 + beta) before the top-k, so a near-tie goes to the expert
+// that costs nothing to fetch; the weights still come from the UNBIASED scores (build_moe_ffn), so every expert that is chosen
+// is computed exactly. Equivalent to adding ln(1 + beta) to its logit. beta comes from LLAMA_MOE_CACHE_BIAS (default 0 = off).
+// The factor table [n_expert, n_layer] is rebuilt from the cache's residency before every decode.
+class llm_graph_input_moe_cache_bias : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_cache_bias(int64_t n_expert, int64_t n_layer, float beta)
+        : n_expert(n_expert), n_layer(n_layer), beta(beta), per_layer((size_t) n_layer, 0) {}
+    virtual ~llm_graph_input_moe_cache_bias() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+    bool can_reuse(const llm_graph_params & params) override { GGML_UNUSED(params); return true; }
+
+    // register the host data pointers of one layer's expert tensors (the cache's keys)
+    void add_layer(int il, const ggml_tensor * t);
+
+    ggml_tensor * factor = nullptr; // F32 [n_expert, n_layer]
+
+    const int64_t n_expert;
+    const int64_t n_layer;
+    const float   beta;
+
+private:
+    std::vector<const void *> bases;
+    std::vector<int32_t>      layer_of;
+    std::vector<int>          per_layer;
+    bool                      resolved = false;
+    typedef size_t (*counts_fn)(const void * const *, const int32_t *, int, int, int64_t, uint8_t *);
+    counts_fn                 counts = nullptr;
+};
+
 class llm_graph_input_pos_bucket : public llm_graph_input_i {
 public:
     llm_graph_input_pos_bucket(const llama_hparams & hparams) : hparams(hparams) {}
@@ -1003,6 +1035,9 @@ struct llm_graph_context {
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
+
+    // created by the first build_moe_ffn of a graph when LLAMA_MOE_CACHE_BIAS > 0
+    mutable llm_graph_input_moe_cache_bias * inp_moe_cache_bias = nullptr;
 
     llm_graph_context(const llm_graph_params & params);
     virtual ~llm_graph_context() = default;

@@ -178,6 +178,46 @@ void llm_graph_input_attn_temp::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_moe_cache_bias::add_layer(int il, const ggml_tensor * t) {
+    if (!t || !t->data || il < 0 || il >= n_layer) {
+        return;
+    }
+    bases.push_back(t->data);
+    layer_of.push_back(il);
+    per_layer[(size_t) il]++;
+}
+
+void llm_graph_input_moe_cache_bias::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    if (!factor) {
+        return;
+    }
+    if (!resolved) {
+        resolved = true;
+        if (ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA")) {
+            counts = (counts_fn) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_cache_resident_counts");
+        }
+    }
+    const size_t n = (size_t) (n_expert * n_layer);
+    std::vector<float> f(n, 1.0f);
+    if (counts && !bases.empty()) {
+        std::vector<uint8_t> cnt(n, 0);
+        counts(bases.data(), layer_of.data(), (int) bases.size(), (int) n_layer, n_expert, cnt.data());
+        for (int64_t l = 0; l < n_layer; l++) {
+            const int need = per_layer[(size_t) l];
+            if (need <= 0) {
+                continue;
+            }
+            for (int64_t e = 0; e < n_expert; e++) {
+                if (cnt[(size_t) (l * n_expert + e)] >= need) {
+                    f[(size_t) (l * n_expert + e)] = 1.0f + beta;
+                }
+            }
+        }
+    }
+    ggml_backend_tensor_set(factor, f.data(), 0, n * sizeof(float));
+}
+
 void llm_graph_input_pos_bucket::set_input(const llama_ubatch * ubatch) {
     if (pos_bucket) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -2192,8 +2232,31 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     // add experts selection bias - introduced in DeepSeek V3
     // leave probs unbiased as it's later used to get expert weights
     ggml_tensor * selection_probs = probs;
+    {
+        static const float cache_bias = [] {
+            const char * e = getenv("LLAMA_MOE_CACHE_BIAS");
+            return e ? std::max(0.0f, (float) atof(e)) : 0.0f;
+        }();
+        if (cache_bias > 0.0f && selected_experts_in == nullptr) {
+            if (!inp_moe_cache_bias) {
+                auto inp = std::make_unique<llm_graph_input_moe_cache_bias>(n_expert, hparams.n_layer_all, cache_bias);
+                inp->factor = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_expert, hparams.n_layer_all);
+                ggml_set_input(inp->factor);
+                cb(inp->factor, "moe_cache_bias", -1);
+                inp_moe_cache_bias = inp.get();
+                res->add_input(std::move(inp));
+            }
+            for (const ggml_tensor * t : { up_exps, gate_exps, down_exps, gate_up_exps }) {
+                inp_moe_cache_bias->add_layer(il, t);
+            }
+            ggml_tensor * f = ggml_view_2d(ctx0, inp_moe_cache_bias->factor, n_expert, 1,
+                    inp_moe_cache_bias->factor->nb[1], (size_t) il * inp_moe_cache_bias->factor->nb[1]);
+            selection_probs = ggml_mul(ctx0, probs, f);
+            cb(selection_probs, "ffn_moe_probs_cache_bias", il);
+        }
+    }
     if (exp_probs_b != nullptr) {
-        selection_probs = ggml_add(ctx0, probs, exp_probs_b);
+        selection_probs = ggml_add(ctx0, selection_probs, exp_probs_b);
         cb(selection_probs, "ffn_moe_probs_biased", il);
     }
 
