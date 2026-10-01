@@ -1310,6 +1310,9 @@ output is not bit-reproducible here, so a bare &ldquo;identical&rdquo; count mea
 <div style="overflow-x:auto"><table style="min-width:680px"><thead><tr><th>Step</th><th>Operator tests</th><th>Output agreement (against the control)</th><th>Speed, paired</th></tr></thead><tbody>
 <tr><td>1. Argsort no longer sorts in place; a divergent barrier fixed in the f16 flash attention</td><td>argsort 67/67, top-k 71/71, flash attention 2,920/2,920</td><td>20.8% (control 24.0%)</td><td>&minus;1.9% (control spread 2%)</td></tr>
 <tr><td>2a. Sparse flash-attention path, inert until a model asks for it</td><td>flash attention 2,926/2,926, six new sparse cases</td><td>34.5% (control 27.4%)</td><td>&minus;0.6% &plusmn;0.8 (control +0.9% &plusmn;0.7), three rounds</td></tr>
+<tr><td>2b. Sparse flash attention enabled for Qwen's head size 256</td><td>flash attention 2,929/2,929</td><td>34.0% (control 21.5%)</td><td>+5.1% on one 12-request sample whose control spread was 2.4%; gemma does not use this path, so read it as noise</td></tr>
+<tr><td>3. MoE expert-matmul race fixes (<code>mmid</code>, <code>mmf</code>, vec attention)</td><td>MUL_MAT_ID 869/869, MUL_MAT 1,186/1,186</td><td>21.0% (controls have ranged 21&ndash;57%)</td><td>+2.8% against a control spread of 0.3%</td></tr>
+<tr><td>4. <code>GGML_CUDA_MOE_CACHE_PART_STATS=1</code>, a read-only counter</td><td>builds and prints at normal speed (61.1 against 61.7)</td><td>not applicable</td><td>measurement: 5.1% of experts are only partly resident, 8.6% of routed rows miss, 69&nbsp;MiB of expert bytes per token are fetched by the CPU. The 15% bar for admitting the two fused tensors together is not reached on gemma</td></tr>
 </tbody></table></div>
 <p>Step 2a first read &minus;4.8% on a single 12-request sample, inside which the control itself spread 3%; three paired rounds showed it was noise. Each later
 step is added to this table when it has passed.</p>
@@ -1321,6 +1324,50 @@ whether it pinned <code>--spec-draft-n-max 8</code> (the calibrated depth of 13 
 <tr><td>Calibration probes: code and reasoning</td><td>79.1 / 75.7 / 75.8</td><td><strong>78.6 / 76.9 / 77.1</strong></td><td>0% &plusmn;2 (13/24)</td></tr></tbody></table></div>
 <p>Pinning the old depth cost 15% on prose and nothing on code: with the confidence gate on, a deeper draft only matters where drafts are accepted. A command line that
 carries a depth from an earlier calibration should drop it.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Why a bare launch was slow: one flag at a time</h3>
+<p>The shipped numbers came from a command with eleven flags. To make a launch with none of them reach the same speed, each flag was removed from that
+command in turn, three paired rounds, mixed prompts:</p>
+<div style="overflow-x:auto"><table style="min-width:640px"><thead><tr><th>Setting</th><th>Warm, paired vs the 11-flag command</th><th>Cache slots / hit rate</th><th>Verdict</th></tr></thead><tbody><tr><td>The 11-flag production command</td><td>&mdash;</td><td>2,967 / 0.856</td><td>reference</td></tr>
+<tr><td>The same command again (the noise floor)</td><td>+1% &plusmn;1 (12/24)</td><td>3,124 / 0.864</td><td>reference</td></tr>
+<tr><td>Without <code>--spec-type draft-mtp</code></td><td>-25% &plusmn;2 (0/24)</td><td>3,273 / 0.842</td><td><strong>&minus;25%</strong>: fixed by reading the draft file's header</td></tr>
+<tr><td>Without <code>--no-mmap</code> (model mapped, not read in)</td><td>-13% &plusmn;2 (1/24)</td><td>2,966 / 0.856</td><td><strong>&minus;13%</strong>: fixed by the load default</td></tr>
+<tr><td>Without <code>-ncmoe 99</code></td><td colspan="2"><strong>the server did not start</strong> in 3 of 3 rounds</td><td>fixed: the draft's VRAM is reserved in the placement</td></tr>
+<tr><td>Without <code>-ctk q8_0 -ctv q8_0</code> (f16 KV)</td><td>+3% &plusmn;1 (15/24)</td><td>2,496 / 0.820</td><td><strong>+3.5%</strong>, 16% fewer cache slots</td></tr>
+<tr><td>Without <code>-t 6 -tb 6</code></td><td>+2% &plusmn;1 (18/24)</td><td>3,280 / 0.871</td><td>tie</td></tr>
+<tr><td>Without <code>-ub 2048</code></td><td>+1% &plusmn;1 (15/24)</td><td>3,244 / 0.870</td><td>tie</td></tr>
+<tr><td>Without <code>--moe-cache auto</code></td><td>+2% &plusmn;2 (11/24)</td><td>3,124 / 0.864</td><td>tie (auto is the default)</td></tr>
+<tr><td>Without <code>--cache-ram 0</code></td><td>-1% &plusmn;1 (10/24)</td><td>3,124 / 0.862</td><td>tie</td></tr></tbody></table></div>
+<p>Two of the flags were doing work the defaults were missing. An <code>-md</code> that names an MTP head with no <code>--spec-type</code> ran as a plain
+draft model (&minus;25%); the server now reads the file's own header and uses the head as one. A MoE model that fits in RAM was mapped instead of read in
+(&minus;13%); it is now read into memory when it fits 3/5 of the machine's RAM, decided on total RAM because an instantaneous figure switched the rule off
+exactly when a service restarts. Without <code>-ncmoe</code> the server did not start at all: the placement gave the target the whole card and the
+446&nbsp;MiB draft head then failed to allocate, so the serving probes now reserve the draft's VRAM. Everything else in the command was a tie. Result:</p>
+<div style="overflow-x:auto"><table style="min-width:640px"><thead><tr><th>Setting</th><th>Warm, paired vs the 11-flag command</th><th>Cache slots / hit rate</th><th>Verdict</th></tr></thead><tbody><tr><td>The 11-flag production command</td><td>&mdash;</td><td>3,124 / 0.864</td><td>reference</td></tr>
+<tr><td>Bare launch: model, draft, <code>-c 65536 --parallel 2</code></td><td>+4% &plusmn;1 (18/24)</td><td>1,699 / 0.757</td><td><strong>+4%</strong></td></tr>
+<tr><td>Production command with f16 KV</td><td>+4% &plusmn;1 (23/24)</td><td>2,623 / 0.832</td><td>+4%: the bare launch's gain is the KV type</td></tr></tbody></table></div>
+<p>A launch with only the model, its draft, <code>-c 65536</code> and <code>--parallel 2</code> now measures at or above the 11-flag command; the extra 4% is f16 KV,
+which a bare launch gets and the production command overrode with q8_0.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Lazy KV commit: a fallback that makes it safe</h3>
+<p>Lazy commit stopped the server on two concurrent ~32K-token prompts (&ldquo;cannot commit KV memory at 88.5% of the context&rdquo;). The fix is taken from how
+vLLM handles a full block pool: reclaim from the side that can be evicted. When a commit runs out of memory the expert cache releases a pool and the commit retries.</p>
+<div style="overflow-x:auto"><table style="min-width:640px"><thead><tr><th>Setting</th><th>Warm, paired vs default</th><th>Cache slots / hit rate</th><th>Verdict</th></tr></thead><tbody><tr><td>Default (lazy commit off)</td><td>&mdash;</td><td>2,811 / 0.848</td><td>reference</td></tr>
+<tr><td>Lazy commit on, with the yield</td><td>+2% &plusmn;1 (16/24)</td><td>2,933 / 0.854</td><td>tie; survives ~30K-token prompts</td></tr>
+<tr><td>Lazy commit on, yield off</td><td>+2% &plusmn;1 (14/24)</td><td>2,933 / 0.855</td><td>tie; stops the server at ~30K tokens</td></tr></tbody></table></div>
+<p>With the yield both prompts complete (&ldquo;KV commit needs 1026&nbsp;MiB (free 32&nbsp;MiB) &ndash; released a 2377&nbsp;MiB expert pool&rdquo;); without it the server stops, as before.
+Speed is a tie either way. It stays opt-in, because a prompt that really fills a 240K window gives a different picture: prefill is faster (657 against 569 tok/s) but the
+cache ends at 106 slots (hit rate 0.11) and decode at 9.7 tok/s, against 510 slots and 12.8 tok/s for the dense run. The case lazy commit is for - a large window with short prompts, where the uncommitted KV leaves room for
+the cache - has not been measured yet; a full window is the case where it does not help.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Techniques taken from other projects, and what they did here</h3>
+<p>Papers and projects on the same problem were read for mechanisms we lack, and each was built behind a flag and measured (gemma-4, mixed prompts, paired):</p>
+<div style="overflow-x:auto"><table style="min-width:680px"><thead><tr><th>Technique (source)</th><th>Result</th></tr></thead><tbody>
+<tr><td>Adaptive draft length from measured throughput (MoE-SpeQ, as a bandit over depths 2 to 8)</td><td>-4.2% &plusmn;1.4 against fixed depth 4 (4 of 16 requests faster); it explores the depths that lose and depth 4 is already the best arm on this mix. Kept, off</td></tr>
+<tr><td>Shallow-layer eviction bonus (Fate): keep the first layers' experts, which are predicted worst</td><td>tie at 2&times; (+1.6% &plusmn;1.9), worse at 4&times; (&minus;2.4% &plusmn;1.7), hit rate unchanged. Removed</td></tr>
+<tr><td>Entropy-coded experts to cut SSD traffic (SSD-LLaMA reports &minus;33%)</td><td>measured on Qwen's own tensors, field by field: 2.7% saving for the IQ3_S blocks, 5.1% for IQ4_NL (lzma 0% and 1%). Not worth a GPU decoder for this quantization</td></tr>
+<tr><td>Similarity-pair substitution (BuddyMoE) and next-layer prefetch (Fate, HOBBIT)</td><td>already in the code (atlas-similarity stand-ins, lookahead and a next-layer predictor); nothing to take</td></tr>
+</tbody></table></div>
 
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
