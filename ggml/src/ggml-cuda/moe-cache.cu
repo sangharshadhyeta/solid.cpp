@@ -10967,7 +10967,7 @@ static void moe_cache_prune_session_maps(moe_cache_device & device) {
     moe_cache_prune_neuron_heat(device);
 }
 
-static int moe_cache_plan(
+static int moe_cache_plan_impl(
         void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
     moe_cache_node * node = (moe_cache_node *)opaque;
     if (!node || !ids || !slot_indices || n_ids < 0 ||
@@ -12049,6 +12049,93 @@ static int moe_cache_plan(
         session.cv.notify_all();
     }
     return hits;
+}
+
+// Read-only measurement for the Strata port decision (GGML_CUDA_MOE_CACHE_PART_STATS=1, off by default):
+// it wraps moe_cache_plan_impl and looks only at its result, so it cannot change what the cache does.
+// An expert is a hit when its slot index is >= 0. A layer plans its expert tensors one after another
+// with the same ids (Qwen: fused gate_up_exps, then down_exps), so two consecutive calls for one layer
+// with equal ids and different pools are paired. "partial" = one tensor of the expert resident, the
+// other not: those are the experts whose miss the CPU still has to fetch (Strata ranks storing and
+// admitting gate/up/down together on this). miss_bytes is what the CPU must read for missed rows, i.e.
+// scattered reads' worth of data per token (Strata's contiguous per-expert blob would make each row one read).
+struct moe_cache_part_pending {
+    const moe_cache_pool * pool = nullptr;
+    std::vector<int32_t>   ids;
+    std::vector<uint8_t>   hit;
+};
+
+static int moe_cache_plan(
+        void * opaque, const int32_t * ids, int n_ids, int32_t * slot_indices) {
+    static const bool on = [] {
+        const char * v = getenv("GGML_CUDA_MOE_CACHE_PART_STATS");
+        return v && atoi(v) != 0;
+    }();
+    moe_cache_node * node = (moe_cache_node *) opaque;
+    const bool measure = on && node && node->pool && ids && slot_indices &&
+            n_ids > 0 && n_ids <= GGML_MOE_CACHE_MAX_BATCH_ROWS && !node->planned;
+    const int rc = moe_cache_plan_impl(opaque, ids, n_ids, slot_indices);
+    if (!measure) {
+        return rc;
+    }
+
+    static std::mutex mu;
+    static std::unordered_map<int, moe_cache_part_pending> pending;
+    static long long calls = 0, tokens = 0, rows = 0, miss_rows = 0, miss_bytes = 0;
+    static long long pairs = 0, both_hit = 0, both_miss = 0, partial = 0;
+
+    std::lock_guard<std::mutex> lock(mu);
+    calls++;
+    rows += n_ids;
+    long long missed = 0;
+    std::vector<uint8_t> hit((size_t) n_ids);
+    for (int k = 0; k < n_ids; k++) {
+        hit[k] = slot_indices[k] >= 0;
+        missed += !hit[k];
+    }
+    miss_rows  += missed;
+    miss_bytes += missed * (long long) node->pool->expert_size;
+
+    if (node->layer >= 0) {
+        auto it = pending.find(node->layer);
+        const bool same_ids = it != pending.end() && it->second.pool != node->pool &&
+                it->second.ids.size() == (size_t) n_ids &&
+                std::equal(it->second.ids.begin(), it->second.ids.end(), ids);
+        if (same_ids) {
+            pairs++;
+            for (int k = 0; k < n_ids; k++) {
+                const bool a = it->second.hit[k], b = hit[k];
+                if (a && b) {
+                    both_hit++;
+                } else if (!a && !b) {
+                    both_miss++;
+                } else {
+                    partial++;
+                }
+            }
+            pending.erase(it);
+        } else {
+            if (node->layer == 0) {
+                tokens += node->n_tokens;
+            }
+            moe_cache_part_pending & pd = pending[node->layer];
+            pd.pool = node->pool;
+            pd.ids.assign(ids, ids + n_ids);
+            pd.hit = hit;
+        }
+    }
+
+    if (calls % 2000 == 0) {
+        const long long pe = both_hit + both_miss + partial;
+        fprintf(stderr,
+                "[moe-cache] PART_STATS calls=%lld tokens=%lld rows=%lld miss_rows=%lld (%.1f%%) miss_MiB=%.1f "
+                "miss_MiB/token=%.2f | pairs=%lld experts=%lld both_hit=%lld both_miss=%lld partial=%lld (%.1f%%)
+",
+                calls, tokens, rows, miss_rows, rows ? 100.0 * miss_rows / rows : 0.0, miss_bytes / 1048576.0,
+                tokens ? miss_bytes / 1048576.0 / tokens : 0.0, pairs, pe, both_hit, both_miss, partial,
+                pe ? 100.0 * partial / pe : 0.0);
+    }
+    return rc;
 }
 
 // Heat-aware neuron subsetting: scatter the reduced-pool sub-batch's dense
