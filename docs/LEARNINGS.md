@@ -53,7 +53,9 @@ heat/LFRU eviction (LRU/LFU/ARC), lazy KV commit (vAttention; we only add the re
   (2) At plan time, with the router result known, issue ALL missed experts of the layer at once (bounded batch, O_DIRECT or io_uring) before CPU compute starts, so queue depth > 1.
   (3) Group prefill rows per expert (check what `-ub` splitting does today: each ubatch reloads).
 - Test: Qwen only (final run); decode tok/s and MB/s paired against EXPLICIT_READ off/on.
-- REJECTED from this paper, with evidence: rANS compression of experts (-33% SSD traffic for them). Our Qwen expert tensors are IQ3_S (gate, up) and IQ4_NL (down); measured order-0 byte entropy is 7.8-7.95 of 8 bits, i.e. 0.6-2.4% saving. Not worth a GPU decoder.
+- Compression (their rANS, -33% SSD traffic): TESTED for compressibility on our tensors, not built. Field-wise ideal entropy coding of Qwen's expert blocks saves 2.7% (IQ3_S gate/up,
+  110 B blocks: scale 61%, grid index 98%, high bits 95%, signs 100%, 4-bit scales 81% of raw) and 5.1% (IQ4_NL down: nibbles 3.91 of 4 bits); lzma finds 0% and 1%. A GPU decoder for <= 5% less SSD traffic is
+  not worth building unless the quant changes (a GSQ-RCO file with different types should be re-measured with the same script before this is closed).
 
 ## L6. Smaller items
 
