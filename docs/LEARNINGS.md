@@ -7,25 +7,34 @@ becomes a default (paired against the shipped default, same-build control, fidel
 Not on this list because ours is already as good or better: atlas-similarity stand-ins (BuddyMoE pairs), lookahead + next-layer predictor (Fate/HOBBIT prefetch),
 heat/LFRU eviction (LRU/LFU/ARC), lazy KV commit (vAttention; we only add the reclaim, see L7), whole-expert admit/evict (Strata; gemma measures 5.1% partial residency).
 
-## L1. Bias the router toward resident experts (Cache-Conditional Experts, arXiv 2412.00099)
+## L1. Bias the router toward resident experts (Cache-Conditional Experts, arXiv 2412.00099) - IMPLEMENTED, tested on both models, not yet defaulted
 
-- Mechanism (source): `z' = z + lambda * delta_avg * m_t`. `z` router logits, `m_t` bitmask of resident experts, `delta_avg` running average of the logit
-  range (max-min) over layers and tokens, `lambda` in [0,1]. `z'` is used ONLY to choose the top-k; the forward pass weights come from the ORIGINAL `z`, so a
-  chosen expert is computed exactly. Always keep the top-J experts by `z` regardless of residency (J=1 for 8-expert models, 2 for fine-grained). Past lambda ~0.8
-  quality degrades. Learnable priors did not beat the fixed one. Source results: miss rate 35%->16% (Qwen1.5-MoE), 28%->7% (DeepSeek-V2-Lite); perplexity +0.1-3%, downstream <0.1%.
-- Why it beats our substitution: substitution fixes a miss AFTER the router picked it and computes a different expert with the missed one's weight (output drifts, no
-  speed gain measured). The bias changes the SELECTION, every chosen expert is exact, and misses never happen.
-- Where: the router top-k in the MoE graph builder (`src/llama-graph.cpp` build_moe_ffn) needs a per-layer residency mask on the device: a bitmask the cache updates
-  on admit/evict (the plan path already knows residency), added to the logits before top-k. Keep the router weights computed from unmodified logits.
-- Test: gemma-4, lambda in {0.1, 0.2, 0.4}, J=1/2; hit rate, tok/s paired, greedy agreement vs substitution-only. Default only if tok/s up AND agreement no worse than the shipped substitution (33% vs 57% control).
+- Mechanism (source): `z' = z + lambda * delta_avg * m_t`. We implemented the simpler multiplicative form: resident-expert scores x(1+beta) before top-k
+  (`LLAMA_MOE_CACHE_BIAS=beta`), forward-pass weights still computed from the UNBIASED scores, so every chosen expert is computed exactly. Lives in
+  `src/llama-graph.cpp` (`llm_graph_input_moe_cache_bias`) + `ggml_backend_cuda_moe_cache_resident_counts` in moe-cache.cu (one pass over each pool's map
+  under the session lock, rebuilt per decode). **Decode-only** (`LLAMA_MOE_CACHE_BIAS_MAX_BATCH`, default 8 tokens) - a first version biased prefill too by
+  mistake, which has no cache-residency benefit and only changes the whole prompt's hidden state for nothing; fixed in `391f116f0`.
+- RESULT (see ROADMAP.md "Router bias vs substitution" for the full table): bias measurably raises cache hit rate on BOTH gemma-4 (0.847->0.917 at beta=1.0)
+  and Qwen3.8-Flash-Next (0.26->0.33 at beta=0.5), which substitution provably cannot do. Substitution's own documented +8.11% win was on a different model
+  (Ornith-1.5-35B, 256 fine-grained experts) that was never re-tested here - so this isn't "bias beats substitution," it's "substitution was never actually
+  validated in gemma's or Qwen's regime, and bias is the first thing that measurably helps the cache-miss problem in THAT regime."
+- NOT a default yet: kept opt-in, substitution kept too (not deleted). Pending a clean Qwen speed/fidelity rerun (the one that ran had disk I/O contention
+  from an unrelated bug) and an owner decision, since this changes default output quality on every request.
 
-## L2. Importance by cumulative gate mass, with a skip class (HOBBIT, arXiv 2411.01433)
+## L2. Importance by cumulative gate mass, with a skip class (HOBBIT, arXiv 2411.01433) - SCOPED, blocked on a plumbing change
 
 - Mechanism (source): rank the K selected experts by gate weight; unimportance `s_i = sum of the weights of all higher-ranked experts`. `s <= 0.6` full precision,
   `0.6 < s <= 0.9` low precision, `s > 0.9` SKIPPED entirely. Gate magnitude correlates 0.99 with the expert's actual output contribution. Mixtral: 67% full / 30% low / 3% skipped; accuracy loss <1%.
 - What we do instead: a rank floor (substitute only ranks >= 6) - rank ignores how much weight the expert carries. On gemma-4 ranks 4-7 hold only 32% of the gate mass.
-- Where: the substitution gate in `moe_cache_plan` / `moe_cache_substitute_min_rank` -> a mass threshold; a missed expert past the skip threshold is dropped (weight 0, no fetch, no CPU compute).
-- Test: replace the rank floor by `s` thresholds (0.6/0.9 first, then sweep); fidelity + paired speed. Candidate to REPLACE the rank floor rather than add to it.
+- CONFIRMED BY READING THE CODE (2 Oct): `rank_bucket` in `moe_cache_plan_impl` is PURELY POSITIONAL (`index % rank_top_k`, i.e. "which slot in the
+  top-k list"), computed from `ids[]` alone - no gate-weight array reaches the planner at all. This is a bigger change than the gemma-4 substitution code's
+  existing rank-based gating: it needs a parallel float-weights array threaded through the op callback interface that feeds `moe_cache_plan_impl`,
+  touching every call site in the hot MoE dispatch path. Deliberately not attempted at the end of a long session (see ROADMAP.md rules) - the risk of a
+  half-verified change to a path every model goes through outweighs getting this one learning in before stopping.
+- Where: the op callback signature feeding `moe_cache_plan_impl` (search call sites of that function) would need a `const float * weights` parallel to
+  `ids[]`. Once that plumbing exists: the substitution gate in `moe_cache_plan` / `moe_cache_substitute_min_rank` -> a cumulative-mass threshold; a missed
+  expert past the skip threshold is dropped (weight 0, no fetch, no CPU compute) instead of substituted.
+- Test (once built): replace the rank floor by `s` thresholds (0.6/0.9 first, then sweep); fidelity + paired speed on the test worktree BEFORE touching main.
 - Second half (later): a low-precision copy of an expert held in RAM, loaded instead of the full one for the middle class. Needs a requantized copy (extra RAM); only after the first half is measured.
 
 ## L3. Adaptive draft length from a cost model (MoE-SpeQ, arXiv 2511.14102)
