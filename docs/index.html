@@ -1224,6 +1224,24 @@ one slot (the headline figure above, 72.6, was recorded in the same probe regime
 slots. The mixed set is the harder case &mdash; a draft model is accepted ~38% of the time on prose, 73&ndash;90% on code and reasoning &mdash; and it
 roughly doubled against the previous defaults. Draft acceptance rose from 0.40 to the figure shown.</p>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Tuning on top of the shipped defaults</h3>
+<p>Eleven single changes against the shipped defaults, on the mixed prompt set, three rounds, paired as above. The identical copy of the
+defaults is the noise floor: any change that does not clear it is a tie.</p>
+<div style="overflow-x:auto"><table style="min-width:700px"><thead><tr><th>Setting</th><th>Warm, paired vs defaults</th><th>First requests, paired</th><th>Slots / hit rate (defaults: 3,080 / 0.862)</th><th>Verdict</th></tr></thead><tbody><tr><td>Identical copy of the defaults (the noise floor)</td><td>+1% &plusmn;1 (12/24)</td><td>+4% &plusmn;3 (3/6)</td><td>3,268 / 0.872</td><td>reference</td></tr>
+<tr><td>One decode thread pinned to each physical core</td><td>0% &plusmn;1 (8/24)</td><td>0% &plusmn;2 (2/6)</td><td>3,268 / 0.871</td><td>tie</td></tr>
+<tr><td>Draft depth 6 (default 4)</td><td>-6% &plusmn;2 (5/24)</td><td>-2% &plusmn;2 (3/6)</td><td>3,080 / 0.868</td><td>worse</td></tr>
+<tr><td>Draft depth 8</td><td>-11% &plusmn;2 (3/24)</td><td>-11% &plusmn;3 (1/6)</td><td>3,455 / 0.904</td><td>clearly worse</td></tr>
+<tr><td>Confidence gate 0.7 (default 0.5)</td><td>+2% &plusmn;1 (14/24)</td><td>+7% &plusmn;4 (4/6)</td><td>3,268 / 0.866</td><td>tie</td></tr>
+<tr><td>Substitution floor at rank 4</td><td>+1% &plusmn;1 (16/24)</td><td>+6% &plusmn;4 (5/6)</td><td>3,455 / 0.881</td><td>tie</td></tr>
+<tr><td>Substitution floor at rank 2</td><td>-1% &plusmn;1 (11/24)</td><td>+3% &plusmn;5 (3/6)</td><td>3,268 / 0.869</td><td>tie, slightly lower</td></tr>
+<tr><td>Admission weights un-substitutable demand 3&times;</td><td>0% &plusmn;1 (11/24)</td><td>+1% &plusmn;2 (4/6)</td><td>3,268 / 0.887</td><td>tie</td></tr>
+<tr><td>Prediction ring of 6% of the pool</td><td>+2% &plusmn;1 (15/24)</td><td>0% &plusmn;3 (4/6)</td><td>3,455 / 0.864</td><td>tie</td></tr>
+<tr><td>Prefill micro-batch 1024 (default 2048)</td><td>+5% &plusmn;1 (20/24)</td><td>+5% &plusmn;2 (6/6)</td><td>3,551 / 0.882</td><td><strong>the one gain outside the noise</strong></td></tr>
+<tr><td>5 decode threads (default 6)</td><td>+2% &plusmn;1 (12/24)</td><td>+2% &plusmn;3 (4/6)</td><td>3,268 / 0.872</td><td>tie</td></tr></tbody></table></div>
+<p>Nothing reaches 70 on the prose-heavy mix by turning a knob: deeper drafts lose even with the confidence gate on, and substitution, admission
+weighting, the prediction ring, pinned cores, a different thread count and a higher gate are all inside the noise. The one gain outside it is a smaller
+prefill micro-batch (<code>-ub 1024</code>), which frees VRAM for cache slots; it was measured on short prompts.</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
 of them tied or lost. Two of those verdicts were later overturned (<code>p_min</code> and lazy KV both won on paired
