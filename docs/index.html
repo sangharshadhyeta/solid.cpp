@@ -1200,6 +1200,34 @@ learned features first.</li>
 <p>The first round below is therefore the <em>untrained, steady-state</em> measurement, kept because it is the
 honest answer to &ldquo;does flipping the switch on a running server help?&rdquo; &mdash; and the answer there was no.</p>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Round two: same prompts, same seeds, two rounds</h3>
+<p>The re-test sends every setting the identical ten prompts with identical seeds (request <em>i</em> is the same
+request everywhere), times the first requests after each start separately, and repeats the whole list. Each cell
+is the median of eight warm requests; the baseline read 29.0 then 33.5 tok/s, so the comparison is within a round.
+Cache slots and hit rate come from the cache's own summary at shutdown.</p>
+<table>
+<colgroup><col style="width:34%"><col style="width:22%"><col style="width:22%"><col style="width:22%"></colgroup>
+<thead><tr><th>Setting (against the baseline in the same round)</th><th>Round 1</th><th>Round 2</th><th>Verdict</th></tr></thead>
+<tbody>
+<tr><td>Neuron subsetting <strong>off</strong></td><td>46.2 (+59%)</td><td>46.9 (+40%)</td><td><strong>win</strong> &mdash; default off unless calibrated</td></tr>
+<tr><td>Draft depth 4 (baseline 8)</td><td>38.4 (+32%)</td><td>41.8 (+25%)</td><td><strong>win</strong></td></tr>
+<tr><td>Draft depth 6</td><td>32.5 (+12%)</td><td>36.6 (+9%)</td><td>win, smaller</td></tr>
+<tr><td>Draft confidence gate <code>p_min</code> 0.5 (depth 8)</td><td>34.1 (+18%)</td><td>38.0 (+13%)</td><td><strong>win</strong></td></tr>
+<tr><td>Probabilistic draft acceptance <strong>off</strong></td><td>25.1 (&minus;13%)</td><td>29.3 (&minus;13%)</td><td>keep it on</td></tr>
+<tr><td>Lazy KV commit: cache slots</td><td>3,197 vs 2,759</td><td>3,197 vs 2,644</td><td><strong>win</strong> &mdash; +16% to +21% cache, hit rate 0.899 and 0.885 against 0.868 and 0.823</td></tr>
+<tr><td>Router lookahead, depth 2</td><td>27.8 (&minus;4%), hit 0.811</td><td>30.5 (&minus;9%), hit 0.790</td><td>loss twice: stays off</td></tr>
+<tr><td>Lookahead gate at the real verify width</td><td>hit +1.8 pts</td><td>hit +0.1 pts</td><td>a wash: unchanged</td></tr>
+<tr><td>Atlas warming</td><td>30.5 (+5%)</td><td>32.0 (&minus;4%)</td><td>tie (hit rate identical at equal slots)</td></tr>
+<tr><td>Substitution off</td><td>28.7 (&minus;1%)</td><td>33.8 (+1%)</td><td>tie in speed (the quality side is measured separately)</td></tr>
+<tr><td>Trained pre-router, frozen</td><td>29.2 (+1%)</td><td>35.0 (+4%)</td><td>small, positive both rounds</td></tr>
+</tbody>
+</table>
+<p>The sizes of the wins are the point: one mechanism &mdash; neuron subsetting, on by default with a fixed 256-neuron
+width, 18% of gemma-4's 1,408-neuron experts &mdash; was costing about a third of the throughput, and the draft
+settings were costing another quarter, both of which a calibration that probes only code and reasoning cannot see.
+The cause of the first: the reduced-expert dispatch compacted its activations with one device copy per reduced row
+(about 30 per MoE op, 60 ops per token, on the decode thread); that loop is one kernel now.</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Bugs found along the way</h3>
 <table>
 <colgroup><col style="width:38%"><col style="width:46%"><col style="width:16%"></colgroup>
