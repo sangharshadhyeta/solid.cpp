@@ -9460,12 +9460,59 @@ static void common_moe_apply_prefill_knobs(const common_moe_calibration_entry & 
 //
 // So it is deliberately NOT guarded by anything. Add new calibrated settings
 // that do not depend on placement here, not in a caller.
+// The trained pre-router, on by default.
+//
+// It was measured to win its role - eviction protection, with router lookahead
+// keeping admission (gemma-4: 71.41 tok/s against 56.59 for admission alone; the
+// docs' prerouter section) - and still never served, because only the full
+// calibration sweep ever turned it on, and the default (short) calibration
+// skips that stage: a gemma entry reads train_predictor = -1, "never decided".
+// An unmeasured entry is not an "off" verdict, so with nothing calibrated and
+// nothing set by the operator the proven configuration applies: learn the NEXT
+// layer's picks (59.2 -> 70.0 against the current layer's), weights in the
+// per-model state file, loaded at every start and kept learning. A calibrated
+// 0 (measured off) or an explicit env setting is left alone, and so is
+// --moe-cache off.
+static void common_moe_default_prerouter(const char * path_model) {
+    const char * cache_env = getenv("GGML_CUDA_MOE_CACHE");
+    if (cache_env && strcmp(cache_env, "0") == 0) {
+        return;
+    }
+    if (getenv("LLAMA_MOE_CALIBRATION_CHILD")) {
+        return; // a calibration candidate: its stages set this knob themselves, from a neutral baseline
+    }
+    if (getenv("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR")) {
+        return; // the operator's choice, or a calibrated one, applied above
+    }
+    auto set_env = [](const char * name, const std::string & v) {
+#if defined(_WIN32)
+        _putenv_s(name, v.c_str());
+#else
+        setenv(name, v.c_str(), 1);
+#endif
+    };
+    set_env("GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR", "1");
+    if (!getenv("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER")) {
+        set_env("GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER", "1");
+    }
+    if (!getenv("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE")) {
+        const std::string base = path_model ? std::string(path_model) : std::string("model");
+        const size_t slash = base.find_last_of("/\\");
+        const std::string state = fs_get_cache_directory() + "predictor-" +
+            (slash == std::string::npos ? base : base.substr(slash + 1)) + ".bin";
+        set_env("GGML_CUDA_MOE_CACHE_TRAIN_STATE_FILE", state);
+        LOG_INF("%s: pre-router on by default (eviction protection, next-layer target); weights: %s\n",
+                __func__, state.c_str());
+    }
+}
+
 static void common_moe_apply_calibrated_quality(const char * path_model, common_params & params) {
     common_moe_calibration_entry cal_q;
     if (common_moe_calibration_lookup(path_model, params, cal_q)) {
         common_moe_apply_quality_knobs(cal_q, path_model);
         common_moe_apply_prefill_knobs(cal_q, params);
     }
+    common_moe_default_prerouter(path_model);
 }
 
 static bool common_maybe_raise_moe_for_ctx(
