@@ -1138,106 +1138,86 @@ regression as a &ldquo;calibrated optimum&rdquo;. Caught by reading the numbers 
 </section>
 
 <section id="audit-2026-10-01">
-<div class="eyebrow">1 October 2026 &mdash; an audit, and what it did and did not find</div>
-<h2>Looking for a regression, and measuring it before believing it</h2>
-<p class="section-lede">Serving gemma-4-26B at <code>-ncmoe 99 --moe-cache auto --parallel 2 -c 65536</code>,
-decode read about 33&nbsp;tok/s on a news-reading workload, against 70.9 recorded by the 13 September
-calibration. Before changing anything, the gap was taken apart. Most of it was not a regression.</p>
+<div class="eyebrow">1 October 2026 &mdash; an audit of served speed</div>
+<h2>Looking for a regression, and measuring each candidate before believing it</h2>
+<p class="section-lede">Serving gemma-4-26B at <code>-ncmoe 99 --moe-cache auto --parallel 2 -c 65536</code>, decode read
+about 33&nbsp;tok/s on a mixed prompt set against the 70.9 recorded by the 13 September calibration. The gap had three
+parts: the workload (prose is accepted by the draft ~38% of the time, code and reasoning 73&ndash;90%, and the
+calibration probed only the latter two), two defaults that were costing real speed, and measurement that could not
+have found them. This section is what was measured, in the order it was understood.</p>
 
-<table>
-<colgroup><col style="width:50%"><col style="width:25%"><col style="width:25%"></colgroup>
-<thead><tr><th>What was measured (same command, warm)</th><th>tok/s</th><th>Why</th></tr></thead>
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">How it was measured</h3>
+<p>Every setting receives the <em>same ten prompts with the same seeds</em> (request <em>i</em> is the identical request in
+every setting) and the comparison is request against request, not median against median: single-request spread is
+&plusmn;8&ndash;12&nbsp;tok/s, so unpaired medians hide any effect under ~15%. Each start serves two timed <em>cold</em> requests (the
+pool still filling), one untimed, then eight timed warm requests; the whole list repeats for three rounds, interleaved.
+The cache's own summary at shutdown gives the slot count and hit rate. The baseline is the <em>previous</em> defaults
+(neuron subsetting on, draft depth 8, no confidence gate); it read 29.0 / 33.5 / 31.3&nbsp;tok/s
+by round, which is the noise floor the table has to clear. Slot count varies from run to run (2,644&ndash;3,197 here, set by
+how much VRAM is free at the cache's first fill) and drives hit rate, so hit rates are only comparable at equal slots.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Results</h3>
+<div style="overflow-x:auto"><table style="min-width:860px">
+<colgroup><col style="width:27%"><col style="width:12%"><col style="width:15%"><col style="width:14%"><col style="width:12%"><col style="width:20%"></colgroup>
+<thead><tr><th>Setting</th><th>Warm tok/s by round (baseline 29.0 / 33.5 / 31.3)</th><th>Warm, paired vs baseline (mean &plusmn;se; requests faster)</th><th>First requests after start, paired</th><th>Cache slots / hit rate</th><th>Verdict</th></tr></thead>
 <tbody>
-<tr><td>Prose prompts (explain, summarise)</td><td>33.4</td><td>MTP draft accepted ~38% of the time</td></tr>
-<tr><td>Calibration's own prompts: code and step-by-step reasoning</td><td>54.8</td><td>accepted 73&ndash;90%</td></tr>
-<tr><td>Expert cache off</td><td>3.2</td><td>the cache is doing its job</td></tr>
+<tr><td>Neuron subsetting <strong>off</strong></td><td>46.2 / 46.9 / 49.7</td><td>+50% &plusmn;3 (24/24)</td><td>+53% &plusmn;5 (6/6)</td><td>2,672 / 0.852</td><td><strong>win</strong> &mdash; now off unless a calibration measured it on</td></tr>
+<tr><td>Draft depth <strong>4</strong> (was 8)</td><td>38.4 / 41.8 / 37.7</td><td>+22% &plusmn;3 (22/24)</td><td>+31% &plusmn;6 (6/6)</td><td>2,682 / 0.821</td><td><strong>win</strong> &mdash; now the default</td></tr>
+<tr><td>Draft depth 6</td><td>32.5 / 36.6 / 35.0</td><td>+12% &plusmn;3 (22/24)</td><td>+15% &plusmn;6 (6/6)</td><td>2,721 / 0.843</td><td>win, smaller than 4</td></tr>
+<tr><td>Draft confidence gate <code>p_min</code> 0.5 (depth 8)</td><td>34.1 / 38.0 / 36.6</td><td>+13% &plusmn;3 (19/24)</td><td>+16% &plusmn;6 (6/6)</td><td>2,682 / 0.828</td><td><strong>win</strong> &mdash; now the default</td></tr>
+<tr><td>Probabilistic draft acceptance <strong>off</strong></td><td>25.1 / 29.3 / 31.0</td><td>-9% &plusmn;2 (4/24)</td><td>-4% &plusmn;3 (1/6)</td><td>2,682 / 0.845</td><td>keep it on (now the default)</td></tr>
+<tr><td>Lazy KV commit</td><td>29.9 / 34.6</td><td>+1% &plusmn;2 (9/16)</td><td>+3% &plusmn;2 (3/4)</td><td>3,197 / 0.892</td><td><strong>win</strong> &mdash; a larger, steadier cache; now on, with headroom</td></tr>
+<tr><td>Router lookahead, depth 2</td><td>27.8 / 30.5 / 32.2</td><td>-6% &plusmn;2 (5/24)</td><td>-3% &plusmn;5 (2/6)</td><td>2,644 / 0.805</td><td>loss: slower and a lower hit rate every round: stays off</td></tr>
+<tr><td>Lookahead boundary at 8 (shipped) against widened to the real verify width</td><td>29.8 / 31.8 / 30.8</td><td>-1% &plusmn;2 (12/24)</td><td>+7% &plusmn;6 (3/6)</td><td>2,721 / 0.863</td><td>8 is better on hit rate every round: kept</td></tr>
+<tr><td>Atlas warming</td><td>30.5 / 32.0 / 34.2</td><td>+1% &plusmn;2 (13/24)</td><td>+3% &plusmn;4 (3/6)</td><td>2,721 / 0.854</td><td>tie: stays off</td></tr>
+<tr><td>Admission after 4 touches</td><td>27.4 / 33.6 / 30.8</td><td>+0% &plusmn;2 (11/24)</td><td>+6% &plusmn;4 (4/6)</td><td>2,759 / 0.853</td><td>no gain in speed, hit rate a little lower: stays off</td></tr>
+<tr><td>Substitution <strong>off</strong></td><td>28.7 / 33.8 / 31.3</td><td>-1% &plusmn;2 (9/24)</td><td>+3% &plusmn;5 (3/6)</td><td>2,721 / 0.853</td><td>tie in speed at the calibrated floor</td></tr>
+<tr><td>Trained pre-router, weights frozen</td><td>29.2 / 35.0</td><td>-1% &plusmn;3 (6/16)</td><td>-1% &plusmn;5 (2/4)</td><td>2,702 / 0.847</td><td>no measurable gain here</td></tr>
+<tr><td>Trained pre-router, learning while it serves</td><td>30.2 / 28.9</td><td>-3% &plusmn;2 (6/16)</td><td>-1% &plusmn;3 (1/4)</td><td>2,644 / 0.834</td><td>no gain; slightly negative</td></tr>
+<tr><td>Previous build, same settings (reference)</td><td>30.1 / 36.2 / 35.6</td><td>+7% &plusmn;3 (16/24)</td><td>+10% &plusmn;2 (6/6)</td><td>3,045 / 0.877</td><td>see the note below the table</td></tr>
 </tbody>
-</table>
+</table></div>
+<p>The previous-build row is a reference, not a candidate: the test binary carried an expert-prefetch reservation
+(since made opt-in) that cost it 13&ndash;17% of its cache slots, which is most of why the old build ran ahead of it. The final
+committed build is re-measured against the old one.</p>
 
-<p style="margin-top:1.5rem">The workload sets the number: the same server, unchanged, reads 33 or 55 depending on
-whether the text is prose or code. Run-to-run spread on a single request is about &plusmn;8&nbsp;tok/s (standard
-deviation), so an eight-request median carries about &plusmn;3 &mdash; any difference smaller than that was not
-counted as a result.</p>
+<p>The two biggest effects have a cause. Neuron subsetting shipped on for every model with a fixed width of 256
+neurons per expert &mdash; 18% of gemma-4's 1,408 &mdash; where the model's own coverage curve says a median 83% is needed
+to hold 90% of the activation mass; it cost about a third of the throughput and bought no cache gain. Part of that cost was
+mechanical: the reduced-expert dispatch compacted its activations with one device copy per reduced row (about 30
+per MoE op, 60 ops per token, on the decode thread), a loop the original comment already named as the thing to remove; it
+is one kernel now. The draft depth was the other: the calibration that picked depth 8 probed code and reasoning only,
+and on prose a shallower draft keeps the verify batch inside the GPU's 5-wide MoE fast path.</p>
 
-<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Round one: switching each flag on, untrained, on a full cache</h3>
-<p>Flags that ship off were first measured the way they would be flipped on a running server: switched on, nothing
-trained, calibration prompts, eight requests each, interleaved with the baseline. As explained below, this cannot
-show a cold-start or trained-weights gain, so it is a first round, not a verdict:</p>
-<table>
-<colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup>
-<thead><tr><th>Setting</th><th>tok/s</th><th>vs baseline 52.1</th></tr></thead>
-<tbody>
-<tr><td>Pre-router switched on cold (<code>TRAIN_PREDICTOR=1</code>, learning while serving)</td><td>43.5</td><td>&minus;8.6 &mdash; CPU spent learning</td></tr>
-<tr><td>Router lookahead, depth 2</td><td>45.9</td><td>&minus;6.2</td></tr>
-<tr><td>Atlas warming</td><td>52.4</td><td>within noise (free-slot-only: inert on a full pool)</td></tr>
-<tr><td>Lazy KV commit (<code>VMM_KV=1</code>, after the fix below)</td><td>50.7</td><td>within noise</td></tr>
-<tr><td>Admission after 4 touches</td><td>50.9</td><td>within noise</td></tr>
-<tr><td>Draft confidence gate <code>p_min</code> 0.5</td><td>49.5</td><td>within noise</td></tr>
-</tbody>
-</table>
-<p>A suspicion that cache dispatches were being refused for scratch space and silently falling back to the CPU
-was checked directly: the new summary line reports <code>dispatch_failed=0</code> in every run.</p>
-
-<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Why those &ldquo;wins&rdquo; did not show &mdash; and what that says about how they were measured</h3>
-<p>Several of the features that ship off were documented as wins, so a test that finds them tied is a reason to
-look for the cause rather than to drop them. Three causes, each checked against the code or the log:</p>
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
+<p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
+of them tied or lost. Two of those verdicts were later overturned (<code>p_min</code> and lazy KV both won on paired
+prompts), so the cause of the miss matters:</p>
 <ul>
-<li><strong>The warming features can only fill free slots.</strong> Atlas warming, predictor-driven warming and
-lookahead admission place a predicted expert only into a free cache slot, only while more than half the pool is
-still free, and never evict (an evicting variant measured &minus;6.55 points and was reverted). On gemma-4 at 64k the
-pool is 100% full (3,193 of 3,193 slots) within the first requests, after which none of them has anywhere to put
-anything. Their wins were real, but they are <em>cold-start</em> wins, measured from an empty pool, and most were
-hit-rate gains of 0.1&ndash;1.1 points on a different model &mdash; a steady-state tok/s test cannot see them.</li>
-<li><strong>The trained pre-router has to be trained.</strong> Its measured gemma-4 gain (50.2 &rarr; 60.9 tok/s, and
-59.2 &rarr; 70.0 predicting the next layer rather than the current one) is for weights trained on calibration
-traffic and then loaded. Run cold with only the on-switch, it learns while it decodes and only costs CPU:
-measured &minus;9 tok/s.</li>
-<li><strong>Different prompts per setting.</strong> Request-to-request spread is about &plusmn;8&ndash;12 tok/s, so medians of
-different prompts hide any effect smaller than 15%. The re-test sends every setting the same prompts with the same
-seeds and compares request against request, times the first requests after start separately, and trains the
-learned features first.</li>
+<li><strong>Unpaired prompts.</strong> With &plusmn;8&ndash;12 tok/s between requests, eight different prompts per setting cannot resolve a 10&ndash;15% effect.</li>
+<li><strong>Warming features can only fill free slots.</strong> Atlas warming, predictor-driven warming and lookahead admission place a
+predicted expert only into a free slot, only while more than half the pool is free, and never evict (an evicting variant measured
+&minus;6.55 points). On gemma-4 at 64k the pool is full within the first requests, so on a warm cache they have nowhere to put
+anything; their documented wins were cold-start gains, mostly in hit rate (0.1&ndash;1.1 points) on a different model. The paired
+test times the first requests after start separately for exactly this reason &mdash; and still finds no gain for atlas warming.</li>
+<li><strong>The trained pre-router did not reproduce its documented win here.</strong> Its gemma-4 gain (50.2 &rarr; 60.9 tok/s, 59.2 &rarr; 70.0
+predicting the next layer) was measured in the calibration's probe regime, with a small 2,048&nbsp;MiB cache under heavy eviction pressure. Trained on 60
+requests and run frozen, it measures within noise of the baseline on this larger cache; learning while it serves costs a few percent.
+Whether it earns a place depends on the cache being contended, which the larger cache here is not.</li>
 </ul>
-<p>The first round below is therefore the <em>untrained, steady-state</em> measurement, kept because it is the
-honest answer to &ldquo;does flipping the switch on a running server help?&rdquo; &mdash; and the answer there was no.</p>
-
-<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Round two: same prompts, same seeds, two rounds</h3>
-<p>The re-test sends every setting the identical ten prompts with identical seeds (request <em>i</em> is the same
-request everywhere), times the first requests after each start separately, and repeats the whole list. Each cell
-is the median of eight warm requests; the baseline read 29.0 then 33.5 tok/s, so the comparison is within a round.
-Cache slots and hit rate come from the cache's own summary at shutdown.</p>
-<table>
-<colgroup><col style="width:34%"><col style="width:22%"><col style="width:22%"><col style="width:22%"></colgroup>
-<thead><tr><th>Setting (against the baseline in the same round)</th><th>Round 1</th><th>Round 2</th><th>Verdict</th></tr></thead>
-<tbody>
-<tr><td>Neuron subsetting <strong>off</strong></td><td>46.2 (+59%)</td><td>46.9 (+40%)</td><td><strong>win</strong> &mdash; default off unless calibrated</td></tr>
-<tr><td>Draft depth 4 (baseline 8)</td><td>38.4 (+32%)</td><td>41.8 (+25%)</td><td><strong>win</strong></td></tr>
-<tr><td>Draft depth 6</td><td>32.5 (+12%)</td><td>36.6 (+9%)</td><td>win, smaller</td></tr>
-<tr><td>Draft confidence gate <code>p_min</code> 0.5 (depth 8)</td><td>34.1 (+18%)</td><td>38.0 (+13%)</td><td><strong>win</strong></td></tr>
-<tr><td>Probabilistic draft acceptance <strong>off</strong></td><td>25.1 (&minus;13%)</td><td>29.3 (&minus;13%)</td><td>keep it on</td></tr>
-<tr><td>Lazy KV commit: cache slots</td><td>3,197 vs 2,759</td><td>3,197 vs 2,644</td><td><strong>win</strong> &mdash; +16% to +21% cache, hit rate 0.899 and 0.885 against 0.868 and 0.823</td></tr>
-<tr><td>Router lookahead, depth 2</td><td>27.8 (&minus;4%), hit 0.811</td><td>30.5 (&minus;9%), hit 0.790</td><td>loss twice: stays off</td></tr>
-<tr><td>Lookahead gate at the real verify width</td><td>hit +1.8 pts</td><td>hit +0.1 pts</td><td>a wash: unchanged</td></tr>
-<tr><td>Atlas warming</td><td>30.5 (+5%)</td><td>32.0 (&minus;4%)</td><td>tie (hit rate identical at equal slots)</td></tr>
-<tr><td>Substitution off</td><td>28.7 (&minus;1%)</td><td>33.8 (+1%)</td><td>tie in speed (the quality side is measured separately)</td></tr>
-<tr><td>Trained pre-router, frozen</td><td>29.2 (+1%)</td><td>35.0 (+4%)</td><td>small, positive both rounds</td></tr>
-</tbody>
-</table>
-<p>The sizes of the wins are the point: one mechanism &mdash; neuron subsetting, on by default with a fixed 256-neuron
-width, 18% of gemma-4's 1,408-neuron experts &mdash; was costing about a third of the throughput, and the draft
-settings were costing another quarter, both of which a calibration that probes only code and reasoning cannot see.
-The cause of the first: the reduced-expert dispatch compacted its activations with one device copy per reduced row
-(about 30 per MoE op, 60 ops per token, on the decode thread); that loop is one kernel now.</p>
 
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Bugs found along the way</h3>
-<table>
+<div style="overflow-x:auto"><table style="min-width:640px">
 <colgroup><col style="width:38%"><col style="width:46%"><col style="width:16%"></colgroup>
 <thead><tr><th>Fault</th><th>Fix</th><th>Verified</th></tr></thead>
 <tbody>
-<tr><td><code>GGML_CUDA_VMM_KV=1</code> crashed the first request in slot 1 (illegal memory access)</td><td>The lazy commit backed the leading fraction of each KV tensor, but tensors are <code>[.., kv_size, n_stream]</code>: every stream past the first was unbacked. Committed per stream now.</td><td>merged; 10 requests served, <code>--parallel 2</code></td></tr>
+<tr><td><code>GGML_CUDA_VMM_KV=1</code> crashed the first request in slot 1 (illegal memory access)</td><td>The lazy commit backed the leading fraction of each KV tensor, but tensors are <code>[.., kv_size, n_stream]</code>: every stream past the first was unbacked. Committed per stream now.</td><td>ten requests served with <code>--parallel 2</code></td></tr>
 <tr><td>Draft tokens accepted past an end-of-generation token</td><td>Upstream <code>d280808f5</code>, ported into the fork's acceptance loop including the probabilistic path.</td><td>merged</td></tr>
 <tr><td>Token-frequency log on by default</td><td>The decode thread wrote the whole vocabulary histogram every 4,096 tokens, for a trimmer the served configuration does not use. Off unless asked for.</td><td>merged</td></tr>
+<tr><td>Expert prefetch slots allocated on the first large batch</td><td>By then the cache's first fill has taken the free VRAM, a 272&nbsp;MiB slot fails, and prefill prefetch is disabled for the session. Reserving them up front costs 13&ndash;17% of the cache, so it is an opt-in switch (<code>GGML_SCHED_PREFETCH_RESERVE=1</code>) pending a measurement on prefill-heavy traffic.</td><td>cost measured; prefill gain not yet</td></tr>
+<tr><td>Cache dispatch failures invisible</td><td>A dispatch refused for scratch space falls back to the CPU for the whole op and was only in verbose logs. The summary reports <code>dispatch_failed</code>: 0 in every run, which cleared that suspicion.</td><td>0 in every run</td></tr>
 </tbody>
-</table>
+</table></div>
 
 <div class="callout">
 <p><strong>Two measurement traps found on the way, both of which produced confident wrong answers.</strong> A
