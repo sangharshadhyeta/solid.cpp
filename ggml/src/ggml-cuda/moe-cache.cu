@@ -5710,9 +5710,11 @@ static bool moe_cache_prepare_budget(
         // cache is sized varies - the budget differed by ~400 MiB between identical runs - and with
         // only 5% reserved a server with neuron subsetting on was left 381 MiB free and stopped in
         // cudaGraphInstantiate on its second request (1 Oct 2026). The non-lazy server this replaced
-        // happened to leave ~1.2 GB. 800 MiB, scaled down on small cards (a sixth of the free VRAM).
-        const size_t floor_mb = std::min<size_t>(800, free_mb / 6);
-        reserve_mb = std::min<size_t>(1024, std::max<size_t>(std::max<size_t>(128, floor_mb), free_mb / 20));
+        // happened to leave ~1.2 GB. A 26K-token prefill needed more still (cudaGraphLaunch out of
+        // memory with 800 MiB; fine with 1,500 - measured 1 Oct 2026, two concurrent requests), so
+        // 1,500 MiB, scaled down on small cards (a sixth of the free VRAM).
+        const size_t floor_mb = std::min<size_t>(1500, free_mb / 6);
+        reserve_mb = std::min<size_t>(1536, std::max<size_t>(std::max<size_t>(128, floor_mb), free_mb / 20));
     }
     const size_t reserve = reserve_mb << 20;
     size_t available = free_for_budget > reserve ? free_for_budget - reserve : 0;
