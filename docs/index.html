@@ -1314,6 +1314,14 @@ output is not bit-reproducible here, so a bare &ldquo;identical&rdquo; count mea
 <p>Step 2a first read &minus;4.8% on a single 12-request sample, inside which the control itself spread 3%; three paired rounds showed it was noise. Each later
 step is added to this table when it has passed.</p>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">An explicit flag outranks the default</h3>
+<p>The defaults above only apply when a launch does not say otherwise, and a launch command written against the older calibration did. The same command, differing only in
+whether it pinned <code>--spec-draft-n-max 8</code> (the calibrated depth of 13 September) and <code>--spec-prob-accept</code>, three paired rounds:</p>
+<div style="overflow-x:auto"><table style="min-width:640px"><thead><tr><th>Prompt set</th><th>Depth 8 and acceptance flag pinned</th><th>Not pinned (the defaults)</th><th>Paired difference</th></tr></thead><tbody><tr><td>Mixed set: mostly prose</td><td>48.5 / 53.7 / 51.5</td><td><strong>56.8 / 60.9 / 59.8</strong></td><td>+15% &plusmn;2 (21/24)</td></tr>
+<tr><td>Calibration probes: code and reasoning</td><td>79.1 / 75.7 / 75.8</td><td><strong>78.6 / 76.9 / 77.1</strong></td><td>0% &plusmn;2 (13/24)</td></tr></tbody></table></div>
+<p>Pinning the old depth cost 15% on prose and nothing on code: with the confidence gate on, a deeper draft only matters where drafts are accepted. A command line that
+carries a depth from an earlier calibration should drop it.</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
 of them tied or lost. One of those verdicts was overturned on paired prompts (<code>p_min</code>), and lazy KV's cache gain did show up there &mdash; though it
