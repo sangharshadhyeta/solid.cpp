@@ -8085,6 +8085,41 @@ static bool moe_cache_partner_index_enabled() {
 // so the router's most confident picks always get exact compute.
 // GGML_CUDA_MOE_CACHE_SUBSTITUTE=0 turns it off.
 
+// Frees one pool's slab in place: the pool object STAYS in device.pools as an empty placeholder (slab null, no
+// slots) so every index and raw pointer held elsewhere stays valid, reduced-width entries that lived in it go
+// back to undecided, and its shape returns to the pending set so the next miss rebuilds it at whatever fits.
+// The caller holds session.mu and has checked that no fill copy is in flight and no slot has a reader.
+static size_t moe_cache_release_pool_in_place(moe_cache_device & device, int victim) {
+    moe_cache_pool * pool = device.pools[victim].get();
+    const size_t victim_bytes = (size_t) pool->n_slots * pool->slot_stride;
+    cudaDeviceSynchronize();
+    const size_t victim_expert_size = pool->expert_size;
+    const int    victim_wtype       = pool->wtype;
+    const bool   victim_draft       = pool->draft;
+    cudaFree(pool->slab);
+    pool->slab = nullptr;
+    pool->n_slots = 0;
+    pool->slots.clear();
+    pool->free_slots.clear();
+    pool->map.clear();
+    device.allocated_bytes = device.allocated_bytes > victim_bytes
+            ? device.allocated_bytes - victim_bytes : 0;
+    for (auto & kv : device.reduced_indices) {
+        if (kv.second.pool_index == victim) {
+            kv.second.pool_index = -1;
+        }
+    }
+    for (moe_cache_shape & sh : device.shapes) {
+        sh.pool = moe_cache_find_pool(device, sh.expert_size, sh.wtype, sh.draft);
+        if (sh.expert_size == victim_expert_size && sh.wtype == victim_wtype &&
+            sh.draft == victim_draft && sh.n_tensors > 0) {
+            sh.pool     = -1;
+            sh.finished = false;
+        }
+    }
+    return victim_bytes;
+}
+
 // Give VRAM back when something else on the card needs it.
 //
 // The expert cache sizes itself once, from free VRAM at startup, and then
@@ -8215,50 +8250,7 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
     const size_t deficit_mb = (device.vram_external_baseline - free_if_we_released) >> 20;
     const size_t baseline_mb = device.vram_external_baseline >> 20;
 
-    cudaDeviceSynchronize();
-    moe_cache_pool * pool = device.pools[victim].get();
-    const size_t victim_expert_size = pool->expert_size;
-    const int    victim_wtype       = pool->wtype;
-    const bool   victim_draft       = pool->draft;
-    cudaFree(pool->slab);
-    pool->slab = nullptr;
-    pool->n_slots = 0;
-    pool->slots.clear();
-    pool->free_slots.clear();
-    pool->map.clear();
-    device.allocated_bytes = device.allocated_bytes > victim_bytes
-            ? device.allocated_bytes - victim_bytes : 0;
-    // The pool object STAYS in device.pools, as an empty placeholder (slab null,
-    // no slots). The rest of this file is written for a pool list that only
-    // grows - "pools can only grow today", as the admit path says - and holds
-    // pool indices in fill jobs, warm and train requests and reduced entries,
-    // and a raw pool pointer in each dispatch node. Erasing here shifted every
-    // later index and destroyed the object a node could still point at; in
-    // practice one release left NOTHING resident (all 3840 cells empty). A
-    // placeholder keeps every index and pointer valid: each use already checks
-    // pool->slab or n_slots, finds nothing, and misses. find_pool skips
-    // placeholders, so the rebuild below appends a fresh pool.
-    //
-    // Reduced-width entries that lived in the victim are sent back to undecided.
-    for (auto & kv : device.reduced_indices) {
-        if (kv.second.pool_index == victim) {
-            kv.second.pool_index = -1;
-        }
-    }
-    // Shapes: recompute every pool index from what now exists, and put the
-    // victim's shape back into the pending set. It was left finished, and
-    // moe_cache_build_pending only builds unfinished shapes - so the pool the
-    // message below promised would be "rebuilt to whatever fits on the next
-    // miss" was never rebuilt at all. Measured: the gemma-4 session above ran
-    // for an hour afterwards with ~7 GB free and no expert pools.
-    for (moe_cache_shape & sh : device.shapes) {
-        sh.pool = moe_cache_find_pool(device, sh.expert_size, sh.wtype, sh.draft);
-        if (sh.expert_size == victim_expert_size && sh.wtype == victim_wtype &&
-            sh.draft == victim_draft && sh.n_tensors > 0) {
-            sh.pool     = -1;
-            sh.finished = false;
-        }
-    }
+    (void) moe_cache_release_pool_in_place(device, victim);
     // Accept the new level as the baseline. The deficit that triggered this is
     // either still there (and now paid for) or gone; either way, measuring the
     // next event from the old high-water mark would read the same deficit again
@@ -8272,6 +8264,87 @@ static bool moe_cache_relieve_vram_pressure(moe_cache_session & session, moe_cac
             deficit_mb, free_if_we_released >> 20, baseline_mb, victim_bytes >> 20);
     fflush(stderr);
     return true;
+}
+
+// On-demand yield for a lazily committed KV cache (called from the VMM buffer's commit when cuMemCreate runs out of
+// memory). The expert cache sized itself against the KV's uncommitted headroom, so a long prompt can need more
+// than was left; instead of stopping the server, the cache gives pools back until `bytes_needed` are free. This is
+// the vLLM answer to a full block pool (reclaim from the evictable side), at pool granularity: a released pool stays
+// as an empty placeholder and is rebuilt, smaller, on the next miss from whatever the card has then.
+// Runs on the caller's thread between graph computes, never concurrently with a kernel that reads a slab (the
+// release synchronizes the device first), and never while a fill copy is in flight or a slot has a reader.
+// Returns the bytes released (0 when the cache is off, empty, or busy for the whole wait).
+size_t ggml_backend_cuda_moe_cache_yield_vram(int device_index, size_t bytes_needed) {
+    std::vector<moe_cache_session *> sessions;
+    {
+        std::lock_guard<std::mutex> registry_lock(g_registry_mu);
+        for (moe_cache_session * session : g_sessions) {
+            if (!session->stopping) {
+                sessions.push_back(session);
+            }
+        }
+    }
+    size_t freed = 0;
+    for (moe_cache_session * session : sessions) {
+        for (const auto & device_ptr : session->devices) {
+            moe_cache_device & device = *device_ptr;
+            if (device.physical != device_index || device.dead.load()) {
+                continue;
+            }
+            for (int attempt = 0; attempt < 400; ) {
+                std::unique_lock<std::mutex> lock(session->mu);
+                ggml_cuda_set_device(device.physical);
+                size_t free_memory = 0, total_memory = 0;
+                if (cudaMemGetInfo(&free_memory, &total_memory) != cudaSuccess) {
+                    (void) cudaGetLastError();
+                    break;
+                }
+                if (free_memory >= bytes_needed) {
+                    break;
+                }
+                if (device.inflight) {          // a fill copy is mid-flight: wait it out, 2 s at most
+                    lock.unlock();
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    attempt++;
+                    continue;
+                }
+                const size_t deficit = bytes_needed - free_memory;
+                int victim = -1;
+                size_t victim_bytes = 0;
+                for (size_t i = 0; i < device.pools.size(); i++) {
+                    moe_cache_pool * pool = device.pools[i].get();
+                    if (!pool || !pool->slab || pool->n_slots <= 0) {
+                        continue;
+                    }
+                    bool pinned = false;
+                    for (const moe_cache_slot & slot : pool->slots) {
+                        if (slot.readers > 0) { pinned = true; break; }
+                    }
+                    if (pinned) {
+                        continue;
+                    }
+                    const size_t bytes = (size_t) pool->n_slots * pool->slot_stride;
+                    // the smallest pool that covers the deficit, else the largest there is
+                    const bool covers = bytes >= deficit, best_covers = victim_bytes >= deficit;
+                    if (victim < 0 || (covers && (!best_covers || bytes < victim_bytes)) ||
+                        (!covers && !best_covers && bytes > victim_bytes)) {
+                        victim = (int) i;
+                        victim_bytes = bytes;
+                    }
+                }
+                if (victim < 0) {
+                    break;
+                }
+                const size_t released = moe_cache_release_pool_in_place(device, victim);
+                freed += released;
+                fprintf(stderr, "[moe-cache] KV commit needs %zu MiB (free %zu MiB) - released a %zu MiB expert pool; "
+                        "it is rebuilt to whatever fits on the next miss\n",
+                        bytes_needed >> 20, free_memory >> 20, released >> 20);
+                fflush(stderr);
+            }
+        }
+    }
+    return freed;
 }
 
 static bool moe_cache_substitute_enabled() {

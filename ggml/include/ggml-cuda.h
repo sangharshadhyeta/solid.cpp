@@ -60,6 +60,10 @@ GGML_BACKEND_API size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffe
 // Reserved-but-not-yet-committed bytes across every lazily-committed buffer: the VRAM the KV cache
 // can still claim as contexts grow.
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_uncommitted_bytes(void);
+
+// The expert cache gives pools back until `bytes_needed` are free on the device; returns the bytes released.
+GGML_BACKEND_API size_t ggml_backend_cuda_moe_cache_yield_vram(int device, size_t bytes_needed);
+
 // Mark the next buffer allocation on this thread as eligible for lazy commit.
 // Only meaningful for allocations whose use lags their reservation (the KV
 // cache); weights are read in full at load and must never be lazy.

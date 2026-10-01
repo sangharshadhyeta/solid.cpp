@@ -850,7 +850,30 @@ struct ggml_backend_cuda_vmm_buffer_context {
             }
             CUmemGenericAllocationHandle handle;
             if (cuMemCreate(&handle, granularity, &prop, 0) != CUDA_SUCCESS) {
-                return false; // out of memory - caller decides what that means
+                // Out of memory. The expert cache sized itself against this KV's uncommitted headroom, so
+                // ask it to give pools back - enough for what is still unbacked in this request, plus a margin
+                // for the compute buffers and graphs allocated after the KV (vLLM reclaims from the evictable
+                // side the same way) - and try once more. GGML_CUDA_VMM_KV_YIELD=0 turns the yield off.
+                static const bool yield_enabled = [] {
+                    const char * e = getenv("GGML_CUDA_VMM_KV_YIELD");
+                    return !e || atoi(e) != 0;
+                }();
+                bool recovered = false;
+                if (yield_enabled) {
+                    size_t missing = 0;
+                    for (size_t k = g; k < last && k < granule_committed.size(); k++) {
+                        missing += granule_committed[k] ? 0 : granularity;
+                    }
+                    static const size_t margin = [] {
+                        const char * e = getenv("GGML_CUDA_VMM_KV_YIELD_MARGIN_MB");
+                        return (size_t) (e ? std::max(0, atoi(e)) : 1024) << 20;
+                    }();
+                    recovered = ggml_backend_cuda_moe_cache_yield_vram(physical_device, missing + margin) > 0 &&
+                                cuMemCreate(&handle, granularity, &prop, 0) == CUDA_SUCCESS;
+                }
+                if (!recovered) {
+                    return false; // out of memory - caller decides what that means
+                }
             }
             if (cuMemMap(base + g * granularity, granularity, 0, handle, 0) != CUDA_SUCCESS) {
                 cuMemRelease(handle);
