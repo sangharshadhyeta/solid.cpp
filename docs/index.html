@@ -507,7 +507,8 @@ reason printed, while the placement and sizing from the same entry &mdash; which
 opinion about &mdash; still apply. This is not hypothetical: a gemma-4 entry recorded rank 2 because it was
 fastest, and the fidelity check added later scored that same rank at 0.33.</p>
 
-<pre><code># the same run, with everything pinned by hand instead
+<pre><code># the same run, with everything pinned by hand instead (as of 1 October 2026 the pre-router, substitution and
+# probabilistic acceptance are the defaults - this form is the record of what was measured, not a requirement)
 GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
 GGML_CUDA_MOE_CACHE_SUBSTITUTE=1 GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=4 \
 llama-server \
@@ -1049,6 +1050,10 @@ improved.</p>
 <p class="section-lede">Caching decides <em>which experts</em> live in GPU memory. But an expert is not
 atomic &mdash; inside one, some neurons carry almost all the signal and others contribute essentially nothing.
 This fork measures that directly, per expert, and serves the ones that matter at reduced width.</p>
+<div class="callout"><p><strong>Status, 1 October 2026:</strong> this mechanism is no longer on by default. It measured +8% on a model that does
+not fit in memory, but shipped on for every model with one fixed width (256 neurons), which on gemma-4 is 18% of an expert and cost
+about a third of the throughput (switching it off: <strong>+50%</strong>, faster in all 24 paired requests; see the audit above). It is
+on only where a calibration measures it as a win.</p></div>
 
 <p>The measurement came first, and it changed the design twice. Concentration is scored by
 <strong>value</strong>, not rank: &ldquo;top 25% of neurons&rdquo; picks a fixed cutoff regardless of what
@@ -1194,12 +1199,12 @@ and on prose a shallower draft keeps the verify batch inside the GPU's 5-wide Mo
 <colgroup><col style="width:30%"><col style="width:36%"><col style="width:34%"></colgroup>
 <thead><tr><th>Default</th><th>Evidence (paired, three rounds, gemma-4)</th><th>Still depends on</th></tr></thead>
 <tbody>
-<tr><td>Neuron subsetting off unless a calibration measures it on</td><td>off: +50% &plusmn;3 (24/24)</td><td>a model where it wins can still have it calibrated on (Qwen is being tested)</td></tr>
+<tr><td>Neuron subsetting off unless a calibration measures it on</td><td>off: +50% &plusmn;3 (24/24)</td><td>a model where it wins can still have it calibrated on</td></tr>
 <tr><td>Draft depth 4 (was 3; the calibrated 8 is no longer trusted)</td><td>+22% &plusmn;3 (22/24), acceptance 0.61 against 0.40</td><td>measured on gemma-4; Qwen's own calibration also chose 4</td></tr>
 <tr><td>Draft confidence gate <code>p_min</code> 0.5</td><td>+13% &plusmn;3 (19/24) at depth 8</td><td>gemma-4 only; a weaker draft head is gated harder</td></tr>
 <tr><td>Probabilistic draft acceptance on</td><td>off is -9% &plusmn;2 (4/24)</td><td>slightly biases output at temperature above 0 (exact under greedy); <code>--no-spec-prob-accept</code> restores exact sampling</td></tr>
 <tr><td>Lazy KV commit on: 25% backed at load, the cache leaves 50% of the rest free</td><td>3,123 slots against 2,721; speed 0% &plusmn;2 (12/24)</td><td>a bigger cache, not a measurable speed gain; the 25% share exists because a first request once found no VRAM left</td></tr>
-<tr><td>Trained pre-router on</td><td>frozen -1% &plusmn;2 (10/24); learning -3% &plusmn;2 (10/24)</td><td><strong>no gain measured on gemma-4.</strong> Kept on because it was documented as winning on a contended cache; Qwen, where the cache is contended, is being tested</td></tr>
+<tr><td>Trained pre-router on</td><td>frozen -1% &plusmn;2 (10/24); learning -3% &plusmn;2 (10/24)</td><td><strong>no gain measured on gemma-4.</strong> Kept on because it was documented as winning on a contended cache, which gemma-4 with this cache is not</td></tr>
 </tbody>
 </table></div>
 
@@ -1208,6 +1213,7 @@ and on prose a shallower draft keeps the verify batch inside the GPU's 5-wide Mo
 of them tied or lost. Two of those verdicts were later overturned (<code>p_min</code> and lazy KV both won on paired
 prompts), so the cause of the miss matters:</p>
 <ul>
+<li><strong>No identical-pair control.</strong> An unpaired test read <code>-ncmoe 30</code> and <code>-ncmoe 99</code> 20% apart &mdash; but gemma-4 has 30 layers, so they are the same placement. Any comparison under ~20% needs an identical copy of the baseline in the same run to show the noise floor.</li>
 <li><strong>Unpaired prompts.</strong> With &plusmn;8&ndash;12 tok/s between requests, eight different prompts per setting cannot resolve a 10&ndash;15% effect.</li>
 <li><strong>Warming features can only fill free slots.</strong> Atlas warming, predictor-driven warming and lookahead admission place a
 predicted expert only into a free slot, only while more than half the pool is free, and never evict (an evicting variant measured
@@ -1229,6 +1235,9 @@ Whether it earns a place depends on the cache being contended, which the larger 
 <tr><td>Draft tokens accepted past an end-of-generation token</td><td>Upstream <code>d280808f5</code>, ported into the fork's acceptance loop including the probabilistic path.</td><td>merged</td></tr>
 <tr><td>Token-frequency log on by default</td><td>The decode thread wrote the whole vocabulary histogram every 4,096 tokens, for a trimmer the served configuration does not use. Off unless asked for.</td><td>merged</td></tr>
 <tr><td>Expert prefetch slots allocated on the first large batch</td><td>By then the cache's first fill has taken the free VRAM, a 272&nbsp;MiB slot fails, and prefill prefetch is disabled for the session. Reserving them up front costs 13&ndash;17% of the cache, so it is an opt-in switch (<code>GGML_SCHED_PREFETCH_RESERVE=1</code>) pending a measurement on prefill-heavy traffic.</td><td>cost measured; prefill gain not yet</td></tr>
+<tr><td>Lazy KV commit: the server stopped on its first request ("cannot commit KV memory at 5.9% of the context")</td><td>The cache's headroom for the uncommitted KV was a sizing hint, not a reservation: allocations outside its budget took the VRAM first. A guaranteed 25% of every stream's window is now committed at load, before the cache exists (<code>GGML_CUDA_VMM_KV_PRECOMMIT_PCT</code>).</td><td>the crashing configuration no longer fails on its first request</td></tr>
+<tr><td>Out of memory while instantiating a CUDA graph on the second request (neuron subsetting on)</td><td>The cache's size depends on when its first fill happens: its budget differed by ~400&nbsp;MiB between identical runs, and with only 5% reserved a server was left 381&nbsp;MiB free, too little for the reduced path's larger graph. The reserve has a floor of 800&nbsp;MiB now (a sixth of the free VRAM on a small card).</td><td>12 requests, three runs, no failure; the cache came out <em>identical</em> each time (3,502 slots, hit 0.890)</td></tr>
+<tr><td>A skipped calibration stage cached the launch value as if it were a measurement</td><td>The default calibration skips the depth, acceptance and <code>p_min</code> searches but wrote the <em>launch</em> values into the entry, so a flag once on a command line (depth 8) outranked every later default. Skipped stages leave their field unmeasured now, and entries written before the current defaults have their speculative fields read as unmeasured.</td><td>gemma-4's cached depth 8 no longer overrides the default 4</td></tr>
 <tr><td>Cache dispatch failures invisible</td><td>A dispatch refused for scratch space falls back to the CPU for the whole op and was only in verbose logs. The summary reports <code>dispatch_failed</code>: 0 in every run, which cleared that suspicion.</td><td>0 in every run</td></tr>
 </tbody>
 </table></div>
@@ -1295,7 +1304,7 @@ the regression the old <code>any</code> policy had at depth&ge;3. Default now, i
 <div class="card">
 <h3>Probabilistic draft acceptance</h3>
 <p><code>--spec-prob-accept</code> accepts a draft token whenever the target considers it at least as likely as
-the draft did, not only on exact match. Opt-in, verified byte-identical when off.</p>
+the draft did, not only on exact match. <strong>On by default since 1 October 2026</strong> (turning it off measured &minus;9%, see the audit above); verified byte-identical when off, and exact under greedy sampling &mdash; at temperature above 0 it biases the output very slightly toward the draft, and <code>--no-spec-prob-accept</code> restores exact-match sampling.</p>
 </div>
 <div class="card">
 <h3>FR-Spec-style vocab trimming</h3>
