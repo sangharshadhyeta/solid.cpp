@@ -521,7 +521,11 @@ struct common_params {
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     bool    fit_params_moe_cache = false; // print a recommended --moe-cache / batch / reserve config
     bool    moe_calibrate      = false; // empirically calibrate -ncmoe / n_threads for this GPU+model+context combo, cache the result, then exit
-    int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
+    // The smallest context solid.cpp serves (65,536, one slot): the floor --fit shrinks to, and the context an
+    // unspecified -c is calibrated and keyed at. A floor of 4,096 meant a memory-starved server quietly served 4K
+    // (logged as "collapsed to 4096" every time); 64K is the context this fork is built and measured for.
+    // -fitc N overrides.
+    int32_t fit_params_min_ctx = 65536;  // minimum context size to set when trying to reduce memory use
 
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);

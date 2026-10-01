@@ -1806,7 +1806,7 @@ static std::string common_moe_calibration_key(const char * path_model, const com
     // with") built a key of c0 that could never match an entry cached at a
     // resolved context, so it re-calibrated from scratch every start and then
     // could not find what it had just written.
-    const uint32_t key_ctx = params.n_ctx > 0 ? params.n_ctx : 4096;
+    const uint32_t key_ctx = params.n_ctx > 0 ? params.n_ctx : 65536;
     return string_format("%s|%s|%lld|c%u|p%u|ngl%d",
             gpu_sig.c_str(), path_model, model_size, key_ctx, params.n_parallel, params.n_gpu_layers);
 }
@@ -4177,7 +4177,7 @@ void common_moe_calibrate(common_params & params) {
         // executed even once - which is why this still reported "does not fit
         // even at 512" while an explicit -c 2048 --parallel 1 fitted
         // immediately. Same for n_seq_max.
-        const uint32_t requested     = cparams.n_ctx     > 0 ? cparams.n_ctx     : 4096;
+        const uint32_t requested     = cparams.n_ctx     > 0 ? cparams.n_ctx     : 65536;
         const uint32_t requested_par = cparams.n_seq_max > 0 ? cparams.n_seq_max : 1;
         bool found = false;
         // Concurrency first, and context only after. On a hybrid model the
@@ -4451,7 +4451,7 @@ void common_moe_calibrate(common_params & params) {
     // "failed" candidate when this was tested.
     int port_counter = 18900 + (int) (getpid() % 500);
     auto next_port = [&]() { return port_counter++; };
-    const uint32_t ctx = cparams.n_ctx > 0 ? cparams.n_ctx : 4096;
+    const uint32_t ctx = cparams.n_ctx > 0 ? cparams.n_ctx : 65536;
 
     // Two independent samples per candidate, averaged - a single subprocess
     // run is one noisy sample, and this isn't a theoretical concern: a
