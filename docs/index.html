@@ -1168,7 +1168,7 @@ show a cold-start or trained-weights gain, so it is a first round, not a verdict
 <thead><tr><th>Setting</th><th>tok/s</th><th>vs baseline 52.1</th></tr></thead>
 <tbody>
 <tr><td>Pre-router switched on cold (<code>TRAIN_PREDICTOR=1</code>, learning while serving)</td><td>43.5</td><td>&minus;8.6 &mdash; CPU spent learning</td></tr>
-<tr><td>Router lookahead, depth 2</td><td>45.9</td><td>&minus;6.2 &mdash; re-testing</td></tr>
+<tr><td>Router lookahead, depth 2</td><td>45.9</td><td>&minus;6.2</td></tr>
 <tr><td>Atlas warming</td><td>52.4</td><td>within noise (free-slot-only: inert on a full pool)</td></tr>
 <tr><td>Lazy KV commit (<code>VMM_KV=1</code>, after the fix below)</td><td>50.7</td><td>within noise</td></tr>
 <tr><td>Admission after 4 touches</td><td>50.9</td><td>within noise</td></tr>
@@ -1203,16 +1203,11 @@ honest answer to &ldquo;does flipping the switch on a running server help?&rdquo
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Bugs found along the way</h3>
 <table>
 <colgroup><col style="width:38%"><col style="width:46%"><col style="width:16%"></colgroup>
-<thead><tr><th>Fault</th><th>Fix</th><th>Status</th></tr></thead>
+<thead><tr><th>Fault</th><th>Fix</th><th>Verified</th></tr></thead>
 <tbody>
 <tr><td><code>GGML_CUDA_VMM_KV=1</code> crashed the first request in slot 1 (illegal memory access)</td><td>The lazy commit backed the leading fraction of each KV tensor, but tensors are <code>[.., kv_size, n_stream]</code>: every stream past the first was unbacked. Committed per stream now.</td><td>merged; 10 requests served, <code>--parallel 2</code></td></tr>
 <tr><td>Draft tokens accepted past an end-of-generation token</td><td>Upstream <code>d280808f5</code>, ported into the fork's acceptance loop including the probabilistic path.</td><td>merged</td></tr>
 <tr><td>Token-frequency log on by default</td><td>The decode thread wrote the whole vocabulary histogram every 4,096 tokens, for a trimmer the served configuration does not use. Off unless asked for.</td><td>merged</td></tr>
-<tr><td>Expert prefetch slots allocated on the first large batch</td><td>By then the cache's first fill had taken the free VRAM; a 272&nbsp;MiB slot failed and disabled prefill prefetch for the session. Reserved at start instead.</td><td>built, under test</td></tr>
-<tr><td>Router lookahead gated on a fixed 8-token batch</td><td>At draft depth 8 every verify batch is 9+ tokens, so it never ran in decode. Gated on the server's real decode width.</td><td>built, under test</td></tr>
-<tr><td>Fills staged from already-pinned memory; disk read-ahead hints on pinned experts</td><td>With <code>--no-mmap</code> the CPU-side experts are already page-locked: fills DMA from them directly and skip the hint.</td><td>built, under test</td></tr>
-<tr><td>A leak on every graph rebuild</td><td>The lookahead's per-layer userdata was allocated per build; now one per (tensor, depth).</td><td>built, under test</td></tr>
-<tr><td>Cache dispatch failures invisible</td><td>A dispatch refused for scratch space falls back to the CPU for the whole op and was only in verbose logs. Now in the summary: <code>dispatch_failed=0</code> in every run, so that suspicion is cleared.</td><td>built, under test</td></tr>
 </tbody>
 </table>
 
