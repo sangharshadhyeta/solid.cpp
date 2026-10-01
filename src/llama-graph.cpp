@@ -1961,9 +1961,14 @@ void llm_graph_context::build_moe_lookahead(
     // Raising this to the server's real decode width (n_parallel x verify width, 18
     // for two slots at draft depth 8) measured as a wash against the fixed 8 over two
     // rounds (hit rate +1.8 then +0.1 points, tok/s +0.8 then -1.7; 1 Oct 2026, same
-    // prompts and seeds), so 8 stays. Past that width the first token's row is a poor
+    // prompts and seeds), so 8 stays (LLAMA_LOOKAHEAD_MAX_BATCH overrides it). Past that width the first token's row is a poor
     // guide for the rest of the batch - LLAMA_LOOKAHEAD_UNION=1 sends every token's.
-    if (n_tokens > 8) {
+    static const int64_t lookahead_max_batch = [] {
+        const char * env = getenv("LLAMA_LOOKAHEAD_MAX_BATCH");
+        const int v = env ? atoi(env) : 0;
+        return (int64_t) (v > 0 ? v : 8);
+    }();
+    if (n_tokens > lookahead_max_batch) {
         return;
     }
 
