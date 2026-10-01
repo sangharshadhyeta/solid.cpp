@@ -1208,6 +1208,22 @@ and on prose a shallower draft keeps the verify batch inside the GPU's 5-wide Mo
 </tbody>
 </table></div>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">The shipped defaults, measured end to end</h3>
+<p>A plain launch &mdash; no depth, acceptance or gate flags, every default above applied together &mdash; at
+<code>-c 65536 --parallel 2 -ncmoe 99 --moe-cache auto</code>: all expert weights stay in host memory, the cache fills from them on demand, and
+two slots share the 64k window. Three rounds, the same prompts and seeds each round, eight warm requests per round.</p>
+<div style="overflow-x:auto"><table style="min-width:720px">
+<thead><tr><th>Prompt set</th><th>Previous defaults, warm tok/s</th><th>Shipped defaults, warm tok/s by round</th><th>First requests after start</th><th>Draft acceptance</th><th>Cache slots / hit rate</th></tr></thead>
+<tbody>
+<tr><td>Calibration probes: a code task and a train problem</td><td>54.8 / 56.2 (earlier, unpaired, depth 8)</td><td><strong>78.3 / 78.2 / 77.1</strong> (mean 77.9)</td><td>79</td><td>0.87</td><td>3,268 / 0.848</td></tr>
+<tr><td>Mixed set: mostly prose, two code and one reasoning prompt</td><td>29.0 / 33.5 / 31.3</td><td><strong>58.7 / 61.5 / 59.2</strong> (mean 59.8)</td><td>58</td><td>0.67</td><td>3,268 / 0.868</td></tr>
+</tbody>
+</table></div>
+<p>The calibration probes are the two prompts the 13 September calibration timed to record <strong>70.9</strong>, at a 4k context and
+one slot (the headline figure above, 72.6, was recorded in the same probe regime): the shipped defaults read above both at a 16-times larger context and twice the
+slots. The mixed set is the harder case &mdash; a draft model is accepted ~38% of the time on prose, 73&ndash;90% on code and reasoning &mdash; and it
+roughly doubled against the previous defaults. Draft acceptance rose from 0.40 to the figure shown.</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
 of them tied or lost. Two of those verdicts were later overturned (<code>p_min</code> and lazy KV both won on paired
