@@ -12129,8 +12129,7 @@ static int moe_cache_plan(
         const long long pe = both_hit + both_miss + partial;
         fprintf(stderr,
                 "[moe-cache] PART_STATS calls=%lld tokens=%lld rows=%lld miss_rows=%lld (%.1f%%) miss_MiB=%.1f "
-                "miss_MiB/token=%.2f | pairs=%lld experts=%lld both_hit=%lld both_miss=%lld partial=%lld (%.1f%%)
-",
+                "miss_MiB/token=%.2f | pairs=%lld experts=%lld both_hit=%lld both_miss=%lld partial=%lld (%.1f%%)\n",
                 calls, tokens, rows, miss_rows, rows ? 100.0 * miss_rows / rows : 0.0, miss_bytes / 1048576.0,
                 tokens ? miss_bytes / 1048576.0 / tokens : 0.0, pairs, pe, both_hit, both_miss, partial,
                 pe ? 100.0 * partial / pe : 0.0);
