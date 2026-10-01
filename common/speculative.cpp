@@ -1293,6 +1293,56 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // Adaptive draft length (LLAMA_SPEC_GOVERNOR=1; MoE-SpeQ's governor, arXiv 2511.14102, as a bandit): the cap on drafted
+    // tokens per round is chosen among {2,3,4,5,6,8} (up to the configured n_max) by the measured throughput of each - tokens
+    // produced per microsecond of the whole cycle (draft + verify + sampling) - because the best length depends on the text
+    // (acceptance 0.87 on code, 0.67 on prose) and on how wide a verify batch the expert cache can afford (the experts needed
+    // grow with the width). Every arm is tried 3 times first, then the best EMA is used with a 1-in-10 exploration round.
+    // It can only shorten a draft below the configured n_max (buffers are sized by it), so run it with a larger n_max.
+    bool                 gov_on = false;
+    std::vector<int>     gov_arms;
+    std::vector<double>  gov_rate;     // EMA of tokens/us per arm
+    std::vector<int>     gov_n;        // rounds measured per arm
+    int                  gov_arm = -1; // arm used by the round in flight
+    int64_t              gov_start_us = 0;
+    int64_t              gov_tokens = 0;
+    int64_t              gov_round = 0;
+
+    int gov_choose() {
+        const int64_t now = ggml_time_us();
+        if (gov_arm >= 0 && gov_start_us > 0 && gov_tokens > 0) {
+            const double cycle = (double) (now - gov_start_us);
+            if (cycle > 0.0 && cycle < 2.0e6) { // a gap longer than 2 s is idle time between requests, not a cycle
+                const double rate = (double) gov_tokens / cycle;
+                gov_rate[gov_arm] = gov_n[gov_arm] == 0 ? rate : 0.9 * gov_rate[gov_arm] + 0.1 * rate;
+                gov_n[gov_arm]++;
+            }
+        }
+        gov_round++;
+        int arm = 0;
+        int min_n = gov_n[0];
+        for (size_t a = 1; a < gov_arms.size(); ++a) {
+            if (gov_n[a] < min_n) { min_n = gov_n[a]; arm = (int) a; }
+        }
+        if (min_n >= 3) {
+            arm = 0;
+            for (size_t a = 1; a < gov_arms.size(); ++a) {
+                if (gov_rate[a] > gov_rate[arm]) { arm = (int) a; }
+            }
+            if (gov_round % 10 == 0) {            // exploration: the least-measured arm
+                int least = 0;
+                for (size_t a = 1; a < gov_arms.size(); ++a) {
+                    if (gov_n[a] < gov_n[least]) { least = (int) a; }
+                }
+                arm = least;
+            }
+        }
+        gov_arm = arm;
+        gov_start_us = now;
+        gov_tokens = 0;
+        return gov_arms[arm];
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1361,6 +1411,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             chain_h.assign(n_seq, {});
             for (auto & c : chain_h) {
                 c.reserve((size_t) (this->params.n_max + 1) * n_embd);
+            }
+        }
+
+        if (const char * g = getenv("LLAMA_SPEC_GOVERNOR")) {
+            gov_on = atoi(g) != 0;
+        }
+        if (gov_on) {
+            for (const int k : { 2, 3, 4, 5, 6, 8 }) {
+                if (k <= this->params.n_max) {
+                    gov_arms.push_back(k);
+                }
+            }
+            if (gov_arms.size() < 2) {
+                gov_on = false;
+            } else {
+                gov_rate.assign(gov_arms.size(), 0.0);
+                gov_n.assign(gov_arms.size(), 0);
+                SPC_TRC("- adaptive draft length over %zu arms up to %d\n", gov_arms.size(), this->params.n_max);
             }
         }
 
@@ -1536,6 +1604,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         common_batch_clear(batch);
 
         // keep track of which sequences are still drafting
+        const int k_cap = gov_on ? gov_choose() : this->params.n_max;
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
 
@@ -1632,7 +1701,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     dp.result_probs->push_back(cur_p->data[0].p);
                 }
 
-                if (params.n_max <= (int) result.size()) {
+                if (k_cap <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1703,6 +1772,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         // apply, so an incorrect one is strictly worse than none.
         if (is_other) {
             return;
+        }
+
+        if (gov_on) {
+            gov_tokens += (int64_t) n_accepted + 1;
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
