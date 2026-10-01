@@ -4965,6 +4965,26 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                              src + job.bytes <= it_reg->second.second;
                 }
             }
+            // The source may be page-locked already, by someone else: with
+            // --no-mmap the CPU-side experts live in the GPU's pinned host
+            // buffer (CUDA_Host), which is also why registering them above
+            // fails ("already mapped"). DMA straight from it - staging would
+            // only memcpy pinned memory into pinned memory, an extra pass over
+            // RAM per fill on the bus the CPU's own miss compute reads from.
+            // Asked once per region (or per source when no region is known).
+            if (!direct && error == cudaSuccess && job.source && job.bytes) {
+                static thread_local const void * last_base = nullptr;
+                static thread_local bool last_pinned = false;
+                const void * base = job.region_base ? job.region_base : job.source;
+                if (base != last_base) {
+                    cudaPointerAttributes attr = {};
+                    last_pinned = cudaPointerGetAttributes(&attr, job.source) == cudaSuccess &&
+                                  attr.type == cudaMemoryTypeHost;
+                    (void) cudaGetLastError();
+                    last_base = base;
+                }
+                direct = last_pinned;
+            }
             // TESTED AND REVERTED (docs/plan.md): a full cudaDeviceSynchronize()
             // wrapped around this fill's H2D copy (draining the device before AND
             // after) did NOT fix the single-CLI-process 2-prompt reproducer -
@@ -5022,7 +5042,11 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                         src_expert_size = it->second.src_expert_size;
                     }
                 }
-                if (error == cudaSuccess && skip_copy) {
+                if (error != cudaSuccess) {
+                    // An earlier step failed (dead device, no destination, refused
+                    // overrun). Keep that error: copying here would overwrite it
+                    // with success and publish the slot as valid.
+                } else if (skip_copy) {
                     // bookkeeping only, same contract as an ordinary fill's
                     // SKIP_COPY branch - fall through with error==cudaSuccess
                 } else if (idx.empty() || row_bytes == 0 || src_expert_size == 0 ||
@@ -5292,17 +5316,22 @@ static int moe_cache_find_pool(
 // its slot survives): re-ranking a resident key from the same
 // ever-growing heat vector would not change the answer anyway, since heat
 // only accumulates and never resets per key.
-// DEFAULT ON. Measured +8.1% tok/s at matched placement and warm-up, with
-// 50% VRAM saved on every converted expert, and correctness verified across
-// multi-topic multi-turn conversation. Set GGML_CUDA_MOE_CACHE_NEURON_REDUCE=0
-// to turn it off.
+// DEFAULT OFF unless calibrated on (GGML_CUDA_MOE_CACHE_NEURON_REDUCE=1, or a
+// calibration entry with neuron_reduce_k > 0, which sets it). It measured +8.1%
+// tok/s on Ornith-1.5-35B, a model that does not fit - and then ran on every
+// model by default with a fixed K of 256 neurons. On gemma-4 (1,408-neuron
+// experts, so 18% of the width, where the model's own coverage curve says a
+// median 83% is needed for 90% of the activation mass) it measured -37%
+// (46.2 -> 29.0 tok/s with it on, 1 Oct 2026, same prompts and seeds) and no
+// cache gain (hit rate 0.880 off vs 0.868 on). A lossy mechanism whose value
+// depends on the model needs a measurement, not a shipped constant.
 //
 // Depends on neuron heat being collected (it is the signal this selects on),
 // so moe_cache_neuron_heat_enabled() defaults on for the same reason.
 static bool moe_cache_neuron_reduce_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
-        return env ? atoi(env) != 0 : true;
+        return env ? atoi(env) != 0 : false;
     }();
     return enabled;
 }
@@ -7084,13 +7113,15 @@ static void moe_cache_session_destroy(void * opaque) {
             const long long lookups = d.hits + d.misses;
             fprintf(stderr, "[moe-cache] SUMMARY CUDA%d slots=%zu/%zu (%.2f%% of pool) "
                     "allocated=%zu MiB budget=%zu MiB hits=%lld misses=%lld hit_rate=%.4f "
-                    "substitutions=%lld declined=%lld evictions=%lld fills_failed=%lld\n",
+                    "substitutions=%lld declined=%lld evictions=%lld fills_failed=%lld "
+                    "dispatch_failed=%lld\n",
                     d.physical, used, total,
                     total ? 100.0 * (double) used / (double) total : 0.0,
                     d.allocated_bytes >> 20, d.budget_limit >> 20,
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
-                    d.substitutions, d.substitute_declined, d.evictions, d.fill_failures);
+                    d.substitutions, d.substitute_declined, d.evictions, d.fill_failures,
+                    (long long) d.dispatch_failures);
             if (d.plan_calls > 0 && d.plan_tokens > 0) {
                 const double tok_per_call  = (double) d.plan_tokens / (double) d.plan_calls;
                 const double ids_per_tok   = (double) d.plan_ids / (double) d.plan_tokens;
@@ -8249,7 +8280,9 @@ static bool moe_cache_substitute_enabled() {
 static bool moe_cache_neuron_heat_enabled() {
     static const bool enabled = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_NEURON_HEAT");
-        return env ? atoi(env) != 0 : true;
+        // the signal reduced-width serving selects on: collected exactly when
+        // that is on (a mutexed pass per decode step otherwise buys nothing)
+        return env ? atoi(env) != 0 : moe_cache_neuron_reduce_enabled();
     }();
     return enabled;
 }
@@ -8747,6 +8780,26 @@ static int moe_cache_atlas_rank(
 // the "page-cache pressure from stuff nothing asked for" cost that made the
 // one-shot version a net loss warm. Re-measure if that reasoning stops
 // holding (e.g. after other changes to the admit path).
+// Whether an expert tensor's host memory is page-locked (a CUDA_Host buffer:
+// the CPU-side experts under --no-mmap). Such pages are never on disk, so a
+// WILLNEED hint for them only walks page tables on the decode thread, once per
+// missed expert. Asked once per tensor.
+static bool moe_cache_host_pinned(const void * host_base) {
+    static std::mutex mu;
+    static std::unordered_map<const void *, bool> seen;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = seen.find(host_base);
+    if (it != seen.end()) {
+        return it->second;
+    }
+    cudaPointerAttributes attr = {};
+    const bool pinned = cudaPointerGetAttributes(&attr, host_base) == cudaSuccess &&
+                        attr.type == cudaMemoryTypeHost;
+    (void) cudaGetLastError();
+    seen.emplace(host_base, pinned);
+    return pinned;
+}
+
 #if defined(__linux__)
 // Use a router-lookahead prediction to read a not-yet-resident expert's mmap
 // pages ahead, rather than only to claim a free VRAM slot. See the call site
@@ -8896,7 +8949,7 @@ static bool moe_cache_atlas_admit(
             // on every admission regardless of residency would be exactly
             // the "more prefetch, unconditionally" mistake that comment
             // warns against.
-            if (moe_cache_live_prefetch_enabled()) {
+            if (moe_cache_live_prefetch_enabled() && !moe_cache_host_pinned(host_base)) {
                 const auto rit = device.residency.find(host_base);
                 if (rit != device.residency.end() &&
                     (size_t) expert < rit->second.is_cold.size() &&
@@ -11376,7 +11429,8 @@ static int moe_cache_plan(
                 return !env || atoi(env) != 0;
             }();
             static const long page_size_p = sysconf(_SC_PAGESIZE);
-            if (cpu_prefetch && page_size_p > 0 && node->host_base && node->expert_size > 0) {
+            if (cpu_prefetch && page_size_p > 0 && node->host_base && node->expert_size > 0 &&
+                !moe_cache_host_pinned(node->host_base)) {
                 const uintptr_t begin = (uintptr_t) node->host_base + (uintptr_t) expert * node->expert_size;
                 const uintptr_t first = begin & ~((uintptr_t) page_size_p - 1);
                 const uintptr_t last  = (begin + node->expert_size + page_size_p - 1) & ~((uintptr_t) page_size_p - 1);
@@ -12012,6 +12066,28 @@ static __global__ void moe_cache_reduce_scatter_kernel(
     }
 }
 
+// Compacts the reduced rows' quantized activations out of the full batch's:
+// reduced row r takes row_map[r]'s activation (row 0 when the activation is
+// shared by every row). One block per reduced row. This replaces a host loop
+// of one cudaMemcpyAsync per reduced row - about 30 per MoE op, 60 ops per
+// decode step, ~1,800 launches on the decode thread per token - which the
+// original comment already named ("a real scatter/gather kernel would remove
+// this loop") and which cost more than the reduction saved (1 Oct 2026: neuron
+// subsetting off measured +59% on gemma-4). row_bytes is a whole number of
+// block_q8_1 (36 bytes), so 4-byte words cover it exactly.
+static __global__ void moe_cache_compact_act_kernel(
+        char * __restrict__ dst, const char * __restrict__ src,
+        const int32_t * __restrict__ d_row_map, size_t row_bytes, int shared) {
+    const int r = blockIdx.x;
+    const size_t orig_row = shared ? 0 : (size_t) d_row_map[r];
+    const int * s = (const int *) (src + orig_row * row_bytes);
+    int * d = (int *) (dst + (size_t) r * row_bytes);
+    const size_t words = row_bytes / sizeof(int);
+    for (size_t i = threadIdx.x; i < words; i += blockDim.x) {
+        d[i] = s[i];
+    }
+}
+
 static int moe_cache_dispatch(
         void * opaque, int wtype, int64_t n_in, int64_t n_out, int n_hits,
         const int32_t * slot_indices, const float * const * act_rows) {
@@ -12423,24 +12499,13 @@ static int moe_cache_dispatch(
     if (ok && n_reduced > 0) {
         // Compact the reduced rows' quantized activation out of the
         // already-quantized device.d_act_q8 (built for the FULL batch just
-        // above) via one small device-to-device copy per reduced row -
-        // correct whether or not shared_activation is true (a shared
-        // source is just the same source row copied n_reduced times).
-        // Bounded by n_reduced <= GGML_MOE_CACHE_MAX_BATCH_ROWS; a real
-        // scatter/gather kernel would remove this loop, but a reduced-pool
-        // sub-batch is a fraction of an already-small decode batch, and
-        // correctness came first for this landing - see docs/plan.md's
-        // "no tok/s claim" note on this mechanism.
+        // above), correct whether or not shared_activation is true: one kernel
+        // over the row map uploaded above (moe_cache_compact_act_kernel).
         const size_t s11_bytes = (size_t) s11_blocks * sizeof(block_q8_1);
-        for (int c = 0; c < n_reduced && ok; c++) {
-            const int orig_row = device.h_reduce_row_map[c];
-            const size_t src_off = (shared_activation ? 0 : (size_t) orig_row) * s11_bytes;
-            ok = moe_cache_cuda_ok(device, cudaMemcpyAsync(
-                        (char *) device.d_act_q8_reduced + (size_t) c * s11_bytes,
-                        (const char *) device.d_act_q8 + src_off, s11_bytes,
-                        cudaMemcpyDeviceToDevice, device.compute_stream),
-                    "reduced activation compact", true);
-        }
+        moe_cache_compact_act_kernel<<<n_reduced, 128, 0, device.compute_stream>>>(
+                (char *) device.d_act_q8_reduced, (const char *) device.d_act_q8,
+                device.d_reduce_row_map, s11_bytes, shared_activation ? 1 : 0);
+        ok = moe_cache_cuda_ok(device, cudaPeekAtLastError(), "reduced activation compact", true);
     }
     if (ok && n_reduced > 0) {
         ggml_cuda_moe_cache_mmv(
