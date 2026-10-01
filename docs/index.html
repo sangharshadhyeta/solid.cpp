@@ -1171,7 +1171,7 @@ how much VRAM is free at the cache's first fill) and drives hit rate, so hit rat
 <tr><td>Draft depth 6</td><td>32.5 / 36.6 / 35.0</td><td>+12% &plusmn;3 (22/24)</td><td>+15% &plusmn;6 (6/6)</td><td>2,721 / 0.843</td><td>win, smaller than 4</td></tr>
 <tr><td>Draft confidence gate <code>p_min</code> 0.5 (depth 8)</td><td>34.1 / 38.0 / 36.6</td><td>+13% &plusmn;3 (19/24)</td><td>+16% &plusmn;6 (6/6)</td><td>2,682 / 0.828</td><td><strong>win</strong> &mdash; now the default</td></tr>
 <tr><td>Probabilistic draft acceptance <strong>off</strong></td><td>25.1 / 29.3 / 31.0</td><td>-9% &plusmn;2 (4/24)</td><td>-4% &plusmn;3 (1/6)</td><td>2,682 / 0.845</td><td>keep it on (now the default)</td></tr>
-<tr><td>Lazy KV commit</td><td>29.9 / 34.6 / 30.5</td><td>0% &plusmn;2 (12/24)</td><td>+6% &plusmn;3 (5/6)</td><td>3,123 / 0.882</td><td>a bigger cache (+8% to +21% slots, hit rate up about 3 points) but no measurable warm speed gain; on, with headroom</td></tr>
+<tr><td>Lazy KV commit</td><td>29.9 / 34.6 / 30.5</td><td>0% &plusmn;2 (12/24)</td><td>+6% &plusmn;3 (5/6)</td><td>3,123 / 0.882</td><td>a bigger cache (+8% to +21% slots, hit rate up about 3 points) but no measurable speed, and it stops the server on long prompts: opt-in</td></tr>
 <tr><td>Router lookahead, depth 2</td><td>27.8 / 30.5 / 32.2</td><td>-6% &plusmn;2 (5/24)</td><td>-3% &plusmn;5 (2/6)</td><td>2,644 / 0.805</td><td>loss: slower and a lower hit rate every round: stays off</td></tr>
 <tr><td>Lookahead boundary at 8 (shipped) against widened to the real verify width</td><td>29.8 / 31.8 / 30.8</td><td>-1% &plusmn;2 (12/24)</td><td>+7% &plusmn;6 (3/6)</td><td>2,721 / 0.863</td><td>8 is better on hit rate every round: kept</td></tr>
 <tr><td>Atlas warming</td><td>30.5 / 32.0 / 34.2</td><td>+1% &plusmn;2 (13/24)</td><td>+3% &plusmn;4 (3/6)</td><td>2,721 / 0.854</td><td>tie: stays off</td></tr>
@@ -1203,7 +1203,8 @@ and on prose a shallower draft keeps the verify batch inside the GPU's 5-wide Mo
 <tr><td>Draft depth 4 (was 3; the calibrated 8 is no longer trusted)</td><td>+22% &plusmn;3 (22/24), acceptance 0.61 against 0.40</td><td>measured on gemma-4; Qwen's own calibration also chose 4</td></tr>
 <tr><td>Draft confidence gate <code>p_min</code> 0.5</td><td>+13% &plusmn;3 (19/24) at depth 8</td><td>gemma-4 only; a weaker draft head is gated harder</td></tr>
 <tr><td>Probabilistic draft acceptance on</td><td>off is -9% &plusmn;2 (4/24)</td><td>slightly biases output at temperature above 0 (exact under greedy); <code>--no-spec-prob-accept</code> restores exact sampling</td></tr>
-<tr><td>Lazy KV commit on: 25% backed at load, the cache leaves 50% of the rest free</td><td>3,123 slots against 2,721; speed 0% &plusmn;2 (12/24)</td><td>a bigger cache, not a measurable speed gain; the 25% share exists because a first request once found no VRAM left</td></tr>
+<tr><td>Expert-cache VRAM reserve floor of 1,500 MiB (was 5% of the free VRAM)</td><td>two concurrent ~27K-token prompts: out of memory at 800&nbsp;MiB, complete at 1,500; ~32K-token prompts complete</td><td>costs about 400 cache slots and no measurable speed (60.6 against 59.8 tok/s on the mixed set)</td></tr>
+<tr><td>Lazy KV commit: <strong>opt-in</strong> (<code>GGML_CUDA_VMM_KV=1</code>), not a default</td><td>+8% to +21% cache slots, speed 0% &plusmn;2 (12/24) &mdash; but two concurrent ~32K-token prompts stop the server at 88.5% of the context, and complete with it off</td><td>only for a deployment that sets a large context and knows it will not fill it</td></tr>
 <tr><td>Trained pre-router on</td><td>frozen -1% &plusmn;2 (10/24); learning -3% &plusmn;2 (10/24)</td><td><strong>no gain measured on gemma-4.</strong> Kept on because it was documented as winning on a contended cache, which gemma-4 with this cache is not</td></tr>
 </tbody>
 </table></div>
@@ -1215,10 +1216,11 @@ two slots share the 64k window. Three rounds, the same prompts and seeds each ro
 <div style="overflow-x:auto"><table style="min-width:720px">
 <thead><tr><th>Prompt set</th><th>Previous defaults, warm tok/s</th><th>Shipped defaults, warm tok/s by round</th><th>First requests after start</th><th>Draft acceptance</th><th>Cache slots / hit rate</th></tr></thead>
 <tbody>
-<tr><td>Calibration probes: a code task and a train problem</td><td>54.8 / 56.2 (earlier, unpaired, depth 8)</td><td><strong>78.3 / 78.2 / 77.1</strong> (mean 77.9)</td><td>79</td><td>0.87</td><td>3,268 / 0.848</td></tr>
-<tr><td>Mixed set: mostly prose, two code and one reasoning prompt</td><td>29.0 / 33.5 / 31.3</td><td><strong>58.7 / 61.5 / 59.2</strong> (mean 59.8)</td><td>58</td><td>0.67</td><td>3,268 / 0.868</td></tr>
+<tr><td>Calibration probes: a code task and a train problem</td><td>54.8 / 56.2 (earlier, unpaired, depth 8)</td><td><strong>77.6 / 78.2 / 77.1</strong> (mean 77.6)</td><td>77</td><td>0.87</td><td>2,967 / 0.827</td></tr>
+<tr><td>Mixed set: mostly prose, two code and one reasoning prompt</td><td>29.0 / 33.5 / 31.3</td><td><strong>59.3 / 62.5 / 59.9</strong> (mean 60.6)</td><td>61</td><td>0.68</td><td>2,967 / 0.855</td></tr>
 </tbody>
 </table></div>
+<p>These are the numbers from the shipped build (reserve floor 1,500&nbsp;MiB, lazy KV off); an earlier run of the same defaults before those two changes read 78.3 / 78.2 / 77.1 and 58.7 / 61.5 / 59.2, so the changes cost nothing measurable.</p>
 <p>The calibration probes are the two prompts the 13 September calibration timed to record <strong>70.9</strong>, at a 4k context and
 one slot (the headline figure above, 72.6, was recorded in the same probe regime): the shipped defaults read above both at a 16-times larger context and twice the
 slots. The mixed set is the harder case &mdash; a draft model is accepted ~38% of the time on prose, 73&ndash;90% on code and reasoning &mdash; and it
@@ -1287,10 +1289,23 @@ head, on prompts that ask the model to quote its input.</p>
 <tr><td>MTP head first, then the n-gram drafter</td><td>+3% &plusmn;4 (11/24)</td><td>2,663&nbsp;ms</td><td>tie</td></tr></tbody></table></div>
 <p>Both orders are inside the noise, so the MTP head alone stays the default.</p>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Long prompts: two defaults that broke them, and what fixed it</h3>
+<p>Two concurrent requests, each close to a slot's whole window (32,768 tokens at <code>-c 65536 --parallel 2</code>), a few seconds after start. This was the
+test the speed numbers above could not show, and it found two failures introduced by changes made to speed things up:</p>
+<div style="overflow-x:auto"><table style="min-width:680px"><thead><tr><th>Build and setting</th><th>~27,400-token prompts</th><th>~31,900-token prompts</th></tr></thead><tbody>
+<tr><td>Previous build</td><td>completes</td><td>not tested</td></tr>
+<tr><td>Lazy KV commit on (made the default for a while)</td><td><strong>server stopped</strong> at 57% of the context</td><td><strong>server stopped</strong> at 88.5% of the context, even with the larger reserve</td></tr>
+<tr><td>Lazy KV off, VRAM reserve 800&nbsp;MiB</td><td><strong>out of memory</strong> in <code>cudaGraphLaunch</code> at the first request</td><td>not tested</td></tr>
+<tr><td>Lazy KV off, reserve 1,500&nbsp;MiB (the shipped build)</td><td>completes</td><td>completes</td></tr>
+</tbody></table></div>
+<p>The reserve is memory the expert cache leaves free for what is allocated after it sizes itself: CUDA graphs, compute buffers, the KV's own growth. Too small and a long
+prefill finds nothing left; capping the cache's budget at 5,000&nbsp;MiB fixed it the same way. A 33,150-token prompt is refused with a clean 400, as it should
+be, because it does not fit the window. The shipped build's speed is unchanged by the larger reserve (below).</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
-of them tied or lost. Two of those verdicts were later overturned (<code>p_min</code> and lazy KV both won on paired
-prompts), so the cause of the miss matters:</p>
+of them tied or lost. One of those verdicts was overturned on paired prompts (<code>p_min</code>), and lazy KV's cache gain did show up there &mdash; though it
+later turned out to cost long-prompt stability and was made opt-in again. The causes of the misses matter:</p>
 <ul>
 <li><strong>No identical-pair control.</strong> An unpaired test read <code>-ncmoe 30</code> and <code>-ncmoe 99</code> 20% apart &mdash; but gemma-4 has 30 layers, so they are the same placement. Any comparison under ~20% needs an identical copy of the baseline in the same run to show the noise floor.</li>
 <li><strong>Unpaired prompts.</strong> With &plusmn;8&ndash;12 tok/s between requests, eight different prompts per setting cannot resolve a 10&ndash;15% effect.</li>
@@ -1314,7 +1329,7 @@ Whether it earns a place depends on the cache being contended, which the larger 
 <tr><td>Draft tokens accepted past an end-of-generation token</td><td>Upstream <code>d280808f5</code>, ported into the fork's acceptance loop including the probabilistic path.</td><td>merged</td></tr>
 <tr><td>Token-frequency log on by default</td><td>The decode thread wrote the whole vocabulary histogram every 4,096 tokens, for a trimmer the served configuration does not use. Off unless asked for.</td><td>merged</td></tr>
 <tr><td>Expert prefetch slots allocated on the first large batch</td><td>By then the cache's first fill has taken the free VRAM, a 272&nbsp;MiB slot fails, and prefill prefetch is disabled for the session. Reserving them up front costs 13&ndash;17% of the cache, so it is an opt-in switch (<code>GGML_SCHED_PREFETCH_RESERVE=1</code>) pending a measurement on prefill-heavy traffic.</td><td>cost measured; prefill gain not yet</td></tr>
-<tr><td>Lazy KV commit: the server stopped on its first request ("cannot commit KV memory at 5.9% of the context")</td><td>The cache's headroom for the uncommitted KV was a sizing hint, not a reservation: allocations outside its budget took the VRAM first. A guaranteed 25% of every stream's window is now committed at load, before the cache exists (<code>GGML_CUDA_VMM_KV_PRECOMMIT_PCT</code>).</td><td>the crashing configuration no longer fails on its first request</td></tr>
+<tr><td>Lazy KV commit (as a default): the server stopped on its first request ("cannot commit KV memory at 5.9% of the context")</td><td>The cache's headroom for the uncommitted KV was a sizing hint, not a reservation: allocations outside its budget took the VRAM first. A guaranteed 25% of every stream's window is now committed at load, before the cache exists (<code>GGML_CUDA_VMM_KV_PRECOMMIT_PCT</code>).</td><td>the crashing configuration no longer fails on its first request</td></tr>
 <tr><td>Out of memory while instantiating a CUDA graph on the second request (neuron subsetting on)</td><td>The cache's size depends on when its first fill happens: its budget differed by ~400&nbsp;MiB between identical runs, and with only 5% reserved a server was left 381&nbsp;MiB free, too little for the reduced path's larger graph. The reserve has a floor of 800&nbsp;MiB now (a sixth of the free VRAM on a small card).</td><td>12 requests, three runs, no failure; the cache came out <em>identical</em> each time (3,502 slots, hit 0.890)</td></tr>
 <tr><td>A skipped calibration stage cached the launch value as if it were a measurement</td><td>The default calibration skips the depth, acceptance and <code>p_min</code> searches but wrote the <em>launch</em> values into the entry, so a flag once on a command line (depth 8) outranked every later default. Skipped stages leave their field unmeasured now, and entries written before the current defaults have their speculative fields read as unmeasured.</td><td>gemma-4's cached depth 8 no longer overrides the default 4</td></tr>
 <tr><td>Cache dispatch failures invisible</td><td>A dispatch refused for scratch space falls back to the CPU for the whole op and was only in verbose logs. The summary reports <code>dispatch_failed</code>: 0 in every run, which cleared that suspicion.</td><td>0 in every run</td></tr>
