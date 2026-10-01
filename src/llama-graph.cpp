@@ -18,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <map>
 #include <mutex>
@@ -1887,11 +1888,36 @@ void llm_graph_context::moe_prefetch_cb(ggml_tensor * dst, const ggml_tensor * a
         return;
     }
     const auto * ud = (const llm_graph_context::moe_lookahead_userdata *) userdata;
-    // Only the first token's row is used: prefetching is per-layer, and the
-    // experts the first token routes to are as good a sample as any for what
-    // the layer is about to touch.
+    // One token (decode): its row. A batch (an MTP verify of 5-18 tokens): the first token's
+    // row covers ~8 of the ~31 distinct experts the batch will want, so with
+    // LLAMA_LOOKAHEAD_UNION=1 the union of every token's picks is sent, in rank order - all
+    // the rank-0 picks first, then rank 1, ... - so the likeliest experts come first when the
+    // cache queue is bounded. Off by default until measured.
+    static const bool use_union = [] {
+        const char * env = getenv("LLAMA_LOOKAHEAD_UNION");
+        return env && atoi(env) != 0;
+    }();
+    const int64_t k = a->ne[0];
+    const int64_t T = a->ne[1];
+    if (!use_union || T <= 1) {
+        for (int t = 0; t < ud->n_host_bases; t++) {
+            ggml_moe_cache.prefetch(ud->host_bases[t], (const int32_t *) a->data, (int) k, ud->depth);
+        }
+        return;
+    }
+    std::vector<int32_t> ids;
+    const size_t cap = (size_t) (4 * k);
+    ids.reserve(cap);
+    for (int64_t r = 0; r < k && ids.size() < cap; r++) {
+        for (int64_t t = 0; t < T && ids.size() < cap; t++) {
+            const int32_t e = *(const int32_t *) ((const char *) a->data + t * a->nb[1] + r * a->nb[0]);
+            if (e >= 0 && std::find(ids.begin(), ids.end(), e) == ids.end()) {
+                ids.push_back(e);
+            }
+        }
+    }
     for (int t = 0; t < ud->n_host_bases; t++) {
-        ggml_moe_cache.prefetch(ud->host_bases[t], (const int32_t *) a->data, (int) a->ne[0], ud->depth);
+        ggml_moe_cache.prefetch(ud->host_bases[t], ids.data(), (int) ids.size(), ud->depth);
     }
 }
 
@@ -1932,11 +1958,11 @@ void llm_graph_context::build_moe_lookahead(
     // ring at its default 0 so not one prediction could even be stored. 8 is the
     // decode/MTP-verify width (n_parallel x draft depth) this fork already uses as
     // the boundary for decode-only work elsewhere.
-    // Tried raising this to the server's real decode width (n_parallel x verify
-    // width, 18 for two slots at draft depth 8): hit rate 0.868 against 0.886
-    // with the fixed 8 (1 Oct 2026, same prompts and seeds). The lookahead
-    // predicts from the first token's row only - a poor guide for the other 8-17
-    // tokens of a verify batch - and its fills queue behind demand fills. 8 stays.
+    // Raising this to the server's real decode width (n_parallel x verify width, 18
+    // for two slots at draft depth 8) measured as a wash against the fixed 8 over two
+    // rounds (hit rate +1.8 then +0.1 points, tok/s +0.8 then -1.7; 1 Oct 2026, same
+    // prompts and seeds), so 8 stays. Past that width the first token's row is a poor
+    // guide for the rest of the batch - LLAMA_LOOKAHEAD_UNION=1 sends every token's.
     if (n_tokens > 8) {
         return;
     }
