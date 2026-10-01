@@ -347,13 +347,13 @@ struct common_params_speculative_draft {
     //
     // The bias is small at high acceptance and grows as the draft diverges. Exact-match
     // mode has no such shift: a match yields the target's token and a mismatch yields the
-    // target's token, so the output is exactly the target's distribution. That is why this
-    // is off by default and why calibration measures it as a throughput knob rather than
-    // treating it as free.
+    // target's token, so at temperature > 0 the output is very slightly biased toward the
+    // draft (under greedy it is exact). It is ON by default since it measured +13..+23%
+    // tok/s (1 Oct 2026, gemma-4, twice) - --no-spec-prob-accept restores exact sampling.
     // Currently only MTP tracks a real per-token probability; other drafters (pattern-
     // matching ones like ngram-suffix) are treated as maximally confident (1.0) for their
     // own tokens, which still lets this help without requiring every drafter to change.
-    bool prob_accept = false;
+    bool prob_accept = true;
 
     common_params_model mparams;
 
