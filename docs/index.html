@@ -1302,6 +1302,18 @@ test the speed numbers above could not show, and it found two failures introduce
 prefill finds nothing left; capping the cache's budget at 5,000&nbsp;MiB fixed it the same way. A 33,150-token prompt is refused with a clean 400, as it should
 be, because it does not fit the window. The shipped build's speed is unchanged by the larger reserve (below).</p>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Porting the hot-rod branch, one step at a time</h3>
+<p>A second branch carries a chain of changes written without a GPU: upstream correctness fixes, a sparse flash attention for Qwen3.8-Flash-Next, and a KV cache that
+streams from host memory for very long contexts. They go into the main branch one at a time, each built and tested against the previous build first. Every step is judged by
+the same three checks: the operator tests it touches, greedy-output agreement with the previous build compared with a <em>previous-build-against-itself</em> control (greedy
+output is not bit-reproducible here, so a bare &ldquo;identical&rdquo; count means nothing), and paired speed with its own control.</p>
+<div style="overflow-x:auto"><table style="min-width:680px"><thead><tr><th>Step</th><th>Operator tests</th><th>Output agreement (against the control)</th><th>Speed, paired</th></tr></thead><tbody>
+<tr><td>1. Argsort no longer sorts in place; a divergent barrier fixed in the f16 flash attention</td><td>argsort 67/67, top-k 71/71, flash attention 2,920/2,920</td><td>20.8% (control 24.0%)</td><td>&minus;1.9% (control spread 2%)</td></tr>
+<tr><td>2a. Sparse flash-attention path, inert until a model asks for it</td><td>flash attention 2,926/2,926, six new sparse cases</td><td>34.5% (control 27.4%)</td><td>&minus;0.6% &plusmn;0.8 (control +0.9% &plusmn;0.7), three rounds</td></tr>
+</tbody></table></div>
+<p>Step 2a first read &minus;4.8% on a single 12-request sample, inside which the control itself spread 3%; three paired rounds showed it was noise. Each later
+step is added to this table when it has passed.</p>
+
 <h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">What the earlier tests missed, and why</h3>
 <p>A first round switched each off-by-default flag on, untrained, with different prompts per setting, and found most
 of them tied or lost. One of those verdicts was overturned on paired prompts (<code>p_min</code>), and lazy KV's cache gain did show up there &mdash; though it
