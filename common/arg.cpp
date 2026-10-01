@@ -1746,10 +1746,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--token-freq-log"},
         {"--no-token-freq-log"},
         "accumulate a persistent per-token generation-frequency histogram from real serving "
-        "traffic, driven by real requests as they're served (default: enabled) - used to derive "
-        "a frequency-ranked vocabulary subset for FR-Spec-style MTP draft-vocab trimming (see "
-        "docs/moe-cache-colibri-notes.md); negligible per-token cost, survives restarts, stored "
-        "under the llama.cpp cache directory keyed by model path",
+        "traffic (default: disabled) - input for llama-frspec-vocab-trim (FR-Spec-style MTP "
+        "draft-vocab trimming, see docs/moe-cache-colibri-notes.md); the decode thread writes the "
+        "whole histogram to disk every 4096 tokens, stored under the cache directory keyed by model path",
         [](common_params & params, bool value) {
             params.token_freq_log = value;
         }

@@ -1,6 +1,6 @@
 // llama-frspec-vocab-trim: reads the real-traffic token-frequency
 // histogram a running llama-server accumulates (server-token-freq.h,
-// --token-freq-log, on by default), ranks tokens by how often they were
+// --token-freq-log, off by default), ranks tokens by how often they were
 // actually generated, and writes a small sidecar mapping file (the "d2t"
 // convention - trimmed-vocab position -> original token id) that a
 // model's MTP path can load at server startup to trim its draft-vocab
@@ -49,7 +49,7 @@ static void print_usage() {
         "       llama-frspec-vocab-trim --histogram <path> --top-n <N> -o <output.d2t>\n"
         "\n"
         "Reads the real-traffic token-frequency histogram a llama-server instance\n"
-        "accumulated (--token-freq-log, on by default), ranks tokens by real\n"
+        "accumulated (--token-freq-log, off by default), ranks tokens by real\n"
         "generation frequency, and writes the top N as a sidecar vocab-trim mapping\n"
         "file for FR-Spec-style MTP draft-vocab trimming.\n"
         "\n"
@@ -120,8 +120,8 @@ int main(int argc, char ** argv) {
     if (!f.good()) {
         fprintf(stderr,
             "error: no histogram found at %s\n"
-            "Run a real llama-server instance against this model first (--token-freq-log "
-            "is on by default) and let it serve some real traffic - this tool has nothing "
+            "Run a real llama-server instance against this model first with --token-freq-log "
+            "and let it serve some real traffic - this tool has nothing "
             "to rank without at least some generated tokens to learn from.\n",
             histogram_path.c_str());
         return 1;

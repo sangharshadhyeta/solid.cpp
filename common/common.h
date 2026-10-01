@@ -688,7 +688,7 @@ struct common_params {
     // the process, so every restart re-prefills prompts it had already computed.
     std::string cache_disk_dir;
     int32_t cache_disk_mib      = -1;    // -1 = derive from free disk space
-    bool    token_freq_log      = true;  // log real generated-token frequency for FR-Spec-style MTP draft-vocab trimming
+    bool    token_freq_log      = false; // log real generated-token frequency for FR-Spec-style MTP draft-vocab trimming (off: it stalls the decode thread on each flush)
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT
