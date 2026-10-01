@@ -700,6 +700,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    // read once: this loop runs for every drafted token
+    static const bool debug_verify = getenv("LLAMA_DEBUG_VERIFY") != nullptr;
+
     size_t i = 0;
     for (; i < draft.size(); i++) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
@@ -707,10 +711,17 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
         if (draft[i] == id) {
             common_sampler_accept(gsmpl, id, true);
             result.push_back(id);
+
+            // do not accept draft tokens after an EOG - they are not output but would
+            // stay in the context (upstream d280808f5); on replay the last token is
+            // the target's and can be EOG, so a trailing EOG is still accepted
+            if (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size()) {
+                break;
+            }
             continue;
         }
 
-        if (getenv("LLAMA_DEBUG_VERIFY")) {
+        if (debug_verify) {
             fprintf(stderr, "[VERIFY] pos=%zu draft=%d '%s' vs target=%d '%s'\n",
                     i, draft[i], common_token_to_piece(ctx, draft[i]).c_str(),
                     id, common_token_to_piece(ctx, id).c_str());
@@ -750,6 +761,10 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
                     if (dist(gsmpl->accept_rng) < alpha) {
                         common_sampler_accept(gsmpl, draft[i], true);
                         result.push_back(draft[i]);
+
+                        if (llama_vocab_is_eog(vocab, draft[i]) && i + 1 < draft.size()) {
+                            break;
+                        }
                         continue;
                     }
                 }
