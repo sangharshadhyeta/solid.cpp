@@ -1172,8 +1172,8 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     static const bool vmm_kv = [] {
         // ON unless GGML_CUDA_VMM_KV=0. The KV cache reserves its address range and backs it as
         // the context grows, so the VRAM a short context does not use goes to the expert cache:
-        // gemma-4 at 64k: 3,197 slots against 2,759 (+16%), hit rate 0.899 against 0.868 (1 Oct
-        // 2026). Safe because the expert cache sizes itself leaving a share of the uncommitted KV
+        // gemma-4 at 64k, three rounds (1 Oct 2026): 3,197 / 3,197 / 2,974 slots against the
+        // baseline's 2,759 / 2,644 / 2,759 (+8% to +21%), hit rate above it every round. Safe because the expert cache sizes itself leaving a share of the uncommitted KV
         // alone (GGML_CUDA_MOE_CACHE_KV_HEADROOM_PCT, default 50), the per-stream commit is
         // fixed, and a commit that still fails stops with its reason.
         const char * env = getenv("GGML_CUDA_VMM_KV");
