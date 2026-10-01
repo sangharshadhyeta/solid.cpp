@@ -293,6 +293,21 @@ llama_kv_cache::llama_kv_cache(
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
 #ifdef GGML_USE_CUDA
             ggml_backend_cuda_vmm_next_alloc(false);
+            // A guaranteed share of a lazily-committed KV, backed NOW - at load, before the expert
+            // cache exists to take the VRAM. The cache's sizing leaves headroom for the rest, but
+            // that is a hint, not a reservation: allocations outside its budget (a reduced-width
+            // pool, scratch growth) left nothing for even the first 5.9% of the context and the
+            // server stopped on its first request (1 Oct 2026, neuron subsetting on). Whatever a
+            // request needs up to this share is therefore always there. Default 25% of each
+            // stream's window; GGML_CUDA_VMM_KV_PRECOMMIT_PCT overrides (0 = fully lazy).
+            if (buf && ggml_backend_cuda_buffer_is_vmm(buf)) {
+                const char * e = getenv("GGML_CUDA_VMM_KV_PRECOMMIT_PCT");
+                const int pct = std::min(100, std::max(0, e ? atoi(e) : 25));
+                if (pct > 0 && !ggml_backend_cuda_vmm_commit_fraction(buf, pct / 100.0, (int) n_stream)) {
+                    LLAMA_LOG_WARN("%s: could not back the first %d%% of the KV cache at load - falling back to "
+                                   "committing it as the context grows\n", __func__, pct);
+                }
+            }
 #endif
         }
         if (!buf) {
