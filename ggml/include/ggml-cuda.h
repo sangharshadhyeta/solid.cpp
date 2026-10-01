@@ -51,9 +51,11 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 // ggml-cuda.cu. Both are no-ops/0 for ordinary buffers, so callers need not
 // know which kind they hold.
 GGML_BACKEND_API bool   ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer);
-// Ensure the leading `fraction` of every tensor in the buffer is backed by
-// physical memory. Returns false if the mapping failed (out of memory).
-GGML_BACKEND_API bool   ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction);
+// Ensure the leading `fraction` of each of the `n_stream` equal parts of every
+// tensor in the buffer is backed by physical memory (a KV tensor holds one part
+// per sequence stream, [.., kv_size, n_stream]). Returns false if the mapping
+// failed (out of memory).
+GGML_BACKEND_API bool   ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction, int n_stream);
 GGML_BACKEND_API size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffer_t buffer);
 // Mark the next buffer allocation on this thread as eligible for lazy commit.
 // Only meaningful for allocations whose use lags their reservation (the KV

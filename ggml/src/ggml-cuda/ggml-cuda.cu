@@ -858,11 +858,16 @@ struct ggml_backend_cuda_vmm_buffer_context {
         return true;
     }
 
-    // Commit the leading `fraction` of every tensor in this buffer. This is the
-    // growth hook: the KV cache knows how many of its cells are live, and every
-    // tensor in a given cache advances in lockstep, so one fraction describes
-    // all of them.
-    bool commit_fraction(double fraction) {
+    // Commit the leading `fraction` of each stream's part of every tensor in
+    // this buffer. This is the growth hook: the KV cache knows how many of its
+    // cells are live, and every tensor in a given cache advances in lockstep,
+    // so one fraction describes all of them. A KV tensor is
+    // [.., kv_size, n_stream]: stream s's cells start at s/n_stream of it, so
+    // committing a prefix of the whole tensor left every stream but the first
+    // unbacked - the first write from slot 1 was an illegal memory access
+    // (1 Oct 2026, --parallel 2, the first request landed in slot 1).
+    bool commit_fraction(double fraction, int n_stream) {
+        n_stream = std::max(1, n_stream);
         fraction = std::min(1.0, std::max(0.0, fraction));
         {
             static int n = 0;
@@ -872,8 +877,11 @@ struct ggml_backend_cuda_vmm_buffer_context {
             }
         }
         for (const auto & [off, size] : slices) {
-            if (!commit(off, (size_t) (size * fraction) + granularity)) {
-                return false;
+            const size_t part = size / (size_t) n_stream;
+            for (int s = 0; s < n_stream; s++) {
+                if (!commit(off + (size_t) s * part, (size_t) (part * fraction) + granularity)) {
+                    return false;
+                }
             }
         }
         return true;
@@ -969,11 +977,11 @@ bool ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer) {
     return buffer && buffer->iface.free_buffer == ggml_backend_cuda_vmm_buffer_free_buffer;
 }
 
-bool ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction) {
+bool ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction, int n_stream) {
     if (!ggml_backend_cuda_buffer_is_vmm(buffer)) {
         return true; // ordinary buffer: already fully backed, nothing to do
     }
-    return ((ggml_backend_cuda_vmm_buffer_context *) buffer->context)->commit_fraction(fraction);
+    return ((ggml_backend_cuda_vmm_buffer_context *) buffer->context)->commit_fraction(fraction, n_stream);
 }
 
 size_t ggml_backend_cuda_vmm_committed_bytes(ggml_backend_buffer_t buffer) {

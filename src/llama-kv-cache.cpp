@@ -1141,7 +1141,7 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
             const double frac = std::min(1.0, (double) (idx_max + 1) / (double) n_cells + 0.01);
 #ifdef GGML_USE_CUDA
             for (auto & [ctx, buf] : ctxs_bufs) {
-                if (!ggml_backend_cuda_vmm_commit_fraction(buf.get(), frac)) {
+                if (!ggml_backend_cuda_vmm_commit_fraction(buf.get(), frac, (int) n_stream)) {
                     LLAMA_LOG_ERROR("%s: failed to commit KV memory at %.1f%% of context - "
                                     "out of VRAM\n", __func__, 100.0 * frac);
                 }
