@@ -188,8 +188,19 @@ void llm_graph_input_moe_cache_bias::add_layer(int il, const ggml_tensor * t) {
 }
 
 void llm_graph_input_moe_cache_bias::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
     if (!factor) {
+        return;
+    }
+    // Decode-sized batches only (the paper applies it at decode): a prefill batch is staged, not served from the cache, so
+    // biasing its routing would change the hidden state of the whole prompt for no speed benefit. A neutral table for the
+    // others. LLAMA_MOE_CACHE_BIAS_MAX_BATCH (default 8, like the lookahead's gate) sets the boundary.
+    static const int max_batch = [] {
+        const char * e = getenv("LLAMA_MOE_CACHE_BIAS_MAX_BATCH");
+        return e ? std::max(1, atoi(e)) : 8;
+    }();
+    if (ubatch && (int) ubatch->n_tokens > max_batch) {
+        std::vector<float> ones((size_t) (n_expert * n_layer), 1.0f);
+        ggml_backend_tensor_set(factor, ones.data(), 0, ones.size() * sizeof(float));
         return;
     }
     if (!resolved) {
