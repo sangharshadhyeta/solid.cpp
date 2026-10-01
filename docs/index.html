@@ -1137,6 +1137,94 @@ regression as a &ldquo;calibrated optimum&rdquo;. Caught by reading the numbers 
 </div>
 </section>
 
+<section id="audit-2026-10-01">
+<div class="eyebrow">1 October 2026 &mdash; an audit, and what it did and did not find</div>
+<h2>Looking for a regression, and measuring it before believing it</h2>
+<p class="section-lede">Serving gemma-4-26B at <code>-ncmoe 99 --moe-cache auto --parallel 2 -c 65536</code>,
+decode read about 33&nbsp;tok/s on a news-reading workload, against 70.9 recorded by the 13 September
+calibration. Before changing anything, the gap was taken apart. Most of it was not a regression.</p>
+
+<table>
+<colgroup><col style="width:50%"><col style="width:25%"><col style="width:25%"></colgroup>
+<thead><tr><th>What was measured (same command, warm)</th><th>tok/s</th><th>Why</th></tr></thead>
+<tbody>
+<tr><td>Prose prompts (explain, summarise)</td><td>33.4</td><td>MTP draft accepted ~38% of the time</td></tr>
+<tr><td>Calibration's own prompts: code and step-by-step reasoning</td><td>54.8</td><td>accepted 73&ndash;90%</td></tr>
+<tr><td>Expert cache off</td><td>3.2</td><td>the cache is doing its job</td></tr>
+</tbody>
+</table>
+
+<p style="margin-top:1.5rem">The workload sets the number: the same server, unchanged, reads 33 or 55 depending on
+whether the text is prose or code. Run-to-run spread on a single request is about &plusmn;8&nbsp;tok/s (standard
+deviation), so an eight-request median carries about &plusmn;3 &mdash; any difference smaller than that was not
+counted as a result.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Round one: switching each flag on, untrained, on a full cache</h3>
+<p>Flags that ship off were first measured the way they would be flipped on a running server: switched on, nothing
+trained, calibration prompts, eight requests each, interleaved with the baseline. As explained below, this cannot
+show a cold-start or trained-weights gain, so it is a first round, not a verdict:</p>
+<table>
+<colgroup><col style="width:52%"><col style="width:24%"><col style="width:24%"></colgroup>
+<thead><tr><th>Setting</th><th>tok/s</th><th>vs baseline 52.1</th></tr></thead>
+<tbody>
+<tr><td>Pre-router switched on cold (<code>TRAIN_PREDICTOR=1</code>, learning while serving)</td><td>43.5</td><td>&minus;8.6 &mdash; CPU spent learning</td></tr>
+<tr><td>Router lookahead, depth 2</td><td>45.9</td><td>&minus;6.2 &mdash; re-testing</td></tr>
+<tr><td>Atlas warming</td><td>52.4</td><td>within noise (free-slot-only: inert on a full pool)</td></tr>
+<tr><td>Lazy KV commit (<code>VMM_KV=1</code>, after the fix below)</td><td>50.7</td><td>within noise</td></tr>
+<tr><td>Admission after 4 touches</td><td>50.9</td><td>within noise</td></tr>
+<tr><td>Draft confidence gate <code>p_min</code> 0.5</td><td>49.5</td><td>within noise</td></tr>
+</tbody>
+</table>
+<p>A suspicion that cache dispatches were being refused for scratch space and silently falling back to the CPU
+was checked directly: the new summary line reports <code>dispatch_failed=0</code> in every run.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Why those &ldquo;wins&rdquo; did not show &mdash; and what that says about how they were measured</h3>
+<p>Several of the features that ship off were documented as wins, so a test that finds them tied is a reason to
+look for the cause rather than to drop them. Three causes, each checked against the code or the log:</p>
+<ul>
+<li><strong>The warming features can only fill free slots.</strong> Atlas warming, predictor-driven warming and
+lookahead admission place a predicted expert only into a free cache slot, only while more than half the pool is
+still free, and never evict (an evicting variant measured &minus;6.55 points and was reverted). On gemma-4 at 64k the
+pool is 100% full (3,193 of 3,193 slots) within the first requests, after which none of them has anywhere to put
+anything. Their wins were real, but they are <em>cold-start</em> wins, measured from an empty pool, and most were
+hit-rate gains of 0.1&ndash;1.1 points on a different model &mdash; a steady-state tok/s test cannot see them.</li>
+<li><strong>The trained pre-router has to be trained.</strong> Its measured gemma-4 gain (50.2 &rarr; 60.9 tok/s, and
+59.2 &rarr; 70.0 predicting the next layer rather than the current one) is for weights trained on calibration
+traffic and then loaded. Run cold with only the on-switch, it learns while it decodes and only costs CPU:
+measured &minus;9 tok/s.</li>
+<li><strong>Different prompts per setting.</strong> Request-to-request spread is about &plusmn;8&ndash;12 tok/s, so medians of
+different prompts hide any effect smaller than 15%. The re-test sends every setting the same prompts with the same
+seeds and compares request against request, times the first requests after start separately, and trains the
+learned features first.</li>
+</ul>
+<p>The first round below is therefore the <em>untrained, steady-state</em> measurement, kept because it is the
+honest answer to &ldquo;does flipping the switch on a running server help?&rdquo; &mdash; and the answer there was no.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Bugs found along the way</h3>
+<table>
+<colgroup><col style="width:38%"><col style="width:46%"><col style="width:16%"></colgroup>
+<thead><tr><th>Fault</th><th>Fix</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td><code>GGML_CUDA_VMM_KV=1</code> crashed the first request in slot 1 (illegal memory access)</td><td>The lazy commit backed the leading fraction of each KV tensor, but tensors are <code>[.., kv_size, n_stream]</code>: every stream past the first was unbacked. Committed per stream now.</td><td>merged; 10 requests served, <code>--parallel 2</code></td></tr>
+<tr><td>Draft tokens accepted past an end-of-generation token</td><td>Upstream <code>d280808f5</code>, ported into the fork's acceptance loop including the probabilistic path.</td><td>merged</td></tr>
+<tr><td>Token-frequency log on by default</td><td>The decode thread wrote the whole vocabulary histogram every 4,096 tokens, for a trimmer the served configuration does not use. Off unless asked for.</td><td>merged</td></tr>
+<tr><td>Expert prefetch slots allocated on the first large batch</td><td>By then the cache's first fill had taken the free VRAM; a 272&nbsp;MiB slot failed and disabled prefill prefetch for the session. Reserved at start instead.</td><td>built, under test</td></tr>
+<tr><td>Router lookahead gated on a fixed 8-token batch</td><td>At draft depth 8 every verify batch is 9+ tokens, so it never ran in decode. Gated on the server's real decode width.</td><td>built, under test</td></tr>
+<tr><td>Fills staged from already-pinned memory; disk read-ahead hints on pinned experts</td><td>With <code>--no-mmap</code> the CPU-side experts are already page-locked: fills DMA from them directly and skip the hint.</td><td>built, under test</td></tr>
+<tr><td>A leak on every graph rebuild</td><td>The lookahead's per-layer userdata was allocated per build; now one per (tensor, depth).</td><td>built, under test</td></tr>
+<tr><td>Cache dispatch failures invisible</td><td>A dispatch refused for scratch space falls back to the CPU for the whole op and was only in verbose logs. Now in the summary: <code>dispatch_failed=0</code> in every run, so that suspicion is cleared.</td><td>built, under test</td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+<p><strong>Two measurement traps found on the way, both of which produced confident wrong answers.</strong> A
+benchmark that sends raw prompts without the chat template makes gemma's instruct model degenerate in every
+configuration &mdash; including with the cache off &mdash; which read exactly like the cache corrupting output. And
+timing prose against a number calibrated on code makes a healthy configuration look half as fast. The first was
+reported as a bug and retracted the same hour.</p>
+</div>
+</section>
+
 <section>
 <div class="eyebrow">What's different from upstream</div>
 <h2>Every fix, one card each</h2>
