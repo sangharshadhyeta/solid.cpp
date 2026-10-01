@@ -776,6 +776,12 @@ struct ggml_backend_cuda_buffer_context {
 // "cells 0..N are in use" maps to a *strided* set of byte ranges, one prefix
 // per tensor, not a single prefix of the buffer. Granule bookkeeping is
 // indifferent to that layout.
+// Bytes reserved by lazily-committed (VMM) buffers, and how many of them are backed by physical
+// memory. What is reserved but not committed is VRAM the KV cache may still claim: the expert cache
+// subtracts a share of it when it sizes itself (ggml_backend_cuda_vmm_uncommitted_bytes).
+static std::atomic<size_t> g_vmm_reserved_bytes{0};
+static std::atomic<size_t> g_vmm_committed_bytes{0};
+
 struct ggml_backend_cuda_vmm_buffer_context {
     int device;
     int physical_device;
@@ -799,14 +805,17 @@ struct ggml_backend_cuda_vmm_buffer_context {
         reserved = GGML_PAD(size, granularity);
         CU_CHECK(cuMemAddressReserve(&base, reserved, 0, 0, 0));
         granule_committed.assign(reserved / granularity, false);
+        g_vmm_reserved_bytes += reserved;
     }
 
     ~ggml_backend_cuda_vmm_buffer_context() {
         for (size_t i = 0; i < granule_committed.size(); i++) {
             if (granule_committed[i]) {
                 cuMemUnmap(base + i * granularity, granularity);
+                g_vmm_committed_bytes -= granularity;
             }
         }
+        g_vmm_reserved_bytes -= reserved;
         for (CUmemGenericAllocationHandle h : handles) {
             cuMemRelease(h);
         }
@@ -854,6 +863,7 @@ struct ggml_backend_cuda_vmm_buffer_context {
             }
             handles.push_back(handle);
             granule_committed[g] = true;
+            g_vmm_committed_bytes += granularity;
         }
         return true;
     }
@@ -975,6 +985,11 @@ void ggml_backend_cuda_vmm_next_alloc(bool enable) {
 
 bool ggml_backend_cuda_buffer_is_vmm(ggml_backend_buffer_t buffer) {
     return buffer && buffer->iface.free_buffer == ggml_backend_cuda_vmm_buffer_free_buffer;
+}
+
+size_t ggml_backend_cuda_vmm_uncommitted_bytes(void) {
+    const size_t r = g_vmm_reserved_bytes.load(), c = g_vmm_committed_bytes.load();
+    return r > c ? r - c : 0;
 }
 
 bool ggml_backend_cuda_vmm_commit_fraction(ggml_backend_buffer_t buffer, double fraction, int n_stream) {
@@ -1144,18 +1159,25 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
 #if defined(GGML_USE_VMM)
-    // Opt-in lazily-committed allocation, for buffers whose size is dictated by
-    // a context length the user may never reach. Reserves the address range and
+    // Lazily-committed allocation, for buffers whose size is dictated by a
+    // context length the user may never reach. Reserves the address range and
     // maps physical memory only as it is used, so `-c 262144` costs what the
-    // conversation actually needs rather than what it might.
+    // conversation actually needs rather than what it might. On by default for
+    // the KV cache (GGML_CUDA_VMM_KV=0 turns it off).
     //
-    // Deliberately not the default and deliberately not applied to weights:
-    // model weights are read in full immediately, so lazy commit buys nothing
-    // and only adds a mapping path to something that works. The KV cache is the
-    // case where reservation and use diverge.
+    // Deliberately not applied to weights: model weights are read in full
+    // immediately, so lazy commit buys nothing and only adds a mapping path to
+    // something that works. The KV cache is the case where reservation and use
+    // diverge.
     static const bool vmm_kv = [] {
+        // ON unless GGML_CUDA_VMM_KV=0. The KV cache reserves its address range and backs it as
+        // the context grows, so the VRAM a short context does not use goes to the expert cache:
+        // gemma-4 at 64k: 3,197 slots against 2,759 (+16%), hit rate 0.899 against 0.868 (1 Oct
+        // 2026). Safe because the expert cache sizes itself leaving a share of the uncommitted KV
+        // alone (GGML_CUDA_MOE_CACHE_KV_HEADROOM_PCT, default 50), the per-stream commit is
+        // fixed, and a commit that still fails stops with its reason.
         const char * env = getenv("GGML_CUDA_VMM_KV");
-        return env && atoi(env) != 0;
+        return !env || atoi(env) != 0;
     }();
     static const size_t vmm_min_size = 64ull << 20; // below this the bookkeeping outweighs the saving
     if (vmm_kv && g_cuda_vmm_next_alloc && ggml_cuda_info().devices[buft_ctx->device].vmm && size >= vmm_min_size) {

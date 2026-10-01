@@ -5693,7 +5693,15 @@ static bool moe_cache_prepare_budget(
     // allocated_bytes was still 0 - so the budget only actually moves in
     // response to something *other* than the cache itself: another process,
     // or this device's own KV cache/compute buffers growing or shrinking.
-    const size_t free_for_budget = free_memory + device.allocated_bytes;
+    // Lazily-committed KV (GGML_CUDA_VMM_KV): its reserved-but-uncommitted bytes are free VRAM
+    // right now but not for long - a context that grows commits them. Leave this share of them
+    // alone (default 50%: every slot may fill half its window without the commit failing;
+    // 100% = sized as if the KV were fully committed, 0 = the cache takes it all and a long
+    // context can run it out of memory). It shrinks as the KV commits.
+    const size_t kv_headroom = ggml_backend_cuda_vmm_uncommitted_bytes() / 100 *
+            (size_t) MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_KV_HEADROOM_PCT", 50);
+    size_t free_for_budget = free_memory + device.allocated_bytes;
+    free_for_budget = free_for_budget > kv_headroom ? free_for_budget - kv_headroom : 0;
     size_t reserve_mb = session.config.reserve_mb;
     if (reserve_mb == 0) {
         const size_t free_mb = free_for_budget >> 20;

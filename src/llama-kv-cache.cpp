@@ -1142,8 +1142,12 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 #ifdef GGML_USE_CUDA
             for (auto & [ctx, buf] : ctxs_bufs) {
                 if (!ggml_backend_cuda_vmm_commit_fraction(buf.get(), frac, (int) n_stream)) {
-                    LLAMA_LOG_ERROR("%s: failed to commit KV memory at %.1f%% of context - "
-                                    "out of VRAM\n", __func__, 100.0 * frac);
+                    // continuing would make the attention kernel read unbacked memory (an
+                    // illegal access, with no hint of the cause): stop with the reason instead
+                    GGML_ABORT("%s: cannot commit KV memory at %.1f%% of the context - the VRAM is held "
+                               "by the expert cache. Leave more room with GGML_CUDA_MOE_CACHE_KV_HEADROOM_PCT "
+                               "(default 50, 100 = never), or set GGML_CUDA_VMM_KV=0 to commit the KV up front",
+                               __func__, 100.0 * frac);
                 }
             }
 #else
