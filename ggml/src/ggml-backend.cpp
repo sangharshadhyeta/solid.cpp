@@ -2481,6 +2481,35 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
         return false;
     }
 
+    // GGML_SCHED_PREFETCH_RESERVE=1: allocate the expert prefetch slots here, with the rest of
+    // the reserve, instead of on the first large batch. By then the moe-cache's first fill has
+    // sized itself from the free VRAM, a 272 MiB slot no longer fits, and prefill prefetch is
+    // disabled for the session (gemma-4, 1 Oct 2026). Reserved up front the slots survive - and
+    // cost the cache ~13-17% of its slots (2644 vs 3193 measured), so it is opt-in until the
+    // prefill gain is measured against that on a prefill-heavy workload.
+    static const bool reserve_prefetch = [] {
+        const char * env = getenv("GGML_SCHED_PREFETCH_RESERVE");
+        return env && atoi(env) != 0;
+    }();
+    if (reserve_prefetch && sched->prefetch_experts && !sched->callback_eval) {
+        bool done = false;
+        for (int split_id = 0; split_id < sched->n_splits && !done; split_id++) {
+            const struct ggml_backend_sched_split * split = &sched->splits[split_id];
+            if (split->graph.n_nodes == 0 || split->graph.nodes[0]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            for (int input_id = 0; input_id < split->n_inputs && !done; input_id++) {
+                const struct ggml_tensor * input = split->inputs[input_id];
+                if (input->buffer &&
+                    ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
+                    ggml_backend_buffer_is_host(input->buffer)) {
+                    ggml_backend_sched_prefetch_init(sched, sched->backends[split->backend_id], ggml_nbytes(input));
+                    done = true;
+                }
+            }
+        }
+    }
+
     ggml_backend_sched_reset(sched);
 
     return true;
