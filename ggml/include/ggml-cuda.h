@@ -71,3 +71,5 @@ GGML_BACKEND_API size_t ggml_backend_cuda_moe_cache_resident_counts(const void *
 // Only meaningful for allocations whose use lags their reservation (the KV
 // cache); weights are read in full at load and must never be lazy.
 GGML_BACKEND_API void ggml_backend_cuda_vmm_next_alloc(bool enable);
+// Whether lazy commit applies to the next KV allocation when GGML_CUDA_VMM_KV is not set (the KV cache passes: window >= 131072 cells).
+GGML_BACKEND_API void ggml_backend_cuda_vmm_kv_auto(bool enable);

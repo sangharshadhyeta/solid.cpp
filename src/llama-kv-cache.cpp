@@ -288,6 +288,8 @@ llama_kv_cache::llama_kv_cache(
             }
         } else {
 #ifdef GGML_USE_CUDA
+            // lazy commit by default for a large window only (see the measurements at the decision in ggml-cuda.cu)
+            ggml_backend_cuda_vmm_kv_auto(kv_size >= 131072);
             ggml_backend_cuda_vmm_next_alloc(true);
 #endif
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer

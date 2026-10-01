@@ -1001,6 +1001,11 @@ static const ggml_backend_buffer_i ggml_backend_cuda_vmm_buffer_interface = {
 // buffer and faulted on first use. The caller now says which allocation this
 // is, rather than the buffer type guessing from size.
 static thread_local bool g_cuda_vmm_next_alloc = false;
+static std::atomic<bool> g_vmm_kv_auto{false};
+
+void ggml_backend_cuda_vmm_kv_auto(bool enable) {
+    g_vmm_kv_auto.store(enable);
+}
 
 void ggml_backend_cuda_vmm_next_alloc(bool enable) {
     g_cuda_vmm_next_alloc = enable;
@@ -1192,20 +1197,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     // immediately, so lazy commit buys nothing and only adds a mapping path to
     // something that works. The KV cache is the case where reservation and use
     // diverge.
-    static const bool vmm_kv = [] {
-        // OFF unless GGML_CUDA_VMM_KV=1. The KV cache reserves its address range and backs it as the
-        // context grows, so the VRAM a short context does not use can go to the expert cache: gemma-4 at
-        // 64k, three rounds (1 Oct 2026), 3,197 / 3,197 / 2,974 slots against 2,759 / 2,644 / 2,759 and a
-        // higher hit rate - but NO measurable speed (-0.5% +-1.6 warm, 24 paired requests), and the cache
-        // can only be given that room by not leaving it for the KV: two concurrent prompts of ~32K tokens
-        // (98% of each slot's window) stop the server at 88.5% of the context ("cannot commit KV memory"),
-        // where the same prompts complete with it off. Leaving all of it free (GGML_CUDA_MOE_CACHE_KV_
-        // HEADROOM_PCT=100) is safe but gives the capacity back. A server that dies on a long document
-        // is a worse trade than a speed-neutral gain, so it is opt-in: for a deployment that sets a large
-        // context and knows it will not fill it.
+    // GGML_CUDA_VMM_KV=1/0 decides when set; otherwise lazy commit is ON for a large window (the KV cache reports
+    // that through ggml_backend_cuda_vmm_kv_auto) and OFF for a small one. Measured (1 Oct 2026, gemma-4, paired):
+    //   -c 262144, short prompts: +15.1% +-1.6 warm (16 of 16 requests faster), 1,315 cache slots against 835, hit
+    //     rate 0.66 against 0.53 - the uncommitted KV is room the expert cache can use;
+    //   -c 65536: a tie (+1.7% +-1.3, 4% more slots), so it stays off there, where there is nothing to gain;
+    //   a prompt that fills a 240K window: worse than dense (9.7 against 12.8 tok/s, 106 cache slots), the one case
+    //     it loses; two concurrent ~30K-token prompts survive because a failed commit makes the expert cache give a
+    //     pool back (ggml_backend_cuda_moe_cache_yield_vram).
+    static const int vmm_kv_env = [] {
         const char * env = getenv("GGML_CUDA_VMM_KV");
-        return env && atoi(env) != 0;
+        return env ? (atoi(env) != 0 ? 1 : 0) : -1;
     }();
+    const bool vmm_kv = vmm_kv_env >= 0 ? vmm_kv_env != 0 : g_vmm_kv_auto.load();
     static const size_t vmm_min_size = 64ull << 20; // below this the bookkeeping outweighs the saving
     if (vmm_kv && g_cuda_vmm_next_alloc && ggml_cuda_info().devices[buft_ctx->device].vmm && size >= vmm_min_size) {
         try {
