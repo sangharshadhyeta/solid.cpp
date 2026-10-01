@@ -1301,6 +1301,55 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
     vocab.load(ml, kv);
 }
 
+// MemTotal from /proc/meminfo, else the CPU backend's total memory; 0 when neither is known.
+static size_t llama_host_ram_total_bytes() {
+    size_t total_bytes = 0;
+    {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key, unit;
+        size_t value_kib = 0;
+        while (meminfo >> key >> value_kib >> unit) {
+            if (key == "MemTotal:") {
+                total_bytes = value_kib * 1024ULL;
+                break;
+            }
+        }
+    }
+    if (total_bytes == 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            size_t free_ram = 0;
+            ggml_backend_dev_memory(cpu_dev, &free_ram, &total_bytes);
+        }
+    }
+    return total_bytes;
+}
+
+// MemAvailable from /proc/meminfo, else the CPU backend's free memory; 0 when neither is known.
+static size_t llama_host_ram_available_bytes() {
+    size_t avail_bytes = 0;
+    {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key, unit;
+        size_t value_kib = 0;
+        while (meminfo >> key >> value_kib >> unit) {
+            if (key == "MemAvailable:") {
+                avail_bytes = value_kib * 1024ULL;
+                break;
+            }
+        }
+    }
+    if (avail_bytes == 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            size_t free_ram = 0, total_ram = 0;
+            ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+            avail_bytes = free_ram;
+        }
+    }
+    return avail_bytes;
+}
+
 bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const bool use_mlock      = params.load_mode == LLAMA_LOAD_MODE_MLOCK || params.load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
@@ -1321,6 +1370,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 ml.use_mmap = false;
                 break;
             }
+        }
+    }
+
+    // A MoE model that fits in host RAM is faster read into memory than mapped: gemma-4, the same launch with and without
+    // --no-mmap, three paired rounds (1 Oct 2026) - without it -12.8% +-1.7, 1 of 24 requests faster. Decided against the
+    // machine's TOTAL RAM (3/5 of it), not MemAvailable: a restart starts the new server while the old one's 17 GiB is still
+    // being released (measured: 13.7 GiB available at the start, 29.2 GiB two minutes later), and an instantaneous figure
+    // silently turned the default off exactly when a service restarts. A model larger than that (Qwen3.8-Flash-Next, 88 GiB
+    // on 31 GiB) stays mapped so its cold experts page in on demand. An explicit --load-mode, --mmap or --no-mmap, and
+    // mlock, are never overridden.
+    if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO && hparams.n_expert > 0 && !use_mlock) {
+        size_t total_file_bytes = 0;
+        for (const auto & file : ml.files) {
+            total_file_bytes += file->size();
+        }
+        const size_t total_ram = llama_host_ram_total_bytes();
+        if (total_ram != 0 && total_file_bytes <= total_ram / 5 * 3) {
+            ml.use_mmap = false;
+            LLAMA_LOG_INFO("%s: MoE model of %zu MiB fits in host RAM (%zu MiB total) - reading it into memory "
+                    "instead of mapping it (pass --load-mode mmap to map)\n",
+                    __func__, total_file_bytes / (1024 * 1024), total_ram / (1024 * 1024));
         }
     }
 
@@ -1610,26 +1680,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             total_mapped += file->size();
         }
 
-        size_t avail_bytes = 0;
-        {
-            std::ifstream meminfo("/proc/meminfo");
-            std::string key, unit;
-            size_t value_kib = 0;
-            while (meminfo >> key >> value_kib >> unit) {
-                if (key == "MemAvailable:") {
-                    avail_bytes = value_kib * 1024ULL;
-                    break;
-                }
-            }
-        }
-        if (avail_bytes == 0) {
-            ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
-            if (cpu_dev) {
-                size_t free_ram = 0, total_ram = 0;
-                ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
-                avail_bytes = free_ram;
-            }
-        }
+        const size_t avail_bytes = llama_host_ram_available_bytes();
 
         // leave headroom for the compute-graph reserve and everything else
         // sharing the host, not just the raw model file size
