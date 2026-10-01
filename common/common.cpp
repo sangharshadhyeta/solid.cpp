@@ -1509,6 +1509,17 @@ size_t common_measure_draft_memory(const common_params & params, std::vector<siz
     return total;
 }
 
+// The draft's VRAM on the first device, for the serving-time placement probes. Calibration folds the draft into
+// its margin (see the --moe-calibrate probe); the serving paths did not, so a launch that reached them with no
+// calibration entry placed the target into the whole device and then could not load the draft (cudaMalloc out
+// of memory for the 446 MiB MTP head, server exit - found 1 Oct 2026 by dropping -ncmoe from the gemma launch).
+// 0 when there is no draft or it cannot be measured, which is the previous behaviour.
+static int64_t common_draft_reserve_device0(const common_params & params) {
+    std::vector<size_t> per_device;
+    common_measure_draft_memory(params, per_device);
+    return per_device.empty() ? 0 : (int64_t) per_device[0];
+}
+
 struct common_moe_fit_probe_result {
     bool     is_moe        = false;
     bool     already_fits  = false;
@@ -9391,7 +9402,7 @@ static bool common_maybe_autoplace_moe_cpu(
         }
     }
 
-    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams);
+    common_moe_fit_probe_result probe = common_moe_find_safe_layers(path_model, mparams, cparams, common_draft_reserve_device0(params));
     if (probe.already_fits || !probe.is_moe) {
         return false;
     }
@@ -9606,7 +9617,8 @@ static bool common_maybe_raise_moe_for_ctx(
             }
         }
     }
-    const int64_t margin = 3 * (int64_t) params.fit_params_target[0];
+    // The draft is a real allocation on top of the margin: added once, not tripled with it (as in calibration).
+    const int64_t margin = 3 * (int64_t) params.fit_params_target[0] + common_draft_reserve_device0(params);
 
     // Prefer a calibrated placement when one exists. The search below answers
     // "what is the least offload that makes this context fit?", which is a
