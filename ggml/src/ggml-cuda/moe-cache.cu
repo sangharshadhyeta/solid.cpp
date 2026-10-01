@@ -5705,7 +5705,14 @@ static bool moe_cache_prepare_budget(
     size_t reserve_mb = session.config.reserve_mb;
     if (reserve_mb == 0) {
         const size_t free_mb = free_for_budget >> 20;
-        reserve_mb = std::min<size_t>(1024, std::max<size_t>(128, free_mb / 20));
+        // The floor covers allocations made AFTER the cache is sized: a CUDA graph for each new batch
+        // shape (the reduced-expert path's is bigger), compute buffers, the KV's own growth. When the
+        // cache is sized varies - the budget differed by ~400 MiB between identical runs - and with
+        // only 5% reserved a server with neuron subsetting on was left 381 MiB free and stopped in
+        // cudaGraphInstantiate on its second request (1 Oct 2026). The non-lazy server this replaced
+        // happened to leave ~1.2 GB. 800 MiB, scaled down on small cards (a sixth of the free VRAM).
+        const size_t floor_mb = std::min<size_t>(800, free_mb / 6);
+        reserve_mb = std::min<size_t>(1024, std::max<size_t>(std::max<size_t>(128, floor_mb), free_mb / 20));
     }
     const size_t reserve = reserve_mb << 20;
     size_t available = free_for_budget > reserve ? free_for_budget - reserve : 0;
