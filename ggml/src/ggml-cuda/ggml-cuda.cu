@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/kv-stream.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -6258,8 +6259,45 @@ static int ggml_backend_cuda_get_mmvq_mmid_max_batch(int type, ggml_backend_dev_
     return get_mmvq_mmid_max_batch((ggml_type) type, info.devices[dev_ctx->device].cc);
 }
 
+// Test hook for tests/test-kv-stream.cpp: one streamed-KV step (append, resolve, copy) on the backend's stream, then a
+// synchronize. All pointers are device-addressable memory (the host tensors are pinned host memory read in place).
+// See ggml-cuda/kv-stream.cuh. Returns 0 on success.
+static int ggml_backend_cuda_kv_stream_run(
+        ggml_backend_t backend, int32_t * state, int64_t n_pages, int64_t n_slots, int page, int64_t n_cells,
+        const void * host_k, const void * host_v, void * pool_k, void * pool_v, size_t row_bytes_k, size_t row_bytes_v,
+        const int32_t * idxs, int n_idxs, const int32_t * lists, const int32_t * counts, int n_lists, int list_stride) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    ggml_cuda_set_device(cuda_ctx->device);
+
+    ggml_cuda_kv_stream s;
+    s.state       = state;
+    s.n_pages     = n_pages;
+    s.n_slots     = n_slots;
+    s.page        = page;
+    s.n_cells     = n_cells;
+    s.host_k      = (const char *) host_k;
+    s.host_v      = (const char *) host_v;
+    s.pool_k      = (char *) pool_k;
+    s.pool_v      = (char *) pool_v;
+    s.row_bytes_k = row_bytes_k;
+    s.row_bytes_v = row_bytes_v;
+
+    cudaStream_t stream = cuda_ctx->stream();
+
+    ggml_cuda_kv_stream_append(s, idxs, n_idxs, stream);
+    ggml_cuda_kv_stream_resolve(s, lists, counts, n_lists, list_stride, stream);
+
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    return 0;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_kv_stream_run") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_run;
+    }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
     }

@@ -268,6 +268,8 @@ if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   llama_build_and_test(test-opt.cpp)
 endif()
 llama_build_and_test(test-backend-ops.cpp)
+# KV streaming page pool kernels (docs/kv-streaming-s3d-design.md); skips itself without a CUDA backend
+llama_build_and_test(test-kv-stream.cpp LABEL "backend")
 llama_build(test-moe-cache.cpp)
 target_include_directories(test-moe-cache PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src)
 if (GGML_CUDA)
