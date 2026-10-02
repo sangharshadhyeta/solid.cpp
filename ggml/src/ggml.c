@@ -5472,6 +5472,48 @@ void ggml_flash_attn_ext_set_n_kv_max(
     ggml_set_op_params_i32(a, 4, n_kv_max);
 }
 
+int64_t ggml_kv_stream_state_ints(int64_t n_pages, int64_t n_slots) {
+    // page_table[n_pages], then slot_page, slot_stamp, slot_ref, miss_page, miss_slot (n_slots each), then ctl
+    return n_pages + 5*n_slots + GGML_KV_STREAM_CTL_INTS;
+}
+
+// op_params of the flash attention op: [0..2] scale, max_bias, logit_softcap (floats), [3] precision, [4] n_kv_max,
+// [5] page_size, [6] n_pages, [7] n_slots (only when a KV stream is attached). sources 5..8: pool_k, pool_v, state, idxs.
+void ggml_flash_attn_ext_set_kv_stream(
+        struct ggml_tensor * a,
+        struct ggml_tensor * pool_k,
+        struct ggml_tensor * pool_v,
+        struct ggml_tensor * state,
+        struct ggml_tensor * idxs,
+        int32_t              page_size) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT(a->src[5] == NULL && a->src[6] == NULL && a->src[7] == NULL && a->src[8] == NULL);
+    GGML_ASSERT(page_size > 0);
+
+    const struct ggml_tensor * k = a->src[1];
+    const struct ggml_tensor * v = a->src[2];
+
+    GGML_ASSERT(pool_k->type == k->type && pool_k->ne[0] == k->ne[0]);
+    GGML_ASSERT(pool_v->type == v->type && pool_v->ne[0] == v->ne[0]);
+    GGML_ASSERT(pool_k->ne[1] == pool_v->ne[1] && pool_k->ne[1] % page_size == 0);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I32);
+
+    const int64_t n_slots = pool_k->ne[1] / page_size;
+    const int64_t n_pages = ggml_nelements(state) - 5*n_slots - GGML_KV_STREAM_CTL_INTS;
+    GGML_ASSERT(n_slots > 0 && n_pages > 0);
+    GGML_ASSERT(ggml_nelements(state) == ggml_kv_stream_state_ints(n_pages, n_slots));
+
+    ggml_set_op_params_i32(a, 5, page_size);
+    ggml_set_op_params_i32(a, 6, (int32_t) n_pages);
+    ggml_set_op_params_i32(a, 7, (int32_t) n_slots);
+
+    a->src[5] = pool_k;
+    a->src[6] = pool_v;
+    a->src[7] = state;
+    a->src[8] = idxs;
+}
+
 void ggml_flash_attn_ext_add_sinks(
         struct ggml_tensor * a,
         struct ggml_tensor * sinks) {

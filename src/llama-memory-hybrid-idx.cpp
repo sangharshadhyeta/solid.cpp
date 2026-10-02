@@ -38,13 +38,14 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     const layer_filter_cb & filter_idx,
-                     bool   kv_stream) :
+                     bool   kv_stream,
+                 uint32_t   kv_resident) :
     llama_memory_hybrid(
         model,
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, n_rs_seq, offload, unified,
-        filter_attn, filter_recr, nullptr, GGML_TYPE_F16, kv_stream),
+        filter_attn, filter_recr, nullptr, GGML_TYPE_F16, kv_stream, kv_resident),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own

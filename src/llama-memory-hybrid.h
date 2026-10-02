@@ -44,7 +44,8 @@ public:
     const layer_filter_cb & filter_idx  = nullptr,
                 ggml_type   type_idx    = GGML_TYPE_F16,
                             /* attention K/V in pinned host memory, see llama_kv_cache */
-                     bool   kv_stream   = false);
+                     bool   kv_stream   = false,
+                 uint32_t   kv_resident = 0);
 
     ~llama_memory_hybrid() = default;
 

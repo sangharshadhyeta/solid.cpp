@@ -2613,6 +2613,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    if (cparams.kv_resident > 0 && !kv_stream && params.ctx_type != LLAMA_CONTEXT_TYPE_MTP) {
+                        LLAMA_LOG_WARN("%s: --kv-resident needs --kv-stream to be active for this context - ignored\n", __func__);
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
@@ -2657,7 +2661,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx),
-                            /* kv_stream         */ kv_stream);
+                            /* kv_stream         */ kv_stream,
+                            /* kv_resident       */ kv_stream ? cparams.kv_resident : 0);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

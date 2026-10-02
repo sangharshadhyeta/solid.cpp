@@ -117,7 +117,9 @@ public:
                  const char *   name_tag = "",
         // keep K/V in pinned host memory that the device reads in place (see --kv-stream); ignored when the
         // backend has no such buffer type, in which case the layer keeps its normal device buffer
-                       bool   kv_stream = false);
+                       bool   kv_stream = false,
+        // with kv_stream: cells per streamed layer kept in a VRAM page pool (docs/kv-streaming-s3d-design.md); 0 = none
+                   uint32_t   kv_resident = 0);
 
     ~llama_kv_cache() = default;
 
@@ -192,6 +194,21 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // the VRAM page pool of a streamed layer (kv_resident > 0), see docs/kv-streaming-s3d-design.md.
+    // all members are nullptr / 0 when the layer has no pool. K and V (above) stay the authoritative host tensors.
+    struct stream_pool {
+        ggml_tensor * pool_k    = nullptr;
+        ggml_tensor * pool_v    = nullptr;
+        ggml_tensor * state     = nullptr;
+        uint32_t      page_size = 0;
+    };
+
+    stream_pool get_stream_pool(int32_t il) const;
+
+    // evict every page of every pool (state blob: page table and free slots -1, everything else 0); called after
+    // anything that rewrites cache data behind the pool's back (clear, state restore)
+    void stream_reset();
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -261,7 +278,15 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // KV streaming with a VRAM page pool (kv_resident > 0, docs/kv-streaming-s3d-design.md), else nullptr / 0
+        ggml_tensor * pool_k       = nullptr; // [n_embd_k_gqa, n_slots*page_size]
+        ggml_tensor * pool_v       = nullptr; // [n_embd_v_gqa, n_slots*page_size]
+        ggml_tensor * stream_state = nullptr; // I32, ggml_kv_stream_state_ints(n_pages, n_slots)
+        uint32_t      page_size    = 0;       // cells per page
     };
+
+    bool has_stream_pool = false; // at least one layer has a VRAM page pool
 
     bool v_trans = true;  // the value tensor is transposed
 
@@ -406,6 +431,11 @@ public:
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il) const;
+
+    // the VRAM page pool of layer il (all nullptr / 0 if it has none), see llama_kv_cache::get_stream_pool
+    llama_kv_cache::stream_pool get_stream_pool(int32_t il) const {
+        return kv->get_stream_pool(il);
+    }
 
     // store k_cur and v_cur in the cache based on the provided head location
     // note: the heads in k_cur and v_cur should be laid out contiguously in memory

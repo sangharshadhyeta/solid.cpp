@@ -2439,6 +2439,28 @@ extern "C" {
             struct ggml_tensor * a,
             int32_t              n_kv_max);
 
+    // KV streaming (docs/kv-streaming-s3d-design.md): K and V (sources 1 and 2) stay the authoritative host tensors;
+    // a VRAM pool of KV pages and its residency state ride along as extra sources, for a backend that can use them.
+    // A backend that ignores them computes the same result from K and V.
+    //   pool_k, pool_v: [n_embd_k_gqa or n_embd_v_gqa, n_slots*page_size], same types as K and V
+    //   state:          I32, ggml_kv_stream_state_ints(n_pages, n_slots) entries (layout below)
+    //   idxs:           I32 [n_tokens], the cells written for this ubatch
+    // state layout, in order: page_table[n_pages] (page -> slot, -1 not resident, -2 claimed by this call),
+    //   slot_page[n_slots], slot_stamp[n_slots], slot_ref[n_slots], miss_page[n_slots], miss_slot[n_slots],
+    //   ctl[GGML_KV_STREAM_CTL_INTS] (epoch, clock hand, misses of the last call, overflow flag, 64-bit counters)
+    // A page is page_size consecutive cell indices, aligned in cell space.
+#define GGML_KV_STREAM_CTL_INTS 16
+
+    GGML_API int64_t ggml_kv_stream_state_ints(int64_t n_pages, int64_t n_slots);
+
+    GGML_API void ggml_flash_attn_ext_set_kv_stream(
+            struct ggml_tensor * a,
+            struct ggml_tensor * pool_k,
+            struct ggml_tensor * pool_v,
+            struct ggml_tensor * state,
+            struct ggml_tensor * idxs,
+            int32_t              page_size);
+
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);

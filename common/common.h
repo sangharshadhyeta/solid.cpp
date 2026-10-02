@@ -627,6 +627,7 @@ struct common_params {
     bool display_prompt    = true;  // print prompt before generation
     bool no_kv_offload     = false; // disable KV offloading
     bool kv_stream         = false; // keep the K/V of sparse-attention layers in pinned host memory, read in place by the GPU
+    uint32_t kv_resident   = 0;     // with kv_stream: cells per sparse layer in a VRAM page pool (0 = no pool, read every row from host)
     bool warmup            = true;  // warmup run
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

@@ -99,7 +99,8 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
-                   bool   kv_stream) :
+                   bool   kv_stream,
+               uint32_t   kv_resident) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -233,18 +234,24 @@ llama_kv_cache::llama_kv_cache(
 
         const char * dev_name = "CPU";
 
-        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t buft     = ggml_backend_cpu_buffer_type();
+        ggml_backend_buffer_type_t dev_buft = nullptr; // the device buffer type, for the page pool of a streamed layer
+        bool layer_streamed = false;
 
         if (offload) {
             auto * dev = model.dev_layer(il);
             buft = ggml_backend_dev_buffer_type(dev);
+            dev_buft = buft;
 
             dev_name = ggml_backend_dev_name(dev);
 
-            if (kv_stream) {
+            // only sparse-attention layers (compress ratio > 0) can gather a few rows: a dense layer streamed from host
+            // memory would read its whole cache over PCIe on every step, so it keeps its device buffer
+            if (kv_stream && hparams.dsv4_compress_ratios[il] > 0) {
                 if (ggml_backend_buffer_type_t host_buft = llama_kv_stream_buft(dev)) {
                     buft     = host_buft;
                     dev_name = ggml_backend_buft_name(host_buft);
+                    layer_streamed = true;
                     n_stream_layers++;
                 }
             }
@@ -274,9 +281,51 @@ llama_kv_cache::llama_kv_cache(
             v_stream.push_back(has_v ? ggml_view_2d(ctx, v, n_embd_v_gqa, kv_size, v->nb[1], s*v->nb[2]) : nullptr);
         }
 
+        // a VRAM page pool under the streamed K/V (docs/kv-streaming-s3d-design.md): a page resident here is read from
+        // VRAM, any other page is copied in from the host tensors first. K and V above stay the authoritative copy.
+        // The kernels that use the pool are not in yet (design steps S3d-2..4), so for now it is only allocated.
+        ggml_tensor * pool_k     = nullptr;
+        ggml_tensor * pool_v     = nullptr;
+        ggml_tensor * pool_state = nullptr;
+        uint32_t      pool_page  = 0;
+
+        if (layer_streamed && kv_resident > 0) {
+            const uint32_t page = hparams.dsv4_compress_ratios[il]; // the indexer block size: selection is in whole blocks
+            constexpr uint32_t n_slots_min = 1024; // the resolve step sweeps its clock with a 1024-thread block
+
+            if (!has_v || v_trans || n_stream != 1 || page == 0 || type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
+                LLAMA_LOG_WARN("%s: layer %3d: no VRAM page pool (needs f16 K/V, a single stream, V not transposed and a sparse-attention layer)\n",
+                        __func__, il);
+            } else {
+                const uint32_t n_pages = (kv_size + page - 1)/page;
+                const uint32_t n_slots = std::max(n_slots_min, (kv_resident + page - 1)/page);
+
+                if (n_slots >= n_pages) {
+                    LLAMA_LOG_WARN("%s: layer %3d: no VRAM page pool: %u slots would hold all %u pages of the cache\n",
+                            __func__, il, n_slots, n_pages);
+                } else {
+                    ggml_context * ctx_dev = ctx_for_buft(dev_buft);
+                    if (!ctx_dev) {
+                        throw std::runtime_error("failed to create ggml context for the kv page pool");
+                    }
+
+                    pool_k     = ggml_new_tensor_2d(ctx_dev, type_k, n_embd_k_gqa, (int64_t) n_slots*page);
+                    pool_v     = ggml_new_tensor_2d(ctx_dev, type_v, n_embd_v_gqa, (int64_t) n_slots*page);
+                    pool_state = ggml_new_tensor_1d(ctx_dev, GGML_TYPE_I32, ggml_kv_stream_state_ints(n_pages, n_slots));
+                    pool_page  = page;
+
+                    ggml_format_name(pool_k,     "cache_%skpool_l%d",  name_tag, il);
+                    ggml_format_name(pool_v,     "cache_%svpool_l%d",  name_tag, il);
+                    ggml_format_name(pool_state, "cache_%skvstate_l%d", name_tag, il);
+
+                    has_stream_pool = true;
+                }
+            }
+        }
+
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, pool_k, pool_v, pool_state, pool_page, });
     }
 
     if (kv_stream) {
@@ -355,6 +404,25 @@ llama_kv_cache::llama_kv_cache(
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
+    }
+
+    if (has_stream_pool) {
+        // the buffer clear above zeroed the state blobs, which would read as "every page is in slot 0"
+        if (!hparams.no_alloc) {
+            stream_reset();
+        }
+
+        size_t pool_bytes = 0;
+        uint32_t pool_layers = 0;
+        for (const auto & layer : layers) {
+            if (layer.stream_state) {
+                pool_bytes += ggml_nbytes(layer.pool_k) + ggml_nbytes(layer.pool_v) + ggml_nbytes(layer.stream_state);
+                pool_layers++;
+            }
+        }
+
+        LLAMA_LOG_INFO("%s: kv_resident: VRAM page pool on %u layer(s), %.2f MiB in total (not used by any kernel yet)\n",
+                __func__, pool_layers, pool_bytes/1024.0/1024.0);
     }
 
     {
@@ -438,6 +506,39 @@ void llama_kv_cache::clear(bool data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
         }
+
+        // the clear zeroed the pools' state blobs too
+        if (has_stream_pool && !hparams.no_alloc) {
+            stream_reset();
+        }
+    }
+}
+
+llama_kv_cache::stream_pool llama_kv_cache::get_stream_pool(int32_t il) const {
+    auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return {};
+    }
+
+    const auto & layer = layers[it->second];
+
+    return { layer.pool_k, layer.pool_v, layer.stream_state, layer.page_size };
+}
+
+void llama_kv_cache::stream_reset() {
+    for (const auto & layer : layers) {
+        if (!layer.stream_state) {
+            continue;
+        }
+
+        const int64_t n_slots = layer.pool_k->ne[1] / layer.page_size;
+        const int64_t n_pages = ggml_nelements(layer.stream_state) - 5*n_slots - GGML_KV_STREAM_CTL_INTS;
+
+        // everything 0 (epoch, stamps, reference bits, miss lists, counters) ...
+        ggml_backend_tensor_memset(layer.stream_state, 0x00, 0, ggml_nbytes(layer.stream_state));
+
+        // ... except the page table (page -> slot) and slot_page (slot -> page), where -1 means "none": all bytes 0xFF
+        ggml_backend_tensor_memset(layer.stream_state, 0xFF, 0, (size_t) (n_pages + n_slots)*sizeof(int32_t));
     }
 }
 
@@ -1285,6 +1386,11 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 }
 
 bool llama_kv_cache::get_can_shift() const {
+    // a K-shift rewrites K in place, behind a VRAM page pool that mirrors part of it
+    if (has_stream_pool) {
+        return false;
+    }
+
     // Step35 uses per-layer RoPE dims; K-shift assumes a single global n_rot.
     if (model.arch == LLM_ARCH_STEP35) {
         return false;
@@ -2335,6 +2441,11 @@ const slot_info_vec_t *   sinfos_in) {
         if (sinfos_out) {
             (*sinfos_out)[s] = sinfo;
         }
+    }
+
+    // the restore rewrote host K/V rows behind the page pool's back: evict everything
+    if (has_stream_pool && !hparams.no_alloc) {
+        stream_reset();
     }
 }
 

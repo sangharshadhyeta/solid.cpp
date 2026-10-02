@@ -2445,6 +2445,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_STREAM"));
     add_opt(common_arg(
+        {"--kv-resident"}, "N",
+        "with --kv-stream: keep N cells of each sparse-attention layer in a VRAM page pool, so only pages that are not "
+        "already resident cross PCIe (0 = no pool: every selected row is read from host memory, default)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-resident must be >= 0");
+            }
+            params.kv_resident = (uint32_t) value;
+        }
+    ).set_env("LLAMA_ARG_KV_RESIDENT"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),
