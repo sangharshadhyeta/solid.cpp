@@ -2604,8 +2604,10 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             // the draft block attends densely: streaming it would read its whole cache every step
                         } else if (!cparams.offload_kqv) {
                             LLAMA_LOG_WARN("%s: --kv-stream needs the KV cache offloaded - ignored\n", __func__);
-                        } else if (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16) {
-                            LLAMA_LOG_WARN("%s: --kv-stream needs -ctk f16 -ctv f16 (the sparse gather does not read quantized K/V) - ignored\n", __func__);
+                        } else if (!(params.type_k == GGML_TYPE_F16 && params.type_v == GGML_TYPE_F16) &&
+                                   !(params.type_k == GGML_TYPE_Q8_0 && params.type_v == GGML_TYPE_Q8_0)) {
+                            // the sparse gather reads f16 rows, or q8_0 rows that it dequantizes while loading
+                            LLAMA_LOG_WARN("%s: --kv-stream needs -ctk f16 -ctv f16, or -ctk q8_0 -ctv q8_0 (other cache types are not gathered) - ignored\n", __func__);
                         } else if (!cparams.flash_attn) {
                             LLAMA_LOG_WARN("%s: --kv-stream needs flash attention - ignored\n", __func__);
                         } else {

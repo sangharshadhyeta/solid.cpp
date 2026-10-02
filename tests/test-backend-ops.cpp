@@ -7102,7 +7102,8 @@ struct test_flash_attn_ext : public test_case {
             ggml_tensor * m, ggml_tensor * s, int64_t hsk_padded, int64_t hsv_padded) {
         const std::array<int32_t, 4> pool_permute = {0, 2, 1, 3};
         GGML_ASSERT(permute == pool_permute && "a pool needs the cache layout: heads inside a row");
-        GGML_ASSERT(nr23[1] == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && m != nullptr && n_kv_max > 0);
+        GGML_ASSERT(nr23[1] == 1 && m != nullptr && n_kv_max > 0);
+        GGML_ASSERT((type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16) || (type_K == GGML_TYPE_Q8_0 && type_V == GGML_TYPE_Q8_0));
 
         // the caches as 2D tensors of rows (one row per cell, all heads in a row), the tensors k and v are permuted views of
         ggml_tensor * kc = ggml_view_2d(ctx_kv, k->view_src, hsk_padded*nh, kv, k->view_src->nb[2], 0);
@@ -7110,8 +7111,9 @@ struct test_flash_attn_ext : public test_case {
 
         const int64_t n_pages = (kv + pool_page - 1)/pool_page;
 
-        ggml_tensor * pool_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk_padded*nh, POOL_SLOTS*pool_page);
-        ggml_tensor * pool_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsv_padded*nh, POOL_SLOTS*pool_page);
+        // the pool holds rows in the cache's own type
+        ggml_tensor * pool_k = ggml_new_tensor_2d(ctx, type_K, hsk_padded*nh, POOL_SLOTS*pool_page);
+        ggml_tensor * pool_v = ggml_new_tensor_2d(ctx, type_V, hsv_padded*nh, POOL_SLOTS*pool_page);
         ggml_tensor * state  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ggml_kv_stream_state_ints(n_pages, POOL_SLOTS));
         ggml_set_name(pool_k, "pool_k");
         ggml_set_name(pool_v, "pool_v");
@@ -10064,6 +10066,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, true,   4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, true,   4));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  128, true,   4));
+
+    // KV streaming with a q8_0 cache (S3e): the sparse gather dequantizes the selected rows while loading the tiles, no f16 copy of
+    // the cache. First without a pool (the loader alone), then with one, and with K/V in the pinned-host buffer.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3},  512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3},  512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3},  128));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3},  512));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3},  512, false,  4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3},  512, false,  4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3},  128, false,  4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3},  512, true,   4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 2, 1, 3},  512, true,   4));
 
     // a long context, where only a small fraction of K/V is selected (the point of streaming)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 2048, true));

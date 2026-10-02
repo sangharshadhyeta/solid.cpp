@@ -605,6 +605,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        // a q8_0 cache with a sparse mask: the mma kernel gathers the selected rows and dequantizes them while loading, so the
+        // cache is neither read whole (the vec kernel) nor converted to f16 as a whole (the mma kernel without this)
+        if (ggml_cuda_fattn_mma_sparse_q8_gather(cc, dst)) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
+
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 // the sparse gather exists only in the MMA kernel: (DKQ, DV, 1, 8) with GQA > 4
@@ -699,9 +705,13 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
-        case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
+            break;
+        case BEST_FATTN_KERNEL_MMA_F16:
+            // the same predicate the launch uses: when the kernel dequantizes a q8_0 cache itself, there is no f16 copy to hold
+            need_f16_K = !ggml_cuda_fattn_mma_sparse_q8_gather(ggml_cuda_info().devices[device].cc, dst);
+            need_f16_V = need_f16_K;
             break;
         case BEST_FATTN_KERNEL_VEC:
             need_f16_K = K->type == GGML_TYPE_F32;
@@ -737,7 +747,8 @@ static bool ggml_cuda_fattn_kv_stream_get(const ggml_tensor * dst, ggml_cuda_kv_
     const ggml_tensor * state  = dst->src[7];
 
     GGML_ASSERT(pool_v != nullptr && state != nullptr && dst->src[8] != nullptr);
-    GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && "a KV page pool needs f16 K and V");
+    GGML_ASSERT(((K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) || (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q8_0)) &&
+        "a KV page pool needs f16 or q8_0 K and V");
     GGML_ASSERT(pool_k->type == K->type && pool_v->type == V->type);
     GGML_ASSERT(Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && "a KV page pool supports one sequence");
     // the pool has the row layout of the cache: one row holds all heads, with the same row stride as K and V
@@ -785,9 +796,13 @@ static __global__ void ggml_cuda_fattn_write_kv_pool_hdr(
 
 void ggml_cuda_flash_attn_ext_kv_stream_prepare(
         const ggml_tensor * dst, const int32_t * lists, const int32_t * counts, int32_t n_lists, int32_t list_stride,
-        ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream) {
+        const bool pool_usable, ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream) {
     ggml_cuda_kv_stream s;
-    const bool stream_on = ggml_cuda_fattn_kv_stream_get(dst, s);
+
+    // The pool holds rows in the cache's own type. A kernel that reads the cache converted to f16 cannot use a q8_0 pool, so
+    // then the pool is left out of this call (no resolve, header page 0): the rows come from K/V, which is right. The append
+    // step (every call, any path) keeps the resident pages coherent meanwhile.
+    const bool stream_on = ggml_cuda_fattn_kv_stream_get(dst, s) && pool_usable;
 
     if (stream_on) {
         // Whether to fetch the pages this call names is a performance decision, never a correctness one: a page that is

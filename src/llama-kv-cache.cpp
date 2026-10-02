@@ -300,8 +300,10 @@ llama_kv_cache::llama_kv_cache(
             const uint32_t page = hparams.dsv4_compress_ratios[il]; // the indexer block size: selection is in whole blocks
             constexpr uint32_t n_slots_min = 1024; // the resolve step sweeps its clock with a 1024-thread block
 
-            if (!has_v || v_trans || n_stream != 1 || page == 0 || type_k != GGML_TYPE_F16 || type_v != GGML_TYPE_F16) {
-                LLAMA_LOG_WARN("%s: layer %3d: no VRAM page pool (needs f16 K/V, a single stream, V not transposed and a sparse-attention layer)\n",
+            const bool type_ok = (type_k == GGML_TYPE_F16 && type_v == GGML_TYPE_F16) || (type_k == GGML_TYPE_Q8_0 && type_v == GGML_TYPE_Q8_0);
+
+            if (!has_v || v_trans || n_stream != 1 || page == 0 || !type_ok) {
+                LLAMA_LOG_WARN("%s: layer %3d: no VRAM page pool (needs f16 or q8_0 K/V, a single stream, V not transposed and a sparse-attention layer)\n",
                         __func__, il);
             } else {
                 const uint32_t n_pages = (kv_size + page - 1)/page;

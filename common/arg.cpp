@@ -2438,8 +2438,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--kv-stream"},
         "keep the K/V cache of sparse-attention layers (qwen4exp) in pinned host memory that the GPU reads in place, "
-        "so a long context does not take VRAM from the expert cache; CUDA only, needs -ctk f16 -ctv f16 and flash "
-        "attention, ignored otherwise (default: disabled)",
+        "so a long context does not take VRAM from the expert cache; CUDA only (NVIDIA, Turing or newer), needs "
+        "-ctk f16 -ctv f16 or -ctk q8_0 -ctv q8_0 (q8_0 halves the pinned memory) and flash attention, ignored "
+        "otherwise (default: disabled)",
         [](common_params & params) {
             params.kv_stream = true;
         }

@@ -744,7 +744,7 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 // no pool). Defined in fattn.cu.
 void ggml_cuda_flash_attn_ext_kv_stream_prepare(
         const ggml_tensor * dst, const int32_t * lists, const int32_t * counts, int32_t n_lists, int32_t list_stride,
-        ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream);
+        bool pool_usable, ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1132,8 +1132,10 @@ void launch_fattn(
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
 
         // KV streaming: make the pages the lists name resident and describe the page pool to the kernel
+        // (a quantized cache converted to f16 for this kernel cannot be served from a pool of quantized rows)
+        const bool pool_usable = !(need_f16_K && K->type != GGML_TYPE_F16);
         ggml_cuda_flash_attn_ext_kv_stream_prepare(dst, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, n_lists, n_kv_max,
-                (ggml_cuda_fattn_kv_pool_hdr *) (KV_max.ptr + hdr_off), main_stream);
+                pool_usable, (ggml_cuda_fattn_kv_pool_hdr *) (KV_max.ptr + hdr_off), main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
