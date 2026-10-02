@@ -1491,6 +1491,41 @@ reported as a bug and retracted the same hour.</p>
 </div>
 </section>
 
+<section id="sync-fetch-on-miss">
+<div class="eyebrow">2 October 2026 &mdash; a miss was never waiting for its own fetch</div>
+<h2>An unsubstituted expert-cache miss went straight to CPU, with the fetch already queued</h2>
+<p class="section-lede">Qwen3.8-Flash-Next was reading under 10&nbsp;tok/s on a machine also running other
+interactive work, well under the throughput the cache's slot count and hit rate implied it should reach. Reading
+<code>ggml-cpu.c</code>'s <code>MUL_MAT_ID</code> handler found the reason: a row with no resident stand-in
+(<code>moe_cache_slot_idx[&hellip;] &lt; 0</code>) is routed straight into a dense CPU matmul over the raw mmap'd
+weights &mdash; even though the admission logic two lines above it had just pushed that exact expert to the <em>front</em>
+of the fill worker's queue. The worker was woken, the fetch was real, and the request never waited the ~0.3&ndash;0.8&nbsp;ms
+it usually takes to land.</p>
+<p>Direct measurement (summed <code>utime+stime</code> across every thread in <code>/proc/[pid]/task/*/stat</code>,
+before and after one request) made the cost concrete: 48.2 CPU-seconds consumed for 9.7&nbsp;seconds of wall clock on
+one short request &mdash; around five cores sustained, doing work a VRAM-resident hit would have skipped entirely.
+Under real memory pressure the same path got worse in a different way: the fallback's raw mmap read can leave the
+whole request in the kernel's <code>D</code> state waiting on disk, not computing at all.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">The fix: let the row wait for the fetch it already triggered</h3>
+<p>Every genuine miss already produces a job on <code>device.queue</code> and a generation-stamped slot in
+<code>copying</code> state before <code>plan()</code> returns. <code>GGML_CUDA_MOE_CACHE_SYNC_FETCH=1</code> (off by
+default) collects exactly the unsubstituted-miss rows during that existing admission pass, then &mdash; after the
+pass's own <code>notify_all()</code>, so the fill worker is never blocked waiting on the caller it just woke &mdash;
+waits on the same condition variable the worker signals on fill completion, for up to
+<code>GGML_CUDA_MOE_CACHE_SYNC_FETCH_TIMEOUT_MS</code> (default 50&nbsp;ms) per row, capped at
+<code>GGML_CUDA_MOE_CACHE_SYNC_FETCH_MAX_ROWS</code> (default 8) rows per call. A row whose slot turns
+<code>valid</code> in time, with its generation and key unchanged, is handed back as a real hit; anything that times
+out is left exactly as it already was, falling through to the untouched CPU path. Counted separately
+(<code>sync_fetch_hits</code>), not folded into the existing hit/miss counters &mdash; those already mean
+"resident when admission decided", which this deliberately is not.</p>
+<p>Verified against <code>test-backend-ops</code> (13,345/13,345 passing, 2/2 backends) before going anywhere near a
+live server. Live, with the flag on, decode is still reading only around 10&nbsp;tok/s &mdash; this closed one real gap
+between the fetch and the row that needed it, not the whole distance to the ~40&nbsp;tok/s the plumbing should
+support once RAM pressure is no longer the limiter. Where the rest of that gap is &mdash; tracing exactly what each
+decode step is waiting on &mdash; is the open question this session is chasing next.</p>
+</section>
+
 <section>
 <div class="eyebrow">What's different from upstream</div>
 <h2>Every fix, one card each</h2>
