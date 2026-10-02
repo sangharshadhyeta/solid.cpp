@@ -1153,6 +1153,20 @@ static void print_test_result_locked(printer * output_printer, const test_result
     output_printer->print_test_result(result);
 }
 
+// The pinned-host buffer type a backend exposes for a KV cache that the device reads in place (CUDA: CUDA_Host_KV,
+// used by llama --kv-stream). nullptr if the backend has none: tests that ask for it then run on the default buffer.
+static ggml_backend_buffer_type_t get_kv_host_buft(ggml_backend_t backend) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
+    if (!reg) {
+        return nullptr;
+    }
+
+    using buft_fn_t = ggml_backend_buffer_type_t (*)(void);
+    auto fn = (buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_host_buffer_type");
+
+    return fn ? fn() : nullptr;
+}
+
 struct test_case {
     virtual ~test_case() {}
 
@@ -1246,6 +1260,18 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+
+    // buffer type for the tensors of the weight context, nullptr = the backend's default buffer type
+    virtual ggml_backend_buffer_type_t weights_buft(ggml_backend_t backend) {
+        GGML_UNUSED(backend);
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t alloc_weights(ggml_context * ctx_weights, ggml_backend_t backend) {
+        ggml_backend_buffer_type_t buft = weights_buft(backend);
+        return buft ? ggml_backend_alloc_ctx_tensors_from_buft(ctx_weights, buft)
+                    : ggml_backend_alloc_ctx_tensors(ctx_weights, backend);
+    }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1409,7 +1435,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            buf_weights.reset(alloc_weights(ctx_weights.get(), backend1));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -1569,7 +1595,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            buf_weights.reset(alloc_weights(ctx_weights.get(), backend));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
@@ -6936,9 +6962,10 @@ struct test_flash_attn_ext : public test_case {
     const ggml_type type_V;
     std::array<int32_t, 4> permute;
     const int64_t n_kv_max;
+    const bool kv_host; // K and V live in the backend's pinned-host KV buffer type, read in place (KV streaming)
 
     std::string vars() override {
-        return VARS_TO_STR15(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, n_kv_max);
+        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, n_kv_max, kv_host);
     }
 
     double max_nmse_err() override {
@@ -6955,15 +6982,30 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        int64_t n_kv_max = 0)
+                        int64_t n_kv_max = 0, bool kv_host = false)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), n_kv_max(n_kv_max) {}
+          type_K(type_K), type_V(type_V), permute(permute), n_kv_max(n_kv_max), kv_host(kv_host) {}
+
+    bool use_weight_context() override { return kv_host; }
+
+    ggml_backend_buffer_type_t weights_buft(ggml_backend_t backend) override {
+        return kv_host ? get_kv_host_buft(backend) : nullptr;
+    }
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph_impl(ctx, ctx);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
+        return build_graph_impl(ctx, ctx_weights ? ctx_weights : ctx);
+    }
+
+    // K and V (and the tensors they are views of) are created in ctx_kv, everything else in ctx
+    ggml_tensor * build_graph_impl(ggml_context * ctx, ggml_context * ctx_kv) {
         const int64_t hsk_padded = GGML_PAD(hsk, ggml_blck_size(type_K));
         const int64_t hsv_padded = GGML_PAD(hsv, ggml_blck_size(type_V));
 
-        auto const &create_permuted = [&](ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool is_view) -> ggml_tensor * {
+        auto const &create_permuted = [&](ggml_context * c, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, bool is_view) -> ggml_tensor * {
             int64_t ne[4] = {ne0, ne1, ne2, ne3};
             int64_t ne_perm[4];
             for (int i = 0; i < 4; ++i) {
@@ -6971,21 +7013,21 @@ struct test_flash_attn_ext : public test_case {
             }
             ggml_tensor * t;
             if (is_view) {
-                ggml_tensor * t0 = ggml_new_tensor_4d(ctx, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
-                t = ggml_view_4d(ctx, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
+                ggml_tensor * t0 = ggml_new_tensor_4d(c, type, ne_perm[0], 2*ne_perm[1], ne_perm[2], ne_perm[3]);
+                t = ggml_view_4d(c, t0, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3], t0->nb[1], t0->nb[2], t0->nb[3], 0);
             } else {
-                t = ggml_new_tensor_4d(ctx, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
+                t = ggml_new_tensor_4d(c, type, ne_perm[0], ne_perm[1], ne_perm[2], ne_perm[3]);
             }
             if (permute != std::array<int32_t, 4>{0, 1, 2, 3}) {
-                t = ggml_permute(ctx, t, permute[0], permute[1], permute[2], permute[3]);
+                t = ggml_permute(c, t, permute[0], permute[1], permute[2], permute[3]);
             }
             return t;
         };
 
-        ggml_tensor * q = create_permuted(GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
+        ggml_tensor * q = create_permuted(ctx, GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(type_K,        hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(ctx_kv, type_K,  hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -6997,9 +7039,9 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/13435
             //   - https://github.com/ggml-org/llama.cpp/pull/18953#issuecomment-3774948392
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
-            v = ggml_view_4d(ctx, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
+            v = ggml_view_4d(ctx_kv, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(type_V,        hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(ctx_kv, type_V,  hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -9893,6 +9935,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+
+    // MLA head shapes (576/512, V is a sub-view of K): the upstream sparse cases
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 1}, 4096, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512));
+    test_cases.emplace_back(new test_flash_attn_ext(576, 512, 1, {16, 2}, 4096, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  768));
+
+    // KV streaming (S3c): K and V in the backend's pinned-host KV buffer type, read in place by the device.
+    // Each sparse case is paired with a dense one (n_kv_max = 0) on the same host-resident K/V. On a backend
+    // without that buffer type these run on the default buffer and are just the ordinary cases again.
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},    0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},    0, true));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
+    // a long context, where only a small fraction of K/V is selected (the point of streaming)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 2048, true));
 
     // sparse attn, qwen4 shape (head size 256, gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 512));
