@@ -2436,6 +2436,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_OFFLOAD"));
     add_opt(common_arg(
+        {"--kv-stream"},
+        "keep the K/V cache of sparse-attention layers (qwen4exp) in pinned host memory that the GPU reads in place, "
+        "so a long context does not take VRAM from the expert cache; CUDA only, needs -ctk f16 -ctv f16 and flash "
+        "attention, ignored otherwise (default: disabled)",
+        [](common_params & params) {
+            params.kv_stream = true;
+        }
+    ).set_env("LLAMA_ARG_KV_STREAM"));
+    add_opt(common_arg(
         {"--repack"},
         {"-nr", "--no-repack"},
         string_format("whether to enable weight repacking (default: %s)", params.no_extra_bufts ? "disabled" : "enabled"),

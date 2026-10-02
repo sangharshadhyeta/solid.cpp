@@ -37,7 +37,9 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* attention K/V in pinned host memory, see llama_kv_cache; the indexer cache stays on the device */
+                     bool   kv_stream = false);
 
     ~llama_memory_hybrid_idx() = default;
 

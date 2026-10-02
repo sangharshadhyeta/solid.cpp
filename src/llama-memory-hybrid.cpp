@@ -33,7 +33,8 @@ llama_memory_hybrid::llama_memory_hybrid(
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
     const layer_filter_cb & filter_idx,
-                ggml_type   type_idx) :
+                ggml_type   type_idx,
+                     bool   kv_stream) :
     hparams(model.hparams),
     hparams_idx(model.hparams),
     mem_attn(new llama_kv_cache(
@@ -54,7 +55,9 @@ llama_memory_hybrid::llama_memory_hybrid(
             [&](int32_t il) { return !hparams.is_recr(il); }
             : filter_attn,
         nullptr,
-        nullptr
+        nullptr,
+        "",
+        kv_stream
     )),
     mem_recr(new llama_memory_recurrent(
         model,

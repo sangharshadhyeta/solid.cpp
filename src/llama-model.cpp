@@ -2593,6 +2593,26 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         }
                     }
 
+                    // --kv-stream: K/V of the sparse-attention layers in pinned host memory, read in place by the GPU.
+                    // Only the qwen4exp sparse flash attention gathers just the selected rows (f16 K/V, flash attention);
+                    // anything else would read the whole cache over PCIe on every step, so it is refused, not degraded.
+                    bool kv_stream = false;
+                    if (cparams.kv_stream) {
+                        if (!needs_mem_idx) { // needs_mem_idx is true for qwen4exp only
+                            LLAMA_LOG_WARN("%s: --kv-stream only applies to the qwen4exp sparse attention - ignored\n", __func__);
+                        } else if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                            // the draft block attends densely: streaming it would read its whole cache every step
+                        } else if (!cparams.offload_kqv) {
+                            LLAMA_LOG_WARN("%s: --kv-stream needs the KV cache offloaded - ignored\n", __func__);
+                        } else if (params.type_k != GGML_TYPE_F16 || params.type_v != GGML_TYPE_F16) {
+                            LLAMA_LOG_WARN("%s: --kv-stream needs -ctk f16 -ctv f16 (the sparse gather does not read quantized K/V) - ignored\n", __func__);
+                        } else if (!cparams.flash_attn) {
+                            LLAMA_LOG_WARN("%s: --kv-stream needs flash attention - ignored\n", __func__);
+                        } else {
+                            kv_stream = true;
+                        }
+                    }
+
                     if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // llama_memory_hybrid_iswa has no indexer cache, so SWA would silently lose it
                         GGML_ASSERT(filter_idx == nullptr && "hybrid-iswa cannot carry an indexer cache");
@@ -2636,7 +2656,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr),
-                            /* filter_idx        */ std::move(filter_idx));
+                            /* filter_idx        */ std::move(filter_idx),
+                            /* kv_stream         */ kv_stream);
                     } else {
                         res = new llama_memory_hybrid(
                             /* model             */ *this,

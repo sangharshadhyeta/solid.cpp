@@ -42,7 +42,9 @@ public:
     const layer_filter_cb & filter_recr = nullptr,
                             /* optional indexer key cache; absent unless filter_idx */
     const layer_filter_cb & filter_idx  = nullptr,
-                ggml_type   type_idx    = GGML_TYPE_F16);
+                ggml_type   type_idx    = GGML_TYPE_F16,
+                            /* attention K/V in pinned host memory, see llama_kv_cache */
+                     bool   kv_stream   = false);
 
     ~llama_memory_hybrid() = default;
 

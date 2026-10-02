@@ -67,6 +67,20 @@ static void ggml_gen_hadamard(ggml_tensor * tensor) {
 // llama_kv_cache
 //
 
+// The CUDA backend exposes a pinned-host buffer type that the GPU reads in place (zero-copy), through its registry.
+// nullptr when the device's backend has none, so --kv-stream quietly degrades to the normal device buffer.
+static ggml_backend_buffer_type_t llama_kv_stream_buft(ggml_backend_dev_t dev) {
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    if (!reg) {
+        return nullptr;
+    }
+
+    using buft_fn_t = ggml_backend_buffer_type_t (*)(void);
+    auto fn = (buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_host_buffer_type");
+
+    return fn ? fn() : nullptr;
+}
+
 llama_kv_cache::llama_kv_cache(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -84,7 +98,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                   bool   kv_stream) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -167,6 +182,8 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    uint32_t n_stream_layers = 0; // layers whose K/V live in pinned host memory (kv_stream)
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -223,6 +240,14 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            if (kv_stream) {
+                if (ggml_backend_buffer_type_t host_buft = llama_kv_stream_buft(dev)) {
+                    buft     = host_buft;
+                    dev_name = ggml_backend_buft_name(host_buft);
+                    n_stream_layers++;
+                }
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -252,6 +277,16 @@ llama_kv_cache::llama_kv_cache(
         map_layer_ids[il] = layers.size();
 
         layers.push_back({ il, k, v, k_stream, v_stream, });
+    }
+
+    if (kv_stream) {
+        if (n_stream_layers > 0) {
+            LLAMA_LOG_INFO("%s: kv_stream: K/V of %u layer(s) kept in pinned host memory, read in place by the device\n",
+                    __func__, n_stream_layers);
+        } else {
+            LLAMA_LOG_WARN("%s: kv_stream requested, but the backend has no pinned-host KV buffer type - K/V stays in device memory\n",
+                    __func__);
+        }
     }
 
     if (reuse) {
