@@ -216,6 +216,22 @@ static void init_tensor_kq_mask_sparse(ggml_tensor * tensor, int64_t n_kv_max) {
     ggml_backend_tensor_set(tensor, data_f16.data(), 0, data_f16.size()*sizeof(ggml_fp16_t));
 }
 
+// The columns init_tensor_kq_mask_sparse selects in row 0: the same generator and seed, so the KV-pool test can write
+// cache rows into cells the attention is going to read.
+static std::vector<int32_t> kq_mask_sparse_row0_columns(int64_t ne0, int64_t n_kv_max) {
+    std::vector<int32_t> order(ne0);
+    for (int64_t i = 0; i < ne0; ++i) {
+        order[i] = (int32_t) i;
+    }
+
+    std::mt19937 gen(0x5A17);
+    std::shuffle(order.begin(), order.end(), gen);
+    std::sort(order.begin(), order.begin() + n_kv_max); // row 0: all n_kv_max entries are selected
+    order.resize(n_kv_max);
+
+    return order;
+}
+
 // generate a lower triangular matrix
 static void init_tensor_tril(ggml_tensor * tensor, float min = -1.0f, float max = 1.0f) {
     GGML_ASSERT(tensor->type == GGML_TYPE_F32);
@@ -6963,9 +6979,13 @@ struct test_flash_attn_ext : public test_case {
     std::array<int32_t, 4> permute;
     const int64_t n_kv_max;
     const bool kv_host; // K and V live in the backend's pinned-host KV buffer type, read in place (KV streaming)
+    const int  pool_page; // > 0: a VRAM page pool (pages of pool_page cells) is attached to the op, see build_pool_graph
+
+    static constexpr int64_t POOL_SLOTS = 1024; // the smallest pool the kernels accept
+    static constexpr int     POOL_NNEW  = 3;    // cache rows written between the two attention calls of a pool test
 
     std::string vars() override {
-        return VARS_TO_STR16(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, n_kv_max, kv_host);
+        return VARS_TO_STR17(hsk, hsv, nh, nr23, kv, nb, mask, sinks, max_bias, logit_softcap, prec, type_K, type_V, permute, n_kv_max, kv_host, pool_page);
     }
 
     double max_nmse_err() override {
@@ -6982,9 +7002,9 @@ struct test_flash_attn_ext : public test_case {
     test_flash_attn_ext(int64_t hsk = 128, int64_t hsv = 128, int64_t nh = 32, std::array<int64_t, 2> nr23 = {1, 1}, int64_t kv = 96, int64_t nb = 8,
                         bool mask = true, bool sinks = false, float max_bias = 0.0f, float logit_softcap = 0.0f, ggml_prec prec = GGML_PREC_F32,
                         ggml_type type_K = GGML_TYPE_F16, ggml_type type_V = GGML_TYPE_F16, std::array<int32_t, 4> permute = {0, 1, 2, 3},
-                        int64_t n_kv_max = 0, bool kv_host = false)
+                        int64_t n_kv_max = 0, bool kv_host = false, int pool_page = 0)
         : hsk(hsk), hsv(hsv), nh(nh), nr23(nr23), kv(kv), nb(nb), mask(mask), sinks(sinks), max_bias(max_bias), logit_softcap(logit_softcap), prec(prec),
-          type_K(type_K), type_V(type_V), permute(permute), n_kv_max(n_kv_max), kv_host(kv_host) {}
+          type_K(type_K), type_V(type_V), permute(permute), n_kv_max(n_kv_max), kv_host(kv_host), pool_page(pool_page) {}
 
     bool use_weight_context() override { return kv_host; }
 
@@ -7027,7 +7047,7 @@ struct test_flash_attn_ext : public test_case {
         ggml_tensor * q = create_permuted(ctx, GGML_TYPE_F32, hsk_padded, nb, nh*nr23[0], nr23[1], false);
         ggml_set_name(q, "q");
 
-        ggml_tensor * k = create_permuted(ctx_kv, type_K,  hsk_padded, kv, nh,         nr23[1], true); // the K tensor is usually a view of the K cache
+        ggml_tensor * k = create_permuted(ctx_kv, type_K,  hsk_padded, kv, nh,         nr23[1], pool_page == 0); // the K tensor is usually a view of the K cache
         ggml_set_name(k, "k");
 
         ggml_tensor * v = nullptr;
@@ -7041,7 +7061,7 @@ struct test_flash_attn_ext : public test_case {
             //   - https://github.com/ggml-org/llama.cpp/pull/18986
             v = ggml_view_4d(ctx_kv, k, hsv_padded, kv, nh, nr23[1], k->nb[1], k->nb[2], k->nb[3], 0);
         } else {
-            v = create_permuted(ctx_kv, type_V,  hsv_padded, kv, nh,         nr23[1], true); // the V tensor is usually a view of the V cache
+            v = create_permuted(ctx_kv, type_V,  hsv_padded, kv, nh,         nr23[1], pool_page == 0); // the V tensor is usually a view of the V cache
         }
         ggml_set_name(v, "v");
 
@@ -7057,10 +7077,75 @@ struct test_flash_attn_ext : public test_case {
             ggml_set_name(s, "s");
         }
 
+        if (pool_page > 0) {
+            return build_pool_graph(ctx, ctx_kv, q, k, v, m, s, hsk_padded, hsv_padded);
+        }
+
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
         ggml_flash_attn_ext_add_sinks(out, s);
         ggml_flash_attn_ext_set_n_kv_max(out, n_kv_max);
         ggml_flash_attn_ext_set_prec (out, prec);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    // KV streaming with a VRAM page pool (docs/kv-streaming-s3d-design.md), the flow of a decode step, twice:
+    //   write 3 rows into the cache (set_rows, as llama_kv_cache::cpy_k does), attend with the pool attached (cold: the
+    //   pool is empty, pages are fetched), write 3 more rows into cells the attention reads (their pages are now
+    //   resident, so the pool rows must be refreshed), attend again (warm). The result is the sum of the two outputs.
+    // The reference backend ignores the pool and reads K/V, so the sum matches only if every row the attention read was
+    // right: from the pool where a page was resident, from K/V where it was not (a call can name more pages than the pool
+    // holds), and stale pool rows did not survive the write. The pool starts full of garbage: nothing may read it before
+    // the fetch.
+    ggml_tensor * build_pool_graph(ggml_context * ctx, ggml_context * ctx_kv, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+            ggml_tensor * m, ggml_tensor * s, int64_t hsk_padded, int64_t hsv_padded) {
+        const std::array<int32_t, 4> pool_permute = {0, 2, 1, 3};
+        GGML_ASSERT(permute == pool_permute && "a pool needs the cache layout: heads inside a row");
+        GGML_ASSERT(nr23[1] == 1 && type_K == GGML_TYPE_F16 && type_V == GGML_TYPE_F16 && m != nullptr && n_kv_max > 0);
+
+        // the caches as 2D tensors of rows (one row per cell, all heads in a row), the tensors k and v are permuted views of
+        ggml_tensor * kc = ggml_view_2d(ctx_kv, k->view_src, hsk_padded*nh, kv, k->view_src->nb[2], 0);
+        ggml_tensor * vc = ggml_view_2d(ctx_kv, v->view_src, hsv_padded*nh, kv, v->view_src->nb[2], 0);
+
+        const int64_t n_pages = (kv + pool_page - 1)/pool_page;
+
+        ggml_tensor * pool_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsk_padded*nh, POOL_SLOTS*pool_page);
+        ggml_tensor * pool_v = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hsv_padded*nh, POOL_SLOTS*pool_page);
+        ggml_tensor * state  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, ggml_kv_stream_state_ints(n_pages, POOL_SLOTS));
+        ggml_set_name(pool_k, "pool_k");
+        ggml_set_name(pool_v, "pool_v");
+        ggml_set_name(state,  "kv_state");
+
+        auto write_rows = [&](const char * tag) {
+            ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, POOL_NNEW);
+            ggml_tensor * knew = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hsk_padded*nh, POOL_NNEW);
+            ggml_tensor * vnew = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hsv_padded*nh, POOL_NNEW);
+            ggml_set_name(idxs, (std::string("kv_idxs") + tag).c_str());
+            ggml_set_name(knew, (std::string("knew")    + tag).c_str());
+            ggml_set_name(vnew, (std::string("vnew")    + tag).c_str());
+
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, kc, knew, idxs));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, vc, vnew, idxs));
+
+            return idxs;
+        };
+
+        auto attend = [&](ggml_tensor * idxs) {
+            ggml_tensor * o = ggml_flash_attn_ext(ctx, q, k, v, m, 1.0f/sqrtf(hsk), max_bias, logit_softcap);
+            ggml_flash_attn_ext_add_sinks(o, s);
+            ggml_flash_attn_ext_set_n_kv_max(o, n_kv_max);
+            ggml_flash_attn_ext_set_prec (o, prec);
+            ggml_flash_attn_ext_set_kv_stream(o, pool_k, pool_v, state, idxs, pool_page);
+            ggml_build_forward_expand(gf, o);
+
+            return o;
+        };
+
+        ggml_tensor * out1 = attend(write_rows("1"));
+        ggml_tensor * out2 = attend(write_rows("2"));
+
+        ggml_tensor * out = ggml_add(ctx, out1, out2);
         ggml_set_name(out, "out");
 
         return out;
@@ -7071,6 +7156,20 @@ struct test_flash_attn_ext : public test_case {
             if (strcmp(t->name, "s") == 0) {
                 // make the sink values more noticeable in order to trigger a test failure when the implementation is wrong
                 init_tensor_uniform(t, -10.0f, 10.0f);
+            } else if (strcmp(t->name, "kv_state") == 0) {
+                // the initial state of a pool: page table and slot_page -1 (none), everything else 0
+                const int64_t n_pages = (kv + pool_page - 1)/pool_page;
+                ggml_backend_tensor_memset(t, 0x00, 0, ggml_nbytes(t));
+                ggml_backend_tensor_memset(t, 0xFF, 0, (size_t) (n_pages + POOL_SLOTS)*sizeof(int32_t));
+            } else if (strcmp(t->name, "kv_idxs1") == 0) {
+                // the newest cells, as a decode step writes them
+                std::vector<int64_t> cells = { kv - 3, kv - 2, kv - 1 };
+                ggml_backend_tensor_set(t, cells.data(), 0, cells.size()*sizeof(int64_t));
+            } else if (strcmp(t->name, "kv_idxs2") == 0) {
+                // cells the attention reads (selected in the first mask row): their pages are resident after the first call
+                const std::vector<int32_t> cols = kq_mask_sparse_row0_columns(kv, n_kv_max);
+                std::vector<int64_t> cells = { cols[0], cols[cols.size()/2], cols[cols.size() - 1] };
+                ggml_backend_tensor_set(t, cells.data(), 0, cells.size()*sizeof(int64_t));
             } else if (strcmp(t->name, "m") == 0) {
                 if (n_kv_max > 0) {
                     init_tensor_kq_mask_sparse(t, n_kv_max);
@@ -9949,6 +10048,23 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},    0, true));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 2}, 8192, 67, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3},  512, true));
+    // KV streaming with a VRAM page pool (S3d-3): two attention calls with cache writes between them, pool cold then warm
+    // (see test_flash_attn_ext::build_pool_graph). hsk = hsv = 256, 2 KV heads, gqa 12, the cache layout (heads in a row).
+    //   decode: one query names ~512 pages, which fit the 1024-slot pool
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, false,  4));
+    //   a verify window of 4 queries names ~2000 pages against 1024 slots: pages are bypassed and read from K/V
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, false,  4));
+    //   16 queries with resolve still running (below the threshold), more pages than slots
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  128, false,  4));
+    //   64 queries: above the threshold, resolve is skipped, every row comes from K/V
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, false,  4));
+    //   another page size
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, false, 16));
+    //   K and V in the pinned-host KV buffer type, the pool in VRAM (what --kv-stream --kv-resident builds)
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1},  8192,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, true,   4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384,  4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  512, true,   4));
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 16384, 16, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3},  128, true,   4));
+
     // a long context, where only a small fraction of K/V is selected (the point of streaming)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 32768,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, 2048, true));
 

@@ -5493,11 +5493,13 @@ void ggml_flash_attn_ext_set_kv_stream(
     const struct ggml_tensor * k = a->src[1];
     const struct ggml_tensor * v = a->src[2];
 
-    GGML_ASSERT(pool_k->type == k->type && pool_k->ne[0] == k->ne[0]);
-    GGML_ASSERT(pool_v->type == v->type && pool_v->ne[0] == v->ne[0]);
+    // K and V as the attention sees them are [head_dim, n_kv, n_head_kv, n_seq]; a pool row is a whole cache row, all
+    // heads of one cell, the same row as in the cache tensors K and V are views of
+    GGML_ASSERT(pool_k->type == k->type && pool_k->ne[0] == k->ne[0]*k->ne[2]);
+    GGML_ASSERT(pool_v->type == v->type && pool_v->ne[0] == v->ne[0]*v->ne[2]);
     GGML_ASSERT(pool_k->ne[1] == pool_v->ne[1] && pool_k->ne[1] % page_size == 0);
     GGML_ASSERT(state->type == GGML_TYPE_I32);
-    GGML_ASSERT(idxs->type == GGML_TYPE_I32);
+    GGML_ASSERT(idxs->type == GGML_TYPE_I32 || idxs->type == GGML_TYPE_I64);
 
     const int64_t n_slots = pool_k->ne[1] / page_size;
     const int64_t n_pages = ggml_nelements(state) - 5*n_slots - GGML_KV_STREAM_CTL_INTS;

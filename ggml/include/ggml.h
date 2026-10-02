@@ -2444,7 +2444,7 @@ extern "C" {
     // A backend that ignores them computes the same result from K and V.
     //   pool_k, pool_v: [n_embd_k_gqa or n_embd_v_gqa, n_slots*page_size], same types as K and V
     //   state:          I32, ggml_kv_stream_state_ints(n_pages, n_slots) entries (layout below)
-    //   idxs:           I32 [n_tokens], the cells written for this ubatch
+    //   idxs:           I32 or I64 [n_tokens], the cells written for this ubatch (the cache's k_idxs); one stream only
     // state layout, in order: page_table[n_pages] (page -> slot, -1 not resident, -2 claimed by this call),
     //   slot_page[n_slots], slot_stamp[n_slots], slot_ref[n_slots], miss_page[n_slots], miss_slot[n_slots],
     //   ctl[GGML_KV_STREAM_CTL_INTS] (epoch, clock hand, misses of the last call, overflow flag, 64-bit counters)

@@ -6285,7 +6285,7 @@ static int ggml_backend_cuda_kv_stream_run(
 
     cudaStream_t stream = cuda_ctx->stream();
 
-    ggml_cuda_kv_stream_append(s, idxs, n_idxs, stream);
+    ggml_cuda_kv_stream_append(s, idxs, false, n_idxs, stream);
     ggml_cuda_kv_stream_resolve(s, lists, counts, n_lists, list_stride, stream);
 
     CUDA_CHECK(cudaStreamSynchronize(stream));

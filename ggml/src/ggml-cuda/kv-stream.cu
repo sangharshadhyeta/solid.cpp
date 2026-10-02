@@ -3,6 +3,8 @@
 // See kv-stream.cuh and docs/kv-streaming-s3d-design.md. The CLOCK page cache follows the design of Strata's KV
 // streaming (MIT licensed, https://github.com/Niko1221/Strata); the code here is written against this fork's layout.
 
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+
 #define KV_STREAM_THREADS 1024 // the resolve block; one sweep step looks at this many consecutive slots
 #define KV_STREAM_MIN_SLOTS 1024
 
@@ -96,14 +98,15 @@ static __device__ int kv_stream_block_scan(int v, int * warp_sums, int & total) 
 static __global__ void kv_stream_append_kernel(
         int32_t * state, int64_t n_pages, int64_t n_slots, int page, int64_t n_cells,
         const char * host_k, const char * host_v, char * pool_k, char * pool_v,
-        size_t row_bytes_k, size_t row_bytes_v, const int32_t * idxs, int n_idxs) {
+        size_t row_bytes_k, size_t row_bytes_v, const void * idxs, int idxs_i64, int n_idxs) {
     const kv_stream_view sv = kv_stream_make_view(state, n_pages, n_slots);
 
     for (int i = blockIdx.x; i < n_idxs; i += gridDim.x) {
-        const int cell = idxs[i];
-        if (cell < 0 || cell >= n_cells) {
+        const int64_t cell64 = idxs_i64 ? ((const int64_t *) idxs)[i] : (int64_t) ((const int32_t *) idxs)[i];
+        if (cell64 < 0 || cell64 >= n_cells) {
             continue;
         }
+        const int cell = (int) cell64;
 
         const int slot = sv.page_table[cell / page];
         if (slot < 0) {
@@ -281,7 +284,7 @@ static void kv_stream_check(const ggml_cuda_kv_stream & s) {
     GGML_ASSERT(s.row_bytes_k % 16 == 0 && s.row_bytes_v % 16 == 0);
 }
 
-void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const int32_t * idxs, int n_idxs, cudaStream_t stream) {
+void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const void * idxs, bool idxs_i64, int n_idxs, cudaStream_t stream) {
     if (n_idxs <= 0) {
         return;
     }
@@ -292,7 +295,7 @@ void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const int32_t * i
 
     kv_stream_append_kernel<<<n_blocks, 128, 0, stream>>>(
             s.state, s.n_pages, s.n_slots, s.page, s.n_cells,
-            s.host_k, s.host_v, s.pool_k, s.pool_v, s.row_bytes_k, s.row_bytes_v, idxs, n_idxs);
+            s.host_k, s.host_v, s.pool_k, s.pool_v, s.row_bytes_k, s.row_bytes_v, idxs, idxs_i64 ? 1 : 0, n_idxs);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -313,3 +316,18 @@ void ggml_cuda_kv_stream_resolve(const ggml_cuda_kv_stream & s, const int32_t * 
             s.host_k, s.host_v, s.pool_k, s.pool_v, s.row_bytes_k, s.row_bytes_v);
     CUDA_CHECK(cudaGetLastError());
 }
+
+#else // GGML_USE_HIP || GGML_USE_MUSA
+
+void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const void * idxs, bool idxs_i64, int n_idxs, cudaStream_t stream) {
+    GGML_UNUSED_VARS(s, idxs, idxs_i64, n_idxs, stream);
+    GGML_ABORT("KV streaming is only supported on NVIDIA CUDA");
+}
+
+void ggml_cuda_kv_stream_resolve(const ggml_cuda_kv_stream & s, const int32_t * lists, const int32_t * counts,
+        int n_lists, int list_stride, cudaStream_t stream) {
+    GGML_UNUSED_VARS(s, lists, counts, n_lists, list_stride, stream);
+    GGML_ABORT("KV streaming is only supported on NVIDIA CUDA");
+}
+
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)

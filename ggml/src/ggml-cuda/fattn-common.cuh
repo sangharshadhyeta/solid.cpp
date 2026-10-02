@@ -44,6 +44,24 @@ typedef void (* fattn_kernel_t)(
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
+// KV streaming (docs/kv-streaming-s3d-design.md). For a sparse call launch_fattn appends this header to the buffer that holds
+// the index lists and their counts; the mma kernel reads it to find the VRAM page pool. page == 0: there is no pool and
+// K and V are read as usual. A row of cell c is read from the pool at (page_table[c / page]*page + c % page) if that
+// slot is >= 0, and from K/V at c otherwise: the pool is an accelerator, never a correctness requirement.
+struct ggml_cuda_fattn_kv_pool_hdr {
+    const char *    pool_k;
+    const char *    pool_v;
+    const int32_t * page_table;
+    int32_t         page;
+    int32_t         pad;
+};
+
+// Offset, in int32 units from the start of that buffer, of the header: after the n_lists lists of list_stride entries and
+// the n_lists counts, rounded up to 8 bytes so the pointers in it are aligned.
+static __host__ __device__ __forceinline__ int64_t ggml_cuda_fattn_kv_pool_hdr_offset(const int64_t n_lists, const int64_t list_stride) {
+    return (n_lists*list_stride + n_lists + 1) & ~int64_t(1);
+}
+
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;
@@ -721,6 +739,13 @@ static __global__ void flash_attn_mask_to_KV_max(
 void ggml_cuda_flash_attn_ext_compact_mask(
         const ggml_tensor * mask, int32_t * indices, int32_t * counts, int32_t n_queries, int32_t ncols1, int32_t n_kv_max, cudaStream_t stream);
 
+// KV streaming (docs/kv-streaming-s3d-design.md), for a sparse call: if a VRAM page pool is attached to the op (sources 5..8),
+// make the pages named by the index lists resident, then write the pool description the kernel reads into hdr (page 0 =
+// no pool). Defined in fattn.cu.
+void ggml_cuda_flash_attn_ext_kv_stream_prepare(
+        const ggml_tensor * dst, const int32_t * lists, const int32_t * counts, int32_t n_lists, int32_t list_stride,
+        ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1101,9 +1126,14 @@ void launch_fattn(
         n_kv_max = std::min<int64_t>(K->ne[1], int64_t(ncols1)*n_kv_max_query);
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
+        const size_t hdr_off = size_t(ggml_cuda_fattn_kv_pool_hdr_offset(n_lists, n_kv_max)); // in int32 units
 
-        KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
+        KV_max.alloc(hdr_off + sizeof(ggml_cuda_fattn_kv_pool_hdr)/sizeof(int32_t));
         ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max, main_stream);
+
+        // KV streaming: make the pages the lists name resident and describe the page pool to the kernel
+        ggml_cuda_flash_attn_ext_kv_stream_prepare(dst, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, n_lists, n_kv_max,
+                (ggml_cuda_fattn_kv_pool_hdr *) (KV_max.ptr + hdr_off), main_stream);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.

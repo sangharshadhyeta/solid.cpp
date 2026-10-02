@@ -34,9 +34,10 @@ struct ggml_cuda_kv_stream {
 };
 
 // Keep resident pages coherent with cells that were just written to the host tensors: for each cell of idxs (device
-// memory), if its page is resident, copy its K and V row from the host tensors into the pool. A page that is not
-// resident needs nothing: resolve copies it whole, including the new rows.
-void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const int32_t * idxs, int n_idxs, cudaStream_t stream);
+// memory, int32 or int64 (the cache's k_idxs is int64)), if its page is resident, copy its K and V row from the host
+// tensors into the pool. A page that is not resident needs nothing: resolve copies it whole, including the new rows.
+// One stream only: a cell id is an index into the host tensors.
+void ggml_cuda_kv_stream_append(const ggml_cuda_kv_stream & s, const void * idxs, bool idxs_i64, int n_idxs, cudaStream_t stream);
 
 // Make every page named by the lists resident. `lists` holds n_lists lists of cell indices, list l at
 // lists + l*list_stride, with counts[l] valid entries (the layout flash_attn_mask_to_sparse_indices writes); both are

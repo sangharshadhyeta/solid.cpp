@@ -4,6 +4,7 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
+#include "kv-stream.cuh"
 
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 // one list per group of ncols1 queries: a column is selected if any query of the group can see it
@@ -716,8 +717,108 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// KV streaming (docs/kv-streaming-s3d-design.md). A VRAM page pool can be attached to the op as sources 5..8 (pool_k,
+// pool_v, the state blob, the cells written for this ubatch), see ggml_flash_attn_ext_set_kv_stream. K and V stay the
+// authoritative host tensors; the pool is an accelerator: the kernel reads a row from the pool if its page is resident
+// and from K/V otherwise, so every path (sparse, dense, tile, vec) is correct with or without it.
+
+// the geometry of the pool from the op, or false if none is attached
+static bool ggml_cuda_fattn_kv_stream_get(const ggml_tensor * dst, ggml_cuda_kv_stream & s) {
+    const ggml_tensor * pool_k = dst->src[5];
+    if (pool_k == nullptr) {
+        return false;
+    }
+
+    const ggml_tensor * Q      = dst->src[0];
+    const ggml_tensor * K      = dst->src[1];
+    const ggml_tensor * V      = dst->src[2];
+    const ggml_tensor * pool_v = dst->src[6];
+    const ggml_tensor * state  = dst->src[7];
+
+    GGML_ASSERT(pool_v != nullptr && state != nullptr && dst->src[8] != nullptr);
+    GGML_ASSERT(K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 && "a KV page pool needs f16 K and V");
+    GGML_ASSERT(pool_k->type == K->type && pool_v->type == V->type);
+    GGML_ASSERT(Q->ne[3] == 1 && K->ne[3] == 1 && V->ne[3] == 1 && "a KV page pool supports one sequence");
+    // the pool has the row layout of the cache: one row holds all heads, with the same row stride as K and V
+    GGML_ASSERT(K->nb[1] == pool_k->nb[1] && V->nb[1] == pool_v->nb[1]);
+    GGML_ASSERT(K->nb[1] % 16 == 0 && V->nb[1] % 16 == 0);
+
+    s.state       = (int32_t *) state->data;
+    s.page        = ggml_get_op_params_i32(dst, 5);
+    s.n_pages     = ggml_get_op_params_i32(dst, 6);
+    s.n_slots     = ggml_get_op_params_i32(dst, 7);
+    s.n_cells     = K->ne[1]; // cells in use; a page cut short by it is copied short
+    s.host_k      = (const char *) K->data;
+    s.host_v      = (const char *) V->data;
+    s.pool_k      = (char *) pool_k->data;
+    s.pool_v      = (char *) pool_v->data;
+    s.row_bytes_k = K->nb[1];
+    s.row_bytes_v = V->nb[1];
+
+    GGML_ASSERT(s.page > 0 && s.n_slots > 0 && pool_k->ne[1] == s.n_slots*s.page && pool_v->ne[1] == pool_k->ne[1]);
+
+    return true;
+}
+
+// Keep resident pages coherent with the rows just written to K/V. Runs for every path, not only the sparse one: a dense
+// call on a short context must not leave a resident page stale for a later sparse call.
+static void ggml_cuda_fattn_kv_stream_append(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    ggml_cuda_kv_stream s;
+    if (!ggml_cuda_fattn_kv_stream_get(dst, s)) {
+        return;
+    }
+
+    const ggml_tensor * idxs = dst->src[8];
+
+    ggml_cuda_kv_stream_append(s, idxs->data, idxs->type == GGML_TYPE_I64, (int) idxs->ne[0], ctx.stream());
+}
+
+static __global__ void ggml_cuda_fattn_write_kv_pool_hdr(
+        ggml_cuda_fattn_kv_pool_hdr * hdr, const char * pool_k, const char * pool_v, const int32_t * page_table, const int32_t page) {
+    hdr->pool_k     = pool_k;
+    hdr->pool_v     = pool_v;
+    hdr->page_table = page_table;
+    hdr->page       = page;
+    hdr->pad        = 0;
+}
+
+void ggml_cuda_flash_attn_ext_kv_stream_prepare(
+        const ggml_tensor * dst, const int32_t * lists, const int32_t * counts, int32_t n_lists, int32_t list_stride,
+        ggml_cuda_fattn_kv_pool_hdr * hdr, cudaStream_t stream) {
+    ggml_cuda_kv_stream s;
+    const bool stream_on = ggml_cuda_fattn_kv_stream_get(dst, s);
+
+    if (stream_on) {
+        // Whether to fetch the pages this call names is a performance decision, never a correctness one: a page that is
+        // not resident is read from K/V. A call with many queries (a prompt ubatch) names a union of thousands of pages,
+        // most used once; fetching them would evict the pages decode reuses. So resolve only runs up to a number of
+        // queries; the hits are served from the pool either way. GGML_CUDA_KV_STREAM_MAX_Q overrides the default, the
+        // number of queries whose pages (n_kv_max cells each) fit the pool.
+        const int64_t width = ggml_get_op_params_i32(dst, 4);
+        int64_t max_q = std::max<int64_t>(1, s.n_slots/(width/s.page + 2));
+
+        static const int64_t max_q_env = [] {
+            const char * v = getenv("GGML_CUDA_KV_STREAM_MAX_Q");
+            return v ? (int64_t) atoll(v) : (int64_t) 0;
+        }();
+        if (max_q_env > 0) {
+            max_q = max_q_env;
+        }
+
+        if (dst->src[0]->ne[1] <= max_q) {
+            ggml_cuda_kv_stream_resolve(s, lists, counts, n_lists, list_stride, stream);
+        }
+    }
+
+    ggml_cuda_fattn_write_kv_pool_hdr<<<1, 1, 0, stream>>>(hdr,
+            stream_on ? s.pool_k : nullptr, stream_on ? s.pool_v : nullptr, stream_on ? s.state : nullptr, stream_on ? s.page : 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+    ggml_cuda_fattn_kv_stream_append(ctx, dst);
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
