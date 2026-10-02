@@ -81,6 +81,64 @@ struct moe_cache_key_hash {
     }
 };
 
+// Read-ahead I/O pool (ROADMAP.md "Item 4, lever 2"; see moe_cache_readahead_worker
+// further down for the thread loop itself - declared this early only because
+// moe_cache_device below holds a vector of these and needs the complete type).
+// The fill worker does its host read (this file's moe_cache_explicit_read, or a
+// plain mmap-touching memcpy) synchronously, one job at a time - so the NVMe
+// underneath it never has more than one request outstanding, and never
+// approaches its own rated throughput regardless of how fast the PCIe link or
+// the drive itself is (measured: 2.0 GB/s raw dd vs 0.56-0.82 GB/s achieved
+// during a real run - the gap is queue depth, not bandwidth).
+//
+// These buffers exist so a small pool of reader threads can do nothing but
+// that host read, several jobs ahead of wherever the fill worker currently
+// is, so the drive sees N requests in flight instead of one. Deliberately
+// kept out of the fill worker's own correctness-critical surface: a reader
+// thread never touches a CUDA API, never touches `pool->slots` state,
+// device->inflight*, or anything moe_cache_invalidate_session reasons about -
+// it only reads already-mmap'd, read-only model bytes into a buffer it
+// privately owns, which is exactly as safe to do from N threads as from one.
+// The fill worker decides, for each job it pops, whether a matching prefetch
+// landed in time; if not, it falls straight back to its own unchanged
+// synchronous read. Nothing about the worker's GPU-facing behavior (streams,
+// syncs, slot state machine) changes either way - a prefetch hit only
+// replaces where the bytes going into the pinned `stage` buffer came from,
+// via one RAM-to-RAM memcpy, never a direct GPU-visible handoff. That memcpy
+// is deliberately the one cost paid for this: it keeps the GPU-side
+// double-buffering question (when is a staging buffer safe to reuse?) exactly
+// as it already was, instead of adding a second case to reason about on a
+// path corruption bugs have come from before (see the LFRU D2D history in
+// this file's git log).
+struct moe_cache_readahead_buffer {
+    // Owned 1:1 by one reader thread. false: the thread may fill it (and may
+    // be filling it right now). true: filled, and the fill worker may read
+    // it; the thread will not touch `data` again until it sees this flip
+    // back to false. This single flag is the entire synchronization - no
+    // mutex, because exactly one side ever writes `data`/identity in each
+    // state, and the atomic's acquire/release ordering is what makes it
+    // safe for the OTHER side to then read what was written.
+    std::atomic<bool> ready{false};
+    int pool = -1;
+    int slot = -1;
+    uint64_t generation = 0;
+    moe_cache_key key;
+    char * data = nullptr;
+    size_t capacity = 0;
+    size_t valid_bytes = 0;
+    // O_DIRECT scratch (see moe_cache_odirect_read): O_DIRECT needs the
+    // buffer, the file offset, AND the length all aligned to the device's
+    // logical block size, which a job's natural (source, bytes) essentially
+    // never satisfies on its own (expert boundaries are packed tight, no
+    // padding) - so the read lands in this separate, block-aligned,
+    // block-sized-up buffer first, and only the requested sub-range gets
+    // copied into `data` above. Kept apart from `data` so `data`'s contract
+    // (exactly job.bytes, starting at the right content) never changes
+    // regardless of which read path filled it.
+    char * aligned_data = nullptr;
+    size_t aligned_capacity = 0;
+};
+
 // Track 1 steps 4a/4b (docs/plan.md): a real, queryable co-activation edge -
 // which two experts were selected together (4a: same tensor, same routing
 // decision) or in sequence (4b: layer L's top pick -> layer L+1's), rather
@@ -339,6 +397,12 @@ struct moe_cache_job {
     const void * region_base = nullptr;
     size_t region_bytes = 0;
     moe_cache_job_kind kind = moe_cache_job_kind::fill;
+    // Read-ahead pool (see moe_cache_readahead_worker): set once a reader
+    // thread has taken this job to prefetch, so a second reader thread
+    // scanning the same queue doesn't duplicate the read. Never read by the
+    // fill worker itself - it matches readahead results by (pool, slot,
+    // generation, key), not by this flag.
+    bool readahead_claimed = false;
 };
 
 struct moe_cache_demand {
@@ -1062,6 +1126,12 @@ struct moe_cache_device {
     size_t inflight_bytes = 0;
     std::thread worker;
 
+    // Read-ahead I/O pool (see moe_cache_readahead_worker) - empty unless
+    // GGML_CUDA_MOE_CACHE_IO_THREADS enables it. One buffer per thread,
+    // started/joined alongside `worker` above.
+    std::vector<std::unique_ptr<moe_cache_readahead_buffer>> readahead_bufs;
+    std::vector<std::thread> readahead_workers;
+
     cudaStream_t compute_stream = nullptr;
     int32_t * h_ids = nullptr;
     int32_t * d_ids = nullptr;
@@ -1171,6 +1241,14 @@ struct moe_cache_device {
     // one the router asked for, rather than falling back to CPU compute.
     long long substitutions = 0;      // misses served by a stand-in
     long long substitute_declined = 0;// misses where no acceptable stand-in existed
+    // Misses that were already counted as misses above (admission-time
+    // outcome) but then turned into a real resident row before plan()
+    // returned, via GGML_CUDA_MOE_CACHE_SYNC_FETCH's bounded wait for the
+    // fetch just queued for them. Counted separately rather than folded
+    // into hits/rank_hits/layer_hits: those already have an established
+    // meaning (residency at admission time) that this path deliberately
+    // does not share - it is a hit "late", not a hit "then".
+    long long sync_fetch_hits = 0;
     long long inserts = 0;
     long long fills = 0;
     long long fill_failures = 0;
@@ -4028,6 +4106,8 @@ static void moe_cache_host_promote_locked_free(
         moe_cache_device & device, moe_cache_device::cpu_residency & res,
         const void * host_base, int expert, size_t expert_size);
 static size_t moe_cache_host_budget_bytes();
+static void moe_cache_host_evict_to_budget_locked(moe_cache_device & device);
+static size_t moe_cache_host_ram_available_bytes();
 static void moe_cache_host_retire(moe_cache_device & device, void * block, size_t bytes);
 static void moe_cache_history_save(moe_cache_session & session, const moe_cache_device & device);
 static void moe_cache_coact_save(moe_cache_session & session, const moe_cache_device & device);
@@ -4400,13 +4480,25 @@ struct moe_cache_file_backing {
     const char * map_end = nullptr;
     size_t file_offset_at_map_start = 0;
     int fd = -1;
+    // Kept so an O_DIRECT fd can be opened lazily (see moe_cache_odirect_fd)
+    // on top of this same mapping, independent of `fd` above - that one is
+    // opened buffered and is what the already-proven EXPLICIT_READ path
+    // uses; a problem in the O_DIRECT path (unsupported filesystem, EINVAL
+    // on a misaligned request) must never be able to affect it.
+    std::string path;
+    int fd_odirect = -2; // -2 = not yet attempted, -1 = attempted and failed, >=0 = open fd
 };
 
 static std::mutex g_file_backing_mu;
 // Small (one entry per mmap'd GGUF shard actually touched by moe-cache, i.e.
 // single digits to low tens) - linear scan is fine, this only runs once per
-// unique mapping, not once per fill.
-static std::vector<moe_cache_file_backing> g_file_backings;
+// unique mapping, not once per fill. deque, not vector: moe_cache_resolve_file_backing
+// hands back a pointer into this container and releases the lock before the
+// caller dereferences it (read happens outside the lock). A vector's push_back
+// can reallocate and invalidate every existing element's address; a deque's
+// does not, which is what makes handing out that pointer safe once more than
+// one thread (the read-ahead pool) can call resolve concurrently.
+static std::deque<moe_cache_file_backing> g_file_backings;
 
 static const moe_cache_file_backing * moe_cache_resolve_file_backing(const void * addr) {
     std::lock_guard<std::mutex> lock(g_file_backing_mu);
@@ -4457,6 +4549,7 @@ static const moe_cache_file_backing * moe_cache_resolve_file_backing(const void 
         found.map_end   = (const char *) (uintptr_t) end;
         found.file_offset_at_map_start = (size_t) offset;
         found.fd = fd;
+        found.path = path;
         resolved = true;
         break;
     }
@@ -4466,6 +4559,64 @@ static const moe_cache_file_backing * moe_cache_resolve_file_backing(const void 
     }
     g_file_backings.push_back(found);
     return &g_file_backings.back();
+}
+
+// The real, dominant source of host RAM pressure this session traced back
+// to is NOT this file's own host_promote tier (see moe_cache_host_budget_bytes
+// and moe_cache_host_evict_to_budget_locked) - that tier was unused (budget 0)
+// in every run that actually showed the pressure. It is the OS page cache
+// behind the model's mmap, for BOTH expert tensors (this file's own
+// EXPLICIT_READ fills, released individually after each one via
+// moe_cache_release_fill_source_enabled - already handled) and non-expert
+// tensors (attention/SSM/hyper-connection weights - 34 GiB in this model,
+// loaded and held by the generic model loader, which has no release policy
+// at all, see docs/ROADMAP.md). Both live in the SAME underlying file(s) as
+// the expert tensors this code already resolves an fd for, so one call per
+// known file - posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED), "drop every
+// currently-cached page for this file" - relieves pressure from BOTH
+// without this code needing to know anything about non-expert tensors
+// specifically, or needing a per-tensor heat ranking that wouldn't mean
+// anything for weights every token needs equally. Safe to call regardless
+// of concurrent reads elsewhere (dropping a clean file-backed page a reader
+// is mid-fault on just means that fault completes from disk instead of
+// cache - correct either way, never a crash) and cheap to recover from
+// (EXPLICIT_READ reads measured ~2 GB/s - see docs/ROADMAP.md's Item 4).
+// Rate-limited and threshold-gated so this never fires on ordinary,
+// healthy memory headroom - only when the live margin is genuinely tight.
+static void moe_cache_relieve_host_memory_pressure() {
+    static std::mutex mu;
+    static std::chrono::steady_clock::time_point last_check{};
+    std::lock_guard<std::mutex> lock(mu);
+    const auto now = std::chrono::steady_clock::now();
+    if (last_check.time_since_epoch().count() != 0 &&
+        now - last_check < std::chrono::seconds(2)) {
+        return;
+    }
+    last_check = now;
+    const size_t avail = moe_cache_host_ram_available_bytes();
+    // 1.5 GiB: enough that an ordinary, healthy run never trips this (every
+    // observed healthy run this session sat at several GiB available or
+    // more), tight enough to fire well before the box is swap-thrashing
+    // (observed failure state: low hundreds of MiB free, multi-GiB swap
+    // in active use).
+    static const size_t threshold = 1536ull << 20;
+    if (avail == 0 || avail >= threshold) {
+        return;
+    }
+    std::lock_guard<std::mutex> backing_lock(g_file_backing_mu);
+    for (const auto & b : g_file_backings) {
+        if (b.fd >= 0) {
+            posix_fadvise(b.fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+    }
+    static std::atomic<long long> relief_count{0};
+    const long long n = relief_count.fetch_add(1) + 1;
+    if (n <= 10 || n % 50 == 0) {
+        fprintf(stderr, "[moe-cache] host RAM pressure relief #%lld: %zu MiB available (< %zu MiB threshold) - "
+                "dropped page cache for %zu known model file(s)\n",
+                n, avail >> 20, threshold >> 20, g_file_backings.size());
+        fflush(stderr);
+    }
 }
 
 // Reads job.bytes starting at job.source into dst via one explicit pread(),
@@ -4534,6 +4685,203 @@ static bool moe_cache_explicit_read(const void * source, size_t bytes, void * ds
     (void) source; (void) bytes; (void) dst;
     return false;
 #endif
+}
+
+#if defined(__linux__)
+// Lazily opens (once per backing, under g_file_backing_mu since multiple
+// read-ahead threads can race to be first) a SEPARATE O_DIRECT fd for this
+// mapping's file - independent of moe_cache_file_backing::fd, which is
+// opened buffered and is what the already-proven EXPLICIT_READ path uses.
+// Returns -1 if O_DIRECT isn't usable here (open failed - e.g. a filesystem
+// that doesn't support it), which callers treat as "fall back", not an
+// error.
+static int moe_cache_odirect_fd(const moe_cache_file_backing * backing_const) {
+    std::lock_guard<std::mutex> lock(g_file_backing_mu);
+    // Safe: g_file_backings is the only owner of these objects and never
+    // erases (see its own comment) - this is the same object the caller's
+    // const pointer refers to, just mutated under the lock that already
+    // protects every other mutation to it.
+    moe_cache_file_backing * backing = const_cast<moe_cache_file_backing *>(backing_const);
+    if (backing->fd_odirect == -2) {
+        backing->fd_odirect = backing->path.empty()
+            ? -1 : open(backing->path.c_str(), O_RDONLY | O_DIRECT);
+    }
+    return backing->fd_odirect;
+}
+
+// GGML_CUDA_MOE_CACHE_IO_ODIRECT=1 (default off, and only reachable at all
+// when GGML_CUDA_MOE_CACHE_IO_THREADS enables the read-ahead pool these
+// threads belong to): bypasses the page cache entirely, which plain
+// moe_cache_explicit_read above does not - that pread() still goes through
+// the kernel's buffered-I/O path, paying a kernel-side copy into the page
+// cache before the bytes ever reach userspace. O_DIRECT skips that copy, at
+// the cost of needing the request aligned to the device's logical block
+// size (confirmed 512 B here via `blockdev --getss`; 4096 used below as a
+// safe superset covering both 512 B and 4Kn drives, and matching what XFS
+// itself wants for O_DIRECT regardless of the underlying device) for the
+// buffer address, the file offset, AND the length - none of which a job's
+// natural (source, bytes) pair is guaranteed to satisfy, since expert
+// boundaries are packed tight with no padding. Handled by rounding the read
+// OUT to the enclosing aligned region (buf->aligned_data, sized up as
+// needed) and copying only the requested sub-range into buf->data - see the
+// struct comment on moe_cache_readahead_buffer::aligned_data.
+static bool moe_cache_odirect_read(
+        const void * source, size_t bytes, moe_cache_readahead_buffer * buf) {
+    static const size_t ALIGN = 4096;
+    if (!source || !bytes) {
+        return false;
+    }
+    const moe_cache_file_backing * backing = moe_cache_resolve_file_backing(source);
+    if (!backing) {
+        return false;
+    }
+    const int fd = moe_cache_odirect_fd(backing);
+    if (fd < 0) {
+        return false;
+    }
+    const size_t local_off     = (const char *) source - backing->map_start;
+    const size_t file_off      = backing->file_offset_at_map_start + local_off;
+    const size_t aligned_start = file_off & ~(ALIGN - 1);
+    const size_t aligned_end   = (file_off + bytes + ALIGN - 1) & ~(ALIGN - 1);
+    const size_t aligned_len   = aligned_end - aligned_start;
+    const size_t inner_off     = file_off - aligned_start;
+
+    if (buf->aligned_capacity < aligned_len) {
+        free(buf->aligned_data);
+        void * p = nullptr;
+        if (posix_memalign(&p, ALIGN, aligned_len) != 0) {
+            buf->aligned_data = nullptr;
+            buf->aligned_capacity = 0;
+            return false;
+        }
+        buf->aligned_data = (char *) p;
+        buf->aligned_capacity = aligned_len;
+    }
+
+    size_t done = 0;
+    while (done < aligned_len) {
+        const ssize_t got = pread(fd, buf->aligned_data + done, aligned_len - done,
+                                   (off_t) (aligned_start + done));
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return false; // EINVAL (bad alignment somewhere) or any other I/O error - caller falls back
+        }
+        if (got == 0) {
+            return false; // short EOF - shorter file than the mapping implied
+        }
+        done += (size_t) got;
+    }
+    memcpy(buf->data, buf->aligned_data + inner_off, bytes);
+    return true;
+}
+#endif // defined(__linux__)
+
+// One reader thread's loop: claim the earliest not-yet-claimed fill job on
+// device->queue, read its bytes into this thread's own buffer, publish, wait
+// for the fill worker to consume (ready flips back to false), repeat. Exits
+// once session->stopping and nothing left to claim - mirrors the main
+// worker's own stop condition, but never drains a backlog: a prefetch for a
+// job that's about to be cancelled anyway is pure waste, not correctness.
+static void moe_cache_readahead_worker(
+        moe_cache_session * session, moe_cache_device * device,
+        moe_cache_readahead_buffer * buf) {
+    for (;;) {
+        moe_cache_job job;
+        bool have_job = false;
+        {
+            std::unique_lock<std::mutex> lock(session->mu);
+            for (;;) {
+                if (session->stopping || device->dead.load()) {
+                    return;
+                }
+                for (auto & j : device->queue) {
+                    if (j.kind == moe_cache_job_kind::fill && !j.readahead_claimed &&
+                        j.source && j.bytes) {
+                        j.readahead_claimed = true;
+                        job = j;
+                        have_job = true;
+                        break;
+                    }
+                }
+                if (have_job) {
+                    break;
+                }
+                session->cv.wait_for(lock, std::chrono::milliseconds(20));
+            }
+        }
+        // Wait for this thread's own buffer to be free (the fill worker may
+        // still be reading the previous job out of it). Bounded by the same
+        // stopping check so shutdown isn't blocked on a worker that's fallen
+        // behind.
+        while (buf->ready.load(std::memory_order_acquire)) {
+            if (session->stopping || device->dead.load()) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        if (buf->capacity < job.bytes) {
+            char * fresh = (char *) realloc(buf->data, job.bytes);
+            if (!fresh) {
+                continue; // leave unclaimed-by-anyone-else but unread; the fill worker's own fallback covers it
+            }
+            buf->data = fresh;
+            buf->capacity = job.bytes;
+        }
+        static const bool odirect_enabled = [] {
+            const char * e = getenv("GGML_CUDA_MOE_CACHE_IO_ODIRECT");
+            return e && atoi(e) != 0;
+        }();
+        bool read_ok = false;
+#if defined(__linux__)
+        if (odirect_enabled) {
+            read_ok = moe_cache_odirect_read(job.source, job.bytes, buf);
+        }
+#endif
+        if (!read_ok) {
+            read_ok = moe_cache_explicit_read(job.source, job.bytes, buf->data);
+        }
+        if (!read_ok) {
+            // EXPLICIT_READ disabled or failed to resolve/read this mapping -
+            // fall back to the same mmap-touching memcpy the fill worker
+            // itself would do cold. Still worth doing here: even plain page
+            // faults from N threads overlap in the kernel's own readahead,
+            // which is strictly more concurrent than one thread faulting
+            // serially.
+            memcpy(buf->data, job.source, job.bytes);
+            read_ok = true;
+        }
+        buf->pool = job.pool;
+        buf->slot = job.slot;
+        buf->generation = job.generation;
+        buf->key = job.key;
+        buf->valid_bytes = job.bytes;
+        buf->ready.store(true, std::memory_order_release);
+    }
+}
+
+// Called from the fill worker only. Scans this device's (small,
+// IO_THREADS-sized) read-ahead buffers for one that was prefetched for
+// exactly this job; if found, copies it into `dst` (the worker's own pinned
+// `stage` buffer) and hands the buffer back to its owning thread. Returns
+// false - dst untouched - on no match, including the common case where the
+// pool is disabled (readahead_bufs then empty, loop body never runs).
+static bool moe_cache_readahead_consume(
+        moe_cache_device & device, const moe_cache_job & job, char * dst) {
+    for (auto & buf : device.readahead_bufs) {
+        if (!buf->ready.load(std::memory_order_acquire)) {
+            continue;
+        }
+        if (buf->pool == job.pool && buf->slot == job.slot &&
+            buf->generation == job.generation && buf->key == job.key &&
+            buf->valid_bytes == job.bytes) {
+            memcpy(dst, buf->data, job.bytes);
+            buf->ready.store(false, std::memory_order_release);
+            return true;
+        }
+    }
+    return false;
 }
 
 // Defined further down (with the rest of the host-page-release code),
@@ -4684,6 +5032,16 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (!device->dead.load()) {
                     const auto now_idle = std::chrono::steady_clock::now();
                     moe_cache_cold_sweep(*device, now_idle);
+                    // Budget is derived from live MemAvailable and can shrink
+                    // between promotions (see moe_cache_host_budget_bytes) -
+                    // enforced here on the same tick as the cold sweep so a
+                    // shrinking budget gets noticed even if nothing new is
+                    // being promoted right now.
+                    moe_cache_host_evict_to_budget_locked(*device);
+                    // The real pressure relief - see its own comment. Rate-
+                    // limited internally, so calling it on every idle tick
+                    // costs nothing when margin is healthy.
+                    moe_cache_relieve_host_memory_pressure();
                     // Idle is also the right moment to write out usage history:
                     // nothing is decoding, and the file is small.
                     if (now_idle - session->last_history_save >= MOE_CACHE_HISTORY_SAVE_INTERVAL) {
@@ -4708,6 +5066,15 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (now_tick - device->last_cold_sweep >= moe_cache_cold_sweep_interval()) {
                     device->last_cold_sweep = now_tick;
                     moe_cache_cold_sweep(*device, now_tick);
+                    // Same reasoning as the idle branch's call to this -
+                    // the live budget needs enforcing on a schedule, not
+                    // just when a new candidate happens to be promoted.
+                    moe_cache_host_evict_to_budget_locked(*device);
+                    // This is the branch that runs under real load (the idle
+                    // branch, by definition, isn't where load-induced
+                    // pressure shows up) - the busy case is exactly where
+                    // this matters most.
+                    moe_cache_relieve_host_memory_pressure();
                     // Same tick, same lock: check whether this cache is now
                     // standing on VRAM another process needs.
                     moe_cache_relieve_vram_pressure(*session, *device);
@@ -5087,6 +5454,21 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 if (error == cudaSuccess) {
                     error = cudaStreamSynchronize(stream);
                 }
+            } else if (error == cudaSuccess && stage && stage_capacity >= job.bytes &&
+                       moe_cache_readahead_consume(*device, job, stage)) {
+                // A read-ahead thread already has this job's bytes sitting in
+                // RAM - one RAM-to-RAM memcpy (inside the consume call) beats
+                // whatever read this job would otherwise have done cold,
+                // whether that's EXPLICIT_READ's pread() or a plain mmap
+                // touch. No-op (returns false) whenever the pool is disabled
+                // or nothing matched in time, so this costs one scan of a
+                // small (GGML_CUDA_MOE_CACHE_IO_THREADS-sized) array on every
+                // other path.
+                error = cudaMemcpyAsync(
+                        destination, stage, job.bytes, cudaMemcpyHostToDevice, stream);
+                if (error == cudaSuccess) {
+                    error = cudaStreamSynchronize(stream);
+                }
             } else if (error == cudaSuccess && explicit_read_enabled && stage && stage_capacity >= job.bytes &&
                        moe_cache_explicit_read(job.source, job.bytes, stage)) {
                 error = cudaMemcpyAsync(
@@ -5218,6 +5600,30 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         if (fill_timing_log) {
             const double t_finalize_done = moe_cache_wall_clock();
+            // Unsampled, unlike the n<40||n%500==0 block below: that one only
+            // ever prints whichever fill happened to land on a sampled
+            // index, which is a biased sample if read latency is bimodal
+            // (page-cache-hot vs genuinely cold) - exactly the case here,
+            // since the model is 3x larger than RAM. This accumulates EVERY
+            // fill's (copy_ms, i.e. read+copy+sync from job_start) into a
+            // running sum/count/max, so the periodic print below can report
+            // the true mean and worst-case, not just whatever the sparse
+            // sample happened to catch.
+            static std::atomic<long long> g_total_ns{0};
+            static std::atomic<long long> g_count{0};
+            static std::atomic<long long> g_max_ns{0};
+            const long long this_ns = (long long) ((t_copy_done - t_job_start) * 1e9);
+            g_total_ns.fetch_add(this_ns, std::memory_order_relaxed);
+            const long long cnt = g_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            long long cur_max = g_max_ns.load(std::memory_order_relaxed);
+            while (this_ns > cur_max &&
+                   !g_max_ns.compare_exchange_weak(cur_max, this_ns, std::memory_order_relaxed)) {}
+            if (cnt % 200 == 0) {
+                fprintf(stderr, "[moe-cache] FILL_TIMING_AGG n=%lld mean_ms=%.4f max_ms=%.4f\n",
+                        cnt, (double) g_total_ns.load() / (double) cnt / 1e6,
+                        (double) g_max_ns.load() / 1e6);
+                fflush(stderr);
+            }
             static std::atomic<int> logged{0};
             const int n = logged.fetch_add(1);
             if (n < 40 || n % 500 == 0) {
@@ -5252,6 +5658,20 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
     }
 }
 
+// DEFAULT OFF (GGML_CUDA_MOE_CACHE_IO_THREADS=N, 0 = disabled): see
+// moe_cache_readahead_worker's own comment for what this buys and why it's
+// safe to add. Off by default for the same reason every other new mechanism
+// in this file ships off - this needs its own measured A/B before it gets to
+// be the default, not just an argument that it should help.
+static int moe_cache_io_threads() {
+    static const int n = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_IO_THREADS");
+        const int v = e ? atoi(e) : 0;
+        return v > 0 ? v : 0;
+    }();
+    return n;
+}
+
 static bool moe_cache_start_worker(
         moe_cache_session & session, moe_cache_device & device) {
     if (device.worker_started) {
@@ -5260,12 +5680,29 @@ static bool moe_cache_start_worker(
     try {
         device.worker = std::thread(moe_cache_worker, &session, &device);
         device.worker_started = true;
-        return true;
     } catch (...) {
         device.dead.store(true);
         MOE_CACHE_LOG("[moe-cache] CUDA%d failed to start fill worker\n", device.physical);
         return false;
     }
+    const int n_io = moe_cache_io_threads();
+    for (int i = 0; i < n_io; i++) {
+        auto buf = std::make_unique<moe_cache_readahead_buffer>();
+        moe_cache_readahead_buffer * buf_ptr = buf.get();
+        device.readahead_bufs.push_back(std::move(buf));
+        try {
+            device.readahead_workers.emplace_back(
+                    moe_cache_readahead_worker, &session, &device, buf_ptr);
+        } catch (...) {
+            // Not fatal - the fill worker's own synchronous read still
+            // covers every job regardless of how many reader threads
+            // actually started. Just means less queue depth than asked for.
+            MOE_CACHE_LOG("[moe-cache] CUDA%d failed to start read-ahead thread %d/%d\n",
+                    device.physical, i + 1, n_io);
+            break;
+        }
+    }
+    return true;
 }
 
 static int moe_cache_find_pool(
@@ -7146,14 +7583,14 @@ static void moe_cache_session_destroy(void * opaque) {
             fprintf(stderr, "[moe-cache] SUMMARY CUDA%d slots=%zu/%zu (%.2f%% of pool) "
                     "allocated=%zu MiB budget=%zu MiB hits=%lld misses=%lld hit_rate=%.4f "
                     "substitutions=%lld declined=%lld evictions=%lld fills_failed=%lld "
-                    "dispatch_failed=%lld\n",
+                    "dispatch_failed=%lld sync_fetch_hits=%lld\n",
                     d.physical, used, total,
                     total ? 100.0 * (double) used / (double) total : 0.0,
                     d.allocated_bytes >> 20, d.budget_limit >> 20,
                     d.hits, d.misses,
                     lookups ? (double) d.hits / (double) lookups : 0.0,
                     d.substitutions, d.substitute_declined, d.evictions, d.fill_failures,
-                    (long long) d.dispatch_failures);
+                    (long long) d.dispatch_failures, d.sync_fetch_hits);
             if (d.plan_calls > 0 && d.plan_tokens > 0) {
                 const double tok_per_call  = (double) d.plan_tokens / (double) d.plan_calls;
                 const double ids_per_tok   = (double) d.plan_ids / (double) d.plan_tokens;
@@ -7302,6 +7739,23 @@ static void moe_cache_session_destroy(void * opaque) {
     for (auto & device_ptr : session->devices) {
         if (device_ptr->worker_started && device_ptr->worker.joinable()) {
             device_ptr->worker.join();
+        }
+        // Read-ahead pool (see moe_cache_start_worker): session->stopping is
+        // already set and session->cv already notified above, which is the
+        // same condition variable these threads wait on both for a new job
+        // and (bounded) while waiting for their buffer to free up - so this
+        // join is never waiting on an unbounded operation, only whatever
+        // single host read was already in flight.
+        for (auto & t : device_ptr->readahead_workers) {
+            if (t.joinable()) {
+                t.join();
+            }
+        }
+        for (auto & buf : device_ptr->readahead_bufs) {
+            free(buf->data);
+            buf->data = nullptr;
+            free(buf->aligned_data);
+            buf->aligned_data = nullptr;
         }
     }
     {
@@ -11263,6 +11717,48 @@ static int moe_cache_plan_impl(
     // block after the demand-fill queue below.
     bool group_evicted_this_call = false;
 
+    // GGML_CUDA_MOE_CACHE_SYNC_FETCH=1 (default off): rows that just earned
+    // a real (unsubstituted, push_front-priority) demand fill are recorded
+    // here, by (row index into slot_indices, pool, slot, generation) - after
+    // this whole admission pass finishes and the worker is woken (see the
+    // wait loop at this function's end), each is given a short bounded wait
+    // for ITS OWN fetch to land before falling back to -1. The alternative
+    // today is that this exact row - having just been judged worth a real
+    // fetch - still gets handed to the CPU's dense MUL_MAT_ID fallback for
+    // this one token, which reads the expert via a raw, unoptimized mmap
+    // touch (no EXPLICIT_READ, no coordination with anything this file
+    // already does to make reads fast) - the slowest path in the whole
+    // system, reached precisely when demand is real. A short wait for the
+    // SAME fetch this code just decided to do anyway, using the already-fast
+    // path (EXPLICIT_READ, ~0.3-0.8ms per expert, measured directly this
+    // session), converts that into a real GPU hit far more often than not.
+    // Bounded on both sides - a per-row timeout (falls through to today's
+    // unchanged -1 on expiry, same safety net as always) and a cap on how
+    // many rows one plan() call will wait for at all, so a token with an
+    // unusually large miss burst can never make ITS OWN latency worse than
+    // today by waiting for everything serially.
+    static const bool sync_fetch_enabled = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SYNC_FETCH");
+        return e && atoi(e) != 0;
+    }();
+    struct moe_cache_sync_fetch_wait {
+        int row;
+        int slot;
+        uint64_t generation;
+        moe_cache_key key;
+    };
+    std::vector<moe_cache_sync_fetch_wait> sync_fetch_waits;
+    static const int sync_fetch_max_rows = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SYNC_FETCH_MAX_ROWS");
+        const int v = e ? atoi(e) : 8;
+        return v > 0 ? v : 8;
+    }();
+    static const int sync_fetch_timeout_ms = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_SYNC_FETCH_TIMEOUT_MS");
+        const int v = e ? atoi(e) : 50;
+        return v > 0 ? v : 50;
+    }();
+
     // See device.layer_hits/layer_misses's own comment for what this
     // measures and why (throughput cost per layer, not activation shape).
     // session.mu is already held for this whole function, same as the
@@ -11483,8 +11979,17 @@ static int moe_cache_plan_impl(
                 residency->selections[expert] >= MOE_CACHE_HEAT_STEP * 4 &&
                 residency->host_slot[expert].load(std::memory_order_relaxed) == nullptr &&
                 device.host_promote_queue.size() < 64) {
-                device.host_promote_queue.emplace_back(node->host_base, expert);
-                wake_worker = true;
+                // Skip if this expert is already VRAM-resident: a RAM copy
+                // of something already free to serve from VRAM duplicates
+                // the same bytes for no benefit, spending budget that could
+                // instead cover an expert VRAM doesn't currently hold.
+                const auto vram_it = pool.map.find(moe_cache_key{node->host_base, expert});
+                const bool vram_hit = vram_it != pool.map.end() &&
+                        pool.slots[vram_it->second].state == moe_cache_slot_state::valid;
+                if (!vram_hit) {
+                    device.host_promote_queue.emplace_back(node->host_base, expert);
+                    wake_worker = true;
+                }
             }
             // A selected expert is live again: clear the cold mark so a later
             // dormant stretch re-advises rather than being skipped forever.
@@ -11632,6 +12137,17 @@ static int moe_cache_plan_impl(
                 moe_cache_pool_note_heat_step(pool, slot.heat);
                 moe_cache_atlas_align_note_hit(device, key);
                 moe_cache_predictor_note_hit(device, key);
+                // VRAM now serves this expert for free - a RAM copy of it
+                // is pure duplication, bought with budget that could cover
+                // something VRAM doesn't currently hold. Free it the moment
+                // VRAM confirms the hit, not on the next unrelated sweep.
+                if (residency && (size_t) expert < residency->host_slot.size()) {
+                    void * ram_copy = residency->host_slot[expert].exchange(
+                            nullptr, std::memory_order_acq_rel);
+                    if (ram_copy) {
+                        moe_cache_host_retire(device, ram_copy, residency->expert_size);
+                    }
+                }
                 // Any real hit, from either segment, promotes to (or
                 // refreshes within) protected_ - a resident slot being
                 // requested again is exactly the "genuinely hot, not just
@@ -11969,12 +12485,22 @@ static int moe_cache_plan_impl(
             // MOST of its demand went uncovered is a property of the expert's
             // accumulated history, so it stays stable as more tokens arrive
             // and still needs no threshold anybody picked.
-            if ((int) demand->unsubstituted * 2 >= (int) demand->count) {
+            const bool unsubstituted_priority = (int) demand->unsubstituted * 2 >= (int) demand->count;
+            if (unsubstituted_priority) {
                 device.queue.push_front(job);
             } else {
                 device.queue.push_back(job);
             }
             device.queued_bytes += node->expert_size;
+            // Only the push_front (unsubstituted, real-demand) case: the
+            // push_back case already produced a dispatchable row via
+            // substitution this token, so there is nothing for this row to
+            // gain from waiting - see this function's own top-of-function
+            // comment on sync_fetch_waits.
+            if (sync_fetch_enabled && unsubstituted_priority &&
+                (int) sync_fetch_waits.size() < sync_fetch_max_rows) {
+                sync_fetch_waits.push_back({index, slot_index, slot.generation, key});
+            }
         } catch (...) {
             moe_cache_slot_reset(pool, slot_index, true);
             device.insert_skips++;
@@ -12322,10 +12848,55 @@ static int moe_cache_plan_impl(
     }
 
     device.nodes++;
-    lock.unlock();
+
     if (wake_worker) {
         session.cv.notify_all();
     }
+
+    // Synchronous fetch-on-miss (GGML_CUDA_MOE_CACHE_SYNC_FETCH=1, off by
+    // default). The rows collected above are exactly the unsubstituted
+    // misses just admitted into a fresh slot and queued at the front -
+    // the fill worker was just woken to service them. Giving the CPU
+    // fallback a short, bounded chance to see the real fetch land turns
+    // a dense CPU matmul (confirmed by direct /proc stat measurement to
+    // cost tens of CPU-seconds and, under memory pressure, to stall in
+    // D-state on raw mmap reads) into an ordinary VRAM hit, at the cost
+    // of this call waiting a few hundred microseconds to low tens of ms
+    // when the fetch is fast - which the measured fill latency (~0.3-0.8
+    // ms) says it usually is. Any row that does not land in time is left
+    // exactly as it was (slot_indices[row] stays whatever it already
+    // was), falling through to today's existing CPU path - no new
+    // failure mode, only a new chance at a hit.
+    if (!sync_fetch_waits.empty()) {
+        const auto deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(sync_fetch_timeout_ms);
+        for (const auto & w : sync_fetch_waits) {
+            if (w.slot < 0 || w.slot >= pool.n_slots) {
+                continue;
+            }
+            session.idle_cv.wait_until(lock, deadline, [&] {
+                const moe_cache_slot & s = pool.slots[w.slot];
+                return s.state != moe_cache_slot_state::copying ||
+                       s.generation != w.generation;
+            });
+            moe_cache_slot & s = pool.slots[w.slot];
+            if (s.state == moe_cache_slot_state::valid &&
+                s.generation == w.generation && s.key == w.key) {
+                // Deliberately leaves device.misses/rank_misses/layer_misses
+                // alone - this row was already counted as a miss above (the
+                // established meaning: residency at admission time), and
+                // this path is a different thing: a late arrival this same
+                // call waited a bounded amount for. See device.sync_fetch_hits.
+                s.heat = std::min(MOE_CACHE_HEAT_MAX, s.heat + MOE_CACHE_HEAT_STEP);
+                moe_cache_pool_note_heat_step(pool, s.heat);
+                slot_indices[w.row] = w.slot;
+                device.sync_fetch_hits++;
+                hits++;
+            }
+        }
+    }
+
+    lock.unlock();
     return hits;
 }
 
@@ -13785,6 +14356,7 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
                 sum.prefetches      += device.prefetches;
                 sum.substitutions       += device.substitutions;
                 sum.substitute_declined += device.substitute_declined;
+                sum.sync_fetch_hits     += device.sync_fetch_hits;
                 for (int r = 0; r < GGML_MOE_CACHE_MAX_RANK; r++) {
                     sum.rank_hits[r]   += device.rank_hits[r];
                     sum.rank_misses[r] += device.rank_misses[r];
@@ -13861,6 +14433,38 @@ static void moe_cache_get_summary(ggml_moe_cache_summary * out) {
 // makes the two mechanisms a mixture rather than a stack: each holds the part it
 // is good at, and neither holds the other's part.
 //
+// MemAvailable from /proc/meminfo, else the CPU backend's reported free
+// memory; 0 when neither is readable. Same basis tools/server/server-context.cpp
+// already uses to derive the prompt-cache budget, and the same reason:
+// MemAvailable (not MemTotal, not a one-time "free" snapshot) is what
+// actually accounts for reclaimable page cache - exactly the pool this
+// tier's own mmap'd weights sit in, so sizing off anything else either
+// starves the box (sizing off MemTotal) or never grows past whatever was
+// free at the one moment this got read (sizing off a cached "free").
+static size_t moe_cache_host_ram_available_bytes() {
+    size_t avail_bytes = 0;
+    {
+        std::ifstream meminfo("/proc/meminfo");
+        std::string key, unit;
+        size_t value_kib = 0;
+        while (meminfo >> key >> value_kib >> unit) {
+            if (key == "MemAvailable:") {
+                avail_bytes = value_kib * 1024ULL;
+                break;
+            }
+        }
+    }
+    if (avail_bytes == 0) {
+        ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+        if (cpu_dev) {
+            size_t free_ram = 0, total_ram = 0;
+            ggml_backend_dev_memory(cpu_dev, &free_ram, &total_ram);
+            avail_bytes = free_ram;
+        }
+    }
+    return avail_bytes;
+}
+
 // Budget is derived, never constant, on the same rule already used for the VRAM
 // budget and the prompt cache: a share of what is actually available, clamped by
 // any cgroup limit, because a fixed number is wrong on both a 16GB laptop and a
@@ -13874,6 +14478,40 @@ static size_t moe_cache_host_budget_bytes() {
         return 0; // opt-in: this allocates real host memory, never by surprise
     }();
     return value;
+}
+
+// Dead while moe_cache_host_budget_bytes() stays a fixed value (budget never
+// shrinks on its own, so nothing to react to) - kept only because the two
+// call sites below are harmless no-ops at that fixed value and removing
+// them would be a second edit for no behavior change. Not reinstated as a
+// live mechanism without a real reason to shrink the budget again.
+static void moe_cache_host_evict_to_budget_locked(moe_cache_device & device) {
+    const size_t budget = moe_cache_host_budget_bytes();
+    while (device.host_bytes > budget) {
+        moe_cache_device::cpu_residency * victim_res = nullptr;
+        size_t victim_expert = 0;
+        uint32_t victim_heat = UINT32_MAX;
+        for (auto & [vb, vres] : device.residency) {
+            for (size_t e = 0; e < vres.host_slot.size(); e++) {
+                if (vres.host_slot[e].load(std::memory_order_relaxed) == nullptr) {
+                    continue;
+                }
+                if (vres.selections[e] < victim_heat) {
+                    victim_heat   = vres.selections[e];
+                    victim_res    = &vres;
+                    victim_expert = e;
+                }
+            }
+        }
+        if (!victim_res) {
+            return; // nothing left resident to evict
+        }
+        void * old = victim_res->host_slot[victim_expert].exchange(nullptr, std::memory_order_acq_rel);
+        if (!old) {
+            return;
+        }
+        moe_cache_host_retire(device, old, victim_res->expert_size);
+    }
 }
 
 // Release the mmap pages behind an expert now that we hold our own copy.
@@ -14439,8 +15077,18 @@ static void moe_cache_prefetch(const void * host_base, const int32_t * ids, int 
                         (size_t) expert < res_it->second.host_slot.size() &&
                         res_it->second.host_slot[expert].load(std::memory_order_relaxed) == nullptr &&
                         device.host_promote_queue.size() < 64) {
-                        device.host_promote_queue.emplace_back(host_base, expert);
-                        woke = true;
+                        // Same duplication check as the real-hit path: a RAM
+                        // copy of something VRAM already holds (or, on this
+                        // prefetch path, is already in the middle of
+                        // admitting at slot_index above) spends budget on a
+                        // copy nothing needs to read.
+                        const auto existing_check = pool.map.find(key);
+                        const bool already_vram = existing_check != pool.map.end() &&
+                                pool.slots[existing_check->second].state == moe_cache_slot_state::valid;
+                        if (!already_vram) {
+                            device.host_promote_queue.emplace_back(host_base, expert);
+                            woke = true;
+                        }
                     }
                 }
 

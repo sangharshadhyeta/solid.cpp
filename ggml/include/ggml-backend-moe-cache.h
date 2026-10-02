@@ -72,6 +72,10 @@ struct ggml_moe_cache_summary {
 	// a substitution is a miss that was made cheap, not a hit.
 	long long substitutions;
 	long long substitute_declined;
+	// Misses already counted above that turned into a real resident row
+	// before plan() returned, via GGML_CUDA_MOE_CACHE_SYNC_FETCH's bounded
+	// wait for the fetch just queued for them (off by default).
+	long long sync_fetch_hits;
 
 	long long rank_hits[GGML_MOE_CACHE_MAX_RANK];
 	long long rank_misses[GGML_MOE_CACHE_MAX_RANK];
