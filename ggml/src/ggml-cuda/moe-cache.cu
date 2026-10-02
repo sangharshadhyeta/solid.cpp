@@ -219,6 +219,15 @@ struct moe_cache_slot {
     // slot (see moe_cache_ring_take). Cleared by the first real hit, which turns
     // it into an ordinary resident, or by the slot being reset.
     bool spec = false;
+    // Holds confirmed-demand content admitted through the force-GPU reserve
+    // (see moe_cache_force_ring_take) rather than through an ordinary
+    // eviction search. Distinct from spec above - this is real, already-
+    // wanted data, not a prediction - kept as its own flag so the two
+    // mechanisms' bookkeeping never cross. Cleared on reset same as spec;
+    // ordinary demand can still reclaim this slot through the normal LRU
+    // path like any other resident, which only shrinks the reserve, same
+    // as the ring tolerates for predictions.
+    bool force_reserved = false;
     // How confident the prediction that filled this slot was, in [0,1].
     //
     // Two mechanisms predict into this ring - the router-lookahead matmul and
@@ -344,6 +353,18 @@ struct moe_cache_pool {
     int ring_count = 0;
     int ring_seeded = 0;     // lifetime probation slots given up to the ring, capped at its target
     std::deque<int> ring_fifo;
+    // Force-GPU reserve (GGML_CUDA_MOE_CACHE_FORCE_GPU): same lifetime-cap
+    // discipline as the prediction ring above, for a different trigger - a
+    // CONFIRMED miss with no stand-in, not a prediction. Kept fully separate
+    // from ring_count/ring_seeded/ring_fifo (own slot flag, own fifo) rather
+    // than reusing them, so this cannot perturb the lookahead/prerouter
+    // corroboration bookkeeping those fields also carry. See
+    // moe_cache_force_ring_take for why an unbounded version of this
+    // (evicting a real resident on every triggering row, forever) collapsed
+    // hit rate and substitution coverage together in a self-reinforcing
+    // spiral - measured directly, not theorised.
+    int force_ring_seeded = 0;
+    std::deque<int> force_ring_fifo;
     long long fills_since_decay = 0;
     // Slow-moving reference scale for this pool's own heat magnitudes -
     // updated on every heat step and halved alongside moe_cache_pool_decay,
@@ -1249,6 +1270,13 @@ struct moe_cache_device {
     // meaning (residency at admission time) that this path deliberately
     // does not share - it is a hit "late", not a hit "then".
     long long sync_fetch_hits = 0;
+    // Rows forced through admission by GGML_CUDA_MOE_CACHE_FORCE_GPU
+    // because neither a hit nor a stand-in covered them - see
+    // moe_cache_plan_impl's force_admit. A subset of these end up inside
+    // sync_fetch_hits too (the ones that landed in time); this counts the
+    // attempt, not the outcome, so it stays the right denominator for
+    // "how often did the absolute-no-CPU rule actually have to act".
+    long long force_admits = 0;
     long long inserts = 0;
     long long fills = 0;
     long long fill_failures = 0;
@@ -1323,6 +1351,9 @@ struct moe_cache_device {
     long long ring_hits = 0;
     long long ring_rotations = 0;
     long long ring_seeds = 0;
+    long long force_ring_seeds = 0;      // lifetime evictions paid to seed the force-GPU reserve (capped at its target)
+    long long force_ring_rotations = 0;  // reuses within the reserve - costs nothing further against the main pool
+    long long force_ring_exhausted = 0;  // reserve fully occupied and all in flight - the one case force_admit can still miss
     // Cross-depth agreement gate for GGML_CUDA_MOE_CACHE_SPEC_EVICT_MODE=agree
     // (see moe_cache_prefetch): a candidate a farther, less-accurate depth
     // wanted but could not get a free slot for is remembered here, along
@@ -2945,6 +2976,7 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
             pool.ring_count--;
         }
     }
+    slot.force_reserved = false; // stale force_ring_fifo entries are filtered lazily, same as ring_fifo above
     slot.prev = -1;
     slot.next = -1;
     if (add_to_free) {
@@ -9517,6 +9549,8 @@ static bool moe_cache_atlas_admit_ring_enabled() {
 static int moe_cache_ring_target(const moe_cache_pool & pool);
 static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool, int ring_target,
                                float incoming_conf = 0.0f);
+static int moe_cache_force_gpu_reserve_target(const moe_cache_pool & pool);
+static int moe_cache_force_ring_take(moe_cache_device & device, moe_cache_pool & pool, int target);
 static bool moe_cache_spec_corroborate(moe_cache_device & device, moe_cache_pool & pool,
                                        const moe_cache_key & key, uint8_t src);
 
@@ -11741,6 +11775,27 @@ static int moe_cache_plan_impl(
         const char * e = getenv("GGML_CUDA_MOE_CACHE_SYNC_FETCH");
         return e && atoi(e) != 0;
     }();
+    // GGML_CUDA_MOE_CACHE_FORCE_GPU (default ON): a row with neither a cache
+    // hit nor an acceptable stand-in must never fall through to the CPU's
+    // dense MUL_MAT_ID fallback. Unlike sync_fetch above (which only waits
+    // for fetches the ordinary demand-threshold admission already decided
+    // to do), this bypasses that threshold FOR THIS ROW ONLY: admission's
+    // demand->count >= admit_after gate exists to protect the cache's
+    // locality from one-off churn (measured directly - loosening it for
+    // EVERY miss collapsed hit rate from 22% to 1.3%), which is the right
+    // policy for "should this become a reused resident". It is the wrong
+    // policy for "is CPU allowed to compute this at all" - those are
+    // different questions, and only the second one this flag answers.
+    // Implies the row is always queued (never admission_skips'd or
+    // insert_skips'd for lack of per-call budget) and always waited for
+    // below, uncapped by sync_fetch_max_rows - moe_cache never sees a batch
+    // wider than GGML_OP_OFFLOAD_MIN_BATCH (bigger ones are offloaded to
+    // the GPU dense op before this cache exists), so the uncapped wait is
+    // bounded in practice to that same small width, not unbounded.
+    static const bool force_gpu_enabled = [] {
+        const char * e = getenv("GGML_CUDA_MOE_CACHE_FORCE_GPU");
+        return !e || atoi(e) != 0;
+    }();
     struct moe_cache_sync_fetch_wait {
         int row;
         int slot;
@@ -11755,7 +11810,7 @@ static int moe_cache_plan_impl(
     }();
     static const int sync_fetch_timeout_ms = [] {
         const char * e = getenv("GGML_CUDA_MOE_CACHE_SYNC_FETCH_TIMEOUT_MS");
-        const int v = e ? atoi(e) : 50;
+        const int v = e ? atoi(e) : (force_gpu_enabled ? 150 : 50);
         return v > 0 ? v : 50;
     }();
 
@@ -12370,6 +12425,10 @@ static int moe_cache_plan_impl(
             }
         }
         const bool covered_by_standin = slot_indices[index] >= 0;
+        // Neither a hit nor a stand-in: GGML_CUDA_MOE_CACHE_FORCE_GPU says
+        // this row must reach VRAM regardless of admission economics - see
+        // this function's own top-of-function comment on force_gpu_enabled.
+        const bool force_admit = force_gpu_enabled && !covered_by_standin;
 
         moe_cache_demand * demand = nullptr;
         try {
@@ -12411,12 +12470,12 @@ static int moe_cache_plan_impl(
         // not tell them apart. Weight 0 is exactly today's behaviour.
         const int exact_w = moe_cache_admit_exact_weight();
         const int effective_demand = (int) demand->count + exact_w * (int) demand->exact_required;
-        if (effective_demand < admit_after) {
+        if (!force_admit && effective_demand < admit_after) {
             device.admission_skips++;
             continue;
         }
         const size_t queue_limit = session.config.queue_mb << 20;
-        if (inserts_left <= 0 || (int)device.queue.size() >= session.config.queue_max ||
+        if ((!force_admit && inserts_left <= 0) || (int)device.queue.size() >= session.config.queue_max ||
             node->expert_size > queue_limit - std::min(queue_limit, device.queued_bytes)) {
             device.insert_skips++;
             continue;
@@ -12426,6 +12485,26 @@ static int moe_cache_plan_impl(
         if (!pool.free_slots.empty()) {
             slot_index = pool.free_slots.back();
             pool.free_slots.pop_back();
+        } else if (force_admit) {
+            // Never the direct lru_head/protected_head search below for a
+            // forced row: that search evicts whatever is genuinely coldest
+            // in the WHOLE pool, unbounded, once per forced row - measured
+            // directly to collapse hit rate to 0.9% and substitution
+            // coverage to a quarter of normal, because force-admit's own
+            // evictions were destroying the exact residents substitution
+            // depends on, in a self-reinforcing spiral. The reserve bounds
+            // that cost to a one-time seed (see moe_cache_force_ring_take).
+            const int target = moe_cache_force_gpu_reserve_target(pool);
+            slot_index = moe_cache_force_ring_take(device, pool, target);
+            if (slot_index < 0) {
+                // Reserve fully occupied and every member in flight right
+                // now - rare (the reserve is sized well above top-k). No
+                // safe slot to force into; this one row falls through to
+                // the CPU path same as force_gpu being off, same as any
+                // other genuine resource exhaustion in this function.
+                device.insert_skips++;
+                continue;
+            }
         } else {
             // Drain probation first - only touch protected_ (proven-hot
             // slots, reused at least once while resident) once probation
@@ -12486,18 +12565,23 @@ static int moe_cache_plan_impl(
             // accumulated history, so it stays stable as more tokens arrive
             // and still needs no threshold anybody picked.
             const bool unsubstituted_priority = (int) demand->unsubstituted * 2 >= (int) demand->count;
-            if (unsubstituted_priority) {
+            if (unsubstituted_priority || force_admit) {
                 device.queue.push_front(job);
             } else {
                 device.queue.push_back(job);
             }
             device.queued_bytes += node->expert_size;
-            // Only the push_front (unsubstituted, real-demand) case: the
-            // push_back case already produced a dispatchable row via
-            // substitution this token, so there is nothing for this row to
-            // gain from waiting - see this function's own top-of-function
-            // comment on sync_fetch_waits.
-            if (sync_fetch_enabled && unsubstituted_priority &&
+            // force_admit: uncapped and unconditional - this row has no
+            // hit and no stand-in, so GGML_CUDA_MOE_CACHE_FORCE_GPU means
+            // it MUST be waited for, not merely offered a nice-to-have
+            // wait. The sync_fetch_max_rows cap below is for the separate,
+            // genuinely optional case (sync_fetch_enabled on its own,
+            // force_gpu off): a row that already has a dispatchable
+            // substituted row and would only gain a sharper one later.
+            if (force_admit) {
+                device.force_admits++;
+                sync_fetch_waits.push_back({index, slot_index, slot.generation, key});
+            } else if (sync_fetch_enabled && unsubstituted_priority &&
                 (int) sync_fetch_waits.size() < sync_fetch_max_rows) {
                 sync_fetch_waits.push_back({index, slot_index, slot.generation, key});
             }
@@ -14832,6 +14916,63 @@ static int moe_cache_ring_take(moe_cache_device & device, moe_cache_pool & pool,
         device.ring_rotations++;
         return index;
     }
+    return -1;
+}
+
+// Reserve size for GGML_CUDA_MOE_CACHE_FORCE_GPU, as a share of the pool.
+// Floored at 16: top-10 routing means a single layer can need up to 10
+// slots in one plan() call, and the floor leaves headroom for more than
+// one such row still in flight (state=copying, skipped by the rotation
+// below) at once.
+static int moe_cache_force_gpu_reserve_target(const moe_cache_pool & pool) {
+    const int raw = moe_cache_tunable_int_scoped("GGML_CUDA_MOE_CACHE_FORCE_GPU_RESERVE_PCT", 4);
+    const int pct = raw < 1 ? 1 : (raw > 50 ? 50 : raw);
+    return std::max(16, pool.n_slots * pct / 100);
+}
+
+// The force-GPU counterpart to moe_cache_ring_take, same lifetime-cap
+// discipline, different trigger (a confirmed miss with no stand-in, not a
+// prediction) and own bookkeeping (force_reserved/force_ring_fifo/
+// force_ring_seeded, never ring_count/ring_fifo/spec) - see both fields'
+// own comments for why they are kept separate. Plain oldest-first rotation
+// among the reserve's own members: unlike the prediction ring there is no
+// confidence score to compare forced rows by, they are all equally "this
+// token needs it now".
+static int moe_cache_force_ring_take(moe_cache_device & device, moe_cache_pool & pool, int target) {
+    if ((int) pool.force_ring_fifo.size() < target && pool.force_ring_seeded < target) {
+        int candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.lru_head);
+        if (candidate < 0) {
+            candidate = moe_cache_pick_coldest_unpinned(device, pool, pool.protected_head);
+        }
+        if (candidate >= 0) {
+            pool.force_ring_seeded++;
+            moe_cache_slot_reset(pool, candidate, false);
+            device.evictions++;
+            device.force_ring_seeds++;
+            pool.slots[candidate].force_reserved = true;
+            pool.force_ring_fifo.push_back(candidate);
+            return candidate;
+        }
+    }
+    for (size_t n = pool.force_ring_fifo.size(); n > 0; n--) {
+        const int index = pool.force_ring_fifo.front();
+        pool.force_ring_fifo.pop_front();
+        moe_cache_slot & slot = pool.slots[index];
+        if (!slot.force_reserved) {
+            continue; // reclaimed by ordinary demand already - no longer ours to rotate
+        }
+        if (slot.readers > 0 || slot.state == moe_cache_slot_state::copying) {
+            pool.force_ring_fifo.push_back(index); // still in flight - try the next member
+            continue;
+        }
+        moe_cache_slot_reset(pool, index, false);
+        device.evictions++;
+        device.force_ring_rotations++;
+        pool.slots[index].force_reserved = true;
+        pool.force_ring_fifo.push_back(index);
+        return index;
+    }
+    device.force_ring_exhausted++;
     return -1;
 }
 
