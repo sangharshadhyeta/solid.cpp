@@ -330,12 +330,15 @@ footer a{color:var(--muted);text-decoration:underline;}
 <span class="hero-zero-sub">what one plain launch works out, per model</span>
 </div>
 <div class="hero-zero-grid">
-<div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">72.62<small> tok/s</small></span><span class="hz-note">served, reasoning on, 10/10 answers correct &mdash; ncmoe 20, rank&nbsp;4, cache 8192&nbsp;MiB, &minus;ub 2048</span></div>
-<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">12.85<small> tok/s</small></span><span class="hz-note">ncmoe 47, rank&nbsp;2, cache 2048&nbsp;MiB</span></div>
+<div><span class="hz-model">Gemma-4 26B</span><span class="hz-note">17&nbsp;GB &mdash; fits</span><span class="hz-num">77.6<small> tok/s</small></span><span class="hz-note">shipped defaults, bare launch, paired &amp; controlled &mdash; 64k context, all experts host-resident, cache fills on demand</span></div>
+<div><span class="hz-model">Qwen3.8-Flash-Next</span><span class="hz-note">87&nbsp;GB &mdash; does not</span><span class="hz-num">&mdash;<small> tok/s</small></span><span class="hz-note">a clean number is pending a re-run &mdash; the last attempt ran while an unrelated background job was contending for the same disk the model streams experts from</span></div>
 </div>
-<p class="hero-zero-foot">Same code, same 12&nbsp;GB card, same day. It reached opposite conclusions on the two
-&mdash; trading GPU layers for cache on one and not the other, accepting the most aggressive substitution setting
-on one and <em>rejecting it as degenerate</em> on the other. <a href="#self-calibrating">What it decides, and how</a>.</p>
+<p class="hero-zero-foot">Same code, same 12&nbsp;GB card. The two models still get opposite treatment where it
+matters &mdash; one keeps every expert in host RAM and streams on demand, the other cannot avoid real SSD
+reads &mdash; but the numbers above are from the <strong>paired, controlled</strong> method this page now uses
+throughout: same prompts and seeds across settings, an identical-config control run alongside every comparison,
+because greedy output here is not bit-reproducible run to run and an unpaired number can read 10&ndash;20%
+either side of the real effect. <a href="#self-calibrating">What it decides, and how</a>.</p>
 </div>
 </div>
 </header>
@@ -507,48 +510,47 @@ reason printed, while the placement and sizing from the same entry &mdash; which
 opinion about &mdash; still apply. This is not hypothetical: a gemma-4 entry recorded rank 2 because it was
 fastest, and the fidelity check added later scored that same rank at 0.33.</p>
 
-<pre><code># the same run, with everything pinned by hand instead (as of 1 October 2026 the pre-router, substitution and
-# probabilistic acceptance are the defaults - this form is the record of what was measured, not a requirement)
-GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1 \
-GGML_CUDA_MOE_CACHE_SUBSTITUTE=1 GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK=4 \
+<pre><code># the same bare launch, with the knobs that are genuinely worth knowing about pinned by hand instead - as of
+# 2 October 2026 everything in this block is ALREADY the default; pin it only to override, not because the
+# bare launch needs help reaching it
 llama-server \
   -m gemma-4-26B-A4B-it-UD-Q4_K_M.gguf \
   -md mtp-gemma-4-26B-A4B-it-Q8_0.gguf \
-  --spec-type draft-mtp -bs --jinja \
-  --moe-cache auto \
-  -c 65536 \
-  -ctk q8_0 -ctv q8_0 \
-  --expert-atlas-file expert-atlas-evolve.json \
+  --spec-type draft-mtp \
+  --moe-cache auto -ncmoe 99 \
+  -c 65536 --parallel 2 \
+  --spec-draft-n-max 4 \
   --host 0.0.0.0 --port 8080</code></pre>
 
 <div class="tablewrap">
 <table>
 <colgroup><col style="width:34%"><col style="width:66%"></colgroup>
-<thead><tr><th>Flag</th><th>What it turns on</th></tr></thead>
+<thead><tr><th>Flag</th><th>What it turns on, and whether you still need to type it</th></tr></thead>
 <tbody>
-<tr><td><code>-c 65536</code></td><td>The context you want. Expert placement is derived <em>from</em> this &mdash; ask for more and the fork moves experts to CPU RAM to fit it, rather than silently shrinking your context. <strong>No <code>-ncmoe</code> needed:</strong> it resolved to 21 CPU layers on its own.</td></tr>
-<tr><td><code>--moe-cache auto</code></td><td>GPU-resident cache for the CPU-offloaded experts, LFRU eviction. 79% hit rate warm. Also enables router-lookahead prefetch, which predicts the next layer's experts and fetches them during the current layer's compute.</td></tr>
-<tr><td><code>GGML_CUDA_MOE_CACHE_TRAIN_PREDICTOR=1</code></td><td>Live-activation predictor: a small linear layer per model, trained online on the real hidden state each routing decision came from, feeding the same free-slot-only warming path the atlas uses. Self-tuning (no rate constant to guess) and persists its learned weights across restarts. Measured separately, on Ornith-1.5-35B: +0.12pp hit rate, 3/4 rounds &mdash; see the proof table below, not part of this command's own gemma-4 numbers.</td></tr>
-<tr><td><code>GGML_CUDA_MOE_CACHE_SUBSTITUTE=1</code> <code>_MIN_RANK=4</code></td><td>On a miss, serve a resident stand-in instead of paying CPU fallback, gated so the router's most consequential picks still get exact compute. <strong>The rank is calibrated per model now</strong>, and so is the stand-in quality bar that decides when a miss waits for the real expert instead &mdash; gemma-4 measures rank 4 (72.62 served against 58.62 with substitution off, both answering 10/10), Qwen3.8-Flash-Next rank 2. Set this by hand only to override. Measured separately on Ornith-1.5-35B: +8.11% tok/s, 4/4 rounds, hit rate unchanged (it can't move that metric by construction).</td></tr>
-<tr><td><code>-ctk q8_0 -ctv q8_0</code></td><td>8-bit KV cache &mdash; halves it (2,180 &rarr; 1,158 MiB) and the freed gigabyte automatically becomes two more expert layers on the GPU. Verified lossless here: identical outputs, full needle recall at 24.7k tokens. Keep K and V the <em>same</em> type or you fall off the fused Flash Attention path.</td></tr>
-<tr><td><code>--spec-type draft-mtp</code> <code>-md</code></td><td>Multi-token prediction with the draft model. ~0.6 draft acceptance here.</td></tr>
-<tr><td><code>-bs</code></td><td>Backend sampling.</td></tr>
-<tr><td><code>--expert-atlas-file</code></td><td><strong>Optional now</strong> &mdash; defaults to a per-model path under the cache directory, which the server keeps current from live traffic (<code>scripts/moe-atlas-evolve.py</code>, co-activation-derived, accumulating and re-deciding its own axis count as more traffic arrives). Pass this only to override the location. The static 9-topic-probe generator that used to seed it has been removed: the discovered atlas needs no seed, and its layout is what the Brain view was designed around. Cells serving as a live substitution stand-in flash yellow in the same view.</td></tr>
+<tr><td><code>-c 65536</code></td><td>The context you want. <strong>No <code>-ncmoe</code> needed to make it fit:</strong> a MoE model with no explicit <code>-ncmoe</code> places every expert layer on the host and lets the cache fill on demand (measured faster than any partial-residency placement on a card this size), and the server now refuses to silently collapse to a 4,096-token context when memory is tight - 65,536 is the floor.</td></tr>
+<tr><td><code>--spec-type draft-mtp</code></td><td><strong>Default now if <code>-md</code> names an MTP head</strong> - the server reads the file's own header (not its filename) to recognise one. Pin this only if you have a draft file that is <em>not</em> an MTP head and want a different speculative mode. Leaving it off entirely when the file IS an MTP head cost 25% on prose, measured.</td></tr>
+<tr><td><code>--spec-draft-n-max 4</code></td><td><strong>4 is the default</strong>, not 8 - a deeper draft loses on this stack (&minus;11% at depth 8, paired) because a wider speculative-verify batch widens the union of experts the cache has to serve. An adaptive bandit that picks depth by measured throughput was built and tested: it lost (&minus;4.2%) because the depths it must explore are the ones that lose, so the fixed default stays.</td></tr>
+<tr><td>(no flag - draft confidence gate)</td><td><code>p_min 0.5</code> is the default. +13% measured, paired, over no gate.</td></tr>
+<tr><td><code>--moe-cache auto</code></td><td>Host-resident experts, GPU-side LFRU cache, 0.84&ndash;0.86 hit rate warm on this model at 64k/2 slots. Also enables router-lookahead prefetch (predicts the next layer's experts during the current layer's compute) and, for a MoE model that fits inside about 3/5 of total host RAM, reads the weights into memory instead of mapping them (&minus;13% measured if you turn that off).</td></tr>
+<tr><td>(no flag - KV reservation)</td><td>Lazy (uncommitted) KV reservation now defaults ON for a context of 131,072 cells or more, OFF below - verified with a 3-way paired check, not just by the log line it prints. At this model's 65,536 default it stays off: measured a tie here, with the gain showing up only at larger windows. <code>GGML_CUDA_VMM_KV=1/0</code> overrides either way; when it's on, a KV allocation that runs out of room now makes the expert cache give a pool back and retries, rather than stopping the server.</td></tr>
+<tr><td>(no flag - cache miss handling)</td><td><strong>Substitution</strong> (serve a resident stand-in on a miss rather than fetching the exact expert over PCIe) is still the shipped default, but its documented win was measured on a different model entirely (256 fine-grained experts) and does not reproduce here: paired testing found no speed gain on gemma-4 or Qwen3.8-Flash-Next, and the served text drifts further from an unbiased reference as the floor is loosened. An opt-in alternative, <code>LLAMA_MOE_CACHE_BIAS=0.5</code>, biases the router's own choice toward resident experts instead of substituting after a miss - it measurably raises the cache hit rate on both models (gemma 0.85&rarr;0.92, Qwen 0.26&rarr;0.33), where substitution cannot move that number at all. Not yet a default: it changes which expert actually runs on every request, which needs an explicit decision, not a quiet flip.</td></tr>
+<tr><td><code>-ctk</code> / <code>-ctv</code></td><td>Left at the model's own default (f16) in the line above on purpose. q8_0 halves the KV cache and is what makes very large contexts (256k+) possible on a 12&nbsp;GB card at all, but at this model's 64k default, f16 measured 3.5&ndash;4% faster, paired. Pass <code>-ctk q8_0 -ctv q8_0</code> explicitly if you need the headroom for a much larger context than this.</td></tr>
+<tr><td><code>--expert-atlas-file</code></td><td><strong>Optional, not shown above</strong> &mdash; defaults to a per-model path under the cache directory, which the server keeps current from live traffic. Pass it only to override the location.</td></tr>
 </tbody>
 </table>
 </div>
 
-<p class="note">Measured on that command (predictor/substitute env vars not included in this specific run):
-<strong>~64 tok/s</strong> generation warm (61.8&ndash;66.3 across runs), 4 concurrent slots.
-The first request after startup runs nearer 35 tok/s and climbs as the expert cache fills &mdash; the steady-state
-number is the honest one to plan around, and the cold one is the honest one to expect. The predictor and
-substitute numbers above are real but come from a separate hardware/model pairing (Ornith-1.5-35B) - not yet
-re-measured on this exact gemma-4 command.</p>
+<p class="note">Measured on the command above, shipped defaults, paired against an identical-config control, three
+rounds: <strong>77.6 tok/s</strong> (77.6&nbsp;/&nbsp;78.2&nbsp;/&nbsp;77.1) on code-and-reasoning prompts,
+<strong>60.6 tok/s</strong> (59.3&nbsp;/&nbsp;62.5&nbsp;/&nbsp;59.9) on a mixed, mostly-prose set - prose is
+where a draft model is accepted least, and that is the honest ceiling right now, not a tuning gap. The first
+few requests after startup run slower while the expert cache is still filling; the steady-state number is the
+one to plan around.</p>
 
 <p class="note">Two optional extras, deliberately not in the line above. <code>--cache-disk DIR</code> persists the
 prompt cache so a restart costs 271ms instead of 5.8s &mdash; but it writes prompt content to disk (owner-only,
-model-fingerprinted), so it is opt-in on purpose. And <code>GGML_CUDA_VMM_KV=1</code> reserves KV lazily,
-committing only what a conversation actually reaches.</p>
+model-fingerprinted), so it is opt-in on purpose. And the router-bias alternative to substitution above,
+<code>LLAMA_MOE_CACHE_BIAS=0.5</code>, for anyone who wants to try it ahead of a default decision.</p>
 </section>
 
 <section>
@@ -595,9 +597,8 @@ measured before and after, and reported whether or not it flattered us.</p>
   <div class="stat-card"><div class="num">21&times;</div><div class="label">faster restarts<br>5,775ms &rarr; 271ms prefill</div></div>
 </div>
 <div class="stat-row">
-  <div class="stat-card"><div class="num">1<small>&nbsp;GiB</small></div><div class="label">VRAM freed by q8_0 KV<br>spent on 2 more expert layers</div></div>
-  <div class="stat-card"><div class="num">6/6</div><div class="label">byte-identical outputs<br>quantized vs f16 KV</div></div>
   <div class="stat-card"><div class="num">3/3</div><div class="label">needle recall at 24.7k tokens<br>10% / 50% / 90% depth</div></div>
+  <div class="stat-card"><div class="num">&plusmn;4<small>%</small></div><div class="label">q8_0 vs f16 KV, speed<br>depends on how tight VRAM already is</div></div>
 </div>
 
 <p><strong>Context that follows the request, not the flag.</strong> Placement used to be chosen first and
@@ -608,11 +609,15 @@ Same hardware, 16&times; the context and 4&times; the concurrency.</p>
 hash, so a 3,600-token document that cost 5.8s to process is restored in 0.27s after a full restart. Files
 are owner-only and model-fingerprinted - they contain your prompts, and the docs say so plainly.</p>
 
-<p><strong>KV cache quantization that pays for itself twice.</strong> Symmetric q8_0 halves the conversation
-cache (2,180 &rarr; 1,158 MiB), and because placement is derived from <em>measured</em> memory rather than a
-fixed flag, the freed gigabyte automatically becomes two more layers of experts on the GPU - no code, no
-tuning. Verified lossless here: 6/6 byte-identical outputs at temperature 0, and full needle recall at 10/50/90%
-depth of a 24,700-token prompt.</p>
+<p><strong>KV cache type is not a flat win either way - it depends on how tight VRAM already is.</strong>
+Symmetric q8_0 halves the conversation cache, and when the freed memory is what lets a draft model load at all
+(Qwen3.8-Flash-Next at 64k, below) it is a clear win: +9.7% and the difference between serving with a draft or
+not. On this card, with this model, at this same 64k context - where VRAM is comfortable rather than desperate -
+the paired, controlled result reverses: f16 KV measured 3.5-4% <em>faster</em> than q8_0, because the freed
+cache slots did not translate into enough extra hit rate to beat the plainer compute path. Both numbers are
+real; which one applies depends on whether the model you are running is VRAM-starved or not. Full needle recall
+at 10/50/90% depth of a 24,700-token prompt either way - the quantization is not lossy for retrieval at this
+context length, whichever speed wins for your model.</p>
 
 <p class="note">And the ones that didn't work, because a fork that only publishes its wins is the thing this
 project exists not to be: pinning hot experts in RAM measured <em>worse</em> than doing nothing and ships
@@ -677,6 +682,13 @@ session's real history and some are pp2048 (prompt processing) rather than tg (g
 <p class="section-lede" style="margin-bottom:1rem;">Not every real result is a tok/s number — some are context/VRAM
 capacity, hit-rate improvements too small to move tok/s yet, live-found bugs, or losses reported because a fork
 that only publishes wins is the thing this project exists not to be.</p>
+<p class="note">This is a changelog, not a live status report: each row is what was true when it was measured,
+against whichever model and hardware regime was the test subject that day — several rows below were measured
+on Ornith-1.5-35B, a model since retired from this fork's own primary testing in favor of gemma-4 and
+Qwen3.8-Flash-Next. A result does not stop being real because the test model changed, but it can stop
+reproducing on a different one — the substitution row below is exactly that case, re-tested properly in the
+audit section further down with the fuller story. For what currently ships and what was re-verified on the
+models this project actually tracks now, see that audit section.</p>
 
 <div class="tablewrap">
 <table>
@@ -710,7 +722,7 @@ that only publishes wins is the thing this project exists not to be.</p>
 <tr><td>Topic-affinity atlas cache warming, iterated to a real win <span class="note">(3 designs tried in sequence &mdash; thin/wide eviction, then free-slot-only admission)</span></td><td class="num">3 designs</td><td class="num">-0.31 / -6.55 / -0.35pp</td><td class="num delta-neg">unwound in order</td><td><span class="tag tag-solid">superseded below</span></td></tr>
 <tr><td>Live-activation MoE predictor <span class="note">(two graph-discovered alternatives lost decisively to the hand-picked atlas on link-prediction AUC)</span></td><td class="num">0.71 vs 0.57/0.49 AUC</td><td class="num">40-45% top-1 (~3% chance)</td><td class="num delta-pos">real signal, not noise</td><td><span class="tag tag-solid">solid</span></td></tr>
 <tr><td>Predictor-driven warming, self-tuned and persisted <span class="note">(free-slot budget floor + live evidence ratio, both self-tuning; weights persist across restarts)</span></td><td class="num">off (no warming)</td><td class="num">+0.12pp hit rate, 3/4 rounds</td><td class="num delta-pos">first real win, post-atlas</td><td><span class="tag tag-solid">solid</span></td></tr>
-<tr><td>Substitution, rank-gated draft/fallback <span class="note">(exact fallback above a router-rank floor, cheap resident stand-in below it)</span></td><td class="num">55.12 tok/s</td><td class="num">59.59 tok/s</td><td class="num delta-pos">+8.11%, 4/4 rounds</td><td><span class="tag tag-solid">solid</span></td></tr>
+<tr><td>Substitution, rank-gated draft/fallback <span class="note">(exact fallback above a router-rank floor, cheap resident stand-in below it; measured on Ornith-1.5-35B, 256 fine-grained experts - re-tested on gemma-4 and Qwen3.8-Flash-Next below and does not reproduce on either: no speed gain, and output drifts further from an unbiased reference as the floor loosens)</span></td><td class="num">55.12 tok/s</td><td class="num">59.59 tok/s</td><td class="num delta-pos">+8.11%, 4/4 rounds (Ornith only)</td><td><span class="tag tag-solid">solid, model-specific</span></td></tr>
 </tbody>
 </table>
 </div>
@@ -913,6 +925,13 @@ output is checked; leave the small one whose worth is measured in how often it i
 <section id="prerouter">
 <div class="eyebrow">A predictor that trains itself while it serves</div>
 <h2>The prerouter: learning which experts are coming, one layer ahead</h2>
+<div class="callout"><p><strong>Status, 2 October 2026:</strong> the clean win described below (71.41 vs 50.16 tok/s, "on
+both models") was measured in the calibration probe regime - a small cache under heavy eviction pressure. Re-tested
+on the shipped stack with a larger cache (0.84-0.86 hit rate, not contended): gemma-4 measures a <strong>tie</strong>
+with the pre-router frozen, and Qwen3.8-Flash-Next measures <strong>-7%</strong> with it on - though that Qwen run
+did not confirm the saved predictor weights actually loaded, so it may be testing an untrained model, not a trained
+one. Kept on by default anyway (no measured harm on gemma, and the Qwen result needs a clean re-run before acting
+on it either way), but "wins on both models" below is the calibration-probe story, not the shipped one.</p></div>
 <p class="section-lede">The expert cache decides what to keep. A prerouter decides what is about to be
 <em>wanted</em> &mdash; a small logistic model over the hidden state, trained by SGD on every real routing
 decision the model makes, with labels that cost nothing because the router produces them a layer later.</p>

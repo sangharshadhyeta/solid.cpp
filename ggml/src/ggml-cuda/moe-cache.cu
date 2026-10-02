@@ -8500,6 +8500,40 @@ static int moe_cache_substitute_min_rank_verify() {
     return MOE_CACHE_TUNABLE_INT("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK_VERIFY", -1);
 }
 
+// HOBBIT-style (arXiv 2411.01433) cumulative-gate-mass skip, approximated with a STATIC per-rank profile instead
+// of HOBBIT's live per-token weights: the real version needs the softmax gate weight at the point a miss is
+// decided, and that value is not reachable there without adding a 4th operand to GGML_OP_MUL_MAT_ID - a core op
+// every backend and every MoE model builds, not something this cache should be changing the arity of for a
+// different substitution heuristic. The static profile is a measured compromise: the model's own AVERAGE
+// per-rank share of gate mass (not the live per-token value), looked up by the same positional rank_bucket the
+// rank floor already uses.
+//
+// Measured on gemma-4 (2 Oct 2026, llama-debug --tensor-filter "ffn_moe_weights_norm", 1,620 token x layer
+// samples across a real prompt, n_expert_used=8): cumulative share of gate mass consumed by ranks STRICTLY
+// ABOVE a given rank (HOBBIT's unimportance s_i) -
+//   rank 0: 0.0%   rank 1: 26.9%   rank 2: 43.7%   rank 3: 56.8%   rank 4: 67.7%   rank 5: 77.1%   rank 6: 85.4%   rank 7: 93.0%
+// matches the existing "ranks 4-7 carry only 32% of the gate mass" note elsewhere in this file exactly
+// (100% - 67.7% = 32.3%). No profile is measured for any other model; this table is gemma-4-specific and the
+// threshold defaults OFF (rank-based gating unchanged) everywhere else.
+static float moe_cache_substitute_cum_mass_before_rank(int rank_bucket) {
+    static const float cum[8] = { 0.0f, 0.269f, 0.437f, 0.568f, 0.677f, 0.771f, 0.854f, 0.930f };
+    if (rank_bucket < 0) {
+        return 0.0f;
+    }
+    if (rank_bucket >= 8) {
+        return 1.0f; // past the measured table: treat as if all mass is already spent, always eligible
+    }
+    return cum[rank_bucket];
+}
+
+// -1 (default) means off: the existing rank floor decides alone. When set (0.0-1.0), a miss at rank_bucket is
+// eligible for substitution only once the cumulative mass ABOVE it exceeds this threshold - i.e. only once the
+// router's higher-confidence picks have already used up most of its total mass. GGML_CUDA_MOE_CACHE_SUBSTITUTE_MASS_THRESHOLD.
+static float moe_cache_substitute_mass_threshold() {
+    const char * e = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MASS_THRESHOLD");
+    return e ? (float) atof(e) : -1.0f;
+}
+
 static int moe_cache_substitute_min_rank(moe_cache_device & device) {
     // -1 means "no pin, use the pace-driven floor below"; a live override lands here.
     const int pinned = moe_cache_tunable_int_scoped("GGML_CUDA_MOE_CACHE_SUBSTITUTE_MIN_RANK", -1);
@@ -11615,8 +11649,12 @@ static int moe_cache_plan_impl(
             }
             return moe_cache_substitute_min_rank(device);
         }();
+        const float mass_threshold_here = moe_cache_substitute_mass_threshold();
+        const bool rank_gate_passes = mass_threshold_here >= 0.0f
+            ? moe_cache_substitute_cum_mass_before_rank(rank_bucket) >= mass_threshold_here
+            : rank_bucket >= min_rank_here;
         if (moe_cache_substitute_enabled() && !moe_cache_scope_exact() && slot_indices[index] < 0 &&
-            rank_bucket >= min_rank_here &&
+            rank_gate_passes &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
             // Hot-loaded-first by default (2026-09-04): picks the hottest
             // currently-resident expert for this tensor, tiebroken by
