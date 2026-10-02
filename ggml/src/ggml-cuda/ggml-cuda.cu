@@ -507,11 +507,15 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
             clear_pool();
             err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
             if (err == cudaErrorMemoryAllocation) {
-                // last resort: the expert cache surrenders its slabs (no-op
-                // when inactive); one degraded decode beats a process abort
+                // last resort: the expert cache gives back only as much as this allocation needs (no-op when
+                // inactive); one degraded decode beats a process abort. ggml_moe_cache_trim() used to be called
+                // here instead - it marks the whole cache device permanently dead rather than freeing victim
+                // pools incrementally, so one narrowly-failed allocation during model load (common on a tight
+                // card) silently killed the cache for the rest of the process. yield_vram frees only what's
+                // asked for and never kills the device.
 
                 (void)cudaGetLastError();
-                if (ggml_moe_cache_trim(device) > 0) {
+                if (ggml_backend_cuda_moe_cache_yield_vram(device, look_ahead_size) > 0) {
                     err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
                 }
             }
@@ -605,7 +609,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #else
             CUresult create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             if (create_result == CUDA_ERROR_OUT_OF_MEMORY &&
-                ggml_moe_cache_trim(device) > 0) {
+                ggml_backend_cuda_moe_cache_yield_vram(device, reserve_size) > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             }
             CU_CHECK(create_result);
@@ -3146,6 +3150,28 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     return res;
 }
 
+// cudaGraphInstantiate allocates its own executable-graph memory internally - the capture above only recorded
+// operations, it did not reserve this. Every call site used to wrap this in CUDA_CHECK alone, which GGML_ABORTs
+// the whole process on any CUDA error including OOM - the one call in the hot decode-time graph path with no
+// yield-and-retry at all, unlike the pool/KV allocators elsewhere in this file. There is no way to know the exact
+// shortfall from here (unlike those call sites, which know the requested byte count), so this asks for a flat
+// margin, same default as the VMM-KV commit path's own margin (GGML_CUDA_VMM_KV_YIELD_MARGIN_MB, 1024 MiB).
+static cudaError_t ggml_cuda_graph_instantiate_with_yield(int device, cudaGraphExec_t * instance, cudaGraph_t graph) {
+    cudaError_t err = cudaGraphInstantiate(instance, graph, NULL, NULL, 0);
+    if (err != cudaErrorMemoryAllocation) {
+        return err;
+    }
+    (void) cudaGetLastError();
+    static const size_t margin = [] {
+        const char * e = getenv("GGML_CUDA_GRAPH_INSTANTIATE_YIELD_MARGIN_MB");
+        return (size_t) (e ? std::max(0, atoi(e)) : 1024) << 20;
+    }();
+    if (ggml_backend_cuda_moe_cache_yield_vram(device, margin) == 0) {
+        return cudaErrorMemoryAllocation;
+    }
+    return cudaGraphInstantiate(instance, graph, NULL, NULL, 0);
+}
+
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, uint64_t graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -3168,7 +3194,7 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
         (void)cudaGetLastError();
         CUDA_CHECK(cudaGraphExecDestroy(graph->instance));
         graph->instance = nullptr;
-        CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+        CUDA_CHECK(ggml_cuda_graph_instantiate_with_yield(ggml_cuda_get_device(), &graph->instance, graph->graph));
     } else {
         GGML_ASSERT(stat == cudaSuccess);
     }
@@ -4906,7 +4932,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
     if (use_cuda_graph) {
         ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
         if (graph->instance == nullptr) { // Create executable graph from captured graph.
-            CUDA_CHECK(cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0));
+            CUDA_CHECK(ggml_cuda_graph_instantiate_with_yield(ggml_cuda_get_device(), &graph->instance, graph->graph));
         }
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);

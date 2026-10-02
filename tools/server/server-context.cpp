@@ -4930,7 +4930,12 @@ void server_routes::atlas_regen_loop(std::string atlas_file, std::string coact_f
             continue; // no traffic logged yet - nothing to fold in this round
         }
 
-        const std::string cmd = "python3 " + server_shell_quote(script_path) +
+        // nice -n 19 + ionice -c3 (idle class): this competes directly with the moe-cache fill worker's own
+        // CPU time and disk reads for every fetch it's servicing at the moment this fires (every interval_s,
+        // regardless of how busy the server is) - measured contributing to a visible per-turn slowdown during
+        // an active Qwen run (2 Oct). Idle class means the kernel only schedules this subprocess's I/O when
+        // nothing else wants the disk, so it never competes with a cache miss's own pread()/page-fault.
+        const std::string cmd = "nice -n 19 ionice -c3 python3 " + server_shell_quote(script_path) +
             " --coact "  + server_shell_quote(coact_file) +
             " --state "  + server_shell_quote(state_path.string()) +
             " --out "    + server_shell_quote(atlas_file) +

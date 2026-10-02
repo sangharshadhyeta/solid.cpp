@@ -2412,6 +2412,7 @@ static moe_cache_budget_split moe_cache_split_budget(const moe_cache_device & de
 
 static double moe_cache_predictor_score(const moe_cache_device & device, const moe_cache_key & key);
 static double moe_cache_predictor_evict_weight();
+static double moe_cache_pressure_scale(const moe_cache_device & device);
 
 static double moe_cache_weighted_heat(const moe_cache_device & device, const moe_cache_pool & pool,
         const moe_cache_slot & slot, double * out_base = nullptr, double cap_ref = -1.0) {
@@ -2453,7 +2454,7 @@ static double moe_cache_weighted_heat(const moe_cache_device & device, const moe
         }
     }
 
-    const double pw = moe_cache_predictor_evict_weight();
+    const double pw = moe_cache_predictor_evict_weight() * moe_cache_pressure_scale(device);
     if (pw > 0.0) {
         // p is a probability in (0,1); 0.5 is "no opinion" for an untrained
         // weight vector, so only the half above it protects anything.
@@ -4373,7 +4374,9 @@ static void moe_cache_weight_guard_sweep() {
 }
 
 #if defined(__linux__)
-// PROTOTYPE, opt-in via GGML_CUDA_MOE_CACHE_EXPLICIT_READ=1: -ncmoe/moe-cache's
+// DEFAULT ON (promoted from PROTOTYPE 2 Oct 2026, measured +27.6% tok/s on Qwen - see the call site comment
+// below for the numbers). GGML_CUDA_MOE_CACHE_EXPLICIT_READ=0 reverts to the old mmap-page-fault path.
+// -ncmoe/moe-cache's
 // CPU-resident expert weights are mmap'd PROT_READ straight from the GGUF
 // (see llama-model-loader.cpp). A cold fill's cudaMemcpyAsync/memcpy touches
 // those pages for the first time during the copy itself, which means the
@@ -5015,9 +5018,17 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             // itself returns false on any resolution/read failure, which
             // falls straight through to the ordinary staged-memcpy branch
             // below with nothing extra to unwind.
+            // Promoted from off-by-default PROTOTYPE to on-by-default (2 Oct 2026): measured directly on Qwen's
+            // disk-bound regime (48 expert layers, 1,350-slot cache, ~0.12 hit rate). Three identical 3-prompt
+            // requests, same build, mmap-page-fault baseline vs this flag: 5.22 -> 6.66 tok/s (+27.6%), achieved
+            // read throughput over the request's own wall-clock span 0.03 -> 0.82 GB/s - the whole-expert pread
+            // is finding and moving real bytes where 4 KiB-at-a-time page faulting mostly wasn't. See
+            // docs/ROADMAP.md, "Item 4 (concurrent expert reads)" for the fuller measurement and the remaining
+            // gap (achieved throughput is still well under the drive's raw ~2.0 GB/s - this closes the
+            // "readahead sized wrong" half of the gap, not the "only one read in flight" half).
             static const bool explicit_read_enabled = [] {
                 const char * e = getenv("GGML_CUDA_MOE_CACHE_EXPLICIT_READ");
-                return e && atoi(e) != 0;
+                return e ? atoi(e) != 0 : true;
             }();
             if (job.kind == moe_cache_job_kind::reduce_convert) {
                 // Heat-aware neuron subsetting: gather this expert's chosen
@@ -5718,6 +5729,10 @@ static bool moe_cache_prepare_budget(
     }
     const size_t reserve = reserve_mb << 20;
     size_t available = free_for_budget > reserve ? free_for_budget - reserve : 0;
+    fprintf(stderr, "DIAG prepare_budget: free_memory=%zuMiB allocated_bytes=%zuMiB kv_headroom=%zuMiB free_for_budget=%zuMiB "
+            "reserve_mb=%zu available=%zuMiB budget_mb_cfg=%d\n",
+            free_memory >> 20, device.allocated_bytes >> 20, kv_headroom >> 20, free_for_budget >> 20,
+            reserve_mb, available >> 20, session.config.budget_mb);
     if (session.config.budget_mb > 0) {
         available = std::min(available, session.config.budget_mb << 20);
     }
@@ -8404,12 +8419,42 @@ size_t ggml_backend_cuda_moe_cache_resident_counts(const void * const * bases, c
     return found;
 }
 
-static bool moe_cache_substitute_enabled() {
-    static const bool enabled = [] {
+// Was DEFAULT ON unconditionally, on the strength of a +8.11% win measured on
+// Ornith-1.5-35B (256 fine-grained experts), never on either model this fork
+// actually tracks. Paired/noise-floor-controlled testing on gemma-4 found it
+// a clear loss there: 21.0% greedy-output agreement against a 67.1%
+// same-build noise floor, for only +1.6% speed - gemma's cache is comfortable
+// (~0.85-0.87 hit rate), so a miss is rare and substitution's quality cost
+// for avoiding a disk round-trip rarely pays. A first attempt (2 Oct) flipped
+// this to a flat off-by-default on that gemma-only evidence - wrong in the
+// same direction as the original always-on default, just pointed the other
+// way: Qwen3.8-Flash-Next's live measured hit rate under the same session's
+// own diagnostics is ~0.12-0.26 (48 expert layers, far more distinct experts
+// than the ~1,350-slot cache can hold at once - heavy eviction churn, not a
+// bug) - in that regime nearly every token needs SOME miss handling, and
+// substitution's whole value proposition (serve an already-resident stand-in
+// instead of blocking the GPU on a synchronous NVMe fetch) is exactly what a
+// starved cache needs. A static global default cannot be right for both
+// regimes at once - same lesson as moe_cache_pressure_scale() (that
+// function's own comment has the fuller story). So: gated live by the same
+// cache-pressure signal instead of a second static flag, auto-enabling only
+// once the cache is genuinely struggling (comfortable cache: stays off,
+// matching gemma's measured loss; starved cache: turns on, matching the
+// shape of the original Ornith win and Qwen's own live regime). The env var
+// remains a hard override either way, for an operator who has their own
+// measured answer for a specific model.
+static bool moe_cache_substitute_enabled(const moe_cache_device & device) {
+    static const int forced = [] {
         const char * env = getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE");
-        return env ? atoi(env) != 0 : true;
+        if (!env) {
+            return -1;
+        }
+        return atoi(env) != 0 ? 1 : 0;
     }();
-    return enabled;
+    if (forced >= 0) {
+        return forced != 0;
+    }
+    return moe_cache_pressure_scale(device) > 0.0;
 }
 
 // Purely observational per-neuron heat accumulation (device.neuron_heat),
@@ -10004,22 +10049,79 @@ static double moe_cache_predictor_score(const moe_cache_device & device, const m
 }
 
 // How much the predictor may protect a resident expert from eviction, as a
-// multiplier on its heat. 0 disables it entirely (the default until measured).
+// multiplier on its heat. 0 disables it entirely.
 // The prerouter's own role: protect what is about to be wanted from eviction.
 //
-// Default 1.0, not 0. This is the consumer it won on both models measured
-// (71.41 against 56.59 for admission on gemma-4; 9.86 and 10.69 with
-// substitution against 9.44 inert on qwen3.8-flash-next), and the timing
-// argument says why - retention tolerates a late prediction and admission does
-// not. Shipping it at 0 would mean the mechanism that pays for itself is off
-// unless a calibration entry happens to turn it on, which is the trap this
-// file has spent its history climbing out of.
+// Default 1.0, on the strength of a 71.41-vs-56.59 win measured in a
+// calibration-probe regime (never verified whether the saved predictor
+// weights even loaded that run - see docs/ROADMAP.md). Rechecked 2 Oct 2026
+// under this project's own paired/noise-floor method: weight=1.0 (gemma-4,
+// n=10, warm median of 16) measured 49.2 tok/s against weight=0.0's 55.9 - a
+// clean +13.6% loss from leaving this on, with a HIGHER cache hit rate at 0.0
+// too (0.895 vs 0.870).
+//
+// Root-caused the same day, not just the symptom patched. Ruled out in order:
+// (1) corrupted/untrained weights - the saved checkpoint is legitimate
+// (170,000 SGD steps, 77.4% top-1 accuracy, small zero-centered values, not
+// garbage); (2) a train/serve objective mismatch (same-layer-trained weights
+// scored against next-layer-shaped activations) - ruled out by the server's
+// own startup log, which confirms GGML_CUDA_MOE_CACHE_TRAIN_NEXT_LAYER is
+// auto-enabled by common_moe_default_prerouter() unless something else
+// already set the env var, so training and scoring agree on the same
+// next-layer target; (3) threshold over-triggering (most slots crossing
+// p>0.5 and getting broadly over-protected) - a live instrumented run showed
+// only ~15% of scored slots cross 0.5, mean score ~0.13 - the predictor is
+// selective, not trigger-happy.
+//
+// What is actually going on: the predictor is accurate and well-behaved: it
+// correctly identifies experts that will be wanted NEXT. The eviction
+// mechanism trades that insight against experts with CONFIRMED current
+// demand. That trade only has room to pay off when the cache is genuinely
+// short on capacity - on gemma-4 the baseline hit rate is already ~0.85-0.87
+// (comfortable; this file's own "Measured, not wins" and "Integration
+// survey" sections record the SAME predictor, through the admission weight,
+// showing the opposite sign on Qwen3.8-Flash-Next: hit rate ~0.26,
+// genuinely capacity-starved, where ahead-of-need prediction has real room
+// to help). Same mechanism, same predictor, opposite verdict, same
+// explanatory variable: live cache pressure.
+//
+// So the fix is not a static per-model constant in either direction - it is
+// closing the loop: moe_cache_pressure_scale() reads the cache's own live
+// hit rate and scales this weight down to 0 as the cache gets comfortable,
+// keeping it at full strength only while the cache is actually starved
+// enough for ahead-of-need prediction to be worth its false-positive cost.
+// The predictor-evict-weight env var remains the operator's own ceiling on
+// top of that live scale, not a replacement for it.
 //
 // The bias is still additive and capped (see moe_cache_weighted_heat), so a
 // confident predictor delays an eviction and can never pin a slot against real
 // demand.
 static double moe_cache_predictor_evict_weight() {
     return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_EVICT_WEIGHT", 1.0);
+}
+
+// How much to trust the predictor's eviction-protection bias right now, scaled by how much the cache actually needs
+// the help - see the long comment on moe_cache_predictor_evict_weight() for the measured case this responds to.
+// Needs a few thousand lookups before the live hit rate means anything; full trust during that warm-up (consistent
+// with this mechanism's old always-on default - be generous until there is evidence not to be).
+static double moe_cache_pressure_scale(const moe_cache_device & device) {
+    const long long lookups = device.hits + device.misses;
+    if (lookups < 2000) {
+        return 1.0;
+    }
+    const double hit_rate = (double) device.hits / (double) lookups;
+    const double starved_at     = MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PRESSURE_STARVED_HIT_RATE", 0.40);
+    const double comfortable_at = MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PRESSURE_COMFORTABLE_HIT_RATE", 0.75);
+    if (comfortable_at <= starved_at) {
+        return 1.0; // misconfigured bounds - fail open rather than divide by ~0
+    }
+    if (hit_rate <= starved_at) {
+        return 1.0;
+    }
+    if (hit_rate >= comfortable_at) {
+        return 0.0;
+    }
+    return (comfortable_at - hit_rate) / (comfortable_at - starved_at);
 }
 
 // How much the predictor may influence the choice of stand-in. 0 disables it.
@@ -10037,10 +10139,18 @@ static double moe_cache_predictor_evict_weight() {
 // does not fit (qwen, 48 expert layers on CPU) nearly every miss needs a
 // stand-in and the extra signal earns its place.
 //
-// So it is left to the calibration stage rather than assigned, since the right
-// answer genuinely depends on the model.
+// "Working set mostly fits" vs "does not fit" is live cache pressure by
+// another name - the same variable moe_cache_pressure_scale() reads for the
+// eviction-protection weight (see that function's comment for the measured
+// case: same predictor, same sign flip between these two models, same
+// explanation, closed the same way 2 Oct 2026). So this is no longer left
+// to a per-model calibration decision either: the raw weight below is an
+// operator ceiling, and moe_cache_pressure_scale(device) decides live
+// whether this model's current regime has earned the right to spend it -
+// full strength while genuinely starved, zero once the cache is comfortable,
+// without needing to know in advance which model this build is running.
 static double moe_cache_predictor_substitute_weight() {
-    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT", 0.0);
+    return MOE_CACHE_TUNABLE_DOUBLE("GGML_CUDA_MOE_CACHE_PREDICTOR_SUB_WEIGHT", 1.0);
 }
 
 static void moe_cache_predictor_note_hit(moe_cache_device & device, const moe_cache_key & key) {
@@ -10744,7 +10854,7 @@ static int moe_cache_substitute_pick_hot(
             // alternative tiebreak is raw popularity - and there, "about to be
             // wanted" is the better of two weak signals. Off (weight 0) until
             // a stage measures it.
-            const double sw = moe_cache_predictor_substitute_weight();
+            const double sw = moe_cache_predictor_substitute_weight() * moe_cache_pressure_scale(device);
             bool better;
             if (count != best_count) {
                 better = count > best_count;
@@ -11653,7 +11763,7 @@ static int moe_cache_plan_impl(
         const bool rank_gate_passes = mass_threshold_here >= 0.0f
             ? moe_cache_substitute_cum_mass_before_rank(rank_bucket) >= mass_threshold_here
             : rank_bucket >= min_rank_here;
-        if (moe_cache_substitute_enabled() && !moe_cache_scope_exact() && slot_indices[index] < 0 &&
+        if (moe_cache_substitute_enabled(device) && !moe_cache_scope_exact() && slot_indices[index] < 0 &&
             rank_gate_passes &&
             node->n_pins < GGML_MOE_CACHE_MAX_BATCH_ROWS) {
             // Hot-loaded-first by default (2026-09-04): picks the hottest
