@@ -121,7 +121,7 @@ public:
         // with kv_stream: cells per streamed layer kept in a VRAM page pool (docs/kv-streaming-s3d-design.md); 0 = none
                    uint32_t   kv_resident = 0);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache(); // logs the page pool statistics, if there is a pool
 
     //
     // llama_memory_i

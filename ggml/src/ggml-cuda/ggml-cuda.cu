@@ -6259,6 +6259,20 @@ static int ggml_backend_cuda_get_mmvq_mmid_max_batch(int type, ggml_backend_dev_
     return get_mmvq_mmid_max_batch((ggml_type) type, info.devices[dev_ctx->device].cc);
 }
 
+// Whether KV streaming can work on this device: it needs the sparse flash attention (NVIDIA, Turing or newer), otherwise the
+// attention would read the whole cache from pinned host memory on every step. Asked by llama before it streams a cache.
+static int ggml_backend_cuda_kv_stream_supported(ggml_backend_dev_t dev) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    return 0;
+#else
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+
+    return GGML_CUDA_CC_IS_NVIDIA(cc) && turing_mma_available(cc) ? 1 : 0;
+#endif
+}
+
 // Test hook for tests/test-kv-stream.cpp: one streamed-KV step (append, resolve, copy) on the backend's stream, then a
 // synchronize. All pointers are device-addressable memory (the host tensors are pinned host memory read in place).
 // See ggml-cuda/kv-stream.cuh. Returns 0 on success.
@@ -6297,6 +6311,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_kv_stream_run") == 0) {
         return (void *)ggml_backend_cuda_kv_stream_run;
+    }
+    if (strcmp(name, "ggml_backend_kv_stream_supported") == 0) {
+        return (void *)ggml_backend_cuda_kv_stream_supported;
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;

@@ -1236,7 +1236,14 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+                            // KV streaming (docs/kv-streaming-s3d-design.md): the VRAM page pool of a streamed layer, all
+                            // nullptr / 0 when there is none. K and V stay the authoritative tensors.
+            ggml_tensor * kv_pool_k     = nullptr,
+            ggml_tensor * kv_pool_v     = nullptr,
+            ggml_tensor * kv_pool_state = nullptr,
+            ggml_tensor * kv_pool_idxs  = nullptr, // the cells written for this ubatch (the cache's k_idxs)
+                    int   kv_pool_page  = 0) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 

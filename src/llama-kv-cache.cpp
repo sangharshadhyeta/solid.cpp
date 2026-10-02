@@ -75,6 +75,14 @@ static ggml_backend_buffer_type_t llama_kv_stream_buft(ggml_backend_dev_t dev) {
         return nullptr;
     }
 
+    // streaming relies on the sparse flash attention gathering a few rows; where the device cannot do that, the attention
+    // would read the whole cache from host memory on every step
+    using supported_fn_t = int (*)(ggml_backend_dev_t);
+    auto supported = (supported_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_stream_supported");
+    if (supported && !supported(dev)) {
+        return nullptr;
+    }
+
     using buft_fn_t = ggml_backend_buffer_type_t (*)(void);
     auto fn = (buft_fn_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_kv_host_buffer_type");
 
@@ -283,7 +291,6 @@ llama_kv_cache::llama_kv_cache(
 
         // a VRAM page pool under the streamed K/V (docs/kv-streaming-s3d-design.md): a page resident here is read from
         // VRAM, any other page is copied in from the host tensors first. K and V above stay the authoritative copy.
-        // The kernels that use the pool are not in yet (design steps S3d-2..4), so for now it is only allocated.
         ggml_tensor * pool_k     = nullptr;
         ggml_tensor * pool_v     = nullptr;
         ggml_tensor * pool_state = nullptr;
@@ -421,7 +428,7 @@ llama_kv_cache::llama_kv_cache(
             }
         }
 
-        LLAMA_LOG_INFO("%s: kv_resident: VRAM page pool on %u layer(s), %.2f MiB in total (not used by any kernel yet)\n",
+        LLAMA_LOG_INFO("%s: kv_resident: VRAM page pool on %u layer(s), %.2f MiB in total\n",
                 __func__, pool_layers, pool_bytes/1024.0/1024.0);
     }
 
@@ -511,6 +518,47 @@ void llama_kv_cache::clear(bool data) {
         if (has_stream_pool && !hparams.no_alloc) {
             stream_reset();
         }
+    }
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    if (!has_stream_pool || hparams.no_alloc) {
+        return;
+    }
+
+    // the counters of the page pools (ggml-cuda/kv-stream.cuh, ctl[4..11]); they cannot be read per call: a device to
+    // host read is not allowed inside the CUDA graphs the backend captures
+    uint64_t fetched  = 0;
+    uint64_t lookups  = 0;
+    uint64_t calls    = 0;
+    uint64_t bypassed = 0;
+    uint32_t n_pools  = 0;
+
+    for (const auto & layer : layers) {
+        if (!layer.stream_state) {
+            continue;
+        }
+
+        const int64_t n_slots = layer.pool_k->ne[1] / layer.page_size;
+        const int64_t n_pages = ggml_nelements(layer.stream_state) - 5*n_slots - GGML_KV_STREAM_CTL_INTS;
+
+        int32_t ctl[GGML_KV_STREAM_CTL_INTS];
+        ggml_backend_tensor_get(layer.stream_state, ctl, (size_t) (n_pages + 5*n_slots)*sizeof(int32_t), sizeof(ctl));
+
+        auto u64 = [&](int i) { return (uint64_t) (uint32_t) ctl[i] | ((uint64_t) (uint32_t) ctl[i + 1] << 32); };
+
+        fetched  += u64(4);
+        lookups  += u64(6);
+        calls    += u64(8);
+        bypassed += u64(10);
+        n_pools++;
+    }
+
+    if (calls > 0) {
+        LLAMA_LOG_INFO("%s: kv_resident: %u page pool(s), %llu attention calls named %llu distinct pages, %llu fetched from host "
+                "(%.1f%%), %llu bypassed (read from host, no free slot)\n",
+                __func__, n_pools, (unsigned long long) calls, (unsigned long long) lookups, (unsigned long long) fetched,
+                lookups ? 100.0*fetched/lookups : 0.0, (unsigned long long) bypassed);
     }
 }
 

@@ -1029,7 +1029,11 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
 
     // sparse flash attention: the indexer keeps at most top_k->ne[0] columns visible per query
     // ref: https://github.com/ggml-org/llama.cpp/pull/27970, pull/28770 (head size 256)
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    // KV streaming: the VRAM page pool of this layer, if --kv-stream --kv-resident gave it one
+    const auto pool = mctx_cur->get_stream_pool(il);
+
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il,
+            pool.pool_k, pool.pool_v, pool.state, pool.state ? inp->get_k_idxs() : nullptr, (int) pool.page_size);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
