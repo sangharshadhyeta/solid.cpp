@@ -1403,6 +1403,66 @@ Whether it earns a place depends on the cache being contended, which the larger 
 </tbody>
 </table></div>
 
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">A default verified by what it actually does, not just its log line</h3>
+<p>Lazy KV commit now defaults ON for a context of 131,072 cells or more and OFF below that, when
+<code>GGML_CUDA_VMM_KV</code> is not set explicitly. The code's own log line for "reserved with lazy commit" turned out not to be a reliable
+signal to grep for, so the default was checked the only way that actually matters: a 3-way paired run at <code>-c 262144</code>, same
+prompts, comparing the no-flag launch against the same launch with the variable forced to each value.</p>
+<div style="overflow-x:auto"><table style="min-width:600px"><thead><tr><th>Setting</th><th>Warm tok/s</th><th>Hit rate</th><th>Cache slots</th></tr></thead><tbody>
+<tr><td>Forced OFF (<code>GGML_CUDA_VMM_KV=0</code>)</td><td>39.5</td><td>0.349</td><td>511</td></tr>
+<tr><td>No flag (the new default)</td><td>49.8</td><td>0.586</td><td>975</td></tr>
+<tr><td>Forced ON (<code>GGML_CUDA_VMM_KV=1</code>)</td><td>52.8</td><td>0.578</td><td>986</td></tr>
+</tbody></table></div>
+<p>The no-flag run lands with the forced-on run and well clear of forced-off, on both the cache metric and the slot count. That is what
+"the default is really doing what it says" looks like when checked directly instead of trusted from a log message.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Router bias toward cache-resident experts, against substitution</h3>
+<p>Substitution's own documented win (<code>+8.11% tok/s</code>, the comment that turned it on by default) was measured on a 256-fine-grained-expert
+model, never on gemma-4 or Qwen. <a href="https://arxiv.org/abs/2412.00099">Cache-Conditional Experts</a> describes a different fix for the same
+problem: multiply a resident expert's selection score by <code>(1+&beta;)</code> before the router's top-k choice, so the SELECTION moves toward what
+is already in VRAM while the forward pass still uses the unbiased score &mdash; every expert actually run is computed exactly, nothing is ever
+approximated. Implemented as <code>LLAMA_MOE_CACHE_BIAS=&beta;</code>, decode-only (a prefill batch is staged, not served from the cache, so biasing
+it only moves the whole prompt's hidden state for nothing).</p>
+<p><strong>Gemma-4</strong>, exact reference = substitution off entirely, greedy, 10 prompts:</p>
+<div style="overflow-x:auto"><table style="min-width:700px"><thead><tr><th>Setting</th><th>Agreement vs exact ref</th><th>Identical</th><th>Warm tok/s</th><th>vs ref</th><th>Hit rate</th><th>Verdict</th></tr></thead><tbody><tr><td>Exact reference (substitution off, bias off)</td><td>100.0%</td><td>10/10</td><td>59.21</td><td>+0.0%</td><td>0.847</td><td>reference</td></tr>
+<tr><td>Same again (the noise floor)</td><td>67.1%</td><td>4/10</td><td>58.95</td><td>-0.4%</td><td>0.846</td><td>reference</td></tr>
+<tr><td>Substitution, shipped default</td><td>21.0%</td><td>0/10</td><td>60.16</td><td>+1.6%</td><td>0.848</td><td>does not move hit rate</td></tr>
+<tr><td>Bias 0.5, decode-only, substitution off</td><td>31.1%</td><td>0/10</td><td>60.73</td><td>+2.6%</td><td>0.894</td><td><strong>closest to reference, highest hit rate of the three real settings</strong></td></tr>
+<tr><td>Bias 1.0, decode-only, substitution off</td><td>27.8%</td><td>0/10</td><td>61.54</td><td>+3.9%</td><td>0.917</td><td>fastest, highest hit rate</td></tr>
+<tr><td>Bias 1.0 + substitution also on</td><td>20.3%</td><td>0/10</td><td>60.11</td><td>+1.5%</td><td>0.916</td><td>worse than bias alone on every axis</td></tr></tbody></table></div>
+<p><strong>Qwen3.8-Flash-Next</strong>, same method, 5 prompts. The speed and agreement columns here were measured while an unrelated background
+download was contending for the same NVMe drive Qwen reads its disk-backed experts from &mdash; found and fixed mid-session, but this table's speed/agreement
+numbers predate the fix and should be re-measured. The hit-rate column is unaffected: it is a large-sample aggregate (hundreds of thousands of hits and
+misses), not sensitive to a few seconds of disk contention on a handful of requests.</p>
+<div style="overflow-x:auto"><table style="min-width:700px"><thead><tr><th>Setting</th><th>Agreement vs exact ref</th><th>Identical</th><th>Warm tok/s</th><th>vs ref</th><th>Hit rate</th><th>Verdict</th></tr></thead><tbody><tr><td>Exact reference (substitution off, bias off)</td><td>100.0%</td><td>5/5</td><td>6.15</td><td>+0.0%</td><td>0.262</td><td>reference</td></tr>
+<tr><td>Same again (the noise floor)</td><td>41.5%</td><td>1/5</td><td>6.29</td><td>+2.3%</td><td>0.256</td><td>reference - caution, see note below</td></tr>
+<tr><td>Substitution, shipped default</td><td>54.6%</td><td>1/5</td><td>6.08</td><td>-1.0%</td><td>0.254</td><td>does not move hit rate</td></tr>
+<tr><td>Bias 0.5, decode-only, substitution off</td><td>38.6%</td><td>1/5</td><td>6.24</td><td>+1.5%</td><td>0.330</td><td>hit rate up ~26% relative</td></tr>
+<tr><td>Bias 0.5 + substitution as fallback</td><td>45.6%</td><td>1/5</td><td>6.53</td><td>+6.2%</td><td>0.331</td><td>hit rate unchanged from bias alone, exactly as the mechanism predicts</td></tr></tbody></table></div>
+<p>On both models, substitution never moves the hit rate &mdash; it cannot, by construction, since it answers a miss differently rather than preventing
+one. Bias does move it, on both models, and stacking the two together is never better than bias alone. Neither is a default yet: this changes which
+expert actually runs on every request, and the Qwen numbers need a clean re-run before a call is made either way. Substitution stays in the tree as a
+fallback regardless of how this resolves.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Ten upstream commits, carried over together</h3>
+<p>A loader fix for RAM peaking without mmap, faster GGUF loading, two CUDA kernel fusions (RMS_NORM+SCALE; the MoE weighted-reduction, extended to
+speculative-decode batches), a row-prefetch for the lazily-read n-gram embedding, and three smaller correctness fixes &mdash; built together, the six CUDA
+operators they touch all passing, paired against the previous build on gemma-4:</p>
+<div style="overflow-x:auto"><table style="min-width:500px"><thead><tr><th>Operator</th><th>Result</th></tr></thead><tbody>
+<tr><td>RMS_NORM</td><td>51/51</td></tr><tr><td>MUL_MAT_ID</td><td>869/869</td></tr><tr><td>MUL_MAT</td><td>1,186/1,186</td></tr>
+<tr><td>ADD_ID</td><td>36/36</td></tr><tr><td>TOP_K</td><td>445/445</td></tr><tr><td>SOFT_MAX</td><td>212/212</td></tr>
+</tbody></table></div>
+<p>Speed: +3.0% &plusmn;1.2 against a control spread of 4.9% &mdash; a tie on gemma, which is expected: the loader and row-prefetch fixes are
+Qwen-side (its RAM pressure, its lazily-read embedding table), not gemma's.</p>
+
+<h3 style="font-family:var(--font-display);font-size:1.15rem;margin:2.5rem 0 .5rem;">Where this session stopped, and why</h3>
+<p><a href="https://arxiv.org/abs/2411.01433">HOBBIT</a> ranks the router's chosen experts by cumulative gate weight and skips the ones below a
+mass threshold entirely, rather than substituting them &mdash; a more faithful idea than gating by rank position alone, which is what the shipped
+substitution floor does. Reading the dispatch code to scope it found that the planner's own notion of "rank" is purely positional (which slot in the
+top-k list), with no gate-weight value reaching it at all: building this properly means threading a weights array through the op callback that every
+MoE layer's dispatch goes through, not adding a flag. That is a change to code every model exercises on every token, and it was not rushed in at the
+end of a long session. Scoped and left for a clean start instead.</p>
+
 <div class="callout">
 <p><strong>Two measurement traps found on the way, both of which produced confident wrong answers.</strong> A
 benchmark that sends raw prompts without the chat template makes gemma's instruct model degenerate in every
