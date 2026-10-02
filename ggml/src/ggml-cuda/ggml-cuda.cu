@@ -1666,6 +1666,69 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
 
+// KV-host buffer type: pinned host memory that the GPU reads in place (zero-copy over PCIe, via UVA).
+//
+// Used for the K/V of sparse-attention layers when the KV cache is streamed from RAM (llama --kv-stream): the
+// sparse flash attention gathers only the selected rows, so the traffic follows the top-k, not the context length.
+//
+// It is a separate buffer type from CUDA_Host on purpose. ggml_backend_cuda_device_supports_buft accepts CUDA_Host
+// only on integrated GPUs, because on a discrete GPU a tensor in an unsupported buffer is copied to the device whole
+// before each op. This type is reported as supported on every device, so KV tensors in it are used in place, and
+// nothing else that lives in ordinary pinned buffers changes behaviour.
+//
+// Allocation is portable (usable from every device's context) and, unlike CUDA_Host, never falls back to an ordinary
+// CPU buffer: a pageable buffer is not addressable by the GPU, so failing loudly is the only safe outcome.
+
+static const char * ggml_backend_cuda_kv_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
+    return GGML_CUDA_NAME "_Host_KV";
+
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_buft_is_cuda_kv_host(ggml_backend_buffer_type_t buft) {
+    return buft->iface.get_name == ggml_backend_cuda_kv_host_buffer_type_name;
+}
+
+static ggml_backend_buffer_t ggml_backend_cuda_kv_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        GGML_LOG_ERROR("%s: GGML_CUDA_NO_PINNED is set, but a streamed KV cache needs pinned memory\n", __func__);
+        return nullptr;
+    }
+
+    void * ptr = nullptr;
+    cudaError_t err = cudaHostAlloc((void **) &ptr, size, cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        // clear the error
+        (void)cudaGetLastError();
+        GGML_LOG_ERROR("%s: failed to allocate %.2f MiB of pinned memory for the streamed KV cache: %s\n", __func__,
+                       size / 1024.0 / 1024.0, cudaGetErrorString(err));
+        return nullptr;
+    }
+
+    ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+    buffer->buft = buft;
+    buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+
+    return buffer;
+}
+
+static ggml_backend_buffer_type_t ggml_backend_cuda_kv_host_buffer_type() {
+    static struct ggml_backend_buffer_type ggml_backend_cuda_buffer_type_kv_host = {
+        /* .iface    = */ {
+            /* .get_name         = */ ggml_backend_cuda_kv_host_buffer_type_name,
+            /* .alloc_buffer     = */ ggml_backend_cuda_kv_host_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
+        },
+        /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
+        /* .context  = */ nullptr,
+    };
+
+    return &ggml_backend_cuda_buffer_type_kv_host;
+}
+
 /// kernels
 
 typedef void (*ggml_cuda_op_mul_mat_t)(
@@ -4793,12 +4856,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // node's output on the host-visible buffer, which the compute path
                 // handles. Allow that here, mirroring the src-tensor check below.
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)));
+                       (integrated && ggml_backend_buft_is_cuda_host(node->buffer->buft)) ||
+                       ggml_backend_buft_is_cuda_kv_host(node->buffer->buft));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_backend_buft_is_cuda_kv_host(node->src[j]->buffer->buft));
                     }
                 }
 #else
@@ -6001,7 +6066,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+           ggml_backend_buft_is_cuda_kv_host(buft);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
@@ -6211,6 +6277,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
+    }
+    if (strcmp(name, "ggml_backend_kv_host_buffer_type") == 0) {
+        return (void *)ggml_backend_cuda_kv_host_buffer_type;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
