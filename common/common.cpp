@@ -1651,6 +1651,7 @@ struct common_moe_calibration_entry {
     int         moe_cache_mb    = -1; // -1 = not calibrated, use --moe-cache auto
     int         substitute_min_rank = -1; // -1 = not calibrated, use the runtime default gate
     int         admit_after         = -1; // -1 = not calibrated, use the runtime default (2)
+    int         readmit_after       = -1; // -1 = not calibrated, use the runtime default (8)
     int         spec_prob_accept    = -1; // -1 = not calibrated; 0 = exact-match only, 1 = probabilistic
     // The drafter cascade, as a --spec-type list. Empty = not calibrated, leave
     // the user's own --spec-type alone. The speculative framework already runs
@@ -1918,6 +1919,27 @@ static void common_moe_apply_quality_knobs(const common_moe_calibration_entry & 
         setenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cal.admit_after).c_str(), 1);
 #endif
         LOG_WRN("%s: using calibrated admission threshold of %d\n", __func__, cal.admit_after);
+    }
+    // readmit_after: the SAME demand->count gate, but for a pool that is
+    // already full and must evict something to admit this one - see
+    // moe_cache_plan_impl's own admit_after computation (max of the two
+    // once free_slots is empty, which is almost always). A much higher bar
+    // than admit_after is deliberate: an eviction is not free the way
+    // filling a free slot is, so a one-off demand should not be allowed to
+    // displace an already-proven resident. Measured directly on this
+    // model: loosening it toward admit_after's own value thrashes the pool
+    // (hit rate 22% -> 1.3%, THROTTLE=1), while raising it well above the
+    // 2026-08-13 constant of 8 instead WON (THROTTLE=32 measured 26-30%
+    // hit rate against the default's 22%) - the opposite direction from
+    // admit_after, and large enough to clear this machine's run-to-run
+    // noise, unlike admit_after's own ladder.
+    if (cal.readmit_after >= 0 && !getenv("GGML_CUDA_MOE_CACHE_THROTTLE")) {
+#if defined(_WIN32)
+        _putenv_s("GGML_CUDA_MOE_CACHE_THROTTLE", std::to_string(cal.readmit_after).c_str());
+#else
+        setenv("GGML_CUDA_MOE_CACHE_THROTTLE", std::to_string(cal.readmit_after).c_str(), 1);
+#endif
+        LOG_WRN("%s: using calibrated readmission threshold of %d\n", __func__, cal.readmit_after);
     }
     if (!std::isnan(cal.substitute_quality_sigma) &&
         !getenv("GGML_CUDA_MOE_CACHE_SUBSTITUTE_QUALITY_SIGMA")) {
@@ -2210,6 +2232,7 @@ static bool common_moe_calibration_lookup(
         out.moe_cache_mb    = e.value("moe_cache_mb", -1);
         out.substitute_min_rank = e.value("substitute_min_rank", -1);
         out.admit_after         = e.value("admit_after", -1);
+        out.readmit_after       = e.value("readmit_after", -1);
         out.spec_prob_accept    = e.value("spec_prob_accept", -1);
         out.spec_types          = e.value("spec_types", std::string());
         out.spec_p_min          = e.value("spec_p_min", -1.0);
@@ -2301,6 +2324,7 @@ static void common_moe_calibration_save(
         {"moe_cache_mb",    entry.moe_cache_mb},
         {"substitute_min_rank", entry.substitute_min_rank},
         {"admit_after", entry.admit_after},
+        {"readmit_after", entry.readmit_after},
         {"spec_prob_accept", entry.spec_prob_accept},
         {"spec_types", entry.spec_types},
         {"spec_p_min", entry.spec_p_min},
@@ -7299,6 +7323,67 @@ void common_moe_calibrate(common_params & params) {
         }
     }
 
+    // Readmission threshold: the SAME demand->count gate, but for the case
+    // (almost always, once the pool fills) where admission must evict a
+    // resident rather than take a free slot - see moe_cache_plan_impl's own
+    // admit_after computation, which takes the max of this and admit_after
+    // once free_slots is empty. A direct test of the opposite extreme
+    // (THROTTLE=1, i.e. this gate removed entirely) showed why the shipped
+    // constant of 8 cannot be lowered by guessing: hit rate collapsed from
+    // 22% to 1.3% and throughput fell below every other configuration
+    // measured, because an eviction is not free the way filling a free
+    // slot is, and a one-off demand should not be allowed to keep
+    // displacing an already-proven resident. But the SAME direct test
+    // found the other direction wins: THROTTLE=32 measured 26-30% hit rate
+    // against the default's 22%, large enough to clear this machine's
+    // 12-20% run-to-run spread - unlike admit_after's own ladder, which
+    // never has. So unlike admit_after, this stage is worth running by
+    // default; GGML_MOE_CALIBRATE_SEARCH_READMIT=0 skips it.
+    int    best_readmit_after     = -1;
+    double best_readmit_after_tps = cheap_incumbent_tps > 0.0 ? cheap_incumbent_tps : best_tps;
+    const bool search_readmit = [] {
+        const char * e = getenv("GGML_MOE_CALIBRATE_SEARCH_READMIT");
+        return !e || atoi(e) != 0;
+    }();
+    if (!search_readmit) {
+        LOG_WRN("%s: readmission threshold left at its shipped constant "
+                "(GGML_MOE_CALIBRATE_SEARCH_READMIT=0 was set)\n", __func__);
+        common_moe_calibration_status_note("readmission threshold", "default",
+                "DEFAULT - search explicitly disabled", true, true);
+    } else if (!common_moe_calibrate_budget_spent()) {
+        LOG_INF("%s: searching readmission threshold (readmit_after) ...\n", __func__);
+        common_moe_calibration_status_set("searching readmission threshold");
+        for (const int candidate : {8, 16, 32, 64}) {
+            if (common_moe_calibrate_budget_spent()) {
+                break;
+            }
+            char env_buf[64];
+            snprintf(env_buf, sizeof(env_buf), "GGML_CUDA_MOE_CACHE_THROTTLE=%d ", candidate);
+            const double tps = common_moe_bench_candidate_server(
+                    self_exe, path_model, mtp_path_for_threads, best_n, n_max_for_threads,
+                    best_threads, next_port(), ctx, n_predict, concurrency, best_cache_mb, -1,
+                    active_ngl, active_min_rank, nullptr, 1234,
+                    std::numeric_limits<double>::quiet_NaN(), false, false, env_buf);
+            LOG_INF("%s:   readmit_after=%d -> %s\n", __func__, candidate,
+                    tps > 0 ? string_format("%.2f tok/s", tps).c_str() : "failed");
+            common_moe_calibration_status_note("readmission threshold",
+                    string_format("readmit_after=%d", candidate),
+                    tps > 0 ? string_format("%.2f tok/s", tps) : std::string("failed"), tps > 0);
+            common_moe_calibration_status_candidate_done();
+            if (tps > best_readmit_after_tps) {
+                best_readmit_after_tps = tps;
+                best_readmit_after     = candidate;
+            }
+        }
+        if (best_readmit_after >= 0) {
+            LOG_INF("%s: readmission threshold: readmit_after=%d at %.2f tok/s\n",
+                    __func__, best_readmit_after, best_readmit_after_tps);
+            common_moe_calibration_status_note("readmission threshold",
+                    string_format("readmit_after=%d", best_readmit_after),
+                    string_format("SELECTED - %.2f tok/s", best_readmit_after_tps), true, true);
+        }
+    }
+
     // One measurement on the candidate held open for live sweeps, applying the
     // given policy knobs first, and one that launches and holds a candidate open.
     // Declared here because the ring is the first sweep that can use them; the
@@ -8542,6 +8627,7 @@ void common_moe_calibrate(common_params & params) {
     entry.substitute_quality_sigma = active_quality_sigma;
     entry.fit_target_mb   = best_fit_mb;
     entry.admit_after     = best_admit_after;
+    entry.readmit_after   = best_readmit_after;
     entry.spec_prob_accept = best_prob_accept;
     entry.spec_types      = best_spec_types;
     entry.spec_p_min      = best_p_min;
@@ -9381,6 +9467,13 @@ static bool common_maybe_autoplace_moe_cpu(
                 _putenv_s("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cached.admit_after).c_str());
 #else
                 setenv("GGML_CUDA_MOE_CACHE_ADMIT_AFTER", std::to_string(cached.admit_after).c_str(), 1);
+#endif
+            }
+            if (cached.readmit_after >= 0 && !getenv("GGML_CUDA_MOE_CACHE_THROTTLE")) {
+#if defined(_WIN32)
+                _putenv_s("GGML_CUDA_MOE_CACHE_THROTTLE", std::to_string(cached.readmit_after).c_str());
+#else
+                setenv("GGML_CUDA_MOE_CACHE_THROTTLE", std::to_string(cached.readmit_after).c_str(), 1);
 #endif
             }
             const bool neuron_reduce_is_default = !getenv("GGML_CUDA_MOE_CACHE_NEURON_REDUCE");
